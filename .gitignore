@@ -10,3 +10,6 @@ src-tauri/target
 src-tauri/gen
 announcement-recordings
 headroom_memory.db
+
+# Local git worktrees (isolated feature branches)
+.worktrees/
