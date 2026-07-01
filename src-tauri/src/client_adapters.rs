@@ -18,6 +18,7 @@ use crate::storage::{app_data_dir, config_file};
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_OPENAI_BASE_URL: &str = "http://127.0.0.1:6767/v1";
+const HEADROOM_GROK_PROXY_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const ZSH_PROFILE_FILE: &str = ".zprofile";
 const ZSH_RC_FILE: &str = ".zshrc";
 const BASH_PROFILE_FILE: &str = ".bash_profile";
@@ -39,7 +40,7 @@ struct ManagedClientSpec {
     name: &'static str,
 }
 
-const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 2] = [
+const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 3] = [
     ManagedClientSpec {
         id: "claude_code",
         name: "Claude Code",
@@ -47,6 +48,10 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 2] = [
     ManagedClientSpec {
         id: "codex",
         name: "Codex",
+    },
+    ManagedClientSpec {
+        id: "grok_build",
+        name: "Grok Build",
     },
 ];
 
@@ -63,6 +68,7 @@ pub fn detect_clients() -> Vec<ClientStatus> {
     vec![
         detect_claude_code_client(is_configured(&setup_state, "claude_code")),
         detect_codex_client(is_configured(&setup_state, "codex")),
+        detect_grok_build_client(is_configured(&setup_state, "grok_build")),
     ]
 }
 
@@ -342,6 +348,30 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             // Codex history list stays whole once it routes through Headroom.
             retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
         }
+        "grok_build" => {
+            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            let mut updates = configure_grok_proxy_block()?;
+            let env_block = format!(
+                "export GROK_CLI_CHAT_PROXY_BASE_URL={}",
+                HEADROOM_GROK_PROXY_BASE_URL
+            );
+            match shell_step_best_effort(configure_shell_block(
+                &shell_targets,
+                "grok_build",
+                &env_block,
+            ))? {
+                Some(mut shell) => {
+                    updates.0.append(&mut shell.0);
+                    updates.1.append(&mut shell.1);
+                }
+                None => shell_unwritable = true,
+            }
+            changed_files.extend(updates.0);
+            backup_files.extend(updates.1);
+            state
+                .managed_shell_files
+                .insert(state_id.clone(), serialize_paths(&shell_targets));
+        }
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
 
@@ -386,6 +416,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
                 "Run one {} prompt and verify activity appears in Headroom.",
                 match normalized_setup_id(client_id) {
                     "codex_cli" => "Codex",
+                    "grok_build" => "Grok Build",
                     _ => "Claude Code",
                 }
             ));
@@ -526,6 +557,39 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 }
             });
         }
+        "grok_build" => {
+            let state = load_setup_state();
+            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            let shell_ok = shell_block_contains_in_files(
+                &shell_targets,
+                "grok_build",
+                "GROK_CLI_CHAT_PROXY_BASE_URL",
+                HEADROOM_GROK_PROXY_BASE_URL,
+            )?;
+            let toml_ok = grok_proxy_block_matches()?;
+
+            if shell_ok {
+                checks.push(
+                    "Found Grok Build GROK_CLI_CHAT_PROXY_BASE_URL export in managed shell block."
+                        .into(),
+                );
+            }
+            if toml_ok {
+                checks
+                    .push("Found Headroom-managed proxy block in ~/.grok/config.toml.".into());
+            }
+            if !toml_ok {
+                failures.push(
+                    "Headroom-managed proxy block was not found in ~/.grok/config.toml.".into(),
+                );
+            }
+            if !shell_ok {
+                failures.push(
+                    "Grok Build GROK_CLI_CHAT_PROXY_BASE_URL export was not found in shell profiles."
+                        .into(),
+                );
+            }
+        }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
     }
 
@@ -553,6 +617,10 @@ pub fn is_claude_code_enabled() -> bool {
 
 pub fn is_codex_enabled() -> bool {
     is_configured(&load_setup_state(), "codex_cli")
+}
+
+pub fn is_grok_build_enabled() -> bool {
+    is_configured(&load_setup_state(), "grok_build")
 }
 
 pub fn list_client_connectors(
@@ -659,6 +727,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 .cloned();
             remove_vscode_connector_keys(preserved.as_deref())?;
         }
+        "grok_build" => disable_grok_build()?,
         other => {
             return Err(anyhow!(
                 "Automatic setup disable is not supported yet for {other}.",
@@ -863,6 +932,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     backup_targets.push(codex_config_toml_path());
     backup_targets.push(codex_hooks_json_path());
     backup_targets.push(codex_guard_hook_path());
+    backup_targets.push(grok_config_toml_path());
     backup_targets.push(
         home_dir()
             .join("Library")
@@ -2438,6 +2508,158 @@ fn bracket_delta(line: &str) -> i32 {
     delta
 }
 
+const GROK_PROXY_BLOCK_ID: &str = "grok_build_proxy";
+
+fn grok_config_toml_path() -> PathBuf {
+    grok_home().join("config.toml")
+}
+
+fn grok_proxy_body() -> String {
+    format!(
+        "[model.grok-build]\nbase_url = \"{base}\"",
+        base = HEADROOM_GROK_PROXY_BASE_URL
+    )
+}
+
+fn strip_grok_managed_toml(content: &str) -> String {
+    strip_marker_block(content, GROK_PROXY_BLOCK_ID)
+}
+
+fn render_grok_config(existing: &str) -> String {
+    let mid = strip_grok_managed_toml(existing);
+    let mid = mid.trim();
+
+    let mut out = codex_marker_block(GROK_PROXY_BLOCK_ID, &grok_proxy_body());
+    if !mid.is_empty() {
+        out.push('\n');
+        out.push_str(mid);
+        out.push('\n');
+    }
+    out
+}
+
+fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
+    let path = grok_config_toml_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let updated = render_grok_config(&existing);
+    if updated == existing {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let backup = backup_if_exists(&path)?;
+    std::fs::write(&path, &updated).with_context(|| format!("writing {}", path.display()))?;
+
+    let mut backup_files = Vec::new();
+    if let Some(backup_path) = backup {
+        backup_files.push(backup_path.display().to_string());
+    }
+    Ok((vec![path.display().to_string()], backup_files))
+}
+
+fn grok_proxy_block_matches() -> Result<bool> {
+    let path = grok_config_toml_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let base_url = format!("base_url = \"{}\"", HEADROOM_GROK_PROXY_BASE_URL);
+    Ok(marker_block_contains(&content, GROK_PROXY_BLOCK_ID, &base_url))
+}
+
+fn remove_grok_proxy_block() -> Result<()> {
+    let path = grok_config_toml_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let stripped = strip_grok_managed_toml(&existing);
+    let normalized = {
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        }
+    };
+    if normalized == existing {
+        return Ok(());
+    }
+    let _ = backup_if_exists(&path)?;
+    std::fs::write(&path, &normalized).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn disable_grok_build() -> Result<()> {
+    remove_grok_proxy_block()?;
+    let shell_targets = all_shell_paths();
+    let _ = remove_shell_block(&shell_targets, "grok_build");
+    Ok(())
+}
+
+/// Rewrite the `command` of the `[mcp_servers.headroom]` table in
+/// `~/.grok/config.toml` to the absolute `entrypoint`. Mirrors
+/// [`pin_codex_mcp_command`]: the upstream Python registrar writes a bare
+/// `command = "headroom"` that relies on PATH, which dangles when the managed
+/// runtime relocates.
+pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
+    let path = grok_config_toml_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+
+    let target_line = format!("command = {}", toml_basic_string(&entrypoint.to_string_lossy()));
+
+    let mut in_headroom_table = false;
+    let mut replaced = false;
+    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_headroom_table = trimmed == "[mcp_servers.headroom]";
+            out.push(line.to_string());
+            continue;
+        }
+        if in_headroom_table
+            && !replaced
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "command")
+        {
+            out.push(target_line.clone());
+            replaced = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if !replaced {
+        return Ok(None);
+    }
+    let mut rebuilt = out.join("\n");
+    if content.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+    if rebuilt == content {
+        return Ok(None);
+    }
+    let _ = backup_if_exists(&path)?;
+    std::fs::write(&path, rebuilt).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 fn toml_basic_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -3962,6 +4184,14 @@ fn codex_home() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".codex"))
 }
 
+/// Grok Build's home directory. Honors `$GROK_HOME` when set, else `~/.grok`.
+fn grok_home() -> PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".grok"))
+}
+
 fn detect_claude_code_client(configured: bool) -> ClientStatus {
     let executable = claude_code_candidate_paths()
         .into_iter()
@@ -4148,6 +4378,79 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
         health: ClientHealth::NotDetected,
         notes: vec!["Not detected on this machine yet.".into()],
     }
+}
+
+fn detect_grok_build_client(configured: bool) -> ClientStatus {
+    let executable = grok_candidate_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .or_else(|| find_on_path(&["grok"]));
+
+    let detected = executable
+        .as_ref()
+        .map(|path| format!("Detected at {}", path.display()))
+        .or_else(|| {
+            grok_user_state_exists()
+                .then(|| format!("Detected Grok Build data in {}.", grok_home().display()))
+        });
+
+    if let Some(detected_note) = detected {
+        return ClientStatus {
+            id: "grok_build".into(),
+            name: "Grok Build".into(),
+            installed: true,
+            configured,
+            health: if configured {
+                ClientHealth::Healthy
+            } else {
+                ClientHealth::Attention
+            },
+            notes: if configured {
+                vec![detected_note, "Configured by Headroom.".into()]
+            } else {
+                vec![
+                    detected_note,
+                    "Route Grok Build through Headroom's localhost proxy so prompts stay lean."
+                        .into(),
+                ]
+            },
+        };
+    }
+
+    ClientStatus {
+        id: "grok_build".into(),
+        name: "Grok Build".into(),
+        installed: false,
+        configured: false,
+        health: ClientHealth::NotDetected,
+        notes: vec!["Not detected on this machine yet.".into()],
+    }
+}
+
+fn grok_candidate_paths() -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut candidates = vec![
+        PathBuf::from("/usr/local/bin/grok"),
+        PathBuf::from("/opt/homebrew/bin/grok"),
+        home.join(".grok").join("downloads").join("grok-macos-aarch64"),
+        home.join(".grok").join("downloads").join("grok-macos-x86_64"),
+    ];
+
+    let user_bin_dirs = vec![
+        home.join(".local").join("bin"),
+        home.join("bin"),
+        home.join(".cargo").join("bin"),
+    ];
+    candidates.extend(binary_candidates_in_dirs(&user_bin_dirs, &["grok"]));
+    dedupe_paths(candidates)
+}
+
+fn grok_user_state_exists() -> bool {
+    let grok_root = grok_home();
+    grok_root.join("config.toml").exists()
+        || grok_root.join("auth.json").exists()
+        || grok_root.join("sessions").exists()
+        || grok_root.join("downloads").exists()
 }
 
 fn codex_candidate_paths() -> Vec<PathBuf> {
@@ -6134,6 +6437,49 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
             "shell export removed on disable, got:\n{combined_after}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_then_verify_then_disable_grok_build_round_trip() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+
+        let result =
+            super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        assert!(result.applied);
+        assert_eq!(result.client_id, "grok_build");
+
+        let config_toml = home.path().join(".grok").join("config.toml");
+        let toml = fs::read_to_string(&config_toml).expect("grok config.toml written");
+        assert!(
+            toml.contains("# >>> headroom:grok_build_proxy >>>"),
+            "managed marker present, got:\n{toml}"
+        );
+        assert!(
+            toml.contains("base_url = \"http://127.0.0.1:6767/v1\""),
+            "proxy base_url set, got:\n{toml}"
+        );
+
+        let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        let combined = format!("{zshrc}\n{zshenv}");
+        assert!(
+            combined.contains("GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:6767/v1"),
+            "GROK_CLI_CHAT_PROXY_BASE_URL exported, got:\n{combined}"
+        );
+
+        let verification =
+            super::verify_client_setup("grok_build").expect("verify_client_setup succeeds");
+        assert!(verification.failures.is_empty(), "{:?}", verification.failures);
+
+        super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
+        assert!(
+            !toml_after.contains("# >>> headroom:grok_build_proxy >>>"),
+            "managed block removed on disable, got:\n{toml_after}"
         );
     }
 

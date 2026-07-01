@@ -220,17 +220,31 @@ export function mergeProviderSavingsForDisplay(
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
       totalTokensSent: 0
+    },
+    grok: {
+      label: "Grok Build",
+      count: 0,
+      estimatedSavingsUsd: 0,
+      estimatedTokensSaved: 0,
+      actualCostUsd: 0,
+      totalTokensSent: 0
     }
   };
   for (const point of byProvider) {
-    const group = point.provider.toLowerCase() === "openai" ? groups.codex : groups.claude;
+    const provider = point.provider.toLowerCase();
+    const group =
+      provider === "openai"
+        ? groups.codex
+        : provider === "xai"
+          ? groups.grok
+          : groups.claude;
     group.count += 1;
     group.estimatedSavingsUsd += point.estimatedSavingsUsd;
     group.estimatedTokensSaved += point.estimatedTokensSaved;
     group.actualCostUsd += point.actualCostUsd;
     group.totalTokensSent += point.totalTokensSent;
   }
-  return [groups.claude, groups.codex]
+  return [groups.claude, groups.codex, groups.grok]
     .filter((group) => group.count > 0)
     .map(({ count: _count, ...display }) => display);
 }
@@ -369,7 +383,7 @@ export function formatLearnStatus(project: {
   return `last scan: ${diffDays} days ago`;
 }
 
-const SUPPORTED_CONNECTOR_IDS = new Set(["claude_code", "codex"]);
+const SUPPORTED_CONNECTOR_IDS = new Set(["claude_code", "codex", "grok_build"]);
 
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {
   return connectors.filter((connector) =>
