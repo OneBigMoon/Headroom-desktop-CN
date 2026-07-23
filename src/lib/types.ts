@@ -11,6 +11,7 @@ export interface ManagedTool {
   sourceUrl: string;
   version: string;
   checksum?: string | null;
+  savingsLabel?: string | null;
 }
 
 export interface PipelineStageMetric {

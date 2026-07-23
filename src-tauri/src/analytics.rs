@@ -44,6 +44,10 @@ const ALLOWED_EVENTS: &[&str] = &[
     "ponytail_enabled",
     "ponytail_disabled",
     "ponytail_uninstalled",
+    // Feature engagement: learn runs (per run, `agent` property) and Activity
+    // tab opens (once per app run, mirroring app_started's cadence).
+    "headroom_learn_run",
+    "activity_tab_opened",
 ];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;

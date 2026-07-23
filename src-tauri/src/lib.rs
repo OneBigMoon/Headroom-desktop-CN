@@ -882,6 +882,12 @@ async fn install_addon(
                 );
             }
         }
+        "serena" => {
+            state
+                .tool_manager
+                .install_serena()
+                .map_err(|err| err.to_string())?;
+        }
         other => return Err(format!("unknown addon: {other}")),
     }
     analytics::track_event(&app, &format!("{id}_installed"), None);
@@ -919,6 +925,12 @@ async fn set_addon_enabled(
             state
                 .tool_manager
                 .set_ponytail_enabled(enabled)
+                .map_err(|err| err.to_string())?;
+        }
+        "serena" => {
+            state
+                .tool_manager
+                .set_serena_enabled(enabled)
                 .map_err(|err| err.to_string())?;
         }
         other => return Err(format!("unknown addon: {other}")),
@@ -960,6 +972,12 @@ async fn uninstall_addon(
             state
                 .tool_manager
                 .uninstall_ponytail()
+                .map_err(|err| err.to_string())?;
+        }
+        "serena" => {
+            state
+                .tool_manager
+                .uninstall_serena()
                 .map_err(|err| err.to_string())?;
         }
         other => return Err(format!("unknown addon: {other}")),

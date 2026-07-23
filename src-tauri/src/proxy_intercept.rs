@@ -35,6 +35,12 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 // under a second; 30s is a generous stall bound, not a throughput budget.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+// Ceiling on the client-supplied Content-Length that sizes the up-front body
+// allocation in the direct-forward path. Prevents a single request with e.g.
+// `Content-Length: 9000000000` from OOM-ing the tray process (which carries the
+// always-on proxy). 100 MiB clears Anthropic's 32 MB request limit with room to
+// spare for image payloads.
+const MAX_DIRECT_BODY: usize = 100 * 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1341,6 +1347,14 @@ async fn forward_direct_to_anthropic(
             .await
             .is_err()
     {
+        return;
+    }
+
+    // Cap the client-declared body before it sizes the allocation below.
+    if parsed.content_length.is_some_and(|n| n > MAX_DIRECT_BODY) {
+        let _ = client
+            .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n")
+            .await;
         return;
     }
 

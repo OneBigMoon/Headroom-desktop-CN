@@ -23,6 +23,10 @@ pub struct ManagedTool {
     pub source_url: String,
     pub version: String,
     pub checksum: Option<String>,
+    /// Short savings/usage line for the addon card chip ("12 docs converted").
+    /// None when the addon has no measurable or citable figure.
+    #[serde(default)]
+    pub savings_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -228,6 +228,17 @@ const addonCopy: Record<string, AddonCopy> = {
     enabling: "Enabling Ponytail...",
     disabling: "Disabling Ponytail...",
     disabled: "Ponytail is off. It stays installed but no longer nudges the agent."
+  },
+  serena: {
+    whatItDoes:
+      "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and Codex. Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+    installing: "Installing Serena and registering its MCP server...",
+    installed: "Serena installed. Restart open agent sessions to pick up the new MCP server.",
+    uninstalling: "Removing Serena and its MCP registrations...",
+    uninstalled: "Serena removed. Your agent reads code as whole files again.",
+    enabling: "Re-registering the Serena MCP server...",
+    disabling: "Removing the Serena MCP registrations...",
+    disabled: "Serena is off but still installed. Re-enable any time without re-downloading."
   }
 };
 
@@ -812,12 +823,14 @@ function renderConnectorLogo(clientId: string) {
 }
 
 function AddonClientChips({
-  connectors
+  connectors,
+  savings
 }: {
   connectors: ClientConnectorStatus[];
+  savings?: string | null;
 }) {
   const clients = sortClientConnectors(aggregateClientConnectors(connectors));
-  if (clients.length === 0) {
+  if (clients.length === 0 && !savings) {
     return null;
   }
   return (
@@ -839,6 +852,15 @@ function AddonClientChips({
           </span>
         );
       })}
+      {savings ? (
+        <span className="callout-banner__chip" title="Savings">
+          <span
+            className="callout-banner__chip-dot callout-banner__chip-dot--active"
+            aria-hidden="true"
+          />
+          <span className="callout-banner__chip-name">{savings}</span>
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -864,6 +886,7 @@ function AddonCard({
   onOpenSource,
   connectors,
   showClients,
+  savings,
   actionsDisabled,
   onInstall,
   onToggleEnabled,
@@ -886,6 +909,7 @@ function AddonCard({
   onOpenSource: () => void;
   connectors: ClientConnectorStatus[];
   showClients: boolean;
+  savings?: string | null;
   actionsDisabled: boolean;
   onInstall: () => void;
   onToggleEnabled: () => void;
@@ -923,7 +947,9 @@ function AddonCard({
           <p className="addon-card__info-text">{copy.whatItDoes}</p>
         ) : null}
         <p className="addon-card__description">{description}</p>
-        {showClients ? <AddonClientChips connectors={connectors} /> : null}
+        {showClients ? (
+          <AddonClientChips connectors={connectors} savings={savings} />
+        ) : null}
         <button type="button" className="addon-card__link" onClick={onOpenSource}>
           {sourceUrl}
         </button>
@@ -1127,6 +1153,7 @@ export default function App() {
   // at least once this session. The tray-focus pre-warm is gated on this so
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
   const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
+  const activityTabTrackedRef = useRef(false);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
@@ -2135,6 +2162,12 @@ export default function App() {
     if (activeView === "notifications" || activeView === "optimization") {
       setHeavyTabEverOpened(true);
     }
+    // Once per app run, mirroring app_started's cadence so adoption ratios
+    // (activity users / app_started users) compare like with like.
+    if (activeView === "notifications" && !activityTabTrackedRef.current) {
+      activityTabTrackedRef.current = true;
+      trackAnalyticsEvent("activity_tab_opened");
+    }
   }, [activeView]);
 
   // Pre-warm Optimize + Activity data the moment the tray gains focus, so
@@ -3052,6 +3085,7 @@ export default function App() {
           projectPath ??
           "");
     const startupSummary = `Running headroom learn for ${displayName}.`;
+    trackAnalyticsEvent("headroom_learn_run", { agent });
     setHeadroomLearnBusy(true);
     setHeadroomLearnStatus((current) => ({
       ...current,
@@ -3578,6 +3612,10 @@ export default function App() {
   const rtkAvgSavingsPct =
     runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalCommands ?? 0) > 0
       ? runtimeStatus.rtk.avgSavingsPct ?? 0
+      : null;
+  const rtkSavingsChip =
+    runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalSaved ?? 0) > 0
+      ? `~${compactNumber(runtimeStatus.rtk.totalSaved ?? 0)} tokens saved`
       : null;
   const lifetimeDataDays = new Set(
     dashboard.dailySavings
@@ -5717,6 +5755,7 @@ export default function App() {
                 showClients={
                   runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
                 }
+                savings={rtkSavingsChip}
                 actionsDisabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
                 onInstall={() => void runAddonAction("install_addon", "rtk")}
                 onToggleEnabled={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
@@ -5777,6 +5816,7 @@ export default function App() {
                       onOpenSource={() => void openExternalLink(tool.sourceUrl)}
                       connectors={connectors}
                       showClients={installed && tool.enabled}
+                      savings={tool.savingsLabel ?? null}
                       actionsDisabled={addonBusyId === tool.id}
                       onInstall={() => void runAddonAction("install_addon", tool.id)}
                       onToggleEnabled={() =>

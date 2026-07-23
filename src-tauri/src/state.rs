@@ -757,6 +757,14 @@ impl AppState {
             log::warn!("RTK integrations failed during warm_runtime_on_launch: {err:#}");
         }
 
+        // Pre-wrapper installs still have a bare symlink shim; refresh it so
+        // the conversion counter starts recording without a reinstall.
+        if self.tool_manager.markitdown_installed() {
+            if let Err(err) = self.tool_manager.ensure_markitdown_shim() {
+                log::warn!("markitdown shim refresh failed during warm_runtime_on_launch: {err:#}");
+            }
+        }
+
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
         // during a prior install), retry it now.
         if let Err(err) = self.tool_manager.ensure_mcp_configured() {
@@ -6197,10 +6205,10 @@ mod tests {
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
-        rebuild_persisted_savings_from_records,
-        tcp_port_accepts_connection, total_dir_size_bytes, AppState, BootValidationOutcome,
-        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
-        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        rebuild_persisted_savings_from_records, tcp_port_accepts_connection, total_dir_size_bytes,
+        AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
+        SavingsObservation, SavingsRecord, SavingsTracker,
     };
 
     #[test]
@@ -6222,8 +6230,7 @@ mod tests {
     fn readyz_503_upstream_only_body_counts_as_reachable() {
         // Only the cached upstream probe is down: process alive and serving, so
         // don't flap the UI banner "crashed" on a transient network blip.
-        let upstream_only =
-            r#"{"checks":{"startup":{"ready":true},"upstream":{"ready":false}}}"#;
+        let upstream_only = r#"{"checks":{"startup":{"ready":true},"upstream":{"ready":false}}}"#;
         assert!(proxy_readyz_503_body_is_upstream_only(upstream_only));
         // A core component down is a real readiness failure: stay unreachable.
         let core_down = r#"{"checks":{"cache":{"ready":false},"upstream":{"ready":false}}}"#;
@@ -8600,7 +8607,12 @@ mod tests {
         let mut tracker = make_tracker();
 
         for (requests, saved, sent, history) in [
-            (1usize, 0u64, 0u64, vec![history_point_at(2026, 3, 20, 8, 0)]),
+            (
+                1usize,
+                0u64,
+                0u64,
+                vec![history_point_at(2026, 3, 20, 8, 0)],
+            ),
             (
                 2,
                 1_000,

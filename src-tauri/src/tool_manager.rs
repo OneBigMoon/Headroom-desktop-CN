@@ -253,6 +253,73 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
 }
 const RTK_VERSION: &str = "0.42.4";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.6";
+const SERENA_PINNED_VERSION: &str = "1.6.1";
+/// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
+/// take tens of seconds.
+const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Registers/unregisters the managed Serena MCP entry with every detected
+/// agent, reusing the bundled headroom package's registrars and install
+/// ledger instead of reimplementing Claude Code JSON / Codex TOML handling in
+/// Rust. Mirrors upstream `_setup_serena_mcp` / `_remove_headroom_installed_serena_mcp`
+/// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
+/// ever overwritten or removed — a user-managed serena entry is left alone.
+/// argv: `register <serena-bin>` | `unregister`.
+const SERENA_MCP_HELPER: &str = r#"
+import sys
+
+from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, ServerSpec
+from headroom.mcp_registry.base import RegisterStatus
+from headroom.mcp_registry.ledger import (
+    clear_install,
+    headroom_installed_matching,
+    record_install,
+)
+
+action = sys.argv[1]
+failures = []
+for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar(), "codex")):
+    if not registrar.detect():
+        print(f"{registrar.name}: not detected, skipping")
+        continue
+    if action == "register":
+        spec = ServerSpec(
+            name="serena",
+            command=sys.argv[2],
+            args=(
+                "start-mcp-server",
+                "--project-from-cwd",
+                "--context",
+                context,
+                "--open-web-dashboard",
+                "False",
+            ),
+        )
+        result = registrar.register_server(spec)
+        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
+            registrar.name, registrar.get_server("serena")
+        ):
+            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            record_install(registrar.name, spec)
+        elif result.status == RegisterStatus.FAILED:
+            failures.append(f"{registrar.name}: {result.detail}")
+        print(f"{registrar.name}: {result.status.value}")
+    else:
+        current = registrar.get_server("serena")
+        if current is None:
+            print(f"{registrar.name}: no serena entry")
+            continue
+        if not headroom_installed_matching(registrar.name, current):
+            print(f"{registrar.name}: serena entry is user-managed, leaving it")
+            continue
+        if registrar.unregister_server("serena"):
+            clear_install(registrar.name, "serena")
+            print(f"{registrar.name}: removed")
+        else:
+            failures.append(f"{registrar.name}: removal failed")
+if failures:
+    sys.exit("; ".join(failures))
+"#;
 const PONYTAIL_MARKETPLACE: &str = "DietrichGebert/ponytail";
 const PONYTAIL_MARKETPLACE_NAME: &str = "ponytail";
 const PONYTAIL_PLUGIN_REF: &str = "ponytail@ponytail";
@@ -542,6 +609,18 @@ impl ToolManager {
                 required: false,
             },
             ManagedToolManifest {
+                id: "serena".into(),
+                name: "Serena".into(),
+                description:
+                    "MCP server that gives your agent symbol-level code tools, so it reads one function instead of a whole file. Saves most in large repos; adds its tool definitions to every request."
+                        .into(),
+                runtime: "python".into(),
+                source_url: "https://github.com/oraios/serena".into(),
+                version: SERENA_PINNED_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
                 id: "ponytail".into(),
                 name: "Ponytail".into(),
                 description:
@@ -583,8 +662,27 @@ impl ToolManager {
                     manifest.version.clone()
                 },
                 checksum: manifest.checksum.clone(),
+                savings_label: self.tool_savings_label(&manifest.id),
             })
             .collect()
+    }
+
+    /// Chip text for the Addons tab. markitdown is a measured count (shim
+    /// counter); ponytail is the plugin's published benchmark median — its
+    /// skill forbids inventing per-repo figures, so the label says "benchmark".
+    /// rtk's figure comes from `rtk gain` via RuntimeStatus, not from here.
+    fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
+        match tool_id {
+            "markitdown" => self.markitdown_conversion_count().map(|count| {
+                if count == 1 {
+                    "1 doc converted".to_string()
+                } else {
+                    format!("{count} docs converted")
+                }
+            }),
+            "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
+            _ => None,
+        }
     }
 
     pub fn python_runtime_installed(&self) -> bool {
@@ -3792,21 +3890,59 @@ impl ToolManager {
         self.runtime.venv_dir.join("bin").join("markitdown")
     }
 
-    /// Symlink in the Headroom-managed bin dir. The Office nudge and the Bash
+    /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
     /// permission both reference this absolute path, so it works whether or not
     /// the bin dir is on PATH (RTK, which exports it, is now opt-in).
     pub fn markitdown_shim_path(&self) -> PathBuf {
         self.runtime.bin_dir.join("markitdown")
     }
 
-    fn ensure_markitdown_shim(&self) -> Result<()> {
+    fn markitdown_conversion_counter_path(&self) -> PathBuf {
+        self.runtime.tools_dir.join("markitdown-conversions")
+    }
+
+    /// Lifetime conversions recorded by the shim. None until the first one.
+    pub fn markitdown_conversion_count(&self) -> Option<u64> {
+        let raw = std::fs::read_to_string(self.markitdown_conversion_counter_path()).ok()?;
+        raw.trim().parse::<u64>().ok().filter(|count| *count > 0)
+    }
+
+    /// Wrapper script (previously a bare symlink) so each real conversion bumps
+    /// a counter the Addons tab can show. Flag-only invocations (--help) are
+    /// not counted. Re-run on every launch so pre-wrapper installs pick it up.
+    pub fn ensure_markitdown_shim(&self) -> Result<()> {
         let shim = self.markitdown_shim_path();
         if shim.exists() || shim.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&shim);
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(self.markitdown_entrypoint(), &shim)
-            .with_context(|| format!("symlinking markitdown shim {}", shim.display()))?;
+        {
+            // ponytail: single-quoting is enough - both paths live under
+            // Application Support (spaces, no quotes).
+            let script = format!(
+                "#!/bin/sh\n\
+                 # Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\n\
+                 case \"$1\" in\n\
+                   \"\"|-*) ;;\n\
+                   *)\n\
+                     C='{counter}'\n\
+                     n=$(cat \"$C\" 2>/dev/null)\n\
+                     case \"$n\" in ''|*[!0-9]*) n=0;; esac\n\
+                     printf '%s' $((n+1)) > \"$C.tmp\" 2>/dev/null && mv -f \"$C.tmp\" \"$C\" 2>/dev/null\n\
+                     ;;\n\
+                 esac\n\
+                 exec '{real}' \"$@\"\n",
+                counter = self.markitdown_conversion_counter_path().display(),
+                real = self.markitdown_entrypoint().display(),
+            );
+            crate::client_adapters::atomic_write(&shim, script.as_bytes())
+                .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
+            let mut perms = std::fs::metadata(&shim)?.permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&shim, perms).with_context(|| {
+                format!("marking markitdown shim executable {}", shim.display())
+            })?;
+        }
         Ok(())
     }
 
@@ -3880,6 +4016,129 @@ impl ToolManager {
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// Serena lives in its own venv: its LSP dependency tree must never
+    /// up/downgrade headroom-ai's pins in the shared venv (a broken optional
+    /// addon must not take down the proxy). Outside runtime/ so in-place and
+    /// atomic runtime upgrades can't wipe it.
+    pub fn serena_venv_dir(&self) -> PathBuf {
+        self.runtime.root_dir.join("serena-venv")
+    }
+
+    pub fn serena_entrypoint(&self) -> PathBuf {
+        self.serena_venv_dir().join("bin").join("serena")
+    }
+
+    pub fn serena_installed(&self) -> bool {
+        self.runtime.tools_dir.join("serena.json").exists() && self.serena_entrypoint().exists()
+    }
+
+    pub fn install_serena(&self) -> Result<()> {
+        // --clear so a retry after a partial install starts from a clean venv.
+        run_command_with_timeout(
+            &self.runtime.standalone_python(),
+            &[
+                "-m",
+                "venv",
+                "--clear",
+                &self.serena_venv_dir().to_string_lossy(),
+            ],
+            &self.runtime.root_dir,
+            Duration::from_secs(120),
+        )
+        .context("creating serena venv")?;
+        let serena_python = self.serena_venv_dir().join("bin").join("python3");
+        run_pip_install_with_retries_streaming(
+            &serena_python,
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                &format!("serena-agent=={SERENA_PINNED_VERSION}"),
+            ],
+            &self.runtime.root_dir,
+            |line| log::info!("serena pip: {line}"),
+        )?;
+        if !self.serena_entrypoint().exists() {
+            bail!(
+                "serena install completed but {} was not found",
+                self.serena_entrypoint().display()
+            );
+        }
+        run_command_with_timeout(
+            &self.serena_entrypoint(),
+            &["--help"],
+            &self.runtime.root_dir,
+            SERENA_SMOKE_TEST_TIMEOUT,
+        )
+        .context("serena installed but failed its smoke test")?;
+        self.register_serena_mcp()?;
+        self.write_tool_receipt(
+            "serena",
+            json!({ "version": SERENA_PINNED_VERSION, "enabled": true }),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_serena_enabled(&self, enabled: bool) -> Result<()> {
+        if !self.serena_installed() {
+            bail!("serena is not installed");
+        }
+        if enabled {
+            self.register_serena_mcp()?;
+        } else {
+            self.unregister_serena_mcp()?;
+        }
+        self.write_tool_receipt(
+            "serena",
+            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled }),
+        )?;
+        Ok(())
+    }
+
+    pub fn uninstall_serena(&self) -> Result<()> {
+        // Unregister before deleting the venv, and fail if it doesn't land: a
+        // leftover MCP entry pointing at a deleted binary would make every new
+        // agent session spawn a failing server.
+        self.unregister_serena_mcp()?;
+        let venv = self.serena_venv_dir();
+        if venv.exists() {
+            std::fs::remove_dir_all(&venv)
+                .with_context(|| format!("removing {}", venv.display()))?;
+        }
+        let receipt = self.runtime.tools_dir.join("serena.json");
+        if receipt.exists() {
+            std::fs::remove_file(&receipt)
+                .with_context(|| format!("removing {}", receipt.display()))?;
+        }
+        Ok(())
+    }
+
+    fn register_serena_mcp(&self) -> Result<()> {
+        let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
+        self.run_serena_mcp_helper(&["-c", SERENA_MCP_HELPER, "register", &entrypoint])
+            .context("registering serena MCP server")
+    }
+
+    fn unregister_serena_mcp(&self) -> Result<()> {
+        self.run_serena_mcp_helper(&["-c", SERENA_MCP_HELPER, "unregister"])
+            .context("unregistering serena MCP server")
+    }
+
+    fn run_serena_mcp_helper(&self, args: &[&str]) -> Result<()> {
+        // ClaudeRegistrar may shell out to the `claude` CLI, which can take a
+        // few seconds per agent; 60s covers both registrars comfortably.
+        run_command_with_timeout(
+            &self.managed_python(),
+            args,
+            &self.runtime.root_dir,
+            Duration::from_secs(60),
+        )
     }
 
     /// Remove the managed rtk binary and its receipt. Shell PATH and Claude Code
@@ -4344,9 +4603,15 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
     else {
         return false;
     };
-    String::from_utf8_lossy(&output.stdout)
-        .to_lowercase()
-        .contains("headroom")
+    let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // A bare "headroom" substring also matches unrelated dev processes whose
+    // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
+    // Require the `proxy` subcommand as well: every version of the managed
+    // backend runs as `... headroom proxy ...` (or `-m headroom.proxy.server`),
+    // so this still recognizes old orphans the upgrade path must reclaim while
+    // excluding a random headroom-pathed process. Only ever consulted for the
+    // exact port being reclaimed, so the blast radius is one port either way.
+    argv.contains("headroom") && argv.contains("proxy")
 }
 
 fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
@@ -6100,9 +6365,8 @@ mod tests {
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, ledger_bytes_without_control, looks_like_corrupt_venv_error,
-        parse_major_minor_patch,
-        parse_pid_from_lsof_detail, path_with_binary_dir, pre_upstream_concurrency,
-        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        parse_major_minor_patch, parse_pid_from_lsof_detail, path_with_binary_dir,
+        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
@@ -6387,6 +6651,22 @@ mod tests {
         assert!(runtime.standalone_python().starts_with(&runtime.root_dir));
         assert!(runtime.managed_pip().starts_with(&runtime.root_dir));
         assert!(runtime.bin_dir.starts_with(&runtime.root_dir));
+    }
+
+    #[test]
+    fn serena_venv_lives_outside_runtime_dir_so_upgrades_keep_it() {
+        let root = std::env::temp_dir().join("headroom-tool-manager-test");
+        let runtime = ManagedRuntime::bootstrap_root(&root);
+        let runtime_dir = runtime.runtime_dir.clone();
+        let manager = ToolManager::new(runtime);
+
+        assert!(manager
+            .serena_venv_dir()
+            .starts_with(&manager.runtime.root_dir));
+        assert!(!manager.serena_venv_dir().starts_with(&runtime_dir));
+        assert!(manager
+            .serena_entrypoint()
+            .starts_with(manager.serena_venv_dir()));
     }
 
     #[test]
@@ -6928,13 +7208,14 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 "#;
 
         // The trailing marker arg makes the stand-in pass the
-        // pid_is_headroom_backend argv identity gate, like a real orphan
-        // running from the Headroom app-support venv path would.
+        // pid_is_headroom_backend argv identity gate (needs both a "headroom"
+        // and a "proxy" token), like a real orphan running as
+        // `.../headroom proxy ...` from the app-support venv path would.
         let mut child = std::process::Command::new("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
-            .arg("--headroom-test-standin")
+            .arg("--headroom-proxy-test-standin")
             .spawn()
             .expect("spawn stand-in proxy");
 
@@ -7500,6 +7781,69 @@ after
         )
         .expect("receipt");
         assert!(manager.tool_enabled("markitdown"));
+    }
+
+    #[test]
+    fn markitdown_conversion_count_reads_counter_file() {
+        let (_root, runtime, manager) = seed_test_runtime("markitdown-count");
+        assert_eq!(manager.markitdown_conversion_count(), None);
+
+        fs::write(runtime.tools_dir.join("markitdown-conversions"), b"7\n").expect("counter");
+        assert_eq!(manager.markitdown_conversion_count(), Some(7));
+
+        fs::write(runtime.tools_dir.join("markitdown-conversions"), b"junk").expect("counter");
+        assert_eq!(manager.markitdown_conversion_count(), None);
+
+        fs::write(runtime.tools_dir.join("markitdown-conversions"), b"0").expect("counter");
+        assert_eq!(manager.markitdown_conversion_count(), None);
+    }
+
+    #[test]
+    fn markitdown_shim_counts_file_conversions_but_not_flag_calls() {
+        let (_root, _runtime, manager) = seed_test_runtime("markitdown-shim");
+        write_executable(
+            &manager.markitdown_entrypoint(),
+            "#!/bin/sh\necho converted:$1\n",
+        );
+        manager.ensure_markitdown_shim().expect("shim");
+
+        let run = |arg: &str| {
+            let out = std::process::Command::new(manager.markitdown_shim_path())
+                .arg(arg)
+                .output()
+                .expect("run shim");
+            assert!(out.status.success(), "shim exited non-zero for {arg}");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+
+        assert!(run("/tmp/a.docx").contains("converted:/tmp/a.docx"));
+        run("/tmp/b.xlsx");
+        run("--help"); // flag-only invocation must not count
+        assert_eq!(manager.markitdown_conversion_count(), Some(2));
+    }
+
+    #[test]
+    fn list_tools_exposes_savings_labels() {
+        let (_root, runtime, manager) = seed_test_runtime("savings-labels");
+        let label_of = |id: &str| {
+            manager
+                .list_tools()
+                .into_iter()
+                .find(|tool| tool.id == id)
+                .expect("tool listed")
+                .savings_label
+        };
+
+        assert_eq!(label_of("markitdown"), None);
+        fs::write(runtime.tools_dir.join("markitdown-conversions"), b"3").expect("counter");
+        assert_eq!(label_of("markitdown").as_deref(), Some("3 docs converted"));
+
+        let ponytail = label_of("ponytail").expect("ponytail label");
+        assert!(
+            ponytail.contains("benchmark"),
+            "must cite benchmark: {ponytail}"
+        );
+        assert_eq!(label_of("rtk"), None, "rtk figure comes from RuntimeStatus");
     }
 
     #[test]

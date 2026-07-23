@@ -3190,8 +3190,14 @@ fn upsert_managed_block(
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
     let block = format!("{start}\n{block_body}\n{end}\n");
-    let updated =
-        if let (Some(start_idx), Some(end_idx)) = (existing.find(&start), existing.find(&end)) {
+    let updated = match (existing.find(&start), existing.find(&end)) {
+        // Only rewrite in place when the markers are well-ordered. A stray or
+        // reordered end-before-start (leftover from an interrupted write, or a
+        // hand-pasted/duplicated half-block) makes `end_with_marker < start_idx`,
+        // so `existing[..start_idx]` re-emits the region the suffix also carries
+        // and the old opening marker gets duplicated. Mirror strip_marker_block:
+        // treat a malformed block as absent and append a fresh one instead.
+        (Some(start_idx), Some(end_idx)) if end_idx >= start_idx => {
             let end_with_marker = end_idx + end.len();
             let mut rebuilt = String::with_capacity(existing.len() + block.len());
             rebuilt.push_str(&existing[..start_idx]);
@@ -3205,11 +3211,10 @@ fn upsert_managed_block(
                 rebuilt.push_str(suffix);
             }
             rebuilt
-        } else if existing.trim().is_empty() {
-            block
-        } else {
-            format!("{}\n{}", existing.trim_end(), block)
-        };
+        }
+        _ if existing.trim().is_empty() => block,
+        _ => format!("{}\n{}", existing.trim_end(), block),
+    };
 
     if updated == existing {
         return Ok((false, None));
@@ -4629,6 +4634,47 @@ mod tests {
     }
 
     #[test]
+    fn managed_block_upsert_treats_reordered_markers_as_absent() {
+        // A stray end-before-start block (leftover from an interrupted write).
+        // The old slice-based rewrite duplicated the stray fragments and left a
+        // dangling opening marker at the tail; the guarded path appends a fresh,
+        // well-formed block instead.
+        let root = unique_temp_dir("headroom-reordered-markers");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zshrc");
+        fs::write(
+            &path,
+            "# <<< headroom:claude_code <<<\nstray old body\n# >>> headroom:claude_code >>>\n",
+        )
+        .expect("write malformed shell file");
+
+        upsert_managed_block(
+            &path,
+            "claude_code",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767",
+        )
+        .expect("upsert over malformed block");
+
+        let content = fs::read_to_string(&path).expect("read updated shell file");
+        // Tail must be a well-ordered block: the last opening marker precedes the
+        // last closing marker, and the file ends on the closing marker (not on a
+        // dangling opener as the buggy slice produced).
+        let last_start = content
+            .rfind("# >>> headroom:claude_code >>>")
+            .expect("start marker present");
+        let last_end = content
+            .rfind("# <<< headroom:claude_code <<<")
+            .expect("end marker present");
+        assert!(last_start < last_end, "tail block must be well-ordered");
+        assert!(content
+            .trim_end()
+            .ends_with("# <<< headroom:claude_code <<<"));
+        assert!(content.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6767"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn remove_managed_block_keeps_surrounding_shell_content_intact() {
         let root = unique_temp_dir("headroom-remove-block");
         fs::create_dir_all(&root).expect("create root");
@@ -5705,7 +5751,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "base url stripped despite shell-block failure, got:\n{after:#}"
         );
         assert!(
-            !serde_json::to_string(&after["hooks"]).unwrap().contains("headroom-claude-guard.py"),
+            !serde_json::to_string(&after["hooks"])
+                .unwrap()
+                .contains("headroom-claude-guard.py"),
             "guard hook stripped despite shell-block failure, got:\n{after:#}"
         );
         assert!(!guard_script.exists(), "guard script deleted");
