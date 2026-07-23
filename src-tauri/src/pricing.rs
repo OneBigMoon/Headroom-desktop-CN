@@ -1813,7 +1813,7 @@ fn paid_plan_gate(
 fn format_nudge_message(product: &str, weekly_usage: f64, disable: f64, level: u8) -> String {
     match level {
         1 => format!(
-            "You're at {:.1}% of weekly {product} usage. Upgrade Headroom to keep optimization through {:.1}% — invites also raise your limit.",
+            "You're at {:.1}% of weekly {product} usage. Upgrade Headroom to keep optimization through {:.1}%.",
             weekly_usage, disable
         ),
         2 => format!(

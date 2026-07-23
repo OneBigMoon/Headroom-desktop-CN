@@ -434,6 +434,8 @@ pub struct ToolManager {
     runtime: ManagedRuntime,
     manifests: Vec<ManagedToolManifest>,
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
+    serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
+    serena_live_stats_cache: Arc<Mutex<Option<(Instant, Option<(u64, Option<Instant>)>)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -442,6 +444,14 @@ struct ToolLogMarkerCache {
     path: PathBuf,
     modified: std::time::SystemTime,
     result: Option<bool>,
+}
+
+/// Cached result of scanning today's serena logs for tool-call lines.
+#[derive(Debug)]
+struct SerenaCallsCache {
+    day: String,
+    at: Instant,
+    count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -638,6 +648,8 @@ impl ToolManager {
             runtime,
             manifests,
             log_marker_cache: Arc::new(Mutex::new(None)),
+            serena_calls_cache: Arc::new(Mutex::new(None)),
+            serena_live_stats_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -667,10 +679,11 @@ impl ToolManager {
             .collect()
     }
 
-    /// Chip text for the Addons tab. markitdown is a measured count (shim
-    /// counter); ponytail is the plugin's published benchmark median — its
-    /// skill forbids inventing per-repo figures, so the label says "benchmark".
-    /// rtk's figure comes from `rtk gain` via RuntimeStatus, not from here.
+    /// Chip text for the Addons tab. markitdown and serena are measured
+    /// (shim counter / serena's logs plus its live dashboard stats); ponytail
+    /// is the plugin's published benchmark median — its skill forbids
+    /// inventing per-repo figures, so the label says "benchmark". rtk's
+    /// figure comes from `rtk gain` via RuntimeStatus, not from here.
     fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
         match tool_id {
             "markitdown" => self.markitdown_conversion_count().map(|count| {
@@ -680,9 +693,100 @@ impl ToolManager {
                     format!("{count} docs converted")
                 }
             }),
+            "serena" => {
+                let live = self.serena_live_stats().map(|(tokens, session_start)| {
+                    (tokens, session_start.map(|start| start.elapsed()))
+                });
+                serena_savings_label(self.serena_tool_calls_local_today(), live)
+            }
             "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
             _ => None,
         }
+    }
+
+    /// Estimated tokens serena's tools have returned in the live session(s),
+    /// summed from each running MCP process's dashboard `/get_tool_stats`
+    /// (v1.6.1 records unconditionally, CHAR_COUNT estimator; our registration
+    /// only suppresses the browser popup, not the dashboard server). In-memory
+    /// upstream, so the figure resets when the session ends — by design.
+    /// Paired with the oldest matching MCP process's start (from `ps` etime),
+    /// so the chip can say over what span those tokens accumulated.
+    /// 60s cache; closed local ports refuse instantly, so a miss is cheap.
+    fn serena_live_stats(&self) -> Option<(u64, Option<Instant>)> {
+        if !self.serena_installed() {
+            return None;
+        }
+        {
+            let cache = self.serena_live_stats_cache.lock();
+            if let Some((at, stats)) = cache.as_ref() {
+                if at.elapsed() < Duration::from_secs(60) {
+                    return *stats;
+                }
+            }
+        }
+        // The dashboard scans upward from the base port when it's taken, one
+        // process per MCP session; sum whatever responds in the first few.
+        let mut total: u64 = 0;
+        let mut any_responder = false;
+        for offset in 0..SERENA_DASHBOARD_PORT_SCAN {
+            let port = SERENA_DASHBOARD_BASE_PORT + offset;
+            if let Some(tokens) = fetch_serena_output_tokens(&format!("http://127.0.0.1:{port}")) {
+                any_responder = true;
+                total = total.saturating_add(tokens);
+            }
+        }
+        let stats = (any_responder && total > 0).then(|| {
+            let session_start = self
+                .serena_oldest_session_age()
+                .and_then(|age| Instant::now().checked_sub(age));
+            (total, session_start)
+        });
+        *self.serena_live_stats_cache.lock() = Some((Instant::now(), stats));
+        stats
+    }
+
+    /// Age of the oldest running serena MCP session, from `ps` elapsed time.
+    /// Matched on our managed entrypoint path plus the `start-mcp-server`
+    /// subcommand — same argv-identity idea as `pid_is_headroom_backend`.
+    /// With several sessions the tokens above span all of them, so the oldest
+    /// is the honest window. `-ww`: unlimited width, argv must not truncate.
+    fn serena_oldest_session_age(&self) -> Option<Duration> {
+        let output = Command::new("/bin/ps")
+            .args(["-axww", "-o", "etime=,args="])
+            .output()
+            .ok()?;
+        let marker = self.serena_entrypoint().display().to_string();
+        oldest_serena_session_age(&String::from_utf8_lossy(&output.stdout), &marker)
+    }
+
+    /// Today's serena tool calls, counted from `~/.serena/logs/<local day>/`.
+    /// Serena's usage stats are in-memory only (analytics.py), so its log
+    /// files are the only persisted trace: one line containing
+    /// "; session_id: " per tool application (tools_base.py, pinned v1.6.1).
+    /// Local day matches serena's own log-dir bucketing (datetime.now()).
+    /// 60s cache: Result lines make these files large enough that scanning on
+    /// every dashboard poll would be wasteful.
+    fn serena_tool_calls_local_today(&self) -> Option<u64> {
+        let day = Local::now().format("%Y-%m-%d").to_string();
+        {
+            let cache = self.serena_calls_cache.lock();
+            if let Some(cached) = cache.as_ref() {
+                if cached.day == day && cached.at.elapsed() < Duration::from_secs(60) {
+                    return cached.count;
+                }
+            }
+        }
+        // ponytail: default ~/.serena only; honor SERENA_HOME if a user ever
+        // actually overrides it.
+        let count = dirs::home_dir()
+            .map(|home| home.join(".serena").join("logs").join(&day))
+            .and_then(|dir| count_serena_tool_calls_in_dir(&dir));
+        *self.serena_calls_cache.lock() = Some(SerenaCallsCache {
+            day,
+            at: Instant::now(),
+            count,
+        });
+        count
     }
 
     pub fn python_runtime_installed(&self) -> bool {
@@ -4428,6 +4532,162 @@ fn codex_ponytail_present() -> bool {
     text.lines().any(|line| line.trim_start() == header)
 }
 
+/// One serena tool application logs exactly one line containing this marker
+/// (`tools_base.py` `_log_tool_application`, stable through pinned v1.6.1).
+const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
+
+/// Serena's dashboard API binds the first free port scanning upward from here
+/// (`constants.py` 0x5EDA, `dashboard.py` `_find_first_free_port`).
+const SERENA_DASHBOARD_BASE_PORT: u16 = 24282;
+const SERENA_DASHBOARD_PORT_SCAN: u16 = 4;
+
+/// GET `{base_url}/get_tool_stats` and sum `output_tokens` across tools.
+/// Response shape: `{"stats": {tool: {num_times_called, input_tokens,
+/// output_tokens}}}`; empty stats yield Some(0), no/invalid responder None.
+fn fetch_serena_output_tokens(base_url: &str) -> Option<u64> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .ok()?;
+    let value: Value = client
+        .get(format!("{base_url}/get_tool_stats"))
+        .send()
+        .ok()?
+        .json()
+        .ok()?;
+    let stats = value.get("stats")?.as_object()?;
+    let mut total: u64 = 0;
+    for entry in stats.values() {
+        total = total.saturating_add(
+            entry
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    Some(total)
+}
+
+/// "231 tool calls today, ~48k tokens returned in 2h 14m" — either half may
+/// be absent (and the duration within the second), None only when both are.
+fn serena_savings_label(
+    calls_today: Option<u64>,
+    live: Option<(u64, Option<Duration>)>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(count) = calls_today {
+        if count == 1 {
+            parts.push("1 tool call today".to_string());
+        } else {
+            parts.push(format!("{count} tool calls today"));
+        }
+    }
+    match live {
+        Some((tokens, Some(age))) => parts.push(format!(
+            "~{} tokens returned in {}",
+            compact_token_count(tokens),
+            compact_duration(age)
+        )),
+        // No session age (e.g. serena running from a non-managed install):
+        // still name the window, or the figure reads as all-time.
+        Some((tokens, None)) => parts.push(format!(
+            "~{} tokens returned this session",
+            compact_token_count(tokens)
+        )),
+        None => {}
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Parse `ps` etime, `[[dd-]hh:]mm:ss`.
+fn parse_ps_etime(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let (days, clock) = match raw.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, raw),
+    };
+    let fields: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds) = match fields.as_slice() {
+        [m, s] => (0, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [h, m, s] => (
+            h.parse::<u64>().ok()?,
+            m.parse::<u64>().ok()?,
+            s.parse::<u64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(Duration::from_secs(
+        ((days * 24 + hours) * 60 + minutes) * 60 + seconds,
+    ))
+}
+
+/// Oldest `start-mcp-server` session matching our entrypoint in
+/// `ps -axww -o etime=,args=` output.
+fn oldest_serena_session_age(ps_output: &str, entrypoint_marker: &str) -> Option<Duration> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let (etime, argv) = line.trim_start().split_once(char::is_whitespace)?;
+            (argv.contains(entrypoint_marker) && argv.contains("start-mcp-server"))
+                .then(|| parse_ps_etime(etime))
+                .flatten()
+        })
+        .max()
+}
+
+fn compact_duration(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    if minutes >= 60 {
+        let hours = minutes / 60;
+        let rest = minutes % 60;
+        if rest == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {rest}m")
+        }
+    } else if minutes == 0 {
+        "under a minute".to_string()
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Count tool-call lines across every `*.txt` log in one day's serena log dir.
+/// None when the dir is missing or holds no calls, so the chip stays hidden.
+// ponytail: a tool result that itself quotes serena log text would inflate the
+// count; switch to per-line prefix matching if that ever shows up in practice.
+fn count_serena_tool_calls_in_dir(dir: &Path) -> Option<u64> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut count: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        count += String::from_utf8_lossy(&bytes)
+            .matches(SERENA_TOOL_CALL_LOG_MARKER)
+            .count() as u64;
+    }
+    (count > 0).then_some(count)
+}
+
 fn installed_ponytail_version() -> Option<String> {
     let plugins = ponytail_installed_plugins()?;
     let installs = plugins
@@ -7820,6 +8080,127 @@ after
         run("/tmp/b.xlsx");
         run("--help"); // flag-only invocation must not count
         assert_eq!(manager.markitdown_conversion_count(), Some(2));
+    }
+
+    #[test]
+    fn count_serena_tool_calls_counts_marker_lines_in_txt_logs_only() {
+        let dir = unique_temp_dir("serena-log-count");
+        assert_eq!(
+            super::count_serena_tool_calls_in_dir(&dir),
+            None,
+            "missing dir"
+        );
+
+        fs::create_dir_all(&dir).expect("log dir");
+        fs::write(
+            dir.join("mcp_20260723_1.txt"),
+            "INFO find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
+             INFO Result: 42 lines\n\
+             INFO read_file: {\"path\": \"x.rs\"}; session_id: abc\n",
+        )
+        .expect("log file");
+        fs::write(dir.join("ignored.log"), "x: {}; session_id: zzz\n").expect("non-txt");
+        assert_eq!(super::count_serena_tool_calls_in_dir(&dir), Some(2));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn serena_savings_label_combines_calls_live_tokens_and_timing() {
+        assert_eq!(super::serena_savings_label(None, None), None);
+        assert_eq!(
+            super::serena_savings_label(Some(1), None).as_deref(),
+            Some("1 tool call today")
+        );
+        assert_eq!(
+            super::serena_savings_label(None, Some((500, None))).as_deref(),
+            Some("~500 tokens returned this session")
+        );
+        let age = std::time::Duration::from_secs(2 * 3600 + 14 * 60 + 5);
+        assert_eq!(
+            super::serena_savings_label(Some(231), Some((48_200, Some(age)))).as_deref(),
+            Some("231 tool calls today, ~48k tokens returned in 2h 14m")
+        );
+        assert_eq!(super::compact_token_count(1_234_000), "1.2M");
+    }
+
+    #[test]
+    fn parse_ps_etime_handles_all_ps_formats() {
+        use std::time::Duration;
+        assert_eq!(
+            super::parse_ps_etime("05:33"),
+            Some(Duration::from_secs(333))
+        );
+        assert_eq!(
+            super::parse_ps_etime(" 02:14:33"),
+            Some(Duration::from_secs(2 * 3600 + 14 * 60 + 33))
+        );
+        assert_eq!(
+            super::parse_ps_etime("3-01:02:03"),
+            Some(Duration::from_secs(3 * 86400 + 3600 + 2 * 60 + 3))
+        );
+        assert_eq!(super::parse_ps_etime("garbage"), None);
+    }
+
+    #[test]
+    fn oldest_serena_session_age_matches_entrypoint_and_subcommand_only() {
+        let marker = "/tmp/hr/serena-venv/bin/serena";
+        let ps = "\
+  01:00 /usr/bin/python other-tool start-mcp-server\n\
+  45:00 /tmp/hr/serena-venv/bin/python /tmp/hr/serena-venv/bin/serena start-mcp-server --context claude-code\n\
+2-00:00:00 /tmp/hr/serena-venv/bin/serena --help\n\
+  02:14:33 /tmp/hr/serena-venv/bin/serena start-mcp-server --context codex\n";
+        assert_eq!(
+            super::oldest_serena_session_age(ps, marker),
+            Some(std::time::Duration::from_secs(2 * 3600 + 14 * 60 + 33)),
+            "picks oldest matching session; ignores other tools and non-server invocations"
+        );
+        assert_eq!(super::oldest_serena_session_age("", marker), None);
+    }
+
+    #[test]
+    fn compact_duration_formats() {
+        use std::time::Duration;
+        assert_eq!(
+            super::compact_duration(Duration::from_secs(30)),
+            "under a minute"
+        );
+        assert_eq!(super::compact_duration(Duration::from_secs(47 * 60)), "47m");
+        assert_eq!(super::compact_duration(Duration::from_secs(2 * 3600)), "2h");
+        assert_eq!(
+            super::compact_duration(Duration::from_secs(2 * 3600 + 14 * 60)),
+            "2h 14m"
+        );
+    }
+
+    #[test]
+    fn fetch_serena_output_tokens_sums_stats_across_tools() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"stats":{"find_symbol":{"num_times_called":3,"input_tokens":10,"output_tokens":4500},"read_file":{"num_times_called":1,"input_tokens":5,"output_tokens":500}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write");
+        });
+
+        let total = super::fetch_serena_output_tokens(&format!("http://127.0.0.1:{port}"));
+        handle.join().expect("server thread");
+        assert_eq!(total, Some(5000));
+
+        // Nothing listening: must be None, not Some(0).
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead_port = unused.local_addr().expect("addr").port();
+        drop(unused);
+        assert_eq!(
+            super::fetch_serena_output_tokens(&format!("http://127.0.0.1:{dead_port}")),
+            None
+        );
     }
 
     #[test]
