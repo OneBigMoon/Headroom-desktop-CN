@@ -1376,6 +1376,23 @@ async fn forward_direct_to_anthropic(
         None => leftover_body.to_vec(),
     };
 
+    // Stale tool-search reference rescue, direct path only. Anthropic
+    // validates every replayed tool_reference against this request's tools
+    // array and 400s the whole request when one is missing — permanently,
+    // since the client replays the same history every turn. The Python
+    // backend sanitizes optimized traffic (headroomlabs-ai/headroom#2507),
+    // but bypass/backend-down requests skip it — and a session that did CCR
+    // while optimized references the proxy-injected headroom_retrieve tool,
+    // so entering bypass would brick it exactly when Headroom pauses. The
+    // rewrite is the API's own validation predicate: it only ever converts a
+    // guaranteed 400 into a working request. Content-Length is hop-by-hop
+    // here (reqwest recomputes it), so shrinking the body is safe.
+    let body = if is_codex_request_head(&parsed) {
+        body
+    } else {
+        sanitize_stale_tool_references(body, &parsed.path)
+    };
+
     let url = format!("{}{}", effective_base, parsed.path);
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
         Ok(m) => m,
@@ -1574,6 +1591,84 @@ fn parse_request_head(buf: &[u8]) -> Option<ParsedRequestHead> {
         headers,
         content_length,
     })
+}
+
+/// Drop replayed tool-search `tool_reference` entries whose `tool_name` is
+/// absent from the request's `tools` array. Anthropic rejects the whole
+/// request with `400 Tool reference '<name>' not found in available tools`
+/// otherwise, and since the client replays the same history every turn the
+/// session stays bricked. The filter is exactly the API's validation
+/// predicate, so a resolvable reference is never touched and any change can
+/// only turn a guaranteed 400 into a working request. Fails open: anything
+/// unexpected (non-messages path, no marker substring, unparseable JSON)
+/// returns the body unchanged.
+fn sanitize_stale_tool_references(body: Vec<u8>, path: &str) -> Vec<u8> {
+    if !path.starts_with("/v1/messages") {
+        return body;
+    }
+    const NEEDLE: &[u8] = b"tool_search_tool_result";
+    if !body.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let available: std::collections::HashSet<String> = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut dropped: Vec<String> = Vec::new();
+    if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+                continue;
+            };
+            for block in content {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_search_tool_result") {
+                    continue;
+                }
+                // GA wire shape nests refs at content.tool_references (dict);
+                // a list-shaped content is handled defensively.
+                let refs = match block.get_mut("content") {
+                    Some(serde_json::Value::Object(obj)) => obj.get_mut("tool_references"),
+                    Some(list @ serde_json::Value::Array(_)) => Some(list),
+                    _ => None,
+                };
+                let Some(serde_json::Value::Array(refs)) = refs else {
+                    continue;
+                };
+                refs.retain(|r| {
+                    let name = r.get("tool_name").and_then(|n| n.as_str());
+                    let is_stale = r.get("type").and_then(|t| t.as_str()) == Some("tool_reference")
+                        && name.is_some_and(|n| !available.contains(n));
+                    if is_stale {
+                        dropped.push(name.unwrap_or_default().to_owned());
+                    }
+                    !is_stale
+                });
+            }
+        }
+    }
+    if dropped.is_empty() {
+        return body;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(rewritten) => {
+            log::warn!(
+                "[proxy_intercept] dropped {} stale tool_search reference(s) {:?} from a direct-forwarded request — absent from the tools array, upstream would 400 the session permanently",
+                dropped.len(),
+                dropped
+            );
+            rewritten
+        }
+        Err(_) => body,
+    }
 }
 
 fn is_hop_by_hop_request_header(name: &str) -> bool {
@@ -1889,8 +1984,9 @@ mod tests {
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
         parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, rewrite_use_responses_lite, run, set_response_content_length,
-        stamp_codex_client_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
+        request_is_loopback_safe, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        set_response_content_length, stamp_codex_client_header, strip_request_header, BypassFlag,
+        ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -3405,5 +3501,105 @@ mod tests {
         );
         drop(held);
         assert!(sem.try_acquire_owned().is_ok(), "permit released on drop");
+    }
+
+    // Exact GA wire shape captured from a live bricked session: content is a
+    // dict holding tool_references.
+    fn tool_search_body(ref_names: &[&str], tool_names: &[&str]) -> Vec<u8> {
+        let refs: Vec<serde_json::Value> = ref_names
+            .iter()
+            .map(|n| serde_json::json!({"type": "tool_reference", "tool_name": n}))
+            .collect();
+        let tools: Vec<serde_json::Value> = tool_names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "input_schema": {"type": "object"}}))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "searching"},
+                    {"type": "tool_search_tool_result",
+                     "tool_use_id": "srvtoolu_x",
+                     "content": {"type": "tool_search_tool_search_result",
+                                 "tool_references": refs}}
+                ]}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn reference_names(body: &[u8]) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+        v["messages"][1]["content"][1]["content"]["tool_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["tool_name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn sanitize_drops_only_the_stale_reference() {
+        let body = tool_search_body(
+            &["headroom_retrieve", "mcp__headroom__headroom_retrieve"],
+            &["mcp__headroom__headroom_retrieve"],
+        );
+        let out = sanitize_stale_tool_references(body, "/v1/messages?beta=true");
+        assert_eq!(
+            reference_names(&out),
+            vec!["mcp__headroom__headroom_retrieve"]
+        );
+    }
+
+    #[test]
+    fn sanitize_noop_returns_identical_bytes() {
+        let body = tool_search_body(&["kept"], &["kept"]);
+        let out = sanitize_stale_tool_references(body.clone(), "/v1/messages");
+        assert_eq!(out, body, "resolvable references must be byte-untouched");
+    }
+
+    #[test]
+    fn sanitize_all_stale_leaves_empty_reference_list() {
+        // An empty tool_references list is accepted upstream (observed in a
+        // live transcript), so the block itself must survive.
+        let body = tool_search_body(&["gone_a", "gone_b"], &["other"]);
+        let out = sanitize_stale_tool_references(body, "/v1/messages");
+        assert!(reference_names(&out).is_empty());
+    }
+
+    #[test]
+    fn sanitize_skips_non_messages_paths_and_bad_json() {
+        let body = tool_search_body(&["gone"], &[]);
+        let out = sanitize_stale_tool_references(body.clone(), "/v1/complete");
+        assert_eq!(out, body, "non-messages path must be untouched");
+
+        let junk = b"tool_search_tool_result but not json".to_vec();
+        let out = sanitize_stale_tool_references(junk.clone(), "/v1/messages");
+        assert_eq!(out, junk, "unparseable body must fail open");
+    }
+
+    #[test]
+    fn sanitize_handles_list_shaped_content() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tools": [{"name": "kept"}],
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_search_tool_result", "content": [
+                    {"type": "tool_reference", "tool_name": "gone"},
+                    {"type": "tool_reference", "tool_name": "kept"}
+                ]}
+            ]}]
+        }))
+        .unwrap();
+        let out = sanitize_stale_tool_references(body, "/v1/messages");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let refs = v["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["tool_name"], "kept");
     }
 }
