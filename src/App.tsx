@@ -250,6 +250,28 @@ const addonCopy: Record<string, AddonCopy> = {
     enabling: "Re-registering the Serena MCP server...",
     disabling: "Removing the Serena MCP registrations...",
     disabled: "Serena is off but still installed. Re-enable any time without re-downloading."
+  },
+  "codebase-memory": {
+    whatItDoes:
+      "Installing downloads the codebase-memory binary into Headroom's managed runtime, verifies it, and registers it as an MCP server in Claude Code and Codex. It indexes a repo into a persistent knowledge graph - functions, classes, call chains - so your agent answers structure questions from the graph instead of re-reading files. Ask your agent to index a repo the first time you use it there. Indexes are stored inside Headroom's app data, a codebase-memory MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+    installing: "Downloading Codebase Memory and registering its MCP server...",
+    installed: "Codebase Memory installed. Restart open agent sessions, then ask your agent to index the repo.",
+    uninstalling: "Removing Codebase Memory, its indexes, and its MCP registrations...",
+    uninstalled: "Codebase Memory removed. Your agent explores code by reading files again.",
+    enabling: "Re-registering the Codebase Memory MCP server...",
+    disabling: "Removing the Codebase Memory MCP registrations...",
+    disabled: "Codebase Memory is off but still installed. Re-enable any time without re-downloading."
+  },
+  context7: {
+    whatItDoes:
+      "Installing verifies the Context7 MCP server runs via npx, then registers it in Claude Code and Codex. Your agent can pull current, version-specific documentation for the libraries you use instead of guessing APIs from stale training data - docs are fetched only when it asks, so the idle cost is just its tool definitions. A context7 MCP entry you configured yourself is never touched, and the registration is removed cleanly when you uninstall it or Headroom. Requires Node.js on PATH.",
+    installing: "Verifying Context7 with npx and registering its MCP server...",
+    installed: "Context7 installed. Restart open agent sessions to pick up the new MCP server.",
+    uninstalling: "Removing the Context7 MCP registrations...",
+    uninstalled: "Context7 removed. Your agent relies on its training data for library docs again.",
+    enabling: "Re-registering the Context7 MCP server...",
+    disabling: "Removing the Context7 MCP registrations...",
+    disabled: "Context7 is off but still installed. Re-enable any time."
   }
 };
 
@@ -1016,7 +1038,14 @@ function AddonCard({
   );
 }
 
-const ADDON_DISPLAY_ORDER = ["ponytail", "caveman", "serena", "markitdown"];
+const ADDON_DISPLAY_ORDER = [
+  "ponytail",
+  "serena",
+  "codebase-memory",
+  "context7",
+  "markitdown",
+  "caveman"
+];
 
 // Unknown ids land after the curated ones, before the trailing RTK card.
 function addonDisplayRank(id: string): number {

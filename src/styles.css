@@ -114,20 +114,23 @@
   box-sizing: border-box;
 }
 
+/* Every window renders a fixed 100vh shell (.tray-shell / .app-shell--launcher)
+   that owns its own scrolling, so the document must never scroll: with
+   overflow auto, macOS WKWebView rubber-bands the whole UI (sidebar included)
+   when a trackpad scroll can't be consumed by an inner panel. */
 html,
 body,
 #root {
   height: 100%;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 button,
@@ -919,6 +922,7 @@ select {
   padding: 10px 12px;
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .tray-content {

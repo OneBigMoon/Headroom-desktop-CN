@@ -1230,9 +1230,14 @@ impl AppState {
             // gate is asserting Python should be down. Client-side routing is
             // already pointed direct-to-Anthropic by whoever asserted the
             // gate, so the validation Python wasn't receiving traffic anyway.
+            // Claude-only gate (Codex enabled) keeps Python up for Codex —
+            // same carve-out as stop_python_if_gated / ensure_headroom_running
+            // (RUST-53); without it every upgrade bounces the backend for
+            // gated Codex users (stop here, watchdog respawn ~5-10s later).
             let gate_wants_python_down =
                 self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
-                    || !self.pricing_allows_optimization()
+                    || (!self.pricing_allows_optimization()
+                        && !crate::client_adapters::is_codex_enabled())
                     || self.runtime_is_paused();
             if gate_wants_python_down {
                 log::info!(
@@ -2724,7 +2729,16 @@ impl AppState {
             if !self.pricing_allows_optimization() {
                 self.enforce_pricing_gate();
                 self.stop_python_if_gated();
-                return Ok(());
+                // Only the FULL gate declines the spawn. Under the Claude-only
+                // gate (Codex enabled) Python must keep running for Codex, so
+                // fall through and spawn (RUST-53: returning Ok here left
+                // gated Codex users with no backend at all — the watchdog's
+                // restarts silently no-opped until auto-pause, and the
+                // self-heal loop re-declined forever). Mirrors
+                // `stop_python_if_gated`'s codex carve-out.
+                if !crate::client_adapters::is_codex_enabled() {
+                    return Ok(());
+                }
             }
 
             if self.runtime_is_paused() {
@@ -2761,7 +2775,19 @@ impl AppState {
         if !*self.runtime_upgrade_in_progress.lock() {
             if !self.pricing_allows_optimization() {
                 self.enforce_pricing_gate();
-                return Ok(());
+                // Same Claude-only carve-out as the pre-lock check above.
+                if !crate::client_adapters::is_codex_enabled() {
+                    // Full gate: Python must come down, and enforce_pricing_gate
+                    // just set proxy_bypass, which makes the pricing poll's
+                    // swap-edge stop a no-op — so the teardown is owed HERE.
+                    // (Codex flipped off between the two checks; skipping the
+                    // stop would leave Python running under full bypass until
+                    // the gate exits.) stop takes lifecycle_lock: release ours
+                    // first.
+                    drop(_lifecycle_guard);
+                    self.stop_python_if_gated();
+                    return Ok(());
+                }
             }
             if self.runtime_is_paused() {
                 return Ok(());

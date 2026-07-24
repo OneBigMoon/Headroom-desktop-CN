@@ -874,7 +874,11 @@ async fn install_addon(
                 .install_plugin(&id)
                 .map_err(|err| err.to_string())?;
             if codex_outdated {
-                let name = if id == "caveman" { "Caveman" } else { "Ponytail" };
+                let name = if id == "caveman" {
+                    "Caveman"
+                } else {
+                    "Ponytail"
+                };
                 let _ = show_notification_impl(
                     &app,
                     &format!("Update Codex to finish {name} setup"),
@@ -887,6 +891,18 @@ async fn install_addon(
             state
                 .tool_manager
                 .install_serena()
+                .map_err(|err| err.to_string())?;
+        }
+        "context7" => {
+            state
+                .tool_manager
+                .install_context7()
+                .map_err(|err| err.to_string())?;
+        }
+        "codebase-memory" => {
+            state
+                .tool_manager
+                .install_codebase_memory()
                 .map_err(|err| err.to_string())?;
         }
         other => return Err(format!("unknown addon: {other}")),
@@ -934,6 +950,18 @@ async fn set_addon_enabled(
                 .set_serena_enabled(enabled)
                 .map_err(|err| err.to_string())?;
         }
+        "context7" => {
+            state
+                .tool_manager
+                .set_context7_enabled(enabled)
+                .map_err(|err| err.to_string())?;
+        }
+        "codebase-memory" => {
+            state
+                .tool_manager
+                .set_codebase_memory_enabled(enabled)
+                .map_err(|err| err.to_string())?;
+        }
         other => return Err(format!("unknown addon: {other}")),
     }
     let action = if enabled { "enabled" } else { "disabled" };
@@ -979,6 +1007,18 @@ async fn uninstall_addon(
             state
                 .tool_manager
                 .uninstall_serena()
+                .map_err(|err| err.to_string())?;
+        }
+        "context7" => {
+            state
+                .tool_manager
+                .uninstall_context7()
+                .map_err(|err| err.to_string())?;
+        }
+        "codebase-memory" => {
+            state
+                .tool_manager
+                .uninstall_codebase_memory()
                 .map_err(|err| err.to_string())?;
         }
         other => return Err(format!("unknown addon: {other}")),
@@ -4903,6 +4943,11 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // and no-ops when the model is already cached; this flag just avoids
         // spawning a throwaway thread on every subsequent tick.
         let mut kompress_prefetch_spawned = false;
+        // One-shot tiktoken vocab-cache seeding, deliberately NOT gated on a
+        // healthy proxy: the machines that need it most are the ones whose
+        // backend boot is wedged on a stalled vocab download (RUST-5D) and
+        // would never reach the healthy branch.
+        let mut tiktoken_prefetch_spawned = false;
 
         loop {
             std::thread::sleep(POLL);
@@ -4949,6 +4994,30 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     auto_pause_next_retry = None;
                 }
                 continue;
+            }
+
+            if !tiktoken_prefetch_spawned && runtime.installed {
+                tiktoken_prefetch_spawned = true;
+                let app_clone = app.clone();
+                std::thread::spawn(move || {
+                    let state: tauri::State<'_, AppState> = app_clone.state();
+                    if let Err(err) = state.tool_manager.prefetch_tiktoken_encodings() {
+                        // warn -> Sentry: fleet signal for vocab-fetch
+                        // failures — but once per MACHINE, not per launch. A
+                        // firewalled CDN would otherwise re-report on every
+                        // start, forever.
+                        let marker = state
+                            .tool_manager
+                            .logs_dir()
+                            .join("tiktoken-prefetch.warned");
+                        if marker.exists() {
+                            log::info!("tiktoken prefetch failed (repeat): {err:#}");
+                        } else {
+                            let _ = std::fs::write(&marker, b"1");
+                            log::warn!("tiktoken prefetch failed: {err:#}");
+                        }
+                    }
+                });
             }
 
             // Only care when the runtime is supposed to be up: installed,
@@ -5232,7 +5301,15 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 continue;
             }
 
-            // Otherwise try to bring it back.
+            // Otherwise try to bring it back. When we own no child, tear down
+            // whatever holds the backend port first (identity-verified inside
+            // stop_headroom) — exactly what the auto-pause self-heal does. A
+            // bare ensure_headroom_running can short-circuit Ok on its own
+            // (cached/laxer) reachability view and "restart" nothing, letting
+            // strikes reach give-up without a single spawn attempt (RUST-53).
+            if !state.tracked_child_alive() {
+                state.stop_headroom();
+            }
             match state.ensure_headroom_running() {
                 Ok(()) => port_conflict::note_proxy_started(&app),
                 Err(err) => {

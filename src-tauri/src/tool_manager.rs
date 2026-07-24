@@ -254,6 +254,19 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
 const RTK_VERSION: &str = "0.42.4";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.6";
 const SERENA_PINNED_VERSION: &str = "1.6.1";
+const CONTEXT7_PINNED_VERSION: &str = "3.2.4";
+/// First run downloads the package into the npx cache; slow networks need
+/// headroom over the usual smoke-test budget.
+const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+const CODEBASE_MEMORY_VERSION: &str = "0.9.0";
+const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
+    "faa02f0404230c451a9812230394481948f80183801fa5bf67044b41c2f25ed4";
+const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
+    "6af3d02a27f589901fa763d3971089337bc8c9838bbed5d0cf543ca9f1a9e543";
+const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
+    "68a345d9a6842f02a3cb07e187b28bc38c4f3a22967f47fadbcd0757ba93a680";
+const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
+    "e2832a8d207c26beaa30efa6222ed4a37cb3f526ca4bee060bfbf336ed6fc679";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -314,6 +327,113 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
             continue
         if registrar.unregister_server("serena"):
             clear_install(registrar.name, "serena")
+            print(f"{registrar.name}: removed")
+        else:
+            failures.append(f"{registrar.name}: removal failed")
+if failures:
+    sys.exit("; ".join(failures))
+"#;
+/// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
+/// the Context7 MCP entry. The registered command is a bare `npx` (resolved
+/// from the agent session's own PATH, so nvm version switches don't strand an
+/// absolute path) running the pinned package. argv: `register <package-spec>`
+/// | `unregister`.
+const CONTEXT7_MCP_HELPER: &str = r#"
+import sys
+
+from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, ServerSpec
+from headroom.mcp_registry.base import RegisterStatus
+from headroom.mcp_registry.ledger import (
+    clear_install,
+    headroom_installed_matching,
+    record_install,
+)
+
+action = sys.argv[1]
+failures = []
+for registrar in (ClaudeRegistrar(), CodexRegistrar()):
+    if not registrar.detect():
+        print(f"{registrar.name}: not detected, skipping")
+        continue
+    if action == "register":
+        spec = ServerSpec(
+            name="context7",
+            command="npx",
+            args=("-y", sys.argv[2]),
+        )
+        result = registrar.register_server(spec)
+        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
+            registrar.name, registrar.get_server("context7")
+        ):
+            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            record_install(registrar.name, spec)
+        elif result.status == RegisterStatus.FAILED:
+            failures.append(f"{registrar.name}: {result.detail}")
+        print(f"{registrar.name}: {result.status.value}")
+    else:
+        current = registrar.get_server("context7")
+        if current is None:
+            print(f"{registrar.name}: no context7 entry")
+            continue
+        if not headroom_installed_matching(registrar.name, current):
+            print(f"{registrar.name}: context7 entry is user-managed, leaving it")
+            continue
+        if registrar.unregister_server("context7"):
+            clear_install(registrar.name, "context7")
+            print(f"{registrar.name}: removed")
+        else:
+            failures.append(f"{registrar.name}: removal failed")
+if failures:
+    sys.exit("; ".join(failures))
+"#;
+/// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
+/// the codebase-memory MCP entry. `CBM_CACHE_DIR` points its index databases
+/// into Headroom's managed tools dir so uninstalling removes them too.
+/// argv: `register <binary> <cache-dir>` | `unregister`.
+const CODEBASE_MEMORY_MCP_HELPER: &str = r#"
+import sys
+
+from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, ServerSpec
+from headroom.mcp_registry.base import RegisterStatus
+from headroom.mcp_registry.ledger import (
+    clear_install,
+    headroom_installed_matching,
+    record_install,
+)
+
+action = sys.argv[1]
+failures = []
+for registrar in (ClaudeRegistrar(), CodexRegistrar()):
+    if not registrar.detect():
+        print(f"{registrar.name}: not detected, skipping")
+        continue
+    if action == "register":
+        spec = ServerSpec(
+            name="codebase-memory",
+            command=sys.argv[2],
+            env={"CBM_CACHE_DIR": sys.argv[3]},
+        )
+        result = registrar.register_server(spec)
+        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
+            registrar.name, registrar.get_server("codebase-memory")
+        ):
+            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            record_install(registrar.name, spec)
+        elif result.status == RegisterStatus.FAILED:
+            failures.append(f"{registrar.name}: {result.detail}")
+        print(f"{registrar.name}: {result.status.value}")
+    else:
+        current = registrar.get_server("codebase-memory")
+        if current is None:
+            print(f"{registrar.name}: no codebase-memory entry")
+            continue
+        if not headroom_installed_matching(registrar.name, current):
+            print(f"{registrar.name}: codebase-memory entry is user-managed, leaving it")
+            continue
+        if registrar.unregister_server("codebase-memory"):
+            clear_install(registrar.name, "codebase-memory")
             print(f"{registrar.name}: removed")
         else:
             failures.append(f"{registrar.name}: removal failed")
@@ -655,6 +775,30 @@ impl ToolManager {
                 runtime: "python".into(),
                 source_url: "https://github.com/oraios/serena".into(),
                 version: SERENA_PINNED_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "codebase-memory".into(),
+                name: "Codebase Memory".into(),
+                description:
+                    "MCP server that indexes your codebase into a persistent knowledge graph - call chains, classes, routes - so your agent answers structure questions from the graph instead of re-reading files. Complements Serena: pre-built map vs live symbol tools."
+                        .into(),
+                runtime: "binary".into(),
+                source_url: "https://github.com/DeusData/codebase-memory-mcp".into(),
+                version: CODEBASE_MEMORY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "context7".into(),
+                name: "Context7".into(),
+                description:
+                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Requires Node.js on PATH."
+                        .into(),
+                runtime: "node".into(),
+                source_url: "https://github.com/upstash/context7".into(),
+                version: CONTEXT7_PINNED_VERSION.into(),
                 checksum: None,
                 required: false,
             },
@@ -1163,6 +1307,14 @@ impl ToolManager {
                     // The SIGABRT is uncatchable in Python; disabling xet falls
                     // back to the stable HTTPS download path.
                     .env("HF_HUB_DISABLE_XET", "1")
+                    // Persistent vocab cache. tiktoken defaults to
+                    // $TMPDIR/data-gym-cache, which macOS purges, so the backend
+                    // re-downloads vocab files; the fetch (requests.get, no
+                    // timeout) can stall on a blocked network and wedge backend
+                    // boot on the main thread (RUST-5D). A stable dir survives
+                    // reboots and runtime reinstalls; prefetch_tiktoken_encodings
+                    // seeds it so boot never needs the network for vocab.
+                    .env("TIKTOKEN_CACHE_DIR", self.tiktoken_cache_dir())
                     .env("HEADROOM_SDK", "headroom-desktop-proxy")
                     // Anonymous aggregate telemetry (opt-in in the package,
                     // off by default). Desktop opts in on the user's behalf.
@@ -1748,6 +1900,91 @@ impl ToolManager {
             Ok(KompressPrefetchOutcome::Failed {
                 cause: summarize_kompress_prefetch_failure(log_path),
             })
+        }
+    }
+
+    /// Stable on-disk tiktoken vocab cache, passed to the backend as
+    /// TIKTOKEN_CACHE_DIR (see the proxy spawn for why the default tmp
+    /// location is not good enough).
+    pub fn tiktoken_cache_dir(&self) -> PathBuf {
+        self.runtime.root_dir.join("tiktoken-cache")
+    }
+
+    /// Best-effort pre-download of the tiktoken vocabularies the backend
+    /// loads at startup (RUST-5D: tiktoken's vocab fetch has no network
+    /// timeout, so a stalled download wedges backend boot until the watchdog
+    /// auto-pauses). Seeds [`Self::tiktoken_cache_dir`] once; with the cache
+    /// populated the backend never touches the network for vocab. Output goes
+    /// to `logs/tiktoken-prefetch.log`. The subprocess is killed after a
+    /// deadline for the same no-timeout reason.
+    pub fn prefetch_tiktoken_encodings(&self) -> Result<()> {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+        let cache_dir = self.tiktoken_cache_dir();
+        // ponytail: coarse skip — any cached entry counts as seeded. A partial
+        // cache (one of two vocabs) still self-completes lazily because the
+        // backend writes to the same persistent dir.
+        if std::fs::read_dir(&cache_dir)
+            .map(|mut dir| dir.next().is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let python = self.managed_python();
+        if !python.exists() {
+            bail!("headroom managed python not found at {}", python.display());
+        }
+        std::fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("creating {}", cache_dir.display()))?;
+
+        let logs_dir = self.runtime.logs_dir();
+        std::fs::create_dir_all(&logs_dir)
+            .with_context(|| format!("creating {}", logs_dir.display()))?;
+        let log_path = logs_dir.join("tiktoken-prefetch.log");
+        rotate_log_if_large(&log_path);
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("opening {}", log_path.display()))?;
+
+        let mut child = Command::new(&python)
+            .arg("-c")
+            // cl100k_base: the proxy's default/fallback encoding.
+            // o200k_base: current OpenAI model family, loaded for codex traffic.
+            .arg(
+                "import tiktoken; \
+                 tiktoken.get_encoding('cl100k_base'); \
+                 tiktoken.get_encoding('o200k_base')",
+            )
+            .current_dir(&self.runtime.root_dir)
+            .env("PYTHONNOUSERSITE", "1")
+            .env("PYTHONUNBUFFERED", "1")
+            .env("TIKTOKEN_CACHE_DIR", &cache_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                log_file
+                    .try_clone()
+                    .with_context(|| format!("cloning {}", log_path.display()))?,
+            ))
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .with_context(|| format!("running tiktoken prefetch via {}", python.display()))?;
+
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait().context("waiting for tiktoken prefetch")? {
+                Some(status) if status.success() => return Ok(()),
+                Some(status) => bail!("tiktoken prefetch exited with {status}"),
+                None if started.elapsed() >= DEADLINE => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "tiktoken prefetch timed out after {}s (stalled vocab download)",
+                        DEADLINE.as_secs()
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(500)),
+            }
         }
     }
 
@@ -2604,14 +2841,41 @@ impl ToolManager {
 
     /// Plugin addons are host plugins, not binaries we own, so "smoke test"
     /// means confirming the plugin is still registered with a host's plugin
-    /// registry. No-op when our receipt says it was never installed.
+    /// registry. No-op when our receipt says it was never installed, or when
+    /// it says the user disabled it — hosts without a disable verb (Codex)
+    /// drop the registration entirely on disable, so absence is expected
+    /// there, not a failure (RUST-22 false positive).
     pub fn smoke_test_plugin(&self, id: &str) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        if !self.plugin_receipt_exists(plugin) {
+        let Some(receipt) = self.read_tool_receipt(plugin.id) else {
+            return Ok(());
+        };
+        let enabled = receipt
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
             return Ok(());
         }
-        if !PluginHost::ALL.iter().any(|host| host.plugin_present(plugin)) {
-            bail!("{id} receipt exists but the plugin is no longer registered with any host");
+        if !PluginHost::ALL
+            .iter()
+            .any(|host| host.plugin_present(plugin))
+        {
+            // The plugin was removed behind our back (host-native `/plugin`
+            // uninstall or a host registry migration). Drop the stale receipt
+            // so this warns once instead of on every future upgrade;
+            // `detect_status` already reports NotInstalled for this state.
+            let receipt_path = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
+            let removed = std::fs::remove_file(&receipt_path).is_ok();
+            bail!(
+                "{id} receipt exists but the plugin is no longer registered \
+                 with any host{}",
+                if removed {
+                    " (stale receipt removed)"
+                } else {
+                    " (stale receipt could not be removed)"
+                }
+            );
         }
         Ok(())
     }
@@ -4269,16 +4533,236 @@ impl ToolManager {
 
     fn register_serena_mcp(&self) -> Result<()> {
         let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
-        self.run_serena_mcp_helper(&["-c", SERENA_MCP_HELPER, "register", &entrypoint])
+        self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "register", &entrypoint])
             .context("registering serena MCP server")
     }
 
     fn unregister_serena_mcp(&self) -> Result<()> {
-        self.run_serena_mcp_helper(&["-c", SERENA_MCP_HELPER, "unregister"])
+        self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "unregister"])
             .context("unregistering serena MCP server")
     }
 
-    fn run_serena_mcp_helper(&self, args: &[&str]) -> Result<()> {
+    pub fn context7_installed(&self) -> bool {
+        self.runtime.tools_dir.join("context7.json").exists()
+    }
+
+    /// No managed venv or binary: the agent runs the pinned package through
+    /// its own `npx`. Install just proves that works once (warming the npx
+    /// cache), then registers the MCP entry — a broken entry would make every
+    /// new agent session spawn a failing server.
+    pub fn install_context7(&self) -> Result<()> {
+        let npx = crate::claude_cli::detect_npx().context(
+            "npx was not found. Context7 runs through Node.js -- install Node.js, then try again.",
+        )?;
+        run_command_with_timeout(
+            &npx,
+            &["-y", &context7_package_spec(), "--help"],
+            &self.runtime.root_dir,
+            CONTEXT7_INSTALL_TIMEOUT,
+        )
+        .context("context7 failed its smoke test (npx download or startup)")?;
+        self.register_context7_mcp()?;
+        self.write_tool_receipt(
+            "context7",
+            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": true }),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_context7_enabled(&self, enabled: bool) -> Result<()> {
+        if !self.context7_installed() {
+            bail!("context7 is not installed");
+        }
+        if enabled {
+            self.register_context7_mcp()?;
+        } else {
+            self.unregister_context7_mcp()?;
+        }
+        self.write_tool_receipt(
+            "context7",
+            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": enabled }),
+        )?;
+        Ok(())
+    }
+
+    pub fn uninstall_context7(&self) -> Result<()> {
+        self.unregister_context7_mcp()?;
+        let receipt = self.runtime.tools_dir.join("context7.json");
+        if receipt.exists() {
+            std::fs::remove_file(&receipt)
+                .with_context(|| format!("removing {}", receipt.display()))?;
+        }
+        Ok(())
+    }
+
+    fn register_context7_mcp(&self) -> Result<()> {
+        self.run_mcp_helper(&[
+            "-c",
+            CONTEXT7_MCP_HELPER,
+            "register",
+            &context7_package_spec(),
+        ])
+        .context("registering context7 MCP server")
+    }
+
+    fn unregister_context7_mcp(&self) -> Result<()> {
+        self.run_mcp_helper(&["-c", CONTEXT7_MCP_HELPER, "unregister"])
+            .context("unregistering context7 MCP server")
+    }
+
+    pub fn codebase_memory_entrypoint(&self) -> PathBuf {
+        self.runtime.bin_dir.join("codebase-memory-mcp")
+    }
+
+    /// Index databases live here (via `CBM_CACHE_DIR`) instead of the
+    /// binary's default `~/.cache/codebase-memory-mcp`, so uninstalling the
+    /// addon or Headroom removes them too.
+    fn codebase_memory_cache_dir(&self) -> PathBuf {
+        self.runtime.tools_dir.join("codebase-memory-cache")
+    }
+
+    pub fn codebase_memory_installed(&self) -> bool {
+        self.runtime.tools_dir.join("codebase-memory.json").exists()
+            && self.codebase_memory_entrypoint().exists()
+    }
+
+    pub fn install_codebase_memory(&self) -> Result<()> {
+        let artifact = codebase_memory_distribution_artifact()?;
+        let archive_path = self.runtime.downloads_dir.join(format!(
+            "codebase-memory-mcp-v{}-{}-{}.tar.gz",
+            CODEBASE_MEMORY_VERSION,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+        download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
+
+        let extract_dir = self.runtime.downloads_dir.join("codebase-memory-extract");
+        if extract_dir.exists() {
+            std::fs::remove_dir_all(&extract_dir)
+                .with_context(|| format!("removing {}", extract_dir.display()))?;
+        }
+        std::fs::create_dir_all(&extract_dir)
+            .with_context(|| format!("creating {}", extract_dir.display()))?;
+
+        let file = std::fs::File::open(&archive_path)
+            .with_context(|| format!("opening {}", archive_path.display()))?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+        archive
+            .unpack(&extract_dir)
+            .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+
+        let extracted_binary = extract_dir.join("codebase-memory-mcp");
+        if !extracted_binary.exists() {
+            bail!(
+                "codebase-memory extraction completed but {} was not found",
+                extracted_binary.display()
+            );
+        }
+
+        // Stage then rename: live agent sessions may be running the old
+        // binary as an MCP server, and copying over it risks ETXTBSY /
+        // truncated-exec. Rename is atomic.
+        let destination = self.codebase_memory_entrypoint();
+        let staged = {
+            let mut s = destination.as_os_str().to_os_string();
+            s.push(".new");
+            PathBuf::from(s)
+        };
+        std::fs::rename(&extracted_binary, &staged)
+            .with_context(|| format!("staging {}", staged.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&staged)
+                .with_context(|| format!("reading permissions of {}", staged.display()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&staged, permissions)
+                .with_context(|| format!("marking {} executable", staged.display()))?;
+        }
+        std::fs::rename(&staged, &destination)
+            .with_context(|| format!("installing {}", destination.display()))?;
+
+        run_command_with_timeout(
+            &destination,
+            &["--version"],
+            &self.runtime.root_dir,
+            Duration::from_secs(15),
+        )
+        .context("codebase-memory installed but failed its smoke test")?;
+        std::fs::create_dir_all(self.codebase_memory_cache_dir())
+            .with_context(|| format!("creating {}", self.codebase_memory_cache_dir().display()))?;
+        self.register_codebase_memory_mcp()?;
+        self.write_tool_receipt(
+            "codebase-memory",
+            json!({ "version": CODEBASE_MEMORY_VERSION, "enabled": true }),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_codebase_memory_enabled(&self, enabled: bool) -> Result<()> {
+        if !self.codebase_memory_installed() {
+            bail!("codebase-memory is not installed");
+        }
+        if enabled {
+            self.register_codebase_memory_mcp()?;
+        } else {
+            self.unregister_codebase_memory_mcp()?;
+        }
+        self.write_tool_receipt(
+            "codebase-memory",
+            json!({ "version": CODEBASE_MEMORY_VERSION, "enabled": enabled }),
+        )?;
+        Ok(())
+    }
+
+    pub fn uninstall_codebase_memory(&self) -> Result<()> {
+        // Unregister first: a leftover MCP entry pointing at a deleted binary
+        // would make every new agent session spawn a failing server.
+        self.unregister_codebase_memory_mcp()?;
+        let binary = self.codebase_memory_entrypoint();
+        if binary.exists() {
+            std::fs::remove_file(&binary)
+                .with_context(|| format!("removing {}", binary.display()))?;
+        }
+        let cache = self.codebase_memory_cache_dir();
+        if cache.exists() {
+            std::fs::remove_dir_all(&cache)
+                .with_context(|| format!("removing {}", cache.display()))?;
+        }
+        let receipt = self.runtime.tools_dir.join("codebase-memory.json");
+        if receipt.exists() {
+            std::fs::remove_file(&receipt)
+                .with_context(|| format!("removing {}", receipt.display()))?;
+        }
+        Ok(())
+    }
+
+    fn register_codebase_memory_mcp(&self) -> Result<()> {
+        let binary = self
+            .codebase_memory_entrypoint()
+            .to_string_lossy()
+            .into_owned();
+        let cache_dir = self
+            .codebase_memory_cache_dir()
+            .to_string_lossy()
+            .into_owned();
+        self.run_mcp_helper(&[
+            "-c",
+            CODEBASE_MEMORY_MCP_HELPER,
+            "register",
+            &binary,
+            &cache_dir,
+        ])
+        .context("registering codebase-memory MCP server")
+    }
+
+    fn unregister_codebase_memory_mcp(&self) -> Result<()> {
+        self.run_mcp_helper(&["-c", CODEBASE_MEMORY_MCP_HELPER, "unregister"])
+            .context("unregistering codebase-memory MCP server")
+    }
+
+    fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
         // ClaudeRegistrar may shell out to the `claude` CLI, which can take a
         // few seconds per agent; 60s covers both registrars comfortably.
         run_command_with_timeout(
@@ -4315,7 +4799,9 @@ impl ToolManager {
             return false;
         };
         self.plugin_receipt_exists(plugin)
-            && PluginHost::ALL.iter().any(|host| host.plugin_present(plugin))
+            && PluginHost::ALL
+                .iter()
+                .any(|host| host.plugin_present(plugin))
     }
 
     fn plugin_receipt_exists(&self, plugin: &PluginAddon) -> bool {
@@ -4474,7 +4960,10 @@ impl ToolManager {
             }
             // Enabled per our receipt: require it still be registered with a host,
             // so a manual `/plugin` removal surfaces as not-installed.
-            return if PluginHost::ALL.iter().any(|host| host.plugin_present(plugin)) {
+            return if PluginHost::ALL
+                .iter()
+                .any(|host| host.plugin_present(plugin))
+            {
                 ToolStatus::Healthy
             } else {
                 ToolStatus::NotInstalled
@@ -5566,6 +6055,24 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
     })
 }
 
+fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
+    let (target, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", CODEBASE_MEMORY_SHA256_MACOS_AARCH64),
+        ("macos", "x86_64") => ("darwin-amd64", CODEBASE_MEMORY_SHA256_MACOS_X86_64),
+        ("linux", "aarch64") => ("linux-arm64", CODEBASE_MEMORY_SHA256_LINUX_AARCH64),
+        ("linux", "x86_64") => ("linux-amd64", CODEBASE_MEMORY_SHA256_LINUX_X86_64),
+        (os, arch) => bail!("unsupported codebase-memory target: {os}/{arch}"),
+    };
+
+    Ok(DownloadArtifact {
+        url: format!(
+            "https://github.com/DeusData/codebase-memory-mcp/releases/download/v{}/codebase-memory-mcp-{}.tar.gz",
+            CODEBASE_MEMORY_VERSION, target
+        ),
+        sha256: Some(sha256),
+    })
+}
+
 fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>) -> Result<()> {
     download_to_path_with_progress(url, destination, expected_sha256, |_, _| {})
 }
@@ -6165,6 +6672,10 @@ fn project_cwd_from_transcript_dir(dir: &Path) -> Option<String> {
 /// Prepend a binary's own directory to PATH so an `#!/usr/bin/env node`
 /// shebang (or similar) resolves the interpreter that nvm installs alongside
 /// it. Falls back to the existing PATH when the binary has no parent.
+fn context7_package_spec() -> String {
+    format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
+}
+
 fn path_with_binary_dir(binary: &Path) -> String {
     let existing = std::env::var("PATH").unwrap_or_default();
     match binary.parent() {
@@ -7382,6 +7893,28 @@ mod tests {
             leftovers.is_empty(),
             "no-op prefetch must not write into downloads: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn prefetch_tiktoken_encodings_gates_before_spawning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = ManagedRuntime::bootstrap_root(dir.path());
+        let manager = ToolManager::new(runtime);
+
+        // Empty cache but no managed python: must bail, not hang or succeed.
+        let err = manager
+            .prefetch_tiktoken_encodings()
+            .expect_err("missing python must error");
+        assert!(err.to_string().contains("managed python not found"));
+
+        // Seeded cache: no-op success without spawning python (which does not
+        // exist here) or touching the network.
+        let cache = manager.tiktoken_cache_dir();
+        fs::create_dir_all(&cache).expect("mkdir cache");
+        fs::write(cache.join("seed"), b"x").expect("seed cache");
+        manager
+            .prefetch_tiktoken_encodings()
+            .expect("seeded cache is a no-op");
     }
 
     #[test]
@@ -9051,6 +9584,36 @@ after
     }
 
     #[test]
+    #[serial_test::serial]
+    fn smoke_test_plugin_skips_disabled_and_self_heals_stale_receipt() {
+        let (root, runtime, manager) = seed_test_runtime("plugin-smoke-receipt");
+        // Host registries resolve under $HOME; point it at the empty test
+        // root so no plugin reads as registered.
+        let _home = HomeGuard::new(&root);
+        for plugin in &PLUGIN_ADDONS {
+            let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
+
+            // Disabled by the user: hosts without a disable verb (Codex) hold
+            // no registration, so absence is not a failure (RUST-22).
+            fs::write(&receipt, br#"{"version":"latest","enabled":false}"#).expect("receipt");
+            manager
+                .smoke_test_plugin(plugin.id)
+                .expect("disabled plugin is not a smoke failure");
+            assert!(receipt.exists(), "disabled receipt must be kept");
+
+            // Enabled but deregistered behind our back: warn once, then
+            // self-heal by dropping the stale receipt.
+            fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+            let err = manager
+                .smoke_test_plugin(plugin.id)
+                .expect_err("enabled but unregistered must fail");
+            assert!(err.to_string().contains("no longer registered"));
+            assert!(!receipt.exists(), "stale receipt must be removed");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn plugin_disabled_receipt_reports_installed_not_missing() {
         // A receipt with enabled:false means the user disabled it via the app.
         // On hosts without a disable verb the plugin is gone, but the card must
@@ -9111,10 +9674,7 @@ after
         let _ = fs::remove_dir_all(&root);
 
         install.expect("install_plugin should succeed");
-        assert!(
-            installed,
-            "plugin_installed() should be true after install"
-        );
+        assert!(installed, "plugin_installed() should be true after install");
         smoke_while_installed.expect("smoke_test_plugin should pass while installed");
         uninstall.expect("uninstall_plugin should succeed");
         assert!(gone, "plugin_installed() should be false after uninstall");

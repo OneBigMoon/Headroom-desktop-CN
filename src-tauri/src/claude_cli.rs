@@ -15,6 +15,10 @@ pub fn detect_codex_cli() -> Option<PathBuf> {
     detect_cli("codex")
 }
 
+pub fn detect_npx() -> Option<PathBuf> {
+    detect_cli("npx")
+}
+
 fn detect_cli(name: &str) -> Option<PathBuf> {
     if let Some(path) = probe_known_paths(name) {
         return Some(path);
