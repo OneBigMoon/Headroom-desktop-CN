@@ -868,16 +868,17 @@ async fn install_addon(
             )
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
-        "ponytail" => {
+        "ponytail" | "caveman" => {
             let codex_outdated = state
                 .tool_manager
-                .install_ponytail()
+                .install_plugin(&id)
                 .map_err(|err| err.to_string())?;
             if codex_outdated {
+                let name = if id == "caveman" { "Caveman" } else { "Ponytail" };
                 let _ = show_notification_impl(
                     &app,
-                    "Update Codex to finish Ponytail setup",
-                    "Ponytail is installed for Claude Code. Your Codex CLI is too old to add it -- update Codex, then re-install Ponytail to enable it there too.",
+                    &format!("Update Codex to finish {name} setup"),
+                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update Codex, then re-install {name} to enable it there too."),
                     None,
                 );
             }
@@ -921,10 +922,10 @@ async fn set_addon_enabled(
                 .map_err(|err| err.to_string())?;
             }
         }
-        "ponytail" => {
+        "ponytail" | "caveman" => {
             state
                 .tool_manager
-                .set_ponytail_enabled(enabled)
+                .set_plugin_enabled(&id, enabled)
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
@@ -968,10 +969,10 @@ async fn uninstall_addon(
                 .uninstall_rtk()
                 .map_err(|err| err.to_string())?;
         }
-        "ponytail" => {
+        "ponytail" | "caveman" => {
             state
                 .tool_manager
-                .uninstall_ponytail()
+                .uninstall_plugin(&id)
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
@@ -3429,11 +3430,13 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
-        // Ponytail lives in Claude Code's plugin registry, outside Headroom's
-        // own footprint that perform_full_cleanup() wipes, so remove it here
+        // Plugin addons live in the hosts' plugin registries, outside Headroom's
+        // own footprint that perform_full_cleanup() wipes, so remove them here
         // while we still have the ToolManager. Best-effort.
-        if let Err(err) = state.tool_manager.uninstall_ponytail() {
-            log::warn!("uninstall: removing ponytail plugin failed: {err:#}");
+        for plugin_id in ["ponytail", "caveman"] {
+            if let Err(err) = state.tool_manager.uninstall_plugin(plugin_id) {
+                log::warn!("uninstall: removing {plugin_id} plugin failed: {err:#}");
+            }
         }
     }
 

@@ -44,6 +44,10 @@ const ALLOWED_EVENTS: &[&str] = &[
     "ponytail_enabled",
     "ponytail_disabled",
     "ponytail_uninstalled",
+    "caveman_installed",
+    "caveman_enabled",
+    "caveman_disabled",
+    "caveman_uninstalled",
     // Feature engagement: learn runs (per run, `agent` property) and Activity
     // tab opens (once per app run, mirroring app_started's cadence).
     "headroom_learn_run",

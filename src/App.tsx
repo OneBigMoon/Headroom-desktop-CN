@@ -229,6 +229,17 @@ const addonCopy: Record<string, AddonCopy> = {
     disabling: "Disabling Ponytail...",
     disabled: "Ponytail is off. It stays installed but no longer nudges the agent."
   },
+  caveman: {
+    whatItDoes:
+      "Installing registers the Caveman marketplace and plugin in Claude Code and/or Codex (whichever CLIs are on your PATH). It makes the agent reply in terse caveman-speak, cutting output tokens while keeping code, commands, and errors exact. Removed from the plugin registry when you uninstall it or Headroom.",
+    installing: "Registering the Caveman plugin with your agent...",
+    uninstalling: "Removing the Caveman plugin...",
+    uninstalled: "Caveman removed. Your agent speaks in full sentences again.",
+    installed: "Caveman installed. Run /caveman-stats in your agent to see session token savings.",
+    enabling: "Enabling Caveman...",
+    disabling: "Disabling Caveman...",
+    disabled: "Caveman is off. It stays installed but no longer compresses replies."
+  },
   serena: {
     whatItDoes:
       "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and Codex. Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
@@ -1003,6 +1014,14 @@ function AddonCard({
       </div>
     </li>
   );
+}
+
+const ADDON_DISPLAY_ORDER = ["ponytail", "caveman", "serena", "markitdown"];
+
+// Unknown ids land after the curated ones, before the trailing RTK card.
+function addonDisplayRank(id: string): number {
+  const rank = ADDON_DISPLAY_ORDER.indexOf(id);
+  return rank === -1 ? ADDON_DISPLAY_ORDER.length : rank;
 }
 
 function buildAddonRequestMailto(): string {
@@ -5720,6 +5739,44 @@ export default function App() {
             </header>
             {addonError ? <p className="addons__error">{addonError}</p> : null}
             <ul className="addons__list">
+              {dashboard.tools
+                .filter((tool) => !tool.required && tool.id !== "rtk")
+                .sort((a, b) => addonDisplayRank(a.id) - addonDisplayRank(b.id))
+                .map((tool) => {
+                  const installed = tool.status !== "not_installed";
+                  return (
+                    <AddonCard
+                      key={tool.id}
+                      name={tool.name}
+                      version={tool.version}
+                      installed={installed}
+                      enabled={tool.enabled}
+                      description={tool.description}
+                      copy={addonCopy[tool.id]}
+                      infoOpen={addonInfoId === tool.id}
+                      onToggleInfo={() =>
+                        setAddonInfoId(addonInfoId === tool.id ? null : tool.id)
+                      }
+                      busy={addonBusyId === tool.id}
+                      busyLabel={addonBusyLabel}
+                      resultMessage={
+                        addonResult?.id === tool.id ? addonResult.message : null
+                      }
+                      onDismissResult={() => setAddonResult(null)}
+                      sourceUrl={tool.sourceUrl}
+                      onOpenSource={() => void openExternalLink(tool.sourceUrl)}
+                      connectors={connectors}
+                      showClients={installed && tool.enabled}
+                      savings={tool.savingsLabel ?? null}
+                      actionsDisabled={addonBusyId === tool.id}
+                      onInstall={() => void runAddonAction("install_addon", tool.id)}
+                      onToggleEnabled={() =>
+                        void runAddonAction("set_addon_enabled", tool.id, !tool.enabled)
+                      }
+                      onUninstall={() => void runAddonAction("uninstall_addon", tool.id)}
+                    />
+                  );
+                })}
               <AddonCard
                 key="rtk"
                 name="RTK"
@@ -5789,43 +5846,6 @@ export default function App() {
                   </>
                 ) : null}
               </AddonCard>
-              {dashboard.tools
-                .filter((tool) => !tool.required && tool.id !== "rtk")
-                .map((tool) => {
-                  const installed = tool.status !== "not_installed";
-                  return (
-                    <AddonCard
-                      key={tool.id}
-                      name={tool.name}
-                      version={tool.version}
-                      installed={installed}
-                      enabled={tool.enabled}
-                      description={tool.description}
-                      copy={addonCopy[tool.id]}
-                      infoOpen={addonInfoId === tool.id}
-                      onToggleInfo={() =>
-                        setAddonInfoId(addonInfoId === tool.id ? null : tool.id)
-                      }
-                      busy={addonBusyId === tool.id}
-                      busyLabel={addonBusyLabel}
-                      resultMessage={
-                        addonResult?.id === tool.id ? addonResult.message : null
-                      }
-                      onDismissResult={() => setAddonResult(null)}
-                      sourceUrl={tool.sourceUrl}
-                      onOpenSource={() => void openExternalLink(tool.sourceUrl)}
-                      connectors={connectors}
-                      showClients={installed && tool.enabled}
-                      savings={tool.savingsLabel ?? null}
-                      actionsDisabled={addonBusyId === tool.id}
-                      onInstall={() => void runAddonAction("install_addon", tool.id)}
-                      onToggleEnabled={() =>
-                        void runAddonAction("set_addon_enabled", tool.id, !tool.enabled)
-                      }
-                      onUninstall={() => void runAddonAction("uninstall_addon", tool.id)}
-                    />
-                  );
-                })}
             </ul>
             <div className="addons__request">
               <span className="addons__request-text">Missing an addon you want?</span>

@@ -320,10 +320,38 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
 if failures:
     sys.exit("; ".join(failures))
 "#;
-const PONYTAIL_MARKETPLACE: &str = "DietrichGebert/ponytail";
-const PONYTAIL_MARKETPLACE_NAME: &str = "ponytail";
-const PONYTAIL_PLUGIN_REF: &str = "ponytail@ponytail";
-const PONYTAIL_DISPLAY_VERSION: &str = "latest";
+/// A marketplace plugin addon installed through the host CLIs' own
+/// `<cli> plugin ...` managers. The install/enable/uninstall plumbing is
+/// shared; addons differ only in these identifiers.
+struct PluginAddon {
+    id: &'static str,
+    /// `owner/repo` passed to `plugin marketplace add`.
+    marketplace: &'static str,
+    /// Marketplace name passed to `plugin marketplace remove`.
+    marketplace_name: &'static str,
+    /// `plugin@marketplace` ref used by install/enable/disable/uninstall.
+    plugin_ref: &'static str,
+}
+
+static PLUGIN_ADDONS: [PluginAddon; 2] = [
+    PluginAddon {
+        id: "ponytail",
+        marketplace: "DietrichGebert/ponytail",
+        marketplace_name: "ponytail",
+        plugin_ref: "ponytail@ponytail",
+    },
+    PluginAddon {
+        id: "caveman",
+        marketplace: "JuliusBrussee/caveman",
+        marketplace_name: "caveman",
+        plugin_ref: "caveman@caveman",
+    },
+];
+const PLUGIN_DISPLAY_VERSION: &str = "latest";
+
+fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
+    PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
+}
 const RTK_SHA256_MACOS_AARCH64: &str =
     "f223ca074a0215af002679bc1d34ca92b93e25b3e8ae16aace6e84c06e586802";
 const RTK_SHA256_MACOS_X86_64: &str =
@@ -638,7 +666,19 @@ impl ToolManager {
                         .into(),
                 runtime: "plugin".into(),
                 source_url: "https://github.com/DietrichGebert/ponytail".into(),
-                version: PONYTAIL_DISPLAY_VERSION.into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "caveman".into(),
+                name: "Caveman".into(),
+                description:
+                    "Plugin that makes the agent reply in terse caveman-speak, cutting output tokens while keeping code, commands, and errors exact. Installs into Claude Code and Codex. Requires their CLI and Node.js on PATH."
+                        .into(),
+                runtime: "plugin".into(),
+                source_url: "https://github.com/JuliusBrussee/caveman".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
                 checksum: None,
                 required: false,
             },
@@ -668,8 +708,8 @@ impl ToolManager {
                 version: if manifest.id == "headroom" {
                     self.installed_headroom_version()
                         .unwrap_or_else(|| manifest.version.clone())
-                } else if manifest.id == "ponytail" {
-                    installed_ponytail_version().unwrap_or_else(|| manifest.version.clone())
+                } else if let Some(plugin) = plugin_addon(&manifest.id) {
+                    installed_plugin_version(plugin).unwrap_or_else(|| manifest.version.clone())
                 } else {
                     manifest.version.clone()
                 },
@@ -681,8 +721,8 @@ impl ToolManager {
 
     /// Chip text for the Addons tab. markitdown and serena are measured
     /// (shim counter / serena's logs plus its live dashboard stats); ponytail
-    /// is the plugin's published benchmark median — its skill forbids
-    /// inventing per-repo figures, so the label says "benchmark". rtk's
+    /// and caveman are the plugins' published benchmark medians — their skills
+    /// forbid inventing per-repo figures, so the labels say "benchmark". rtk's
     /// figure comes from `rtk gain` via RuntimeStatus, not from here.
     fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
         match tool_id {
@@ -700,6 +740,7 @@ impl ToolManager {
                 serena_savings_label(self.serena_tool_calls_local_today(), live)
             }
             "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
+            "caveman" => Some("~65% fewer output tokens (benchmark)".to_string()),
             _ => None,
         }
     }
@@ -2561,15 +2602,16 @@ impl ToolManager {
         Ok(())
     }
 
-    /// Ponytail is a Claude Code plugin, not a binary we own, so "smoke test"
-    /// means confirming it is still registered in Claude Code's plugin registry.
-    /// No-op when our receipt says it was never installed.
-    pub fn smoke_test_ponytail(&self) -> Result<()> {
-        if !self.runtime.tools_dir.join("ponytail.json").exists() {
+    /// Plugin addons are host plugins, not binaries we own, so "smoke test"
+    /// means confirming the plugin is still registered with a host's plugin
+    /// registry. No-op when our receipt says it was never installed.
+    pub fn smoke_test_plugin(&self, id: &str) -> Result<()> {
+        let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
+        if !self.plugin_receipt_exists(plugin) {
             return Ok(());
         }
-        if !PluginHost::ALL.iter().any(|host| host.plugin_present()) {
-            bail!("ponytail receipt exists but the plugin is no longer registered with any host");
+        if !PluginHost::ALL.iter().any(|host| host.plugin_present(plugin)) {
+            bail!("{id} receipt exists but the plugin is no longer registered with any host");
         }
         Ok(())
     }
@@ -3337,8 +3379,10 @@ impl ToolManager {
         if let Err(err) = self.smoke_test_markitdown() {
             log::warn!("markitdown smoke test failed after upgrade: {err:#}");
         }
-        if let Err(err) = self.smoke_test_ponytail() {
-            log::warn!("ponytail smoke test failed after upgrade: {err:#}");
+        for plugin in &PLUGIN_ADDONS {
+            if let Err(err) = self.smoke_test_plugin(plugin.id) {
+                log::warn!("{} smoke test failed after upgrade: {err:#}", plugin.id);
+            }
         }
 
         progress(BootstrapStepUpdate {
@@ -4261,46 +4305,60 @@ impl ToolManager {
         Ok(())
     }
 
-    /// A ponytail install is genuine only when our receipt exists AND at least
+    /// A plugin install is genuine only when our receipt exists AND at least
     /// one host (Claude Code or Codex) still has the plugin registered, so a
     /// user who removes it via `/plugin` doesn't leave the card stuck on
     /// "Enabled".
     #[cfg(test)]
-    pub fn ponytail_installed(&self) -> bool {
-        self.runtime.tools_dir.join("ponytail.json").exists()
-            && PluginHost::ALL.iter().any(|host| host.plugin_present())
+    pub fn plugin_installed(&self, id: &str) -> bool {
+        let Some(plugin) = plugin_addon(id) else {
+            return false;
+        };
+        self.plugin_receipt_exists(plugin)
+            && PluginHost::ALL.iter().any(|host| host.plugin_present(plugin))
     }
 
-    fn ponytail_receipt_exists(&self) -> bool {
-        self.runtime.tools_dir.join("ponytail.json").exists()
+    fn plugin_receipt_exists(&self, plugin: &PluginAddon) -> bool {
+        self.runtime
+            .tools_dir
+            .join(format!("{}.json", plugin.id))
+            .exists()
     }
 
-    fn run_ponytail_cmd(&self, cli: &Path, host: PluginHost, args: &[&str]) -> Result<()> {
+    fn run_plugin_cmd(
+        &self,
+        plugin: &PluginAddon,
+        cli: &Path,
+        host: PluginHost,
+        args: &[&str],
+    ) -> Result<()> {
+        let id = plugin.id;
         let label = host.label();
         run_command_streaming(cli, args, &self.runtime.root_dir, &mut |line: &str| {
-            log::info!("ponytail [{label}]: {line}")
+            log::info!("{id} [{label}]: {line}")
         })
     }
 
     /// Registers the marketplace (best-effort) and installs the plugin into a
     /// single host. Used for both first install and re-enable.
-    fn install_ponytail_into(&self, host: PluginHost) -> Result<()> {
+    fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
         let cli = host.cli().context("CLI not found on PATH")?;
         // Re-adding an already-known marketplace is a benign error, so ignore it.
-        let _ = self.run_ponytail_cmd(&cli, host, host.marketplace_add_args());
-        self.run_ponytail_cmd(&cli, host, host.install_args())?;
-        if !host.plugin_present() {
+        let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin));
+        self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))?;
+        if !host.plugin_present(plugin) {
             bail!("install completed but the plugin was not registered");
         }
         Ok(())
     }
 
-    /// Installs ponytail into every host that has a CLI on PATH. Returns
+    /// Installs a plugin addon into every host that has a CLI on PATH. Returns
     /// `Ok(true)` when at least one host succeeded but Codex was skipped because
     /// it is too old to support `plugin add` -- the caller nudges the user to
     /// update Codex. A too-old Codex is not a real error (no Sentry warning); it
     /// is a version skew the user can only fix by updating Codex.
-    pub fn install_ponytail(&self) -> Result<bool> {
+    pub fn install_plugin(&self, id: &str) -> Result<bool> {
+        let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let hosts: Vec<PluginHost> = PluginHost::ALL
             .into_iter()
             .filter(|host| host.cli().is_some())
@@ -4314,7 +4372,7 @@ impl ToolManager {
         let mut installed_any = false;
         let mut codex_outdated = false;
         for host in hosts {
-            match self.install_ponytail_into(host) {
+            match self.install_plugin_into(plugin, host) {
                 Ok(()) => installed_any = true,
                 Err(err) if matches!(host, PluginHost::Codex) && is_outdated_codex(&err) => {
                     codex_outdated = true;
@@ -4325,32 +4383,30 @@ impl ToolManager {
         if !installed_any {
             if codex_outdated && errors.is_empty() {
                 bail!(
-                    "Your Codex CLI is too old to install the ponytail plugin. Update Codex, then try again."
+                    "Your Codex CLI is too old to install the {id} plugin. Update Codex, then try again."
                 );
             }
-            bail!(
-                "installing the ponytail plugin failed: {}",
-                errors.join("; ")
-            );
+            bail!("installing the {id} plugin failed: {}", errors.join("; "));
         }
         if !errors.is_empty() {
             log::warn!(
-                "ponytail installed for some hosts but not all: {}",
+                "{id} installed for some hosts but not all: {}",
                 errors.join("; ")
             );
         }
         let version =
-            installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
-        self.write_tool_receipt("ponytail", json!({ "version": version, "enabled": true }))?;
+            installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
+        self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
         Ok(codex_outdated)
     }
 
-    pub fn set_ponytail_enabled(&self, enabled: bool) -> Result<()> {
+    pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         // Guard on the receipt, not host presence: disabling on a host without a
-        // disable verb (Codex) removes the plugin, so `ponytail_installed()`
+        // disable verb (Codex) removes the plugin, so `plugin_installed()`
         // would be false and re-enabling could never get past this check.
-        if !self.ponytail_receipt_exists() {
-            bail!("ponytail is not installed");
+        if !self.plugin_receipt_exists(plugin) {
+            bail!("{id} is not installed");
         }
         let mut errors: Vec<String> = Vec::new();
         let mut changed_any = false;
@@ -4359,9 +4415,9 @@ impl ToolManager {
             // Codex has no enable/disable verb, so enabling re-installs and
             // disabling removes. Skip disabling a host that isn't present.
             let result = if enabled {
-                self.install_ponytail_into(host)
-            } else if host.plugin_present() {
-                self.run_ponytail_cmd(&cli, host, host.disable_args())
+                self.install_plugin_into(plugin, host)
+            } else if host.plugin_present(plugin) {
+                self.run_plugin_cmd(plugin, &cli, host, &host.disable_args(plugin))
             } else {
                 continue;
             };
@@ -4371,30 +4427,29 @@ impl ToolManager {
             }
         }
         if !changed_any && !errors.is_empty() {
-            bail!("toggling ponytail failed: {}", errors.join("; "));
+            bail!("toggling {id} failed: {}", errors.join("; "));
         }
         let version =
-            installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
-        self.write_tool_receipt(
-            "ponytail",
-            json!({ "version": version, "enabled": enabled }),
-        )?;
+            installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
+        self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": enabled }))?;
         Ok(())
     }
 
-    pub fn uninstall_ponytail(&self) -> Result<()> {
+    pub fn uninstall_plugin(&self, id: &str) -> Result<()> {
+        let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         // No receipt means Headroom never installed it. Don't touch the user's
         // plugin config or marketplace registration (which they may own).
-        if !self.ponytail_receipt_exists() {
+        if !self.plugin_receipt_exists(plugin) {
             return Ok(());
         }
         for host in PluginHost::ALL {
             if let Some(cli) = host.cli() {
-                let _ = self.run_ponytail_cmd(&cli, host, host.uninstall_args());
-                let _ = self.run_ponytail_cmd(&cli, host, host.marketplace_remove_args());
+                let _ = self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin));
+                let _ =
+                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
             }
         }
-        let receipt = self.runtime.tools_dir.join("ponytail.json");
+        let receipt = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
         if receipt.exists() {
             std::fs::remove_file(&receipt)
                 .with_context(|| format!("removing {}", receipt.display()))?;
@@ -4403,8 +4458,8 @@ impl ToolManager {
     }
 
     fn detect_status(&self, tool_id: &str) -> ToolStatus {
-        if tool_id == "ponytail" {
-            let Some(receipt) = self.read_tool_receipt("ponytail") else {
+        if let Some(plugin) = plugin_addon(tool_id) {
+            let Some(receipt) = self.read_tool_receipt(plugin.id) else {
                 return ToolStatus::NotInstalled;
             };
             // Intentionally disabled via the app: the plugin may be gone from
@@ -4419,7 +4474,7 @@ impl ToolManager {
             }
             // Enabled per our receipt: require it still be registered with a host,
             // so a manual `/plugin` removal surfaces as not-installed.
-            return if PluginHost::ALL.iter().any(|host| host.plugin_present()) {
+            return if PluginHost::ALL.iter().any(|host| host.plugin_present(plugin)) {
                 ToolStatus::Healthy
             } else {
                 ToolStatus::NotInstalled
@@ -4434,7 +4489,7 @@ impl ToolManager {
     }
 }
 
-/// Ponytail ships a marketplace plugin that both Claude Code and Codex can
+/// Plugin addons ship marketplace plugins that both Claude Code and Codex can
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
 /// (Claude has enable/disable/install/uninstall; Codex only add/remove), so
 /// each host carries its own argument vectors.
@@ -4461,46 +4516,46 @@ impl PluginHost {
         }
     }
 
-    fn marketplace_add_args(self) -> &'static [&'static str] {
-        &["plugin", "marketplace", "add", PONYTAIL_MARKETPLACE]
+    fn marketplace_add_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
+        vec!["plugin", "marketplace", "add", plugin.marketplace]
     }
 
-    fn marketplace_remove_args(self) -> &'static [&'static str] {
-        &["plugin", "marketplace", "remove", PONYTAIL_MARKETPLACE_NAME]
+    fn marketplace_remove_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
+        vec!["plugin", "marketplace", "remove", plugin.marketplace_name]
     }
 
-    fn install_args(self) -> &'static [&'static str] {
+    fn install_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         match self {
             PluginHost::ClaudeCode => {
-                &["plugin", "install", PONYTAIL_PLUGIN_REF, "--scope", "user"]
+                vec!["plugin", "install", plugin.plugin_ref, "--scope", "user"]
             }
-            PluginHost::Codex => &["plugin", "add", PONYTAIL_PLUGIN_REF],
+            PluginHost::Codex => vec!["plugin", "add", plugin.plugin_ref],
         }
     }
 
-    fn disable_args(self) -> &'static [&'static str] {
+    fn disable_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         match self {
-            PluginHost::ClaudeCode => &["plugin", "disable", PONYTAIL_PLUGIN_REF],
-            PluginHost::Codex => &["plugin", "remove", PONYTAIL_PLUGIN_REF],
+            PluginHost::ClaudeCode => vec!["plugin", "disable", plugin.plugin_ref],
+            PluginHost::Codex => vec!["plugin", "remove", plugin.plugin_ref],
         }
     }
 
-    fn uninstall_args(self) -> &'static [&'static str] {
+    fn uninstall_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         match self {
-            PluginHost::ClaudeCode => &["plugin", "uninstall", PONYTAIL_PLUGIN_REF],
-            PluginHost::Codex => &["plugin", "remove", PONYTAIL_PLUGIN_REF],
+            PluginHost::ClaudeCode => vec!["plugin", "uninstall", plugin.plugin_ref],
+            PluginHost::Codex => vec!["plugin", "remove", plugin.plugin_ref],
         }
     }
 
-    fn plugin_present(self) -> bool {
+    fn plugin_present(self, plugin: &PluginAddon) -> bool {
         match self {
-            PluginHost::ClaudeCode => claude_ponytail_present(),
-            PluginHost::Codex => codex_ponytail_present(),
+            PluginHost::ClaudeCode => claude_plugin_present(plugin),
+            PluginHost::Codex => codex_plugin_present(plugin),
         }
     }
 }
 
-fn ponytail_installed_plugins() -> Option<Value> {
+fn claude_installed_plugins() -> Option<Value> {
     let path = dirs::home_dir()?
         .join(".claude")
         .join("plugins")
@@ -4509,26 +4564,27 @@ fn ponytail_installed_plugins() -> Option<Value> {
 }
 
 /// Claude Code records installs in `~/.claude/plugins/installed_plugins.json`
-/// under `plugins["ponytail@ponytail"]` as a non-empty array of install records.
-fn claude_ponytail_present() -> bool {
-    ponytail_installed_plugins()
-        .and_then(|v| v.get("plugins")?.get(PONYTAIL_PLUGIN_REF).cloned())
+/// under `plugins["<plugin>@<marketplace>"]` as a non-empty array of install
+/// records.
+fn claude_plugin_present(plugin: &PluginAddon) -> bool {
+    claude_installed_plugins()
+        .and_then(|v| v.get("plugins")?.get(plugin.plugin_ref).cloned())
         .and_then(|entry| entry.as_array().map(|installs| !installs.is_empty()))
         .unwrap_or(false)
 }
 
 /// Codex records installs in `~/.codex/config.toml` under a
-/// `[plugins."ponytail@ponytail"]` table. Keys containing `@` are always
+/// `[plugins."<plugin>@<marketplace>"]` table. Keys containing `@` are always
 /// quoted, so a header substring match is reliable and avoids a TOML parse
 /// dependency (matching how client_adapters edits this file).
-fn codex_ponytail_present() -> bool {
+fn codex_plugin_present(plugin: &PluginAddon) -> bool {
     let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("config.toml")) else {
         return false;
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
-    let header = format!("[plugins.\"{PONYTAIL_PLUGIN_REF}\"]");
+    let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
     text.lines().any(|line| line.trim_start() == header)
 }
 
@@ -4688,12 +4744,9 @@ fn count_serena_tool_calls_in_dir(dir: &Path) -> Option<u64> {
     (count > 0).then_some(count)
 }
 
-fn installed_ponytail_version() -> Option<String> {
-    let plugins = ponytail_installed_plugins()?;
-    let installs = plugins
-        .get("plugins")?
-        .get(PONYTAIL_PLUGIN_REF)?
-        .as_array()?;
+fn installed_plugin_version(plugin: &PluginAddon) -> Option<String> {
+    let plugins = claude_installed_plugins()?;
+    let installs = plugins.get("plugins")?.get(plugin.plugin_ref)?.as_array()?;
     installs
         .first()?
         .get("version")?
@@ -6632,7 +6685,7 @@ mod tests {
         run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
         summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
         CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, PLUGIN_ADDONS, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -8987,39 +9040,45 @@ after
     }
 
     #[test]
-    fn smoke_test_ponytail_is_noop_when_not_installed() {
-        let (root, _runtime, manager) = seed_test_runtime("ponytail-smoke-absent");
-        manager
-            .smoke_test_ponytail()
-            .expect("no-op when ponytail receipt is absent");
+    fn smoke_test_plugin_is_noop_when_not_installed() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-smoke-absent");
+        for plugin in &PLUGIN_ADDONS {
+            manager
+                .smoke_test_plugin(plugin.id)
+                .expect("no-op when plugin receipt is absent");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn ponytail_disabled_receipt_reports_installed_not_missing() {
+    fn plugin_disabled_receipt_reports_installed_not_missing() {
         // A receipt with enabled:false means the user disabled it via the app.
         // On hosts without a disable verb the plugin is gone, but the card must
         // still show "installed" (Enable), not "not installed" (Install).
-        let (root, runtime, manager) = seed_test_runtime("ponytail-disabled");
-        fs::write(
-            runtime.tools_dir.join("ponytail.json"),
-            br#"{"version":"latest","enabled":false}"#,
-        )
-        .expect("receipt");
-        assert!(matches!(
-            manager.detect_status("ponytail"),
-            crate::models::ToolStatus::Healthy
-        ));
+        let (root, runtime, manager) = seed_test_runtime("plugin-disabled");
+        for plugin in &PLUGIN_ADDONS {
+            fs::write(
+                runtime.tools_dir.join(format!("{}.json", plugin.id)),
+                br#"{"version":"latest","enabled":false}"#,
+            )
+            .expect("receipt");
+            assert!(matches!(
+                manager.detect_status(plugin.id),
+                crate::models::ToolStatus::Healthy
+            ));
+        }
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn uninstall_ponytail_is_noop_without_receipt() {
+    fn uninstall_plugin_is_noop_without_receipt() {
         // Cleanup must not touch plugin/marketplace config Headroom never wrote.
-        let (root, _runtime, manager) = seed_test_runtime("ponytail-uninstall-noreceipt");
-        manager
-            .uninstall_ponytail()
-            .expect("no-op when ponytail receipt is absent");
+        let (root, _runtime, manager) = seed_test_runtime("plugin-uninstall-noreceipt");
+        for plugin in &PLUGIN_ADDONS {
+            manager
+                .uninstall_plugin(plugin.id)
+                .expect("no-op when plugin receipt is absent");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9044,21 +9103,21 @@ after
 
         // Capture every result and always run uninstall before asserting, so a
         // failed assertion never leaves the plugin behind on the real machine.
-        let install = manager.install_ponytail();
-        let installed = manager.ponytail_installed();
-        let smoke_while_installed = manager.smoke_test_ponytail();
-        let uninstall = manager.uninstall_ponytail();
-        let gone = !manager.ponytail_installed();
+        let install = manager.install_plugin("ponytail");
+        let installed = manager.plugin_installed("ponytail");
+        let smoke_while_installed = manager.smoke_test_plugin("ponytail");
+        let uninstall = manager.uninstall_plugin("ponytail");
+        let gone = !manager.plugin_installed("ponytail");
         let _ = fs::remove_dir_all(&root);
 
-        install.expect("install_ponytail should succeed");
+        install.expect("install_plugin should succeed");
         assert!(
             installed,
-            "ponytail_installed() should be true after install"
+            "plugin_installed() should be true after install"
         );
-        smoke_while_installed.expect("smoke_test_ponytail should pass while installed");
-        uninstall.expect("uninstall_ponytail should succeed");
-        assert!(gone, "ponytail_installed() should be false after uninstall");
+        smoke_while_installed.expect("smoke_test_plugin should pass while installed");
+        uninstall.expect("uninstall_plugin should succeed");
+        assert!(gone, "plugin_installed() should be false after uninstall");
     }
 
     #[test]
