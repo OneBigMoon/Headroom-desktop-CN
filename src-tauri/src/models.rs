@@ -831,6 +831,15 @@ pub struct ClaudeAccountProfile {
     pub organization_type: Option<String>,
     /// Raw `rate_limit_tier` — same purpose as `organization_type`.
     pub rate_limit_tier: Option<String>,
+    /// Raw per-user `user_rate_limit_tier`. On Team/Enterprise orgs the
+    /// org-level `rate_limit_tier` (e.g. "raven") can't distinguish standard
+    /// from premium seats; this field carries the seat-level limits.
+    #[serde(default)]
+    pub user_rate_limit_tier: Option<String>,
+    /// Raw `seat_tier` — Anthropic's per-seat entitlement on Team/Enterprise
+    /// orgs. Same audit purpose as `user_rate_limit_tier`.
+    #[serde(default)]
+    pub seat_tier: Option<String>,
     pub weekly_utilization_pct: Option<f64>,
     /// When the Claude seven-day usage window resets (RFC3339). Drives the
     /// "savings you'll miss before reset" counterfactual on the weekly gate.

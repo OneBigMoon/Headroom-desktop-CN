@@ -62,6 +62,13 @@ struct IdentityPayload {
     claude_organization_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_rate_limit_tier: Option<String>,
+    /// Per-user rate-limit tier and seat tier, distinct from the org-level
+    /// `rate_limit_tier`. On Team/Enterprise orgs these carry the seat-level
+    /// entitlement (standard vs premium seat) the org-level string can't show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_user_rate_limit_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_seat_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_billing_type: Option<String>,
     // Codex identity, mirroring the Claude fields one-for-one. Sourced from
@@ -128,6 +135,8 @@ impl IdentityPayload {
             claude_plan_tier: claude.map(|p| p.plan_tier.clone()),
             claude_organization_type: claude.and_then(|p| p.organization_type.clone()),
             claude_rate_limit_tier: claude.and_then(|p| p.rate_limit_tier.clone()),
+            claude_user_rate_limit_tier: claude.and_then(|p| p.user_rate_limit_tier.clone()),
+            claude_seat_tier: claude.and_then(|p| p.seat_tier.clone()),
             claude_billing_type: claude.and_then(|p| p.billing_type.clone()),
             codex_account_uuid: codex.and_then(|p| p.account_uuid.clone()),
             codex_email: codex.and_then(|p| p.email.clone()),
@@ -162,6 +171,12 @@ impl IdentityPayload {
         }
         if let Some(value) = self.claude_rate_limit_tier.as_deref() {
             builder = builder.header("X-Headroom-Claude-Rate-Limit-Tier", value);
+        }
+        if let Some(value) = self.claude_user_rate_limit_tier.as_deref() {
+            builder = builder.header("X-Headroom-Claude-User-Rate-Limit-Tier", value);
+        }
+        if let Some(value) = self.claude_seat_tier.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Seat-Tier", value);
         }
         if let Some(value) = self.claude_billing_type.as_deref() {
             builder = builder.header("X-Headroom-Claude-Billing-Type", value);
@@ -262,6 +277,8 @@ pub struct IdentityFingerprint {
     claude_plan_tier: Option<ClaudePlanTier>,
     claude_organization_type: Option<String>,
     claude_rate_limit_tier: Option<String>,
+    claude_user_rate_limit_tier: Option<String>,
+    claude_seat_tier: Option<String>,
     claude_billing_type: Option<String>,
     // Codex plan/account, so an account switch or plan change on the Codex side
     // also forces a fresh `desktop/grace/start` even when Claude is unchanged.
@@ -277,6 +294,8 @@ impl IdentityFingerprint {
             claude_plan_tier: p.claude_plan_tier.clone(),
             claude_organization_type: p.claude_organization_type.clone(),
             claude_rate_limit_tier: p.claude_rate_limit_tier.clone(),
+            claude_user_rate_limit_tier: p.claude_user_rate_limit_tier.clone(),
+            claude_seat_tier: p.claude_seat_tier.clone(),
             claude_billing_type: p.claude_billing_type.clone(),
             codex_account_uuid: p.codex_account_uuid.clone(),
             codex_plan_tier: p.codex_plan_tier,
@@ -405,6 +424,14 @@ struct ClaudeOauthProfileOrganization {
     /// "default_claude_max_x5", "default_claude_max_x20" (Anthropic ships both
     /// the `_5x`/`_20x` and `_x5`/`_x20` orderings in the wild)
     rate_limit_tier: Option<String>,
+    /// Per-user rate-limit tier. On Team/Enterprise orgs the org-level
+    /// `rate_limit_tier` describes the org (e.g. "raven"), while this field
+    /// carries the individual seat's limits. Value taxonomy not yet known —
+    /// forwarded verbatim for server-side auditing.
+    user_rate_limit_tier: Option<String>,
+    /// Per-seat entitlement tier on Team/Enterprise orgs (standard vs premium
+    /// seat). Same audit rationale as `user_rate_limit_tier`.
+    seat_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1977,6 +2004,8 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
                 plan_detection_source: None,
                 organization_type: None,
                 rate_limit_tier: None,
+                user_rate_limit_tier: None,
+                seat_tier: None,
                 weekly_utilization_pct: None,
                 weekly_resets_at: None,
                 five_hour_utilization_pct: None,
@@ -2040,6 +2069,14 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
                 .as_ref()
                 .and_then(|o| o.rate_limit_tier.clone())
         }),
+        user_rate_limit_tier: profile.as_ref().and_then(|p| {
+            p.organization
+                .as_ref()
+                .and_then(|o| o.user_rate_limit_tier.clone())
+        }),
+        seat_tier: profile
+            .as_ref()
+            .and_then(|p| p.organization.as_ref().and_then(|o| o.seat_tier.clone())),
         weekly_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.seven_day.as_ref().map(|w| w.utilization)),
@@ -2176,6 +2213,8 @@ fn parse_oauth_profile_organization(
         .unwrap_or(false),
         organization_type: json_string(value, &["organization_type", "organizationType"]),
         rate_limit_tier: json_string(value, &["rate_limit_tier", "rateLimitTier"]),
+        user_rate_limit_tier: json_string(value, &["user_rate_limit_tier", "userRateLimitTier"]),
+        seat_tier: json_string(value, &["seat_tier", "seatTier"]),
     })
 }
 
@@ -2303,6 +2342,10 @@ fn log_unknown_plan_tier_once(profile: &ClaudeOauthProfile) {
         .and_then(|o| o.organization_type.as_deref())
         .unwrap_or("");
     let rate_limit_tier = org.and_then(|o| o.rate_limit_tier.as_deref()).unwrap_or("");
+    let user_rate_limit_tier = org
+        .and_then(|o| o.user_rate_limit_tier.as_deref())
+        .unwrap_or("");
+    let seat_tier = org.and_then(|o| o.seat_tier.as_deref()).unwrap_or("");
     let billing_type = org.and_then(|o| o.billing_type.as_deref()).unwrap_or("");
     let has_subscription_created_at = org
         .and_then(|o| o.subscription_created_at.as_ref())
@@ -2311,6 +2354,8 @@ fn log_unknown_plan_tier_once(profile: &ClaudeOauthProfile) {
     let mut hasher = DefaultHasher::new();
     organization_type.hash(&mut hasher);
     rate_limit_tier.hash(&mut hasher);
+    user_rate_limit_tier.hash(&mut hasher);
+    seat_tier.hash(&mut hasher);
     billing_type.hash(&mut hasher);
     has_subscription_created_at.hash(&mut hasher);
     let key = hasher.finish();
@@ -2323,6 +2368,8 @@ fn log_unknown_plan_tier_once(profile: &ClaudeOauthProfile) {
     let payload = serde_json::json!({
         "organization_type": organization_type,
         "rate_limit_tier": rate_limit_tier,
+        "user_rate_limit_tier": user_rate_limit_tier,
+        "seat_tier": seat_tier,
         "billing_type": billing_type,
         "has_subscription_created_at": has_subscription_created_at,
     });
@@ -2756,12 +2803,12 @@ mod tests {
     use super::{
         codex_billing_type, decode_jwt_payload, detect_plan_tier_from_profile,
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
-        merge_background_account_sync, plan_tier_header_value, remote_account_to_profile,
-        resolve_account_api_base_url, ClaudeOauthProfile, ClaudeOauthProfileAccount,
-        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
-        IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
-        RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
-        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS,
+        merge_background_account_sync, parse_oauth_profile_value, plan_tier_header_value,
+        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile,
+        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
+        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
+        RemoteAccountResponse, RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS,
+        DEFAULT_ACCOUNT_API_BASE_URL, MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -3073,6 +3120,8 @@ mod tests {
             plan_detection_source: Some("oauth_profile.org.rate_limit_tier".into()),
             organization_type: Some("claude_pro".into()),
             rate_limit_tier: Some("default_claude_ai".into()),
+            user_rate_limit_tier: None,
+            seat_tier: None,
             weekly_utilization_pct: None,
             weekly_resets_at: None,
             five_hour_utilization_pct: None,
@@ -3298,6 +3347,8 @@ mod tests {
             plan_detection_source: None,
             organization_type: None,
             rate_limit_tier: None,
+            user_rate_limit_tier: None,
+            seat_tier: None,
             weekly_utilization_pct: None,
             weekly_resets_at: None,
             five_hour_utilization_pct: None,
@@ -3674,8 +3725,42 @@ mod tests {
                 has_extra_usage_enabled: false,
                 organization_type: organization_type.map(str::to_string),
                 rate_limit_tier: rate_limit_tier.map(str::to_string),
+                user_rate_limit_tier: None,
+                seat_tier: None,
             }),
         }
+    }
+
+    #[test]
+    fn parse_oauth_profile_captures_seat_fields() {
+        let body = serde_json::json!({
+            "account": { "uuid": "u-1", "email": "felix@example.com" },
+            "organization": {
+                "organization_type": "claude_team",
+                "rate_limit_tier": "raven",
+                "user_rate_limit_tier": "raven_standard_seat",
+                "seat_tier": "standard",
+            }
+        });
+        let profile = parse_oauth_profile_value(&body).expect("profile parses");
+        let org = profile.organization.expect("organization present");
+        assert_eq!(
+            org.user_rate_limit_tier.as_deref(),
+            Some("raven_standard_seat")
+        );
+        assert_eq!(org.seat_tier.as_deref(), Some("standard"));
+    }
+
+    #[test]
+    fn parse_oauth_profile_seat_fields_absent_stay_none() {
+        let body = serde_json::json!({
+            "account": { "uuid": "u-1" },
+            "organization": { "organization_type": "claude_pro" }
+        });
+        let profile = parse_oauth_profile_value(&body).expect("profile parses");
+        let org = profile.organization.expect("organization present");
+        assert!(org.user_rate_limit_tier.is_none());
+        assert!(org.seat_tier.is_none());
     }
 
     #[test]

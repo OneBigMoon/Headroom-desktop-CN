@@ -7150,6 +7150,8 @@ mod tests {
                 plan_detection_source: None,
                 organization_type: None,
                 rate_limit_tier: None,
+                user_rate_limit_tier: None,
+                seat_tier: None,
                 weekly_utilization_pct: None,
                 weekly_resets_at: None,
                 five_hour_utilization_pct: None,
