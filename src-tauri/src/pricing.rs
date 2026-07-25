@@ -2218,6 +2218,21 @@ fn parse_oauth_profile_organization(
     })
 }
 
+/// Map Anthropic's per-seat `seat_tier` taxonomy to a plan tier. Values
+/// observed in the wild (Claude Code parses the field as an opaque string, so
+/// this list grows via trial-identity telemetry): `team_standard` seats carry
+/// Pro-scale Claude limits, `team_tier_1` (premium) carries Max-5x-equivalent
+/// limits, `team_tier_2` is the higher premium level. Unknown values return
+/// `None` so callers fall through to the pre-seat-tier behavior.
+fn plan_tier_from_seat_tier(seat_tier: &str) -> Option<ClaudePlanTier> {
+    match seat_tier.trim().to_ascii_lowercase().as_str() {
+        "team_standard" => Some(ClaudePlanTier::Pro),
+        "team_tier_1" => Some(ClaudePlanTier::Max5x),
+        "team_tier_2" => Some(ClaudePlanTier::Max20x),
+        _ => None,
+    }
+}
+
 fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTier, Option<String>) {
     let Some(org) = profile.organization.as_ref() else {
         return (ClaudePlanTier::Free, Some("oauth_profile.account".into()));
@@ -2239,12 +2254,21 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
                 Some("oauth_profile.organization.rateLimitTier".into()),
             );
         }
-        // Anthropic's internal label for Team-plan rate limits. Show Max20x
-        // pricing rather than falling through to Pro. NOTE: this is
-        // intentionally NOT parity with Codex Team/Business (-> Max x5). A
-        // Claude Team seat grants Claude usage at Max-tier limits, whereas a
-        // Codex/ChatGPT Business seat grants a far smaller Codex allowance, so
-        // the right recommendation differs by product. Do not "unify" them.
+        // Per-seat entitlement on Team orgs, checked after the explicit
+        // multiplier strings above (an explicit quota tier wins) and before
+        // the org-wide "raven" fallback. Grounded in observed captures: a
+        // `team_tier_1` (premium) seat reports `default_claude_max_5x`
+        // limits, while `team_standard` seats get Pro-scale limits.
+        if let Some(tier) = org.seat_tier.as_deref().and_then(plan_tier_from_seat_tier) {
+            return (tier, Some("oauth_profile.organization.seatTier".into()));
+        }
+        // Anthropic's internal label for Team-plan rate limits, reached only
+        // when `seat_tier` is absent or unrecognized. Show Max20x pricing
+        // rather than falling through to Pro. NOTE: this is intentionally NOT
+        // parity with Codex Team/Business (-> Max x5). A Claude Team seat
+        // grants Claude usage at Max-tier limits, whereas a Codex/ChatGPT
+        // Business seat grants a far smaller Codex allowance, so the right
+        // recommendation differs by product. Do not "unify" them.
         if normalized.contains("raven") {
             return (
                 ClaudePlanTier::Max20x,
@@ -2272,6 +2296,12 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
                 );
             }
         }
+    }
+
+    // Team profiles whose `rate_limit_tier` is missing or unrecognized can
+    // still classify from the seat alone.
+    if let Some(tier) = org.seat_tier.as_deref().and_then(plan_tier_from_seat_tier) {
+        return (tier, Some("oauth_profile.organization.seatTier".into()));
     }
 
     if let Some(organization_type) = org.organization_type.as_deref() {
@@ -3807,12 +3837,95 @@ mod tests {
         ));
     }
 
+    fn with_seat_tier(mut p: ClaudeOauthProfile, seat: &str) -> ClaudeOauthProfile {
+        p.organization.as_mut().unwrap().seat_tier = Some(seat.into());
+        p
+    }
+
     #[test]
     fn detect_plan_tier_default_raven_is_max20x() {
         let p = oauth_profile(Some("default_raven"), Some("claude_team"), Some(Utc::now()));
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max20x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_team_standard_seat_is_pro() {
+        let p = with_seat_tier(
+            oauth_profile(Some("raven"), Some("claude_team"), Some(Utc::now())),
+            "team_standard",
+        );
+        let (tier, source) = detect_plan_tier_from_profile(&p);
+        assert!(matches!(tier, ClaudePlanTier::Pro));
+        assert_eq!(
+            source.as_deref(),
+            Some("oauth_profile.organization.seatTier")
+        );
+    }
+
+    #[test]
+    fn detect_plan_tier_team_tier_1_seat_is_max5x() {
+        let p = with_seat_tier(
+            oauth_profile(Some("raven"), Some("claude_team"), Some(Utc::now())),
+            "team_tier_1",
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max5x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_team_tier_2_seat_is_max20x() {
+        let p = with_seat_tier(
+            oauth_profile(Some("raven"), Some("claude_team"), Some(Utc::now())),
+            "team_tier_2",
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max20x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_explicit_multiplier_outranks_seat_tier() {
+        let p = with_seat_tier(
+            oauth_profile(
+                Some("default_claude_max_5x"),
+                Some("claude_team"),
+                Some(Utc::now()),
+            ),
+            "team_standard",
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max5x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_unknown_seat_tier_keeps_raven_max20x() {
+        let p = with_seat_tier(
+            oauth_profile(Some("raven"), Some("claude_team"), Some(Utc::now())),
+            "team_tier_9",
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max20x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_seat_tier_without_rate_limit_tier_classifies() {
+        let p = with_seat_tier(
+            oauth_profile(None, Some("claude_team"), Some(Utc::now())),
+            "team_standard",
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Pro
         ));
     }
 
