@@ -3130,8 +3130,27 @@ impl AppState {
         match self.tool_manager.prefetch_kompress_model() {
             Ok(crate::tool_manager::KompressPrefetchOutcome::Downloaded) => {}
             Ok(crate::tool_manager::KompressPrefetchOutcome::Failed { cause }) => {
-                // Reported to Sentry: the cause distinguishes systemic failures
-                // (network / disk / native abort) worth acting on in aggregate.
+                // Explicit per-category fingerprint: message-based grouping
+                // lumped every cause (network blip, ModuleNotFoundError, disk
+                // full) into one grab-bag issue (RUST-3C/RUST-45), so resolving
+                // one shape regressed when a sibling reappeared. The log::warn
+                // is local-only (skip_sentry rule) to avoid double-reporting.
+                let category = cause
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.split_once(']'))
+                    .map(|(cat, _)| cat)
+                    .unwrap_or("other");
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_fingerprint(Some(&["kompress-prefetch-download", category]));
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!("kompress prefetch download error: {cause}"),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
                 log::warn!("kompress prefetch download error: {cause}");
                 return;
             }

@@ -188,6 +188,11 @@ struct AvailableAppUpdate {
 static ZERO_SPEND_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
 static ZERO_SAVINGS_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
 
+// Once per process, like the intercept's `first_optimized_request` beacon:
+// re-fires every launch until a send lands (server is first-write-wins), so
+// one failed POST delays the funnel step instead of losing it forever.
+static FIRST_SAVINGS_FUNNEL_REPORTED: AtomicBool = AtomicBool::new(false);
+
 // Set when the watchdog has captured a Sentry event for the current "down
 // episode". Reset whenever the proxy is observed reachable again, so a
 // subsequent crash re-fires.
@@ -459,6 +464,16 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         check_zero_spend_anomaly(&dashboard);
         check_zero_savings_anomaly(&dashboard);
         maybe_fire_onboarding_recovery_nudge(&app, &state, &dashboard);
+
+        // Funnel finish line, keyed on real savings only (before the fake-data
+        // injector below touches the USD figure). This used to be sent from the
+        // frontend behind a once-per-install localStorage gate, where a single
+        // failed POST lost the step forever and undercounted the funnel tail.
+        if dashboard.lifetime_estimated_tokens_saved > 0
+            && !FIRST_SAVINGS_FUNNEL_REPORTED.swap(true, Ordering::AcqRel)
+        {
+            pricing::report_funnel_step(&state, "first_savings_recorded");
+        }
 
         maybe_inject_fake_daily_savings(&mut dashboard);
 

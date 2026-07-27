@@ -226,6 +226,32 @@ fn shell_step_best_effort(
 }
 
 pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
+    let first = apply_client_setup_once(client_id)?;
+    if first.verification.verified {
+        return Ok(first);
+    }
+    // Apply-ok-but-verify-miss is a lost-update race (RUST-3W): a concurrent
+    // read-modify-write on the same file — the MCP registrar re-run at boot
+    // rewrites ~/.codex/config.toml non-atomically, Codex itself rewrites it on
+    // exit — can clobber a just-written block before verification reads it
+    // back. Re-apply once; a persistent failure still returns unverified and
+    // reaches Sentry.
+    let mut second = apply_client_setup_once(client_id)?;
+    for file in first.changed_files {
+        if !second.changed_files.contains(&file) {
+            second.changed_files.push(file);
+        }
+    }
+    for file in first.backup_files {
+        if !second.backup_files.contains(&file) {
+            second.backup_files.push(file);
+        }
+    }
+    second.already_configured &= first.already_configured;
+    Ok(second)
+}
+
+fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
     let mut state = load_setup_state();
@@ -2128,7 +2154,7 @@ fn codex_provider_table_body(requires_openai_auth: bool) -> String {
         "[model_providers.headroom]\n\
          name = \"Headroom persistent proxy\"\n\
          base_url = \"{base}\"\n\
-         supports_websockets = true",
+         supports_websockets = false",
         base = HEADROOM_OPENAI_BASE_URL,
     );
     if requires_openai_auth {
@@ -2456,7 +2482,12 @@ fn codex_provider_block_matches() -> Result<bool> {
         CODEX_ROOT_BLOCK_ID,
         "model_provider = \"headroom\"",
     ) && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
-    let table_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, &base_url);
+    let table_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, &base_url)
+        && marker_block_contains(
+            &content,
+            CODEX_TABLE_BLOCK_ID,
+            "supports_websockets = false",
+        );
     Ok(root_ok && table_ok)
 }
 
@@ -6132,6 +6163,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             toml.contains("base_url = \"http://127.0.0.1:6767/v1\""),
             "provider base_url points at proxy, got:\n{toml}"
+        );
+        assert!(
+            toml.contains("supports_websockets = false"),
+            "Codex must use the reliable HTTP Responses transport, got:\n{toml}"
         );
         // No ~/.codex/auth.json in this test ⇒ not ChatGPT-OAuth ⇒ the flag is
         // omitted (it would force an OpenAI OAuth login for API-key users, #406).

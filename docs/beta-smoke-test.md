@@ -136,10 +136,11 @@ Run these from a Codex CLI session (or with Codex configured and at least one Co
 grep -q 'model_provider = "headroom"' ~/.codex/config.toml && \
   grep -q 'openai_base_url = "http://127.0.0.1:6767/v1"' ~/.codex/config.toml && \
   grep -qF '[model_providers.headroom]' ~/.codex/config.toml && \
+  grep -q 'supports_websockets = false' ~/.codex/config.toml && \
   grep -q 'export OPENAI_BASE_URL=http://127.0.0.1:6767/v1' ~/.zshrc ~/.zprofile 2>/dev/null && \
   echo PASS || echo FAIL
 ```
-Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `# >>> headroom:codex_cli >>>` with the root `model_provider`/`openai_base_url` keys, and `# >>> headroom:codex_cli_provider >>>` with the `[model_providers.headroom]` table — and a managed shell block exports `OPENAI_BASE_URL`. A `FAIL` means setup didn't write one of them (see `configure_codex_provider_block` / `configure_shell_block` in `client_adapters.rs`).
+Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `# >>> headroom:codex_cli >>>` with the root `model_provider`/`openai_base_url` keys, and `# >>> headroom:codex_cli_provider >>>` with the `[model_providers.headroom]` table — and a managed shell block exports `OPENAI_BASE_URL`. Headroom deliberately keeps `supports_websockets = false` so Codex uses the reliable HTTP Responses stream instead of failing the whole turn when an upstream WebSocket closes before `response.completed`. A `FAIL` means setup didn't write one of them (see `configure_codex_provider_block` / `configure_shell_block` in `client_adapters.rs`).
 
 ### C2. Codex traffic is actively optimized (token mode)
 Codex is billed per token, so unlike a Claude Code subscription it runs in `token` mode and `requests_compressed` *does* move. Run this from inside Codex.

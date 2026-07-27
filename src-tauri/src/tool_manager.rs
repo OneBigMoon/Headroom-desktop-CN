@@ -1841,7 +1841,9 @@ impl ToolManager {
                     if !cause.starts_with("[network]") || attempt == MAX_ATTEMPTS {
                         return Ok(KompressPrefetchOutcome::Failed { cause });
                     }
-                    log::warn!(
+                    // Info: a retried transient is not a fleet signal (RUST-45
+                    // spam); the final Failed outcome carries the cause.
+                    log::info!(
                         "kompress prefetch attempt {attempt}/{MAX_ATTEMPTS} failed (retrying): {cause}"
                     );
                     std::thread::sleep(std::time::Duration::from_secs(3 * attempt as u64));

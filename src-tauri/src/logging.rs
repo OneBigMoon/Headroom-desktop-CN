@@ -96,11 +96,14 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("tauri_plugin_updater") {
         return is_transient_transport_error(msg) || is_updater_endpoint_error(msg);
     }
-    // proxy_intercept bypass forwarder: when CC is bypassing the local Python
-    // proxy and we re-issue directly to api.anthropic.com, transient network
-    // failures aren't actionable — client already gets a 502 and CC retries.
+    // proxy_intercept bypass forwarders (plain + websocket-upgrade variant):
+    // when CC is bypassing the local Python proxy and we re-issue directly to
+    // the upstream API, transient network failures aren't actionable — client
+    // already gets a 502 and CC retries. The upgrade variant was missed by the
+    // original prefix and accumulated as RUST-2R (393 events, all transport).
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
-        && msg.starts_with("proxy_intercept bypass forward failed")
+        && (msg.starts_with("proxy_intercept bypass forward failed")
+            || msg.starts_with("proxy_intercept bypass upgrade forward failed"))
     {
         return is_transient_transport_error(msg);
     }
@@ -119,6 +122,23 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::state")
         && (msg.starts_with("kompress prefetch failed")
             || msg.starts_with("kompress prefetch: restart after download failed"))
+    {
+        return true;
+    }
+    // The download-error variant reaches Sentry via an explicit
+    // category-fingerprinted capture_message at the emit site (RUST-3C
+    // grab-bag split); the accompanying log::warn is local-only.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("kompress prefetch download error")
+    {
+        return true;
+    }
+    // Boot-validation failure reaches Sentry via the fully-tagged Level::Error
+    // capture at the same emit site (capture_runtime_upgrade_failure, RUST-4A:
+    // versions, boot diagnostics, pip tail); this bridged warn double-reports
+    // the same incident as RUST-2N with none of that context.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("run_upgrade_with_ui: boot validation failed")
     {
         return true;
     }
@@ -404,12 +424,39 @@ mod tests {
     }
 
     #[test]
-    fn keeps_kompress_prefetch_download_error() {
-        // The classified-cause variant carries the systemic signal and must
-        // reach Sentry.
-        assert!(!skip_sentry(
+    fn skips_kompress_prefetch_download_error_warn() {
+        // Sentry now gets this via the explicit category-fingerprinted
+        // capture_message at the emit site (RUST-3C grab-bag split); the
+        // bridged warn would double-report.
+        assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "kompress prefetch download error: [network] Max retries exceeded"
+        ));
+    }
+
+    #[test]
+    fn skips_bypass_upgrade_forward_transport_errors() {
+        // The websocket-upgrade forwarder variant (RUST-2R) gets the same
+        // transient-transport treatment as the plain bypass forwarder.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "proxy_intercept bypass upgrade forward failed: error sending request for url (https://api.openai.com/v1/responses)"
+        ));
+        // Non-transport failures on the same path still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "proxy_intercept bypass upgrade forward failed: builder error"
+        ));
+    }
+
+    #[test]
+    fn skips_boot_validation_failed_rollback_warn() {
+        // capture_runtime_upgrade_failure at the same site carries the
+        // fully-tagged event (RUST-4A); the bridged warn duplicated it as
+        // RUST-2N.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "run_upgrade_with_ui: boot validation failed (timed_out); rolling back to Some(\"0.30.0\")"
         ));
     }
 

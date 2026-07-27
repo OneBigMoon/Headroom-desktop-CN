@@ -1498,18 +1498,14 @@ export default function App() {
     ) {
       return;
     }
-    if (
-      trackInstallMilestoneOnce("first_savings_recorded", {
-        lifetime_tokens_saved: dashboard.lifetimeEstimatedTokensSaved,
-        lifetime_savings_usd: Number(dashboard.lifetimeEstimatedSavingsUsd.toFixed(4))
-      })
-    ) {
-      // Funnel finish line: separates "requests flowed but nothing saved"
-      // (optimizer/config bug) from "never came back" (churn) in the admin
-      // wizard funnel. Server is first-write-wins, so a re-send after a
-      // cleared localStorage is harmless.
-      reportFunnelStep("first_savings_recorded");
-    }
+    // Analytics only. The matching funnel beacon is sent from Rust
+    // (get_dashboard_state), which retries every launch until it lands —
+    // this localStorage gate is once-per-install with no retry, and losing
+    // one POST here permanently undercounted the funnel finish line.
+    trackInstallMilestoneOnce("first_savings_recorded", {
+      lifetime_tokens_saved: dashboard.lifetimeEstimatedTokensSaved,
+      lifetime_savings_usd: Number(dashboard.lifetimeEstimatedSavingsUsd.toFixed(4))
+    });
   }, [dashboard.lifetimeEstimatedSavingsUsd, dashboard.lifetimeEstimatedTokensSaved]);
 
   useEffect(() => {
