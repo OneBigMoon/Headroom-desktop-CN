@@ -40,7 +40,7 @@ struct ManagedClientSpec {
     name: &'static str,
 }
 
-const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 3] = [
+const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     ManagedClientSpec {
         id: "claude_code",
         name: "Claude Code",
@@ -52,6 +52,10 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 3] = [
     ManagedClientSpec {
         id: "grok_build",
         name: "Grok Build",
+    },
+    ManagedClientSpec {
+        id: "opencode",
+        name: "OpenCode",
     },
 ];
 
@@ -69,6 +73,7 @@ pub fn detect_clients() -> Vec<ClientStatus> {
         detect_claude_code_client(is_configured(&setup_state, "claude_code")),
         detect_codex_client(is_configured(&setup_state, "codex")),
         detect_grok_build_client(is_configured(&setup_state, "grok_build")),
+        detect_opencode_client(is_configured(&setup_state, "opencode")),
     ]
 }
 
@@ -398,6 +403,13 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                 .managed_shell_files
                 .insert(state_id.clone(), serialize_paths(&shell_targets));
         }
+        "opencode" => {
+            // Config-file routing only: OpenCode reads provider base URLs from
+            // opencode.json(c); no env vars or shell blocks are involved.
+            let updates = configure_opencode_provider_block(&mut state)?;
+            changed_files.extend(updates.0);
+            backup_files.extend(updates.1);
+        }
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
 
@@ -443,6 +455,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                 match normalized_setup_id(client_id) {
                     "codex_cli" => "Codex",
                     "grok_build" => "Grok Build",
+                    "opencode" => "OpenCode",
                     _ => "Claude Code",
                 }
             ));
@@ -615,6 +628,19 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             }
         }
+        "opencode" => {
+            if opencode_provider_block_matches()? {
+                checks.push(
+                    "Found Headroom proxy base URLs for the anthropic and openai providers in OpenCode's config."
+                        .into(),
+                );
+            } else {
+                failures.push(
+                    "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config."
+                        .into(),
+                );
+            }
+        }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
     }
 
@@ -646,6 +672,17 @@ pub fn is_codex_enabled() -> bool {
 
 pub fn is_grok_build_enabled() -> bool {
     is_configured(&load_setup_state(), "grok_build")
+}
+
+pub fn is_opencode_enabled() -> bool {
+    is_configured(&load_setup_state(), "opencode")
+}
+
+/// True when an enabled connector bills against the user's own provider keys
+/// (or ChatGPT plan), so the Claude pricing gate must neither stop the Python
+/// backend nor bypass the proxy for it.
+pub fn any_gate_exempt_client_enabled() -> bool {
+    is_codex_enabled() || is_opencode_enabled()
 }
 
 pub fn list_client_connectors(
@@ -753,6 +790,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             remove_vscode_connector_keys(preserved.as_deref())?;
         }
         "grok_build" => disable_grok_build()?,
+        "opencode" => disable_opencode(&state)?,
         other => {
             return Err(anyhow!(
                 "Automatic setup disable is not supported yet for {other}.",
@@ -777,6 +815,16 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // Consumed: the provider is back in the user's config now. The next
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove("codex_cli");
+        }
+        "opencode" => {
+            state.configured_clients.remove("opencode");
+            state.remembered_clients.remove("opencode");
+            state.managed_shell_files.remove("opencode");
+            state.remembered_shell_files.remove("opencode");
+            // Consumed: the URLs are back in the user's config now. The next
+            // apply re-captures them if Headroom is re-enabled.
+            state.preserved_base_urls.remove("opencode_anthropic");
+            state.preserved_base_urls.remove("opencode_openai");
         }
         _ => {
             let state_id = normalized_setup_id(client_id);
@@ -2604,9 +2652,9 @@ fn redirect_existing_grok_build_base_url(content: &str) -> Option<String> {
                 .take_while(|c| c.is_whitespace())
                 .collect();
             out[idx] = match old {
-                Some(old) => format!(
-                    "{indent}base_url = \"{HEADROOM_GROK_PROXY_BASE_URL}\"  # was: {old}"
-                ),
+                Some(old) => {
+                    format!("{indent}base_url = \"{HEADROOM_GROK_PROXY_BASE_URL}\"  # was: {old}")
+                }
                 None => format!("{indent}base_url = \"{HEADROOM_GROK_PROXY_BASE_URL}\""),
             };
         }
@@ -2738,6 +2786,389 @@ fn disable_grok_build() -> Result<()> {
     let shell_targets = all_shell_paths();
     let _ = remove_shell_block(&shell_targets, "grok_build");
     Ok(())
+}
+
+/// Both OpenCode @ai-sdk transports append their endpoint to a `/v1` base
+/// (`/messages`, `/responses`), so anthropic and openai share one proxy URL.
+/// Verified against opencode 1.18.5.
+const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
+const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
+
+fn opencode_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("opencode")
+}
+
+/// OpenCode's global config file. Honors `$OPENCODE_CONFIG`; otherwise
+/// prefers `opencode.jsonc` when it exists (OpenCode does the same).
+fn opencode_config_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("OPENCODE_CONFIG").filter(|v| !v.is_empty()) {
+        return PathBuf::from(explicit);
+    }
+    let dir = opencode_config_dir();
+    let jsonc = dir.join("opencode.jsonc");
+    if jsonc.exists() {
+        jsonc
+    } else {
+        dir.join("opencode.json")
+    }
+}
+
+fn opencode_data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local").join("share"))
+        .join("opencode")
+}
+
+fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing {} (JSONC comments are not supported by Headroom setup yet - remove them and retry)",
+            path.display()
+        )
+    })?;
+    if !value.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    Ok(value)
+}
+
+/// Strip `//` and `/* */` comments plus trailing commas so a JSONC config can
+/// be parsed with serde_json. String contents (including escapes) survive.
+fn strip_jsonc(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+                i += 1;
+            }
+            '/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            '/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            ',' => {
+                // Trailing comma: skip when the next non-whitespace,
+                // non-comment character closes the container.
+                let mut j = i + 1;
+                loop {
+                    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'/') {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b'/') && bytes.get(j + 1) == Some(&b'*') {
+                        j += 2;
+                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                            j += 1;
+                        }
+                        j = (j + 2).min(bytes.len());
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(bytes.get(j), Some(b'}') | Some(b']')) {
+                    out.push(',');
+                }
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Lenient fallback for disable/cleanup: a JSONC config must never strand the
+/// user on a dead proxy URL just because it contains comments. The write-back
+/// is comment-free; the byte-for-byte `.headroom-backup` keeps the original.
+fn read_opencode_config_lenient(path: &Path) -> Result<serde_json::Value> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw))
+        .with_context(|| format!("parsing {} (even ignoring JSONC comments)", path.display()))?;
+    if !value.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    Ok(value)
+}
+
+fn opencode_provider_base_url(config: &serde_json::Value, provider: &str) -> Option<String> {
+    config
+        .get("provider")?
+        .get(provider)?
+        .get("options")?
+        .get("baseURL")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn ensure_json_object<'a>(
+    value: &'a mut serde_json::Value,
+    key: &str,
+) -> &'a mut serde_json::Value {
+    let obj = value
+        .as_object_mut()
+        .expect("read_opencode_config guarantees an object root");
+    let entry = obj
+        .entry(key.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+    entry
+}
+
+fn set_opencode_provider_base_url(config: &mut serde_json::Value, provider: &str, url: &str) {
+    let options = ensure_json_object(
+        ensure_json_object(ensure_json_object(config, "provider"), provider),
+        "options",
+    );
+    options
+        .as_object_mut()
+        .expect("ensure_json_object returns an object")
+        .insert("baseURL".into(), serde_json::json!(url));
+}
+
+/// Remove the managed `baseURL`, pruning `options`/provider/`provider` map
+/// entries that end up empty so disable leaves no husks behind.
+fn remove_opencode_provider_base_url(config: &mut serde_json::Value, provider: &str) {
+    let Some(providers) = config.get_mut("provider").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    if let Some(entry) = providers.get_mut(provider) {
+        if let Some(options) = entry.get_mut("options").and_then(|v| v.as_object_mut()) {
+            options.remove("baseURL");
+            if options.is_empty() {
+                entry.as_object_mut().map(|o| o.remove("options"));
+            }
+        }
+        if entry.as_object().is_some_and(|o| o.is_empty()) {
+            providers.remove(provider);
+        }
+    }
+    if providers.is_empty() {
+        config.as_object_mut().map(|o| o.remove("provider"));
+    }
+}
+
+fn write_opencode_config(path: &Path, config: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut payload = serde_json::to_string_pretty(config)
+        .with_context(|| format!("serializing {}", path.display()))?;
+    payload.push('\n');
+    atomic_write(path, payload.as_bytes())
+}
+
+fn configure_opencode_provider_block(
+    state: &mut ClientSetupState,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let path = opencode_config_path();
+    let mut config = read_opencode_config(&path)?;
+
+    // `headroom wrap opencode` (bundled CLI) injects its own provider block
+    // pointing at a wrap-managed proxy. Layering the desktop's routing on top
+    // would fight it; make the user pick one.
+    if config
+        .get("provider")
+        .and_then(|p| p.get("headroom"))
+        .is_some()
+    {
+        return Err(anyhow!(
+            "OpenCode's config contains a provider block from `headroom wrap opencode`. Run `headroom unwrap opencode` first, then retry setup."
+        ));
+    }
+
+    let mut changed = false;
+    for provider in OPENCODE_MANAGED_PROVIDERS {
+        let existing = opencode_provider_base_url(&config, provider);
+        if existing.as_deref() == Some(HEADROOM_OPENCODE_BASE_URL) {
+            continue;
+        }
+        if let Some(original) = existing {
+            // Pre-existing custom base URL (gateway, LiteLLM, ...): preserve
+            // for restore-on-disable, same contract as codex/claude.
+            state
+                .preserved_base_urls
+                .insert(format!("opencode_{provider}"), original);
+        }
+        set_opencode_provider_base_url(&mut config, provider, HEADROOM_OPENCODE_BASE_URL);
+        changed = true;
+    }
+    if !changed {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let backup = backup_if_exists(&path)?;
+    write_opencode_config(&path, &config)?;
+
+    let mut backup_files = Vec::new();
+    if let Some(backup_path) = backup {
+        backup_files.push(backup_path.display().to_string());
+    }
+    Ok((vec![path.display().to_string()], backup_files))
+}
+
+fn opencode_provider_block_matches() -> Result<bool> {
+    let path = opencode_config_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let config = read_opencode_config(&path)?;
+    Ok(OPENCODE_MANAGED_PROVIDERS.iter().all(|provider| {
+        opencode_provider_base_url(&config, provider).as_deref() == Some(HEADROOM_OPENCODE_BASE_URL)
+    }))
+}
+
+fn disable_opencode(state: &ClientSetupState) -> Result<()> {
+    let path = opencode_config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut config = match read_opencode_config(&path) {
+        Ok(config) => config,
+        Err(_) => read_opencode_config_lenient(&path)?,
+    };
+    let mut changed = false;
+    for provider in OPENCODE_MANAGED_PROVIDERS {
+        if opencode_provider_base_url(&config, provider).as_deref()
+            != Some(HEADROOM_OPENCODE_BASE_URL)
+        {
+            // Not ours (user changed it since) - leave it alone.
+            continue;
+        }
+        match state
+            .preserved_base_urls
+            .get(&format!("opencode_{provider}"))
+        {
+            Some(original) => set_opencode_provider_base_url(&mut config, provider, original),
+            None => remove_opencode_provider_base_url(&mut config, provider),
+        }
+        changed = true;
+    }
+    if changed {
+        let _ = backup_if_exists(&path)?;
+        write_opencode_config(&path, &config)?;
+    }
+    Ok(())
+}
+
+fn detect_opencode_client(configured: bool) -> ClientStatus {
+    let executable = opencode_candidate_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .or_else(|| find_on_path(&["opencode"]));
+
+    let detected = executable
+        .as_ref()
+        .map(|path| format!("Detected at {}", path.display()))
+        .or_else(|| {
+            opencode_user_state_exists().then(|| {
+                format!(
+                    "Detected OpenCode data in {}.",
+                    opencode_data_dir().display()
+                )
+            })
+        });
+
+    if let Some(detected_note) = detected {
+        return ClientStatus {
+            id: "opencode".into(),
+            name: "OpenCode".into(),
+            installed: true,
+            configured,
+            health: if configured {
+                ClientHealth::Healthy
+            } else {
+                ClientHealth::Attention
+            },
+            notes: if configured {
+                vec![detected_note, "Configured by Headroom.".into()]
+            } else {
+                vec![
+                    detected_note,
+                    "Route OpenCode through Headroom's localhost proxy so prompts stay lean."
+                        .into(),
+                ]
+            },
+        };
+    }
+
+    ClientStatus {
+        id: "opencode".into(),
+        name: "OpenCode".into(),
+        installed: false,
+        configured: false,
+        health: ClientHealth::NotDetected,
+        notes: vec!["Not detected on this machine yet.".into()],
+    }
+}
+
+fn opencode_candidate_paths() -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut candidates = vec![
+        home.join(".opencode").join("bin").join("opencode"),
+        PathBuf::from("/opt/homebrew/bin/opencode"),
+        PathBuf::from("/usr/local/bin/opencode"),
+    ];
+    let user_bin_dirs = vec![home.join(".local").join("bin"), home.join("bin")];
+    candidates.extend(binary_candidates_in_dirs(&user_bin_dirs, &["opencode"]));
+    dedupe_paths(candidates)
+}
+
+/// Deliberately excludes the config file: setup itself creates one, which
+/// would make detection self-fulfilling after disable (the grok_build bug).
+fn opencode_user_state_exists() -> bool {
+    let data = opencode_data_dir();
+    data.join("auth.json").exists() || data.join("storage").exists()
 }
 
 /// Rewrite the `command` of the `[mcp_servers.headroom]` table in
@@ -5930,6 +6361,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_shell: Option<std::ffi::OsString>,
         prev_codex: Option<std::ffi::OsString>,
         prev_zdotdir: Option<std::ffi::OsString>,
+        prev_xdg_config: Option<std::ffi::OsString>,
+        prev_opencode_config: Option<std::ffi::OsString>,
+        prev_grok_home: Option<std::ffi::OsString>,
         // Held for the guard's lifetime: env vars are process-global, so two
         // TestHome tests running on parallel threads corrupt each other's HOME
         // (and can leak writes into the developer's real profile). serial_test
@@ -5949,8 +6383,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_shell = std::env::var_os("SHELL");
             let prev_codex = std::env::var_os("CODEX_HOME");
             let prev_zdotdir = std::env::var_os("ZDOTDIR");
+            let prev_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+            let prev_opencode_config = std::env::var_os("OPENCODE_CONFIG");
+            let prev_grok_home = std::env::var_os("GROK_HOME");
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+            // Pin XDG_CONFIG_HOME into the temp home and clear the opencode /
+            // grok override vars: a dev machine with any of these set would
+            // otherwise have the opencode/grok tests write the developer's
+            // REAL client configs.
+            std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            std::env::remove_var("OPENCODE_CONFIG");
+            std::env::remove_var("GROK_HOME");
             // Force a deterministic shell family so tests don't depend on the
             // dev's login shell.
             std::env::set_var("SHELL", "/bin/zsh");
@@ -5972,6 +6416,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_shell,
                 prev_codex,
                 prev_zdotdir,
+                prev_xdg_config,
+                prev_opencode_config,
+                prev_grok_home,
                 _env_lock: env_lock,
             }
         }
@@ -5998,6 +6445,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             match self.prev_codex.take() {
                 Some(v) => std::env::set_var("CODEX_HOME", v),
                 None => std::env::remove_var("CODEX_HOME"),
+            }
+            match self.prev_xdg_config.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match self.prev_opencode_config.take() {
+                Some(v) => std::env::set_var("OPENCODE_CONFIG", v),
+                None => std::env::remove_var("OPENCODE_CONFIG"),
+            }
+            match self.prev_grok_home.take() {
+                Some(v) => std::env::set_var("GROK_HOME", v),
+                None => std::env::remove_var("GROK_HOME"),
             }
             match self.prev_zdotdir.take() {
                 Some(v) => std::env::set_var("ZDOTDIR", v),
@@ -6726,6 +7185,184 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn apply_then_verify_then_disable_opencode_round_trip() {
+        let home = TestHome::new();
+
+        let result = super::apply_client_setup("opencode").expect("apply_client_setup succeeds");
+        assert!(result.applied);
+        assert_eq!(result.client_id, "opencode");
+
+        let config_path = home
+            .path()
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("config written"))
+                .expect("valid json");
+        for provider in ["anthropic", "openai"] {
+            assert_eq!(
+                config["provider"][provider]["options"]["baseURL"],
+                serde_json::json!("http://127.0.0.1:6767/v1"),
+                "{provider} routed through proxy, got:\n{config:#}"
+            );
+        }
+
+        let verification =
+            super::verify_client_setup("opencode").expect("verify_client_setup succeeds");
+        assert!(
+            verification.failures.is_empty(),
+            "{:?}",
+            verification.failures
+        );
+
+        super::disable_client_setup("opencode").expect("disable_client_setup succeeds");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            after.get("provider").is_none(),
+            "provider husk removed on disable, got:\n{after:#}"
+        );
+        assert!(!super::is_opencode_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_apply_preserves_existing_base_url_and_restores_on_disable() {
+        let home = TestHome::new();
+        let config_dir = home.path().join(".config").join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("opencode.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "theme": "tokyonight",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://gateway.corp.example/v1",
+        "timeout": 5000
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["theme"], serde_json::json!("tokyonight"));
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["timeout"],
+            serde_json::json!(5000),
+            "sibling option keys preserved"
+        );
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            serde_json::json!("http://127.0.0.1:6767/v1")
+        );
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            after["provider"]["anthropic"]["options"]["baseURL"],
+            serde_json::json!("https://gateway.corp.example/v1"),
+            "original gateway URL restored, got:\n{after:#}"
+        );
+        assert_eq!(after["theme"], serde_json::json!("tokyonight"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_apply_refuses_wrap_managed_config() {
+        let home = TestHome::new();
+        let config_dir = home.path().join(".config").join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("opencode.json"),
+            r#"{"provider":{"headroom":{"npm":"@ai-sdk/openai-compatible"}}}"#,
+        )
+        .unwrap();
+
+        let err = super::apply_client_setup("opencode").expect_err("apply must refuse");
+        assert!(
+            err.to_string().contains("headroom unwrap opencode"),
+            "actionable error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn strip_jsonc_removes_comments_and_trailing_commas() {
+        let src = r#"{
+  // line comment
+  "a": "value with // not a comment",
+  /* block
+     comment */
+  "b": [1, 2, /* inline */ 3,],
+  "c": "trailing \" escape",
+}"#;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&super::strip_jsonc(src)).expect("stripped source parses");
+        assert_eq!(
+            parsed["a"],
+            serde_json::json!("value with // not a comment")
+        );
+        assert_eq!(parsed["b"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_disable_tolerates_comments_added_after_apply() {
+        let home = TestHome::new();
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        let config_path = home
+            .path()
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json");
+        let mut contents = fs::read_to_string(&config_path).unwrap();
+        contents.insert_str(0, "// routed through headroom\n");
+        fs::write(&config_path, &contents).unwrap();
+
+        super::disable_client_setup("opencode").expect("disable succeeds despite comments");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap())
+                .expect("disable wrote parseable json");
+        assert!(
+            after.get("provider").is_none(),
+            "proxy URLs removed, got:\n{after:#}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_config_path_prefers_jsonc_when_present() {
+        let home = TestHome::new();
+        let config_dir = home.path().join(".config").join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("opencode.jsonc"), "{}").unwrap();
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        let jsonc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.jsonc")).unwrap())
+                .unwrap();
+        assert_eq!(
+            jsonc["provider"]["anthropic"]["options"]["baseURL"],
+            serde_json::json!("http://127.0.0.1:6767/v1"),
+            "jsonc file managed when it is the active config"
+        );
+        assert!(
+            !config_dir.join("opencode.json").exists(),
+            "no stray opencode.json created next to the active jsonc"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn grok_config_preserves_user_top_level_keys() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
@@ -6738,7 +7375,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let toml = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
         let key_pos = toml.find("default_model").expect("user key kept");
-        let table_pos = toml.find("[model.grok-build]").expect("managed table present");
+        let table_pos = toml
+            .find("[model.grok-build]")
+            .expect("managed table present");
         assert!(
             key_pos < table_pos,
             "top-level key must precede the managed table, got:\n{toml}"
@@ -6776,7 +7415,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let verification =
             super::verify_client_setup("grok_build").expect("verify_client_setup succeeds");
-        assert!(verification.failures.is_empty(), "{:?}", verification.failures);
+        assert!(
+            verification.failures.is_empty(),
+            "{:?}",
+            verification.failures
+        );
 
         super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
         let after = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
@@ -6784,7 +7427,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             after.contains("base_url = \"http://127.0.0.1:8787/v1\""),
             "original base_url restored, got:\n{after}"
         );
-        assert!(!after.contains("# was:"), "redirect comment removed, got:\n{after}");
+        assert!(
+            !after.contains("# was:"),
+            "redirect comment removed, got:\n{after}"
+        );
     }
 
     #[test]

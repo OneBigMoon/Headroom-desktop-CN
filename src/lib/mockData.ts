@@ -7,6 +7,7 @@ export const mockDashboard: DashboardState = {
   bootstrapComplete: false,
   pythonRuntimeInstalled: false,
   lifetimeRequests: 0,
+  firstPromptRequestSeen: false,
   lifetimeEstimatedSavingsUsd: 0,
   lifetimeEstimatedTokensSaved: 0,
   sessionRequests: 0,

@@ -234,14 +234,54 @@ select {
   color: #5e5650;
 }
 
-.post-install__waiting {
+.post-install__checklist {
   display: flex;
-  align-items: center;
-  gap: 9px;
+  flex-direction: column;
+  gap: 14px;
 }
 
-.post-install__waiting .callout-banner__dot {
-  margin-top: 0;
+.post-install__steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.post-install__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  text-align: left;
+}
+
+.post-install__step strong {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.post-install__step p {
+  margin: 2px 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.post-install__starter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--surface-sunken);
+  text-align: left;
+}
+
+.post-install__starter code {
+  flex: 1;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
 }
 
 .post-install__status {

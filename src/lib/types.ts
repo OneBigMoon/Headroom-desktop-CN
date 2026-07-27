@@ -100,6 +100,7 @@ export interface DashboardState {
   bootstrapComplete: boolean;
   pythonRuntimeInstalled: boolean;
   lifetimeRequests: number;
+  firstPromptRequestSeen: boolean;
   lifetimeEstimatedSavingsUsd: number;
   lifetimeEstimatedTokensSaved: number;
   sessionRequests: number;

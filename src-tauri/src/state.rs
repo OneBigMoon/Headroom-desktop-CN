@@ -1262,7 +1262,7 @@ impl AppState {
             let gate_wants_python_down =
                 self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
                     || (!self.pricing_allows_optimization()
-                        && !crate::client_adapters::is_codex_enabled())
+                        && !crate::client_adapters::any_gate_exempt_client_enabled())
                     || self.runtime_is_paused();
             if gate_wants_python_down {
                 log::info!(
@@ -1833,6 +1833,18 @@ impl AppState {
         true
     }
 
+    /// One-shot gate for the first-savings celebration notification: returns
+    /// true exactly once per install, persisted like the recovery nudge flag.
+    pub fn try_mark_first_savings_notified(&self) -> bool {
+        let mut profile = self.launch_profile.lock();
+        if profile.first_savings_notified {
+            return false;
+        }
+        profile.first_savings_notified = true;
+        persist_launch_profile(&self.launch_profile_path, &profile);
+        true
+    }
+
     pub fn accepted_terms_version(&self) -> u32 {
         self.launch_profile.lock().accepted_terms_version
     }
@@ -2392,6 +2404,7 @@ impl AppState {
                 bootstrap_complete: self.tool_manager.python_runtime_installed(),
                 python_runtime_installed: self.tool_manager.python_runtime_installed(),
                 lifetime_requests: snapshot.lifetime_requests,
+                first_prompt_request_seen: crate::proxy_intercept::first_prompt_request_seen(),
                 lifetime_estimated_savings_usd,
                 lifetime_estimated_tokens_saved,
                 session_requests: snapshot.session_requests,
@@ -2771,7 +2784,7 @@ impl AppState {
                 // restarts silently no-opped until auto-pause, and the
                 // self-heal loop re-declined forever). Mirrors
                 // `stop_python_if_gated`'s codex carve-out.
-                if !crate::client_adapters::is_codex_enabled() {
+                if !crate::client_adapters::any_gate_exempt_client_enabled() {
                     return Ok(());
                 }
             }
@@ -2811,7 +2824,7 @@ impl AppState {
             if !self.pricing_allows_optimization() {
                 self.enforce_pricing_gate();
                 // Same Claude-only carve-out as the pre-lock check above.
-                if !crate::client_adapters::is_codex_enabled() {
+                if !crate::client_adapters::any_gate_exempt_client_enabled() {
                     // Full gate: Python must come down, and enforce_pricing_gate
                     // just set proxy_bypass, which makes the pricing poll's
                     // swap-edge stop a no-op — so the teardown is owed HERE.
@@ -3247,7 +3260,7 @@ impl AppState {
                 // `apply_pricing_gate_status`. Python lifecycle is handled by
                 // `stop_python_if_gated` / `ensure_headroom_running` — this
                 // only flips the flags (lock-safe).
-                if crate::client_adapters::is_codex_enabled() {
+                if crate::client_adapters::any_gate_exempt_client_enabled() {
                     self.claude_only_bypass.store(true, Release);
                     self.proxy_bypass.store(false, Release);
                 } else {
@@ -3268,7 +3281,9 @@ impl AppState {
     fn stop_python_if_gated(&self) {
         // Only tear Python down on a FULL bypass. When Codex is enabled the gate
         // is Claude-only and Python must stay up to keep optimizing Codex.
-        if !self.pricing_allows_optimization() && !crate::client_adapters::is_codex_enabled() {
+        if !self.pricing_allows_optimization()
+            && !crate::client_adapters::any_gate_exempt_client_enabled()
+        {
             self.stop_headroom();
         }
     }
@@ -3698,6 +3713,12 @@ struct LaunchProfile {
     /// notification has fired. Persisted so it can never nag twice.
     #[serde(default)]
     onboarding_recovery_notified: bool,
+    /// One-shot: the first-savings celebration notification has fired.
+    /// Persisted because lifetime savings derive from retained per-day buckets
+    /// and can fall back to zero after long inactivity — without this a
+    /// returning user could be re-congratulated on "first" savings.
+    #[serde(default)]
+    first_savings_notified: bool,
 }
 
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
@@ -3725,6 +3746,7 @@ impl LaunchProfile {
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
             onboarding_recovery_notified: false,
+            first_savings_notified: false,
         }
     }
 
@@ -3786,7 +3808,8 @@ impl LaunchProfile {
 }
 
 fn configured_client_present() -> bool {
-    crate::client_adapters::is_claude_code_enabled() || crate::client_adapters::is_codex_enabled()
+    crate::client_adapters::is_claude_code_enabled()
+        || crate::client_adapters::any_gate_exempt_client_enabled()
 }
 
 fn setup_wizard_satisfied_for_profile(
@@ -6805,6 +6828,7 @@ mod tests {
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
             onboarding_recovery_notified: false,
+            first_savings_notified: false,
         };
 
         assert!(!super::setup_wizard_satisfied_for_profile(&profile, false));
@@ -6830,6 +6854,7 @@ mod tests {
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
             onboarding_recovery_notified: false,
+            first_savings_notified: false,
         };
         assert!(super::onboarding_recovery_nudge_due(&profile));
 
@@ -6874,6 +6899,7 @@ mod tests {
             }),
             accepted_terms_version: 3,
             onboarding_recovery_notified: true,
+            first_savings_notified: true,
         };
         super::persist_launch_profile(&path, &profile);
 
@@ -6895,6 +6921,7 @@ mod tests {
         );
         assert_eq!(round_tripped.accepted_terms_version, 3);
         assert!(round_tripped.onboarding_recovery_notified);
+        assert!(round_tripped.first_savings_notified);
         let _ = std::fs::remove_file(&path);
     }
 

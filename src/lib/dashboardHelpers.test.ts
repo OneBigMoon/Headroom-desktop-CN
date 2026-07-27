@@ -176,17 +176,18 @@ describe("dashboard helpers", () => {
     ]);
   });
 
-  it("keeps codex and grok_build alongside claude_code as supported connectors", () => {
+  it("keeps codex, grok_build and opencode alongside claude_code as supported connectors", () => {
     const connectors: ClientConnectorStatus[] = [
       { clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false },
       { clientId: "grok_build", name: "Grok Build", installed: true, enabled: false, verified: false },
+      { clientId: "opencode", name: "OpenCode", installed: true, enabled: true, verified: false },
       { clientId: "claude_code", name: "Claude Code", installed: true, enabled: true, verified: true },
       { clientId: "cursor", name: "Cursor", installed: true, enabled: false, verified: false }
     ];
 
     expect(
       aggregateClientConnectors(connectors).map((connector) => connector.clientId).sort()
-    ).toEqual(["claude_code", "codex", "grok_build"]);
+    ).toEqual(["claude_code", "codex", "grok_build", "opencode"]);
   });
 
   it("reports enabled supported connectors regardless of which tool", () => {
@@ -309,5 +310,32 @@ describe("mergeProviderSavingsForDisplay", () => {
 
   it("returns nothing for an empty breakdown", () => {
     expect(mergeProviderSavingsForDisplay([])).toEqual([]);
+  });
+
+  it("relabels blended rows while opencode is enabled", () => {
+    const merged = mergeProviderSavingsForDisplay(
+      [
+        {
+          provider: "anthropic",
+          estimatedSavingsUsd: 0.1,
+          estimatedTokensSaved: 100,
+          actualCostUsd: 0.24,
+          totalTokensSent: 120
+        },
+        {
+          provider: "openai",
+          estimatedSavingsUsd: 0.04,
+          estimatedTokensSaved: 40,
+          actualCostUsd: 0.16,
+          totalTokensSent: 80
+        }
+      ],
+      { opencodeEnabled: true }
+    );
+
+    expect(merged.map((group) => group.label)).toEqual([
+      "Claude Code / OpenCode",
+      "Codex / OpenCode"
+    ]);
   });
 });

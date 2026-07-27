@@ -101,11 +101,19 @@ fn stamp_backend_traffic() {
 /// Python backend (and thus `/stats`) does not exist yet.
 static INTERCEPT_CLAUDE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static INTERCEPT_OPENCODE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 /// One-shot guard: has the `first_optimized_request` funnel beacon been sent
 /// this process yet? Fires when a request is actually forwarded to the backend
 /// (optimized), not on bypass/passthrough. See the fire site in `handle`.
 static FIRST_OPTIMIZED_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Same one-shot guard for the `first_prompt_request` funnel beacon, which
+/// fires only for prompt-sized completion POSTs (`is_prompt_request_head`) —
+/// agent startup noise like the models fetch or Claude Code's tiny quota ping
+/// fires `first_optimized_request` but not this. The two beacons split the
+/// funnel tail into "launched an agent once" vs "actually prompted one".
+static FIRST_PROMPT_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
@@ -115,6 +123,48 @@ static FIRST_OPTIMIZED_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 /// line (with how long it was down) and collapses the per-request spam.
 static BACKEND_REACHABILITY_STATE: AtomicU8 = AtomicU8::new(0);
 static BACKEND_DOWN_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static BACKEND_DOWN_CODEX_RETRY_503S: AtomicU64 = AtomicU64::new(0);
+static CODEX_INFLIGHT_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
+static CODEX_GLOBAL_BYPASS_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
+static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
+const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
+
+fn should_report_throttled(slot: &AtomicU64) -> bool {
+    let now = now_epoch_secs();
+    let mut last = slot.load(Ordering::Relaxed);
+    loop {
+        if last != 0 && now.saturating_sub(last) < CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS {
+            return false;
+        }
+        match slot.compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(current) => last = current,
+        }
+    }
+}
+
+fn report_codex_reconnect_incident(
+    cause: &'static str,
+    affected_requests: u64,
+    downtime: Option<Duration>,
+) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("codex_reconnect_cause", cause);
+            scope.set_extra("affected_requests", (affected_requests as i64).into());
+            if let Some(downtime) = downtime {
+                scope.set_extra("downtime_ms", (downtime.as_millis() as i64).into());
+            }
+            scope.set_fingerprint(Some(&["codex-reconnecting", cause]));
+        },
+        || {
+            sentry::capture_message(
+                &format!("Codex entered reconnect retry loop ({cause})"),
+                sentry::Level::Warning,
+            );
+        },
+    );
+}
 
 /// Record the backend's reachability and log only when it changes. Called on
 /// every request from both the connect-failed and connect-succeeded paths.
@@ -125,15 +175,26 @@ fn note_backend_reachability(reachable: bool, backend_addr: SocketAddr) {
     }
     if reachable {
         match BACKEND_DOWN_SINCE.lock().take() {
-            Some(since) => log::info!(
-                "backend {backend_addr} reachable (after {:.0}s unreachable)",
-                since.elapsed().as_secs_f64()
-            ),
+            Some(since) => {
+                let downtime = since.elapsed();
+                log::info!(
+                    "backend {backend_addr} reachable (after {:.0}s unreachable)",
+                    downtime.as_secs_f64()
+                );
+                let affected = BACKEND_DOWN_CODEX_RETRY_503S.swap(0, Ordering::AcqRel);
+                if affected > 0 {
+                    report_codex_reconnect_incident(
+                        "backend_unreachable",
+                        affected,
+                        Some(downtime),
+                    );
+                }
+            }
             None => log::info!("backend {backend_addr} reachable"),
         }
     } else {
         *BACKEND_DOWN_SINCE.lock() = Some(std::time::Instant::now());
-        log::info!("backend {backend_addr} unreachable; forwarding requests direct to provider");
+        log::info!("backend {backend_addr} unreachable; using per-request fallback");
     }
 }
 
@@ -149,7 +210,19 @@ pub fn intercept_request_counts() -> std::collections::HashMap<String, u64> {
             "codex".to_string(),
             INTERCEPT_CODEX_REQUESTS.load(Ordering::Acquire),
         ),
+        (
+            "opencode".to_string(),
+            INTERCEPT_OPENCODE_REQUESTS.load(Ordering::Acquire),
+        ),
     ])
+}
+
+/// Whether this process has forwarded a prompt-sized completion request yet
+/// (the `first_prompt_request` funnel signal). Feeds the post-install
+/// checklist's "first prompt sent" row; process-local is fine there because
+/// the checklist only renders during the install session itself.
+pub fn first_prompt_request_seen() -> bool {
+    FIRST_PROMPT_REQUEST_REPORTED.load(Ordering::Acquire)
 }
 
 /// AsyncRead wrapper that stamps `BACKEND_LAST_TRAFFIC_EPOCH` whenever the
@@ -167,6 +240,70 @@ impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
         let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
         if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
             stamp_backend_traffic();
+        }
+        poll
+    }
+}
+
+/// Backend response reader that stamps liveness and notices whether a Codex
+/// SSE stream delivered any terminal Responses API event. The small rolling
+/// tail catches event names split across TCP reads without buffering content.
+struct CodexTerminalReader<R> {
+    inner: R,
+    tail: Vec<u8>,
+    saw_terminal: bool,
+}
+
+impl<R> CodexTerminalReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            tail: Vec::new(),
+            saw_terminal: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        if self.saw_terminal || bytes.is_empty() {
+            return;
+        }
+        const TERMINAL_EVENTS: &[&[u8]] = &[
+            b"response.completed",
+            b"response.failed",
+            b"response.incomplete",
+        ];
+        const TAIL_BYTES: usize = 32;
+
+        let mut combined = Vec::with_capacity(self.tail.len() + bytes.len());
+        combined.extend_from_slice(&self.tail);
+        combined.extend_from_slice(bytes);
+        self.saw_terminal = TERMINAL_EVENTS.iter().any(|needle| {
+            combined
+                .windows(needle.len())
+                .any(|window| window == *needle)
+        });
+        let keep_from = combined.len().saturating_sub(TAIL_BYTES);
+        self.tail.clear();
+        self.tail.extend_from_slice(&combined[keep_from..]);
+    }
+
+    fn saw_terminal(&self) -> bool {
+        self.saw_terminal
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CodexTerminalReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            stamp_backend_traffic();
+            let bytes = &buf.filled()[before..];
+            self.observe(bytes);
         }
         poll
     }
@@ -393,13 +530,22 @@ async fn handle(
     let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
     let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
     let is_chatgpt_codex = is_codex && request_uses_chatgpt_auth(&buf);
+    // OpenCode is classified by User-Agent, not path: it speaks both API
+    // shapes (`/v1/messages` and `/v1/responses`), so path-based
+    // classification would split it between the Claude and Codex buckets.
+    // Both of its @ai-sdk transports send `opencode/<version> ...` (verified
+    // against opencode 1.18.5), matching the backend's CLIENT_UA_MAP prefix.
+    let is_opencode =
+        extract_header_value(&buf, "user-agent").is_some_and(|ua| ua.starts_with("opencode/"));
 
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
     // attributed to an agent.
     if let Some(head) = parsed_head.as_ref() {
         if !is_local_proxy_path(&head.path) {
-            if is_codex {
+            if is_opencode {
+                INTERCEPT_OPENCODE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+            } else if is_codex {
                 INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel);
             } else {
                 INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel);
@@ -429,11 +575,14 @@ async fn handle(
         // must never land in the Claude bearer slot: pricing would send it to
         // Anthropic's OAuth profile/usage endpoints (cross-provider credential
         // transmission) where it only earns 401s.
-        if is_codex {
+        if is_codex && !is_opencode {
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        } else {
+        } else if !is_codex && !is_opencode {
+            // OpenCode bearers are the user's own provider keys (or OAuth
+            // tokens for a possibly different Anthropic account); landing
+            // them in the Claude identity slot would flap pricing/identity.
             let changed = bearer_value_changed(&token_slot, &token);
             *token_slot.lock() = Some(BearerToken::new(token));
             if changed {
@@ -446,7 +595,7 @@ async fn handle(
     // headers, so `splice_with_codex_capture` below comes up empty. Fetch the
     // live subscription window from the dedicated usage endpoint instead.
     // Throttled and fire-and-forget, so the request hot path is untouched.
-    if is_codex {
+    if is_codex && !is_opencode {
         maybe_spawn_codex_usage_poll(&buf, &codex_slot);
         // Codex stamps `X-OpenAI-Internal-Codex-Responses-Lite` on the
         // `/responses` WS handshake. OpenAI tightened enforcement on 2026-06-26
@@ -469,6 +618,9 @@ async fn handle(
     // retryable response instead of misrouting the credential.
     if bypass.load(Ordering::Acquire) {
         if is_chatgpt_codex {
+            if should_report_throttled(&CODEX_GLOBAL_BYPASS_503_LAST_REPORTED) {
+                report_codex_reconnect_incident("global_bypass", 1, None);
+            }
             write_retryable_service_unavailable(&mut client).await;
         } else {
             forward_direct_to_anthropic(client, buf, &upstream_base).await;
@@ -480,7 +632,9 @@ async fn handle(
     // is still enabled, so the Python backend is kept alive for Codex. Forward
     // only Claude (non-Codex) traffic direct; Codex falls through to the backend
     // below. This keeps a Claude overage from pausing Codex optimization.
-    if !is_codex && claude_only_bypass.load(Ordering::Acquire) {
+    // OpenCode is exempt: it runs on the user's own API keys, so a Claude
+    // plan gate has nothing to do with its billing — keep it optimized.
+    if !is_codex && !is_opencode && claude_only_bypass.load(Ordering::Acquire) {
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
@@ -488,7 +642,7 @@ async fn handle(
     // Codex-only gate: keep Codex routed through the Python backend so it can
     // preserve the correct upstream for either ChatGPT OAuth or an API key,
     // but tell it to skip optimization for this request.
-    if is_codex && codex_bypass.load(Ordering::Acquire) {
+    if is_codex && !is_opencode && codex_bypass.load(Ordering::Acquire) {
         stamp_headroom_bypass_header(&mut buf);
     }
 
@@ -499,7 +653,10 @@ async fn handle(
     // 503 retries transparently; a hung/dropped connect kills the turn. The
     // permit is held in `_permit` until `handle` returns (through the splice).
     let Ok(_permit) = backend_inflight().clone().try_acquire_owned() else {
-        log::warn!("[proxy_intercept] backend in-flight cap reached; returning 503");
+        log::info!("[proxy_intercept] backend in-flight cap reached; returning 503");
+        if is_codex && !is_opencode && should_report_throttled(&CODEX_INFLIGHT_503_LAST_REPORTED) {
+            report_codex_reconnect_incident("backend_inflight_cap", 1, None);
+        }
         let _ = client
             .write_all(
                 b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -520,6 +677,7 @@ async fn handle(
         // capture_watchdog_give_up already reports genuine down episodes.
         note_backend_reachability(false, backend_addr);
         if is_chatgpt_codex {
+            BACKEND_DOWN_CODEX_RETRY_503S.fetch_add(1, Ordering::AcqRel);
             write_retryable_service_unavailable(&mut client).await;
         } else {
             forward_direct_to_anthropic(client, buf, &upstream_base).await;
@@ -537,6 +695,11 @@ async fn handle(
     if !FIRST_OPTIMIZED_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
         crate::pricing::report_funnel_step_device_only("first_optimized_request");
     }
+    if parsed_head.as_ref().is_some_and(is_prompt_request_head)
+        && !FIRST_PROMPT_REQUEST_REPORTED.swap(true, Ordering::AcqRel)
+    {
+        crate::pricing::report_funnel_step_device_only("first_prompt_request");
+    }
 
     // Codex GUI/IDE clients don't send a `codex-cli/` User-Agent, so the
     // backend's UA-based classifier can't tell they're Codex and treats a
@@ -545,7 +708,12 @@ async fn handle(
     // and stops connecting. We already know by request path that this is Codex
     // traffic, so stamp `X-Client: codex` (which the backend honours over the
     // User-Agent) to keep Codex GUI and Codex CLI on the same backend path.
-    if is_codex {
+    if is_opencode {
+        // OpenCode already self-identifies by UA, but its OpenAI-path traffic
+        // would otherwise be stamped codex below; an explicit X-Client wins
+        // over every downstream heuristic (backend honours it over the UA).
+        stamp_client_header(&mut buf, b"X-Client: opencode\r\n");
+    } else if is_codex {
         stamp_codex_client_header(&mut buf);
     }
 
@@ -569,7 +737,7 @@ async fn handle(
     // the untouched zero-copy splice.
     if is_models_fetch {
         splice_with_models_lite_rewrite(client, backend).await;
-    } else if is_codex {
+    } else if is_codex && !is_opencode {
         let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
         splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
     } else {
@@ -848,8 +1016,22 @@ async fn splice_with_codex_capture(
             }
             report_codex_upstream_error(status, req_path, &head, &chunk);
         }
-        let mut stamped = StampReader(backend_rd);
-        let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
+        let monitor_terminal = is_codex_sse_response(&head, req_path);
+        let mut streamed = CodexTerminalReader::new(backend_rd);
+        if monitor_terminal {
+            let body_start = find_header_end(&head)
+                .map(|end| end + 4)
+                .unwrap_or(head.len());
+            streamed.observe(&head[body_start..]);
+        }
+        let copy_result = tokio::io::copy(&mut streamed, &mut client_wr).await;
+        if monitor_terminal
+            && copy_result.is_ok()
+            && !streamed.saw_terminal()
+            && should_report_throttled(&CODEX_STREAM_NO_TERMINAL_LAST_REPORTED)
+        {
+            report_codex_stream_without_terminal(req_path, copy_result.unwrap_or(0));
+        }
         let _ = client_wr.shutdown().await;
     };
 
@@ -859,6 +1041,35 @@ async fn splice_with_codex_capture(
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
 const MAX_ERROR_BODY: usize = 8192;
 const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn is_codex_sse_response(head: &[u8], req_path: &str) -> bool {
+    req_path.starts_with("/v1/responses")
+        && parse_response_status(head).is_some_and(|status| (200..300).contains(&status))
+        && extract_header_value(head, "content-type")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        && extract_header_value(head, "content-encoding").is_none()
+}
+
+fn report_codex_stream_without_terminal(req_path: &str, streamed_bytes: u64) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("codex_reconnect_cause", "stream_ended_without_terminal");
+            scope.set_tag("codex_request_path", req_path);
+            scope.set_tag("codex_transport", "http_sse");
+            scope.set_extra("streamed_bytes", (streamed_bytes as i64).into());
+            scope.set_fingerprint(Some(&[
+                "codex-reconnecting",
+                "stream-ended-without-terminal",
+            ]));
+        },
+        || {
+            sentry::capture_message(
+                "Codex response stream ended without a terminal event",
+                sentry::Level::Warning,
+            );
+        },
+    );
+}
 
 /// Parse the status code from an HTTP response head's status line
 /// (`HTTP/1.1 400 Bad Request` -> `400`).
@@ -1026,8 +1237,13 @@ fn now_epoch_secs() -> u64 {
 }
 
 /// Extract a single request header value (case-insensitive) from raw HTTP bytes.
+/// `read_http_headers` over-reads in 4KB chunks, so `buf` can carry the start
+/// of the body past the header terminator — slice to the head before UTF-8
+/// validation or a multi-byte character split at the chunk boundary makes the
+/// whole lookup fail (same guard as `extract_bearer`).
 fn extract_header_value(buf: &[u8], name: &str) -> Option<String> {
-    let text = std::str::from_utf8(buf).ok()?;
+    let head_end = find_header_end(buf).unwrap_or(buf.len());
+    let text = std::str::from_utf8(&buf[..head_end]).ok()?;
     for line in text.lines() {
         if line.is_empty() {
             break; // end of header block
@@ -1873,6 +2089,10 @@ fn force_connection_close(buf: &mut Vec<u8>) {
 /// already self-identified via `X-Client` is left untouched. No-op if the
 /// header terminator is missing.
 fn stamp_codex_client_header(buf: &mut Vec<u8>) {
+    stamp_client_header(buf, b"X-Client: codex\r\n");
+}
+
+fn stamp_client_header(buf: &mut Vec<u8>, header_line: &'static [u8]) {
     if request_has_header(buf, "x-client") {
         return;
     }
@@ -1883,7 +2103,7 @@ fn stamp_codex_client_header(buf: &mut Vec<u8>) {
     // `end + 2` (start of the blank line) appends a new last header line while
     // preserving the terminating CRLF.
     let insert_at = end + 2;
-    buf.splice(insert_at..insert_at, *b"X-Client: codex\r\n");
+    buf.splice(insert_at..insert_at, header_line.iter().copied());
 }
 
 /// Tell the Python backend to preserve routing/auth handling but skip Headroom
@@ -1937,6 +2157,32 @@ fn is_openai_path(path: &str) -> bool {
         path.strip_prefix(prefix)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('?'))
     })
+}
+
+/// A real prompt carries the agent's multi-kilobyte system prompt; startup
+/// noise (quota ping, models fetch, count_tokens probes) stays well under
+/// 2 KB, so the threshold sits in a wide safe band between the two.
+const PROMPT_REQUEST_MIN_BODY_BYTES: usize = 8 * 1024;
+
+/// True for a "user actually prompted an agent" request, as opposed to
+/// agent-startup noise: a POST to a completion endpoint with a prompt-sized
+/// body. Subpaths are deliberately excluded (`/v1/messages/count_tokens`
+/// carries a full conversation but is not a prompt); query strings count
+/// (Claude Code posts `/v1/messages?beta=true`). Title-generation calls can
+/// pass the size bar, but those only ever follow a real prompt, so the
+/// funnel meaning holds. A chunked body (no Content-Length) is skipped; the
+/// next prompt fires the once-per-process beacon instead.
+fn is_prompt_request_head(head: &ParsedRequestHead) -> bool {
+    const PROMPT_PATHS: &[&str] = &["/v1/messages", "/v1/responses", "/v1/chat/completions"];
+    head.method.eq_ignore_ascii_case("POST")
+        && PROMPT_PATHS.iter().any(|prefix| {
+            head.path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'))
+        })
+        && head
+            .content_length
+            .is_some_and(|len| len >= PROMPT_REQUEST_MIN_BODY_BYTES)
 }
 
 fn request_head_has_header(head: &ParsedRequestHead, name: &str) -> bool {
@@ -2021,13 +2267,15 @@ mod tests {
     use super::{
         bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, intercept_request_counts, is_codex_request_head,
+        find_header_end, intercept_request_counts, is_codex_request_head, is_codex_sse_response,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
-        parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, request_uses_chatgpt_auth, rewrite_use_responses_lite, run,
-        sanitize_stale_tool_references, set_response_content_length, stamp_codex_client_header,
-        stamp_headroom_bypass_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
+        is_openai_path, is_prompt_request_head, is_reportable_codex_error,
+        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
+        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        set_response_content_length, should_report_throttled, stamp_client_header,
+        stamp_codex_client_header, stamp_headroom_bypass_header, strip_request_header, BypassFlag,
+        CodexTerminalReader, ModelsRewrite, ParsedRequestHead, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2036,7 +2284,7 @@ mod tests {
     use parking_lot::Mutex;
     use serial_test::serial;
     use std::net::SocketAddr;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -2546,6 +2794,52 @@ mod tests {
     }
 
     #[test]
+    fn prompt_request_head_matches_real_prompts_only() {
+        let head = |method: &str, path: &str, content_length: Option<usize>| ParsedRequestHead {
+            method: method.into(),
+            path: path.into(),
+            headers: Vec::new(),
+            content_length,
+        };
+        // Real prompts: prompt-sized completion POSTs, query string allowed.
+        assert!(is_prompt_request_head(&head(
+            "POST",
+            "/v1/messages?beta=true",
+            Some(20_000)
+        )));
+        assert!(is_prompt_request_head(&head(
+            "POST",
+            "/v1/messages",
+            Some(8192)
+        )));
+        assert!(is_prompt_request_head(&head(
+            "POST",
+            "/v1/responses",
+            Some(30_000)
+        )));
+        assert!(is_prompt_request_head(&head(
+            "POST",
+            "/v1/chat/completions",
+            Some(9000)
+        )));
+        // Startup noise: tiny quota ping, models fetch.
+        assert!(!is_prompt_request_head(&head(
+            "POST",
+            "/v1/messages",
+            Some(500)
+        )));
+        assert!(!is_prompt_request_head(&head("GET", "/v1/models", None)));
+        // count_tokens carries a full conversation but is not a prompt.
+        assert!(!is_prompt_request_head(&head(
+            "POST",
+            "/v1/messages/count_tokens?beta=true",
+            Some(50_000)
+        )));
+        // Chunked body (no Content-Length): skip, next prompt fires it.
+        assert!(!is_prompt_request_head(&head("POST", "/v1/messages", None)));
+    }
+
+    #[test]
     fn stamp_codex_client_header_inserts_last_header() {
         let mut buf =
             b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: codex_vscode/1.0\r\n\r\n"
@@ -2564,6 +2858,29 @@ mod tests {
         // Header block stays well-formed (single blank-line terminator).
         assert!(buf.ends_with(b"X-Client: codex\r\n\r\n"));
         assert_eq!(buf.windows(4).filter(|w| *w == b"\r\n\r\n").count(), 1);
+    }
+
+    #[test]
+    fn stamp_client_header_stamps_opencode() {
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n".to_vec();
+        stamp_client_header(&mut buf, b"X-Client: opencode\r\n");
+        assert!(buf.ends_with(b"X-Client: opencode\r\n\r\n"));
+        // Second stamp (e.g. the codex path-based branch) must not double up.
+        stamp_codex_client_header(&mut buf);
+        assert_eq!(
+            buf.windows(b"X-Client".len())
+                .filter(|w| *w == b"X-Client")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn intercept_request_counts_exposes_all_agent_keys() {
+        let counts = intercept_request_counts();
+        for key in ["claude-code", "codex", "opencode"] {
+            assert!(counts.contains_key(key), "missing agent key {key}");
+        }
     }
 
     #[test]
@@ -2609,6 +2926,41 @@ mod tests {
             1
         );
         assert!(buf.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn codex_terminal_reader_detects_split_terminal_events() {
+        let mut reader = CodexTerminalReader::new(tokio::io::empty());
+        reader.observe(b"data: {\"type\":\"response.com");
+        assert!(!reader.saw_terminal());
+        reader.observe(b"pleted\"}\n\n");
+        assert!(reader.saw_terminal());
+
+        let mut missing = CodexTerminalReader::new(tokio::io::empty());
+        missing.observe(b"data: {\"type\":\"response.output_text.delta\"}\n\n");
+        assert!(!missing.saw_terminal());
+    }
+
+    #[test]
+    fn reconnect_reports_are_throttled_per_cause() {
+        let slot = AtomicU64::new(0);
+        assert!(should_report_throttled(&slot));
+        assert!(!should_report_throttled(&slot));
+    }
+
+    #[test]
+    fn codex_sse_monitor_only_tracks_uncompressed_responses_streams() {
+        let sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        assert!(is_codex_sse_response(sse, "/v1/responses"));
+        assert!(!is_codex_sse_response(sse, "/v1/models"));
+        assert!(!is_codex_sse_response(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/event-stream\r\n\r\n",
+            "/v1/responses"
+        ));
+        assert!(!is_codex_sse_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\n\r\n",
+            "/v1/responses"
+        ));
     }
 
     #[test]

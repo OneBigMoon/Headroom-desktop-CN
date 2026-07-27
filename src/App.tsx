@@ -281,7 +281,9 @@ const connectorSetupDetails: Record<string, string> = {
   codex:
     "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom. It also installs a guard hook that warns you inside Codex if routing ever breaks - run /hooks in Codex once to trust it (re-trust after a Headroom update).",
   grok_build:
-    "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom."
+    "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
+  opencode:
+    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy. Other OpenCode providers (Google, local models, ...) are not routed through Headroom yet. A project-level opencode.json can override the proxied URLs for that project."
 };
 
 const connectorSupportWarnings: Record<string, string> = {};
@@ -292,7 +294,9 @@ const connectorUnavailableReasons: Record<string, string> = {
   codex:
     "Codex was not detected. Install the Codex CLI and restart Headroom.",
   grok_build:
-    "Grok Build was not detected. Install Grok Build and restart Headroom."
+    "Grok Build was not detected. Install Grok Build and restart Headroom.",
+  opencode:
+    "OpenCode was not detected. Install OpenCode and restart Headroom."
 };
 
 // Grok Build routing is not implemented in the intercept/backend yet:
@@ -301,11 +305,23 @@ const connectorUnavailableReasons: Record<string, string> = {
 // this to re-enable the UI.
 const GROK_CONNECTOR_ENABLED = false;
 
+// OpenCode is visible in RC builds for end-to-end verification; keep the
+// flag so it can ship dark in a stable if the RC pass surfaces problems.
+const OPENCODE_CONNECTOR_ENABLED = true;
+
 function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
-  return GROK_CONNECTOR_ENABLED
-    ? list
-    : list.filter((connector) => connector.clientId !== "grok_build");
+  return list.filter(
+    (connector) =>
+      (GROK_CONNECTOR_ENABLED || connector.clientId !== "grok_build") &&
+      (OPENCODE_CONNECTOR_ENABLED || connector.clientId !== "opencode")
+  );
 }
+
+// Connectors the Claude pricing gate neither auto-disables nor blocks
+// enabling while the user is authenticated: Codex has its own proxy-side
+// gate (codex_bypass); OpenCode bills against the user's own provider API
+// keys, so the Claude gate has nothing to meter (no dedicated bypass).
+const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode"]);
 
 const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnectors([
   {
@@ -325,6 +341,13 @@ const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnecto
   {
     clientId: "grok_build",
     name: "Grok Build",
+    installed: false,
+    enabled: false,
+    verified: false
+  },
+  {
+    clientId: "opencode",
+    name: "OpenCode",
     installed: false,
     enabled: false,
     verified: false
@@ -461,18 +484,22 @@ async function loadDashboard(): Promise<DashboardState> {
 function SavingsChartTooltip({
   active,
   payload,
-  chartMode
+  chartMode,
+  opencodeEnabled
 }: {
   active?: boolean;
   payload?: ReadonlyArray<{ payload?: SavingsChartDatum }>;
   chartMode: SavingsChartMode;
+  opencodeEnabled?: boolean;
 }) {
   const point = payload?.[0]?.payload;
   if (!active || !point) {
     return null;
   }
 
-  const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
+  const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? [], {
+    opencodeEnabled
+  });
 
   return (
     <div className="savings-chart__tooltip">
@@ -644,13 +671,15 @@ function DailySavingsChart({
   hourlyData,
   resetSignal,
   chartMode,
-  setChartMode
+  setChartMode,
+  opencodeEnabled
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
   resetSignal: number;
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
+  opencodeEnabled?: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -816,7 +845,7 @@ function DailySavingsChart({
               />
               <YAxis hide yAxisId="usd" />
               <YAxis hide yAxisId="tokens" />
-              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
+              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} opencodeEnabled={opencodeEnabled} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
               {chartMode === "usd" && (
                 <>
                   <Bar
@@ -2583,7 +2612,8 @@ export default function App() {
       return;
     }
     const target = getEnabledSupportedConnectors(connectors).find(
-      (connector) => !pricingStatus.authenticated || connector.clientId !== "codex"
+      (connector) =>
+        !pricingStatus.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId)
     );
     if (!target) {
       return;
@@ -2822,11 +2852,14 @@ export default function App() {
     // Codex configuration is written to ~/.codex/config.toml, which both the CLI
     // and the GUI app read, so the toggle should be usable even when the CLI
     // binary isn't on the app's PATH (same rationale as claude_code).
+    // opencode's default install (~/.opencode/bin) is likewise invisible to
+    // the GUI app's PATH while its config is a dotfile we can always write.
     return (
       connector.installed ||
       connector.clientId === "claude_code" ||
       connector.clientId === "codex" ||
-      connector.clientId === "grok_build"
+      connector.clientId === "grok_build" ||
+      connector.clientId === "opencode"
     );
   }
 
@@ -2844,7 +2877,7 @@ export default function App() {
       pricingStatus != null &&
       !pricingStatus.optimizationAllowed &&
       !connector.enabled &&
-      (!pricingStatus.authenticated || connector.clientId !== "codex")
+      (!pricingStatus.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId))
     );
   }
 
@@ -2976,10 +3009,17 @@ export default function App() {
     void invoke("restart_app");
   }
 
+  // Single fetch path so hidden connectors can never leak into decision
+  // logic (launcher auto-configure, verification rows) via a raw invoke.
+  async function fetchConnectors(): Promise<ClientConnectorStatus[]> {
+    const items = await invoke<ClientConnectorStatus[]>("get_client_connectors");
+    return withoutHiddenConnectors(items);
+  }
+
   async function refreshConnectors() {
     try {
       setConnectorsError(null);
-      const items = await invoke<ClientConnectorStatus[]>("get_client_connectors");
+      const items = await fetchConnectors();
       applyConnectorsIfChanged(items);
     } catch (error) {
       setConnectorsError(
@@ -3085,7 +3125,7 @@ export default function App() {
     setConnectorsError(null);
 
     try {
-      let latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
+      let latestConnectors = await fetchConnectors();
       applyConnectorsIfChanged(latestConnectors);
 
       const step = nextAutoConfigureStep(
@@ -3105,7 +3145,7 @@ export default function App() {
             setConnectorsNotice(baseUrlTakeoverNotice(result.replacedBaseUrl));
           }
         }
-        latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
+        latestConnectors = await fetchConnectors();
         applyConnectorsIfChanged(latestConnectors);
         reportFunnelStep("client_setup_applied");
 
@@ -3595,7 +3635,7 @@ export default function App() {
   async function beginProxyVerificationStep() {
     let fresh = connectors;
     try {
-      fresh = await invoke<ClientConnectorStatus[]>("get_client_connectors");
+      fresh = await fetchConnectors();
       applyConnectorsIfChanged(fresh);
     } catch {
       // fall back to cached state
@@ -5448,6 +5488,9 @@ export default function App() {
                 resetSignal={chartResetSignal}
                 chartMode={chartMode}
                 setChartMode={setChartMode}
+                opencodeEnabled={connectors.some(
+                  (connector) => connector.clientId === "opencode" && connector.enabled
+                )}
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">

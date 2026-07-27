@@ -202,11 +202,17 @@ export interface ProviderSavingsDisplay {
 // Claude Code is listed first. A group is shown only if at least one source
 // provider mapped into it.
 export function mergeProviderSavingsForDisplay(
-  byProvider: ProviderSavingsPoint[]
+  byProvider: ProviderSavingsPoint[],
+  opts?: { opencodeEnabled?: boolean }
 ): ProviderSavingsDisplay[] {
+  // Backend rollups attribute savings by upstream provider only. OpenCode
+  // speaks to both anthropic and openai, so while it is enabled its savings
+  // land inside these two rows; relabel them rather than misattribute.
+  // A true per-agent split needs an agent dimension in the backend rollups.
+  const opencode = opts?.opencodeEnabled === true;
   const groups = {
     claude: {
-      label: "Claude Code",
+      label: opencode ? "Claude Code / OpenCode" : "Claude Code",
       count: 0,
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
@@ -214,7 +220,7 @@ export function mergeProviderSavingsForDisplay(
       totalTokensSent: 0
     },
     codex: {
-      label: "Codex",
+      label: opencode ? "Codex / OpenCode" : "Codex",
       count: 0,
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
@@ -383,7 +389,12 @@ export function formatLearnStatus(project: {
   return `last scan: ${diffDays} days ago`;
 }
 
-const SUPPORTED_CONNECTOR_IDS = new Set(["claude_code", "codex", "grok_build"]);
+const SUPPORTED_CONNECTOR_IDS = new Set([
+  "claude_code",
+  "codex",
+  "grok_build",
+  "opencode"
+]);
 
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {
   return connectors.filter((connector) =>

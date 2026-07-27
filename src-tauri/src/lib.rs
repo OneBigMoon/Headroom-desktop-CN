@@ -394,6 +394,64 @@ fn maybe_fire_onboarding_recovery_nudge(
     analytics::track_event(app, "onboarding_recovery_nudge_shown", None);
 }
 
+/// The payoff moment: lifetime savings crossed zero during THIS app session.
+/// Gated on the first poll having observed zero, so an upgrade on an install
+/// whose savings predate this session can never fire a fake "first savings"
+/// notification. The persisted flag makes it once-ever: lifetime totals derive
+/// from retained per-day buckets and can fall back to zero after long
+/// inactivity, which would otherwise re-congratulate a returning user.
+fn maybe_fire_first_savings_notification(
+    app: &AppHandle,
+    state: &AppState,
+    dashboard: &DashboardState,
+) {
+    static TOKENS_SAVED_AT_FIRST_POLL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let at_first_poll =
+        *TOKENS_SAVED_AT_FIRST_POLL.get_or_init(|| dashboard.lifetime_estimated_tokens_saved);
+    if at_first_poll > 0 || dashboard.lifetime_estimated_tokens_saved == 0 {
+        return;
+    }
+    if !state.try_mark_first_savings_notified() {
+        return;
+    }
+    let usd = dashboard.lifetime_estimated_savings_usd;
+    let amount = if usd >= 0.01 {
+        format!("${usd:.2}")
+    } else {
+        "Under a cent".to_string()
+    };
+    let _ = show_notification_impl(
+        app,
+        "First savings recorded",
+        &format!(
+            "{} saved across {} tokens Headroom trimmed for you. \
+             It compounds from here — keep coding.",
+            amount,
+            format_token_count(dashboard.lifetime_estimated_tokens_saved)
+        ),
+        None,
+    );
+    analytics::track_event(app, "first_savings_notification_shown", None);
+}
+
+/// "1,240" under 100k, then "124k" / "1.2M" — notification-sized precision.
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 100_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        let mut out = String::new();
+        for (i, ch) in tokens.to_string().chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                out.push(',');
+            }
+            out.push(ch);
+        }
+        out.chars().rev().collect()
+    }
+}
+
 /// Test affordance (opt-in via env, works in release/RC builds): when
 /// HEADROOM_FAKE_WEEKLY_GATE is set, overwrite daily savings with a synthetic
 /// 7-day history so the upgrade-banner dollar figures render on a fresh machine
@@ -464,6 +522,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         check_zero_spend_anomaly(&dashboard);
         check_zero_savings_anomaly(&dashboard);
         maybe_fire_onboarding_recovery_nudge(&app, &state, &dashboard);
+        maybe_fire_first_savings_notification(&app, &state, &dashboard);
 
         // Funnel finish line, keyed on real savings only (before the fake-data
         // injector below touches the USD figure). This used to be sent from the
@@ -2541,7 +2600,10 @@ async fn get_headroom_pricing_status(
     // "Headroom optimization actually resumes" — without this, the pricing
     // gate's bypass flag would stay set and Python would stay down until
     // the next app launch.
-    state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
+    state.apply_pricing_gate_status(
+        &status,
+        crate::client_adapters::any_gate_exempt_client_enabled(),
+    );
     state.apply_codex_pricing_gate_status(status.codex.as_ref());
     state.report_weekly_limit_transitions(&status);
     Ok(status)
@@ -2582,7 +2644,10 @@ async fn verify_headroom_auth_code(
     // `get_headroom_pricing_status` so a user who signs up after grace
     // expiry doesn't have to wait for the next 60s pricing poll for
     // Python to come back online.
-    state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
+    state.apply_pricing_gate_status(
+        &status,
+        crate::client_adapters::any_gate_exempt_client_enabled(),
+    );
     state.apply_codex_pricing_gate_status(status.codex.as_ref());
     analytics::track_event(
         &app,
@@ -3804,7 +3869,8 @@ pub fn run() {
                                     Ok(status) => {
                                         state.apply_pricing_gate_status(
                                             &status,
-                                            crate::client_adapters::is_codex_enabled(),
+                                            crate::client_adapters::any_gate_exempt_client_enabled(
+                                            ),
                                         );
                                         state
                                             .apply_codex_pricing_gate_status(status.codex.as_ref());
@@ -4699,8 +4765,8 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
             .unwrap_or_else(std::time::Instant::now);
-        let mut cached_connector_enabled: bool =
-            client_adapters::is_claude_code_enabled() || client_adapters::is_codex_enabled();
+        let mut cached_connector_enabled: bool = client_adapters::is_claude_code_enabled()
+            || client_adapters::any_gate_exempt_client_enabled();
 
         loop {
             // Re-check connectors at most every ~2s, regardless of whether the
@@ -4710,7 +4776,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             // (Claude Code or Codex) is routing through Headroom.
             if last_connector_check.elapsed() >= std::time::Duration::from_secs(2) {
                 cached_connector_enabled = client_adapters::is_claude_code_enabled()
-                    || client_adapters::is_codex_enabled();
+                    || client_adapters::any_gate_exempt_client_enabled();
                 last_connector_check = std::time::Instant::now();
             }
 
@@ -5857,10 +5923,11 @@ mod tests {
         client_setup_error_kind, compute_tray_window_position, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, extract_llm_failure_warnings,
-        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
-        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        fetch_transformations_feed_from, format_token_count, install_pending_update,
+        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
+        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, parse_live_learnings,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -6650,6 +6717,16 @@ mod tests {
         assert_eq!(lifetime_token_milestone_kind(5_000_000), "first_5m");
         assert_eq!(lifetime_token_milestone_kind(10_000_000), "first_10m");
         assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
+    }
+
+    #[test]
+    fn format_token_count_scales_by_magnitude() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(950), "950");
+        assert_eq!(format_token_count(1_240), "1,240");
+        assert_eq!(format_token_count(99_999), "99,999");
+        assert_eq!(format_token_count(124_500), "124k");
+        assert_eq!(format_token_count(1_240_000), "1.2M");
     }
 
     fn learn_prereq(
