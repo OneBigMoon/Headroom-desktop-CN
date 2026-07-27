@@ -616,9 +616,17 @@ async fn handle(
     // token is scoped for chatgpt.com/backend-api/codex and the Platform API
     // rejects it with a misleading missing `api.responses.write` 401. Return a
     // retryable response instead of misrouting the credential.
+    // OpenCode's transport plugin routes third-party providers (Google, custom
+    // gateways) here with the real upstream in `x-headroom-base-url`. The
+    // direct forwarder only knows the Anthropic/OpenAI bases, so forwarding
+    // such a request would send it (and its credential) to the wrong vendor -
+    // the exact grok-class misroute. 503-retry instead; these windows are
+    // short because the backend is kept alive whenever OpenCode is enabled.
+    let is_plugin_routed = request_has_header(&buf, "x-headroom-base-url");
+
     if bypass.load(Ordering::Acquire) {
-        if is_chatgpt_codex {
-            if should_report_throttled(&CODEX_GLOBAL_BYPASS_503_LAST_REPORTED) {
+        if is_chatgpt_codex || is_plugin_routed {
+            if is_chatgpt_codex && should_report_throttled(&CODEX_GLOBAL_BYPASS_503_LAST_REPORTED) {
                 report_codex_reconnect_incident("global_bypass", 1, None);
             }
             write_retryable_service_unavailable(&mut client).await;
@@ -678,6 +686,10 @@ async fn handle(
         note_backend_reachability(false, backend_addr);
         if is_chatgpt_codex {
             BACKEND_DOWN_CODEX_RETRY_503S.fetch_add(1, Ordering::AcqRel);
+            write_retryable_service_unavailable(&mut client).await;
+        } else if is_plugin_routed {
+            // See the bypass branch above: no correct direct upstream exists
+            // for plugin-routed third-party providers.
             write_retryable_service_unavailable(&mut client).await;
         } else {
             forward_direct_to_anthropic(client, buf, &upstream_base).await;

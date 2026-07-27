@@ -3008,6 +3008,65 @@ fn write_opencode_config(path: &Path, config: &serde_json::Value) -> Result<()> 
     atomic_write(path, payload.as_bytes())
 }
 
+/// Self-contained OpenCode transport plugin (all-provider routing via
+/// `x-headroom-base-url`), vendored from headroom-ai's `plugins/opencode`
+/// built with the desktop wrapper entry (proxy default 127.0.0.1:6767).
+/// Regenerate: `npx tsup --config tsup.desktop.config.ts` in the plugin dir,
+/// copy `dist-desktop/entry.opencode.js` here. Replace with the wheel-shipped
+/// bundle once upstream PR headroomlabs-ai/headroom#2601 lands in a release.
+const OPENCODE_PLUGIN_BYTES: &[u8] = include_bytes!("../resources/opencode/entry.opencode.js");
+
+fn opencode_plugin_install_path() -> PathBuf {
+    crate::storage::app_data_dir()
+        .join("opencode")
+        .join("entry.opencode.js")
+}
+
+/// Write (or refresh after an app update) the vendored plugin bundle.
+fn ensure_opencode_plugin_file() -> Result<PathBuf> {
+    let path = opencode_plugin_install_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if std::fs::read(&path).ok().as_deref() != Some(OPENCODE_PLUGIN_BYTES) {
+        atomic_write(&path, OPENCODE_PLUGIN_BYTES)?;
+    }
+    Ok(path)
+}
+
+fn opencode_plugin_array_contains(config: &serde_json::Value, entry: &str) -> bool {
+    config
+        .get("plugin")
+        .and_then(|p| p.as_array())
+        .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(entry)))
+}
+
+fn add_opencode_plugin_entry(config: &mut serde_json::Value, entry: &str) {
+    let obj = config
+        .as_object_mut()
+        .expect("read_opencode_config guarantees an object root");
+    let list = obj
+        .entry("plugin".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !list.is_array() {
+        *list = serde_json::json!([]);
+    }
+    list.as_array_mut()
+        .expect("ensured array above")
+        .push(serde_json::json!(entry));
+}
+
+fn remove_opencode_plugin_entry(config: &mut serde_json::Value, entry: &str) {
+    let Some(list) = config.get_mut("plugin").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    list.retain(|v| v.as_str() != Some(entry));
+    if list.is_empty() {
+        config.as_object_mut().map(|o| o.remove("plugin"));
+    }
+}
+
 fn configure_opencode_provider_block(
     state: &mut ClientSetupState,
 ) -> Result<(Vec<String>, Vec<String>)> {
@@ -3043,6 +3102,17 @@ fn configure_opencode_provider_block(
         set_opencode_provider_base_url(&mut config, provider, HEADROOM_OPENCODE_BASE_URL);
         changed = true;
     }
+
+    // Transport plugin: routes every other provider (Google, custom
+    // gateways, ...) through the proxy via x-headroom-base-url. The bundle
+    // defaults to 6767, so no env vars are needed.
+    let plugin_path = ensure_opencode_plugin_file()?;
+    let plugin_entry = plugin_path.display().to_string();
+    if !opencode_plugin_array_contains(&config, &plugin_entry) {
+        add_opencode_plugin_entry(&mut config, &plugin_entry);
+        changed = true;
+    }
+
     if !changed {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -3063,9 +3133,13 @@ fn opencode_provider_block_matches() -> Result<bool> {
         return Ok(false);
     }
     let config = read_opencode_config(&path)?;
-    Ok(OPENCODE_MANAGED_PROVIDERS.iter().all(|provider| {
+    let base_urls_ok = OPENCODE_MANAGED_PROVIDERS.iter().all(|provider| {
         opencode_provider_base_url(&config, provider).as_deref() == Some(HEADROOM_OPENCODE_BASE_URL)
-    }))
+    });
+    let plugin_path = opencode_plugin_install_path();
+    let plugin_ok = plugin_path.is_file()
+        && opencode_plugin_array_contains(&config, &plugin_path.display().to_string());
+    Ok(base_urls_ok && plugin_ok)
 }
 
 fn disable_opencode(state: &ClientSetupState) -> Result<()> {
@@ -3094,10 +3168,16 @@ fn disable_opencode(state: &ClientSetupState) -> Result<()> {
         }
         changed = true;
     }
+    let plugin_entry = opencode_plugin_install_path().display().to_string();
+    if opencode_plugin_array_contains(&config, &plugin_entry) {
+        remove_opencode_plugin_entry(&mut config, &plugin_entry);
+        changed = true;
+    }
     if changed {
         let _ = backup_if_exists(&path)?;
         write_opencode_config(&path, &config)?;
     }
+    let _ = std::fs::remove_file(opencode_plugin_install_path());
     Ok(())
 }
 
@@ -7292,6 +7372,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             err.to_string().contains("headroom unwrap opencode"),
             "actionable error, got: {err}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_apply_installs_transport_plugin_and_disable_removes_it() {
+        let home = TestHome::new();
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+
+        let plugin_path = super::opencode_plugin_install_path();
+        assert!(plugin_path.is_file(), "vendored plugin written to app data");
+        let config_path = home
+            .path()
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let plugins = config["plugin"].as_array().expect("plugin array present");
+        assert!(
+            plugins
+                .iter()
+                .any(|v| v.as_str() == Some(&plugin_path.display().to_string())),
+            "plugin path registered, got:\n{config:#}"
+        );
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            after.get("plugin").is_none(),
+            "plugin entry removed on disable, got:\n{after:#}"
+        );
+        assert!(!plugin_path.exists(), "plugin file removed on disable");
     }
 
     #[test]

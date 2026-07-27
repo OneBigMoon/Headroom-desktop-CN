@@ -283,7 +283,7 @@ const connectorSetupDetails: Record<string, string> = {
   grok_build:
     "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
   opencode:
-    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy. Other OpenCode providers (Google, local models, ...) are not routed through Headroom yet. A project-level opencode.json can override the proxied URLs for that project."
+    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project."
 };
 
 const connectorSupportWarnings: Record<string, string> = {};
