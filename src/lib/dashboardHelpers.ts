@@ -423,16 +423,24 @@ export function hasEnabledConnector(connectors: ClientConnectorStatus[]) {
   return getEnabledSupportedConnectors(connectors).length > 0;
 }
 
-export type ConnectorDashboardTone = "active" | "pending" | "idle";
+export type ConnectorDashboardTone = "active" | "pending" | "idle" | "off";
 
-export function connectorDashboardStatus(connector: ClientConnectorStatus): {
+export function connectorDashboardStatus(
+  connector: ClientConnectorStatus,
+  opts?: { proxyReachable?: boolean }
+): {
   label: string;
   tone: ConnectorDashboardTone;
 } {
   if (!connector.enabled) {
+    // Deliberately off, nothing wrong: gray, not red. Red ("idle") is
+    // reserved for enabled-but-broken (see the proxyReachable override).
     return connector.installed
-      ? { label: "Off", tone: "idle" }
-      : { label: "Not installed", tone: "idle" };
+      ? { label: "Off", tone: "off" }
+      : { label: "Not installed", tone: "off" };
+  }
+  if (opts?.proxyReachable === false) {
+    return { label: "Proxy unreachable", tone: "idle" };
   }
   if (!connector.verified) {
     return connector.installed

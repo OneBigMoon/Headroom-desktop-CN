@@ -209,16 +209,23 @@ describe("dashboard helpers", () => {
   it("derives a dashboard status label/tone per connector state", () => {
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: false, enabled: false, verified: false })
-    ).toEqual({ label: "Not installed", tone: "idle" });
+    ).toEqual({ label: "Not installed", tone: "off" });
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false })
-    ).toEqual({ label: "Off", tone: "idle" });
+    ).toEqual({ label: "Off", tone: "off" });
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: false })
     ).toEqual({ label: "Verifying", tone: "pending" });
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true })
     ).toEqual({ label: "Active", tone: "active" });
+    // Red is reserved for enabled-but-broken: proxy down while a connector is on.
+    expect(
+      connectorDashboardStatus(
+        { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true },
+        { proxyReachable: false }
+      )
+    ).toEqual({ label: "Proxy unreachable", tone: "idle" });
   });
 
   it("formats timestamps and learn recency with clear fallbacks", () => {

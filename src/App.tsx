@@ -308,11 +308,9 @@ const connectorUnavailableReasons: Record<string, string> = {
     "OpenCode was not detected. Install OpenCode and restart Headroom."
 };
 
-// Grok Build routing is not implemented in the intercept/backend yet:
-// enabling the connector would send grok traffic to the wrong upstream with
-// the user's xAI key attached. Hide it everywhere until routing lands; flip
-// this to re-enable the UI.
-const GROK_CONNECTOR_ENABLED = false;
+// Grok routing: UA-classified in the intercept, forwarded to api.x.ai via
+// the backend's per-request x-headroom-base-url selection.
+const GROK_CONNECTOR_ENABLED = true;
 
 // OpenCode is visible in RC builds for end-to-end verification; keep the
 // flag so it can ship dark in a stable if the RC pass surfaces problems.
@@ -330,7 +328,7 @@ function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
 // enabling while the user is authenticated: Codex has its own proxy-side
 // gate (codex_bypass); OpenCode bills against the user's own provider API
 // keys, so the Claude gate has nothing to meter (no dedicated bypass).
-const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode"]);
+const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build"]);
 
 const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnectors([
   {
@@ -5425,7 +5423,9 @@ export default function App() {
                 return (
                   <div className="callout-banner__connectors">
                     {homeConnectors.map((connector) => {
-                      const status = connectorDashboardStatus(connector);
+                      const status = connectorDashboardStatus(connector, {
+                        proxyReachable: runtimeStatus?.proxyReachable
+                      });
                       return (
                         <span
                           className={`callout-banner__badge callout-banner__badge--${status.tone}`}
