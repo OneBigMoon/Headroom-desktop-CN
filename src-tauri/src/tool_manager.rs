@@ -4097,6 +4097,7 @@ impl ToolManager {
         // absolute entrypoint so it survives runtime moves. Best-effort: a
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
+        let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by

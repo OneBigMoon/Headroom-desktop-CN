@@ -279,7 +279,9 @@ const connectorSetupDetails: Record<string, string> = {
   claude_code:
     "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Token-saving add-ons like RTK are optional: install them from the add-ons list and Headroom wires up the PATH entry and auto-rewrite hook only then.",
   codex:
-    "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom. It also installs a guard hook that warns you inside Codex if routing ever breaks - run /hooks in Codex once to trust it (re-trust after a Headroom update)."
+    "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom. It also installs a guard hook that warns you inside Codex if routing ever breaks - run /hooks in Codex once to trust it (re-trust after a Headroom update).",
+  grok_build:
+    "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom."
 };
 
 const connectorSupportWarnings: Record<string, string> = {};
@@ -288,7 +290,9 @@ const connectorUnavailableReasons: Record<string, string> = {
   claude_code:
     "Claude Code was not detected. Install Claude Code and restart Headroom.",
   codex:
-    "Codex was not detected. Install the Codex CLI and restart Headroom."
+    "Codex was not detected. Install the Codex CLI and restart Headroom.",
+  grok_build:
+    "Grok Build was not detected. Install Grok Build and restart Headroom."
 };
 
 const launcherConnectorFallback: ClientConnectorStatus[] = [
@@ -302,6 +306,13 @@ const launcherConnectorFallback: ClientConnectorStatus[] = [
   {
     clientId: "codex",
     name: "Codex",
+    installed: false,
+    enabled: false,
+    verified: false
+  },
+  {
+    clientId: "grok_build",
+    name: "Grok Build",
     installed: false,
     enabled: false,
     verified: false
@@ -2794,7 +2805,8 @@ export default function App() {
     return (
       connector.installed ||
       connector.clientId === "claude_code" ||
-      connector.clientId === "codex"
+      connector.clientId === "codex" ||
+      connector.clientId === "grok_build"
     );
   }
 

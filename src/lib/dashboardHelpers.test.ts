@@ -176,16 +176,17 @@ describe("dashboard helpers", () => {
     ]);
   });
 
-  it("keeps codex alongside claude_code as a supported connector", () => {
+  it("keeps codex and grok_build alongside claude_code as supported connectors", () => {
     const connectors: ClientConnectorStatus[] = [
       { clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false },
+      { clientId: "grok_build", name: "Grok Build", installed: true, enabled: false, verified: false },
       { clientId: "claude_code", name: "Claude Code", installed: true, enabled: true, verified: true },
       { clientId: "cursor", name: "Cursor", installed: true, enabled: false, verified: false }
     ];
 
     expect(
       aggregateClientConnectors(connectors).map((connector) => connector.clientId).sort()
-    ).toEqual(["claude_code", "codex"]);
+    ).toEqual(["claude_code", "codex", "grok_build"]);
   });
 
   it("reports enabled supported connectors regardless of which tool", () => {
@@ -234,7 +235,7 @@ describe("dashboard helpers", () => {
 });
 
 describe("mergeProviderSavingsForDisplay", () => {
-  it("folds anthropic and unknown into Claude Code (listed first) and openai into Codex", () => {
+  it("folds anthropic and unknown into Claude Code, openai into Codex, and xai into Grok Build", () => {
     const merged = mergeProviderSavingsForDisplay([
       {
         provider: "openai",
@@ -256,6 +257,13 @@ describe("mergeProviderSavingsForDisplay", () => {
         estimatedTokensSaved: 15,
         actualCostUsd: 0.03,
         totalTokensSent: 20
+      },
+      {
+        provider: "xai",
+        estimatedSavingsUsd: 0.02,
+        estimatedTokensSaved: 25,
+        actualCostUsd: 0.08,
+        totalTokensSent: 50
       }
     ]);
 
@@ -273,6 +281,13 @@ describe("mergeProviderSavingsForDisplay", () => {
         estimatedTokensSaved: 40,
         actualCostUsd: 0.16,
         totalTokensSent: 80
+      },
+      {
+        label: "Grok Build",
+        estimatedSavingsUsd: 0.02,
+        estimatedTokensSaved: 25,
+        actualCostUsd: 0.08,
+        totalTokensSent: 50
       }
     ]);
   });
