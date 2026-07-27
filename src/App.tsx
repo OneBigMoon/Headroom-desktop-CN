@@ -295,7 +295,19 @@ const connectorUnavailableReasons: Record<string, string> = {
     "Grok Build was not detected. Install Grok Build and restart Headroom."
 };
 
-const launcherConnectorFallback: ClientConnectorStatus[] = [
+// Grok Build routing is not implemented in the intercept/backend yet:
+// enabling the connector would send grok traffic to the wrong upstream with
+// the user's xAI key attached. Hide it everywhere until routing lands; flip
+// this to re-enable the UI.
+const GROK_CONNECTOR_ENABLED = false;
+
+function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
+  return GROK_CONNECTOR_ENABLED
+    ? list
+    : list.filter((connector) => connector.clientId !== "grok_build");
+}
+
+const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnectors([
   {
     clientId: "claude_code",
     name: "Claude Code",
@@ -317,7 +329,7 @@ const launcherConnectorFallback: ClientConnectorStatus[] = [
     enabled: false,
     verified: false
   }
-];
+]);
 
 const idleBootstrapProgress: BootstrapProgress = {
   running: false,
@@ -390,6 +402,12 @@ const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
   proxy_verify: "proxy_verify_started",
   post_install: "post_install_shown"
 };
+
+// Concrete first prompt for the post-install checklist: blank-page paralysis
+// is a real drop-off cause between "agent connected" and "first prompt sent",
+// so hand the user something they can paste that works in any repo.
+const STARTER_PROMPT =
+  "Explain what this project does and point out one thing worth improving.";
 
 function baseUrlTakeoverNotice(replaced: string): string {
   return `Claude Code was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
@@ -1255,6 +1273,7 @@ export default function App() {
     }
   };
   const [learnInstallCopyNotice, setLearnInstallCopyNotice] = useState<string | null>(null);
+  const [starterPromptCopied, setStarterPromptCopied] = useState(false);
 
   const [stepSignature, setStepSignature] = useState("");
   const [stepStartedAtMs, setStepStartedAtMs] = useState<number | null>(null);
@@ -1379,7 +1398,8 @@ export default function App() {
     setDashboard(next);
   }
 
-  function applyConnectorsIfChanged(next: ClientConnectorStatus[]) {
+  function applyConnectorsIfChanged(nextConnectors: ClientConnectorStatus[]) {
+    const next = withoutHiddenConnectors(nextConnectors);
     const nextSignature = serializeState(next);
     if (connectorsSignatureRef.current === nextSignature) {
       return;
@@ -4601,10 +4621,58 @@ export default function App() {
             in the background
           </h1>
           {awaitingFirstSavings ? (
-            <p className="post-install__waiting">
-              <span className="callout-banner__dot callout-banner__dot--healthy" aria-hidden="true" />
-              Send a prompt in Claude Code or Codex — your first savings will show up right here.
-            </p>
+            <div className="post-install__checklist">
+              <ol className="post-install__steps">
+                <li className="post-install__step">
+                  <span
+                    className={`callout-banner__dot ${dashboard.lifetimeRequests > 0 ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
+                    aria-hidden="true"
+                  />
+                  <div>
+                    <strong>Claude Code or Codex connected</strong>
+                    {dashboard.lifetimeRequests <= 0 && (
+                      <p>Open a terminal and start your agent — Headroom picks it up automatically.</p>
+                    )}
+                  </div>
+                </li>
+                <li className="post-install__step">
+                  <span
+                    className={`callout-banner__dot ${dashboard.firstPromptRequestSeen ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
+                    aria-hidden="true"
+                  />
+                  <div>
+                    <strong>First prompt sent</strong>
+                    {!dashboard.firstPromptRequestSeen && (
+                      <p>Ask it anything, or paste the starter prompt below.</p>
+                    )}
+                  </div>
+                </li>
+                <li className="post-install__step">
+                  <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
+                  <div>
+                    <strong>First savings recorded</strong>
+                    <p>Shows up right here, moments after your first prompt lands.</p>
+                  </div>
+                </li>
+              </ol>
+              {!dashboard.firstPromptRequestSeen && (
+                <div className="post-install__starter">
+                  <code>{STARTER_PROMPT}</code>
+                  <button
+                    className="secondary-button"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
+                        setStarterPromptCopied(true);
+                        window.setTimeout(() => setStarterPromptCopied(false), 2000);
+                      });
+                    }}
+                    type="button"
+                  >
+                    {starterPromptCopied ? "Copied" : "Copy prompt"}
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             <>
               <p>

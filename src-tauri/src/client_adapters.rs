@@ -2550,17 +2550,116 @@ fn strip_grok_managed_toml(content: &str) -> String {
     strip_marker_block(content, GROK_PROXY_BLOCK_ID)
 }
 
+/// Locate a `[model.grok-build]` table in `lines`: returns the header line
+/// index and, when present, the index of its `base_url` line.
+fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
+    let mut header_idx = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if trimmed == "[model.grok-build]" {
+                header_idx = Some(idx);
+            } else if header_idx.is_some() {
+                return Some((header_idx.unwrap(), None));
+            }
+            continue;
+        }
+        if header_idx.is_some()
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "base_url")
+        {
+            return Some((header_idx.unwrap(), Some(idx)));
+        }
+    }
+    header_idx.map(|h| (h, None))
+}
+
+/// Extract the quoted string value of a `key = "value"` TOML line, ignoring
+/// any trailing comment.
+fn toml_line_value(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once('=')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Rewrite `base_url` inside a user-owned `[model.grok-build]` table (e.g.
+/// written by `headroom wrap grok`), keeping the previous value in a trailing
+/// `# was:` comment so disable can restore it. Mirrors the upstream Python
+/// registrar (headroom/providers/grok_build/config.py). Returns `None` when no
+/// such table exists.
+fn redirect_existing_grok_build_base_url(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let (header_idx, base_url_idx) = find_grok_build_table(&lines)?;
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    match base_url_idx {
+        Some(idx) => {
+            let old = toml_line_value(lines[idx]);
+            if old.as_deref() == Some(HEADROOM_GROK_PROXY_BASE_URL) {
+                return Some(format!("{content}\n"));
+            }
+            let indent: String = lines[idx]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            out[idx] = match old {
+                Some(old) => format!(
+                    "{indent}base_url = \"{HEADROOM_GROK_PROXY_BASE_URL}\"  # was: {old}"
+                ),
+                None => format!("{indent}base_url = \"{HEADROOM_GROK_PROXY_BASE_URL}\""),
+            };
+        }
+        None => out.insert(
+            header_idx + 1,
+            format!("base_url = \"{HEADROOM_GROK_PROXY_BASE_URL}\""),
+        ),
+    }
+    let mut rebuilt = out.join("\n");
+    rebuilt.push('\n');
+    Some(rebuilt)
+}
+
+/// Undo a `base_url` redirect left by [`redirect_existing_grok_build_base_url`]:
+/// restore the value recorded in the `# was:` comment, or drop the line when
+/// Headroom inserted it into a table that had none.
+fn restore_grok_build_base_url(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some((_, Some(idx))) = find_grok_build_table(&lines) else {
+        return content.to_string();
+    };
+    let line = lines[idx];
+    if toml_line_value(line).as_deref() != Some(HEADROOM_GROK_PROXY_BASE_URL) {
+        return content.to_string();
+    }
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    if let Some((_, was)) = line.split_once("# was: ") {
+        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        out[idx] = format!("{indent}base_url = \"{}\"", was.trim());
+    } else {
+        out.remove(idx);
+    }
+    out.join("\n")
+}
+
 fn render_grok_config(existing: &str) -> String {
     let mid = strip_grok_managed_toml(existing);
     let mid = mid.trim();
 
-    let mut out = codex_marker_block(GROK_PROXY_BLOCK_ID, &grok_proxy_body());
-    if !mid.is_empty() {
-        out.push('\n');
-        out.push_str(mid);
-        out.push('\n');
+    // A user-owned [model.grok-build] table must not be duplicated - a second
+    // table is invalid TOML. Redirect its base_url in place instead.
+    if let Some(redirected) = redirect_existing_grok_build_base_url(mid) {
+        return redirected;
     }
-    out
+
+    // The managed block opens a [model.grok-build] table, so it must sit after
+    // the user's content: any top-level key following the block would be
+    // absorbed into the table.
+    let block = codex_marker_block(GROK_PROXY_BLOCK_ID, &grok_proxy_body());
+    if mid.is_empty() {
+        return block;
+    }
+    format!("{mid}\n\n{block}")
 }
 
 fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
@@ -2598,10 +2697,15 @@ fn grok_proxy_block_matches() -> Result<bool> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let base_url = format!("base_url = \"{}\"", HEADROOM_GROK_PROXY_BASE_URL);
-    Ok(marker_block_contains(
-        &content,
-        GROK_PROXY_BLOCK_ID,
-        &base_url,
+    if marker_block_contains(&content, GROK_PROXY_BLOCK_ID, &base_url) {
+        return Ok(true);
+    }
+    // Redirected user-owned table (no managed block).
+    let lines: Vec<&str> = content.lines().collect();
+    Ok(matches!(
+        find_grok_build_table(&lines),
+        Some((_, Some(idx)))
+            if toml_line_value(lines[idx]).as_deref() == Some(HEADROOM_GROK_PROXY_BASE_URL)
     ))
 }
 
@@ -2612,7 +2716,7 @@ fn remove_grok_proxy_block() -> Result<()> {
     }
     let existing =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let stripped = strip_grok_managed_toml(&existing);
+    let stripped = restore_grok_build_base_url(&strip_grok_managed_toml(&existing));
     let normalized = {
         let trimmed = stripped.trim();
         if trimmed.is_empty() {
@@ -6618,6 +6722,69 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
             "shell export removed on disable, got:\n{combined_after}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_config_preserves_user_top_level_keys() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        let grok_dir = home.path().join(".grok");
+        fs::create_dir_all(&grok_dir).unwrap();
+        fs::write(grok_dir.join("config.toml"), "default_model = \"grok-4\"\n").unwrap();
+
+        super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+
+        let toml = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
+        let key_pos = toml.find("default_model").expect("user key kept");
+        let table_pos = toml.find("[model.grok-build]").expect("managed table present");
+        assert!(
+            key_pos < table_pos,
+            "top-level key must precede the managed table, got:\n{toml}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_config_redirects_existing_grok_build_table_and_restores_on_disable() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        let grok_dir = home.path().join(".grok");
+        fs::create_dir_all(&grok_dir).unwrap();
+        fs::write(
+            grok_dir.join("config.toml"),
+            "[model.grok-build]\nbase_url = \"http://127.0.0.1:8787/v1\"\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+
+        let toml = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
+        assert_eq!(
+            toml.matches("[model.grok-build]").count(),
+            1,
+            "no duplicate table, got:\n{toml}"
+        );
+        assert!(
+            toml.contains(
+                "base_url = \"http://127.0.0.1:6767/v1\"  # was: http://127.0.0.1:8787/v1"
+            ),
+            "base_url redirected in place, got:\n{toml}"
+        );
+
+        let verification =
+            super::verify_client_setup("grok_build").expect("verify_client_setup succeeds");
+        assert!(verification.failures.is_empty(), "{:?}", verification.failures);
+
+        super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        let after = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
+        assert!(
+            after.contains("base_url = \"http://127.0.0.1:8787/v1\""),
+            "original base_url restored, got:\n{after}"
+        );
+        assert!(!after.contains("# was:"), "redirect comment removed, got:\n{after}");
     }
 
     #[test]
