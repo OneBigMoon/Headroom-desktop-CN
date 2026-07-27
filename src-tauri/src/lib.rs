@@ -3143,6 +3143,8 @@ async fn start_headroom_learn(
     let run_key = match agent {
         LearnAgent::Claude => project_path.clone().unwrap_or_default(),
         LearnAgent::Codex => "codex".to_string(),
+        LearnAgent::Opencode => "opencode".to_string(),
+        LearnAgent::Grok => "grok".to_string(),
     };
     {
         let state: tauri::State<'_, AppState> = app.state();
@@ -4183,6 +4185,8 @@ pub fn headroom_memory_db_path() -> std::path::PathBuf {
 pub(crate) enum LearnAgent {
     Claude,
     Codex,
+    Opencode,
+    Grok,
 }
 
 impl LearnAgent {
@@ -4190,6 +4194,8 @@ impl LearnAgent {
         match raw {
             "claude" => Ok(LearnAgent::Claude),
             "codex" => Ok(LearnAgent::Codex),
+            "opencode" => Ok(LearnAgent::Opencode),
+            "grok" => Ok(LearnAgent::Grok),
             other => Err(format!("Unknown Headroom Learn agent: {other}")),
         }
     }
@@ -4231,6 +4237,18 @@ fn check_headroom_learn_prereqs(
             }
             if !prereq.codex_logged_in {
                 return Err("Sign in to the Codex CLI with your ChatGPT account to enable Headroom Learn for Codex.".into());
+            }
+        }
+        // OpenCode/Grok sessions are read directly from disk; the analysis
+        // step still needs an LLM, which the desktop runs through the Claude
+        // Code or Codex CLI (no API keys are available in the app env).
+        LearnAgent::Opencode | LearnAgent::Grok => {
+            if !prereq.claude_cli_available
+                && !(prereq.codex_cli_available && prereq.codex_logged_in)
+            {
+                return Err(
+                    "Headroom Learn analyzes sessions with the Claude Code or a signed-in Codex CLI - install one to enable it for this agent.".into(),
+                );
             }
         }
     }
@@ -4357,6 +4375,8 @@ fn execute_headroom_learn_run(
             (path, name)
         }
         LearnAgent::Codex => ("codex", "Codex sessions".to_string()),
+        LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
+        LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
     let entrypoint = state.tool_manager.headroom_entrypoint();
     if !entrypoint.exists() {
@@ -4395,6 +4415,11 @@ fn execute_headroom_learn_run(
     let cli_path = match agent {
         LearnAgent::Claude => claude_cli::detect_claude_cli(),
         LearnAgent::Codex => client_adapters::detect_codex_cli(),
+        // Analysis CLI, not the agent's own binary: prefer Claude, fall back
+        // to Codex (prereq check guarantees one exists).
+        LearnAgent::Opencode | LearnAgent::Grok => {
+            claude_cli::detect_claude_cli().or_else(client_adapters::detect_codex_cli)
+        }
     };
 
     let mut command = Command::new(&entrypoint);
@@ -4421,6 +4446,22 @@ fn execute_headroom_learn_run(
                 .arg("--model")
                 .arg("codex-cli")
                 .env("HEADROOM_LEARN_CLI", "codex");
+        }
+        LearnAgent::Opencode | LearnAgent::Grok => {
+            command.arg("--agent").arg(match agent {
+                LearnAgent::Opencode => "opencode",
+                _ => "grok",
+            });
+            // Session parsing is plugin-side; the analysis LLM runs through
+            // whichever supported CLI is installed (mirrors the prereq check).
+            if claude_cli::detect_claude_cli().is_some() {
+                command.env("HEADROOM_LEARN_CLI", "claude");
+            } else {
+                command
+                    .arg("--model")
+                    .arg("codex-cli")
+                    .env("HEADROOM_LEARN_CLI", "codex");
+            }
         }
     }
     command
@@ -4559,6 +4600,8 @@ fn execute_headroom_learn_run(
                                 match agent {
                                     LearnAgent::Claude => "claude",
                                     LearnAgent::Codex => "codex",
+                                    LearnAgent::Opencode => "opencode",
+                                    LearnAgent::Grok => "grok",
                                 },
                             );
                             scope.set_tag("exit_code", &exit_code_str);
@@ -4619,6 +4662,8 @@ fn execute_headroom_learn_run(
         match agent {
             LearnAgent::Claude => "claude",
             LearnAgent::Codex => "codex",
+            LearnAgent::Opencode => "opencode",
+            LearnAgent::Grok => "grok",
         },
         run_id,
         status_copy,

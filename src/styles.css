@@ -240,6 +240,16 @@ select {
   gap: 14px;
 }
 
+.first-savings-card {
+  padding: 14px 16px;
+}
+
+.first-savings-card h2 {
+  margin: 0 0 12px;
+  font-size: var(--text-base);
+  color: var(--text-primary);
+}
+
 .post-install__steps {
   display: flex;
   flex-direction: column;

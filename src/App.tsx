@@ -440,6 +440,68 @@ const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
 const STARTER_PROMPT =
   "Explain what this project does and point out one thing worth improving.";
 
+// Live first-savings checklist. Rendered on the launcher's post-install stage
+// AND as a Home card in the tray window: the launcher hides on click-away and
+// the menu bar icon reopens the tray window, so without the Home card there
+// is no way back to the checklist once it's been dismissed.
+function FirstSavingsChecklist({ dashboard }: { dashboard: DashboardState }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="post-install__checklist">
+      <ol className="post-install__steps">
+        <li className="post-install__step">
+          <span
+            className={`callout-banner__dot ${dashboard.lifetimeRequests > 0 ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
+            aria-hidden="true"
+          />
+          <div>
+            <strong>Coding agent connected</strong>
+            {dashboard.lifetimeRequests <= 0 && (
+              <p>Open a terminal and start your agent — Headroom picks it up automatically.</p>
+            )}
+          </div>
+        </li>
+        <li className="post-install__step">
+          <span
+            className={`callout-banner__dot ${dashboard.firstPromptRequestSeen ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
+            aria-hidden="true"
+          />
+          <div>
+            <strong>First prompt sent</strong>
+            {!dashboard.firstPromptRequestSeen && (
+              <p>Ask it anything, or paste the starter prompt below.</p>
+            )}
+          </div>
+        </li>
+        <li className="post-install__step">
+          <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
+          <div>
+            <strong>First savings recorded</strong>
+            <p>Shows up right here, moments after your first prompt lands.</p>
+          </div>
+        </li>
+      </ol>
+      {!dashboard.firstPromptRequestSeen && (
+        <div className="post-install__starter">
+          <code>{STARTER_PROMPT}</code>
+          <button
+            className="secondary-button"
+            onClick={() => {
+              void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 2000);
+              });
+            }}
+            type="button"
+          >
+            {copied ? "Copied" : "Copy prompt"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function baseUrlTakeoverNotice(replaced: string): string {
   return `Claude Code was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
 }
@@ -1310,7 +1372,6 @@ export default function App() {
     }
   };
   const [learnInstallCopyNotice, setLearnInstallCopyNotice] = useState<string | null>(null);
-  const [starterPromptCopied, setStarterPromptCopied] = useState(false);
 
   const [stepSignature, setStepSignature] = useState("");
   const [stepStartedAtMs, setStepStartedAtMs] = useState<number | null>(null);
@@ -2516,12 +2577,25 @@ export default function App() {
   const codexLearnEnabled = aggregateClientConnectors(connectors).some(
     (connector) => connector.clientId === "codex" && connector.enabled
   );
+  const opencodeLearnEnabled = aggregateClientConnectors(connectors).some(
+    (connector) => connector.clientId === "opencode" && connector.enabled
+  );
+  const grokLearnEnabled = aggregateClientConnectors(connectors).some(
+    (connector) => connector.clientId === "grok_build" && connector.enabled
+  );
+  const learnAgentCount =
+    Number(claudeLearnEnabled) +
+    Number(codexLearnEnabled) +
+    Number(opencodeLearnEnabled) +
+    Number(grokLearnEnabled);
   const learnBlurb =
-    claudeLearnEnabled && codexLearnEnabled
-      ? "Headroom learns from your Claude Code and Codex sessions. When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
+    learnAgentCount > 1
+      ? "Headroom learns from your coding agents' sessions. When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
       : codexLearnEnabled
         ? "Headroom learns from your Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
-        : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.";
+        : opencodeLearnEnabled || grokLearnEnabled
+          ? "Headroom learns from your agent's sessions. When it repeats a mistake, Headroom updates the agent's memory so it doesn't happen again."
+          : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.";
   useEffect(() => {
     // connectors === [] means get_client_connectors hasn't returned yet (the
     // Rust side always lists every managed client). Don't treat that launch
@@ -3187,7 +3261,10 @@ export default function App() {
     await handleBootstrap();
   }
 
-  async function runHeadroomLearn(agent: "claude" | "codex", projectPath?: string) {
+  async function runHeadroomLearn(
+    agent: "claude" | "codex" | "opencode" | "grok",
+    projectPath?: string
+  ) {
     if (runtimeStatus?.headroomLearnSupported === false) {
       setHeadroomLearnStatus((current) => ({
         ...current,
@@ -3200,14 +3277,19 @@ export default function App() {
       return;
     }
 
-    // Codex isn't project-organized, so it shares a stable run key.
-    const runKey = agent === "codex" ? "codex" : (projectPath ?? "");
+    // Only Claude is project-organized; every other agent shares a stable
+    // run key equal to its agent id.
+    const runKey = agent === "claude" ? (projectPath ?? "") : agent;
     const displayName =
       agent === "codex"
         ? "Codex sessions"
-        : (claudeProjects.find((project) => project.projectPath === projectPath)?.displayName ??
-          projectPath ??
-          "");
+        : agent === "opencode"
+          ? "OpenCode sessions"
+          : agent === "grok"
+            ? "Grok sessions"
+            : (claudeProjects.find((project) => project.projectPath === projectPath)?.displayName ??
+              projectPath ??
+              "");
     const startupSummary = `Running headroom learn for ${displayName}.`;
     trackAnalyticsEvent("headroom_learn_run", { agent });
     setHeadroomLearnBusy(true);
@@ -3247,17 +3329,24 @@ export default function App() {
     }
   }
 
-  async function handleRunHeadroomLearn(agent: "claude" | "codex", projectPath?: string) {
+  async function handleRunHeadroomLearn(
+    agent: "claude" | "codex" | "opencode" | "grok",
+    projectPath?: string
+  ) {
     if (agent === "claude" && projectPath) {
       setSelectedClaudeProjectPath(projectPath);
     }
     try {
       const status = await invoke<HeadroomLearnPrereqStatus>("get_headroom_learn_prereq_status");
       setHeadroomLearnPrereq(status);
+      // opencode/grok sessions are read from disk; analysis runs through
+      // whichever supported CLI exists (mirrors the Rust prereq check).
       const ready =
         agent === "codex"
           ? status.codexCliAvailable && status.codexLoggedIn
-          : status.claudeCliAvailable;
+          : agent === "claude"
+            ? status.claudeCliAvailable
+            : status.claudeCliAvailable || (status.codexCliAvailable && status.codexLoggedIn);
       if (!ready) {
         return;
       }
@@ -4107,7 +4196,7 @@ export default function App() {
         showSpinner={bootstrapping}
       >
         <h1>
-          Headroom cuts Claude Code and Codex costs
+          Headroom cuts Claude Code, Codex &amp; friends&apos; costs
            ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
         </h1>
         <div className="intro-shell__checklist">
@@ -4669,64 +4758,13 @@ export default function App() {
             in the background
           </h1>
           {awaitingFirstSavings ? (
-            <div className="post-install__checklist">
-              <ol className="post-install__steps">
-                <li className="post-install__step">
-                  <span
-                    className={`callout-banner__dot ${dashboard.lifetimeRequests > 0 ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
-                    aria-hidden="true"
-                  />
-                  <div>
-                    <strong>Claude Code or Codex connected</strong>
-                    {dashboard.lifetimeRequests <= 0 && (
-                      <p>Open a terminal and start your agent — Headroom picks it up automatically.</p>
-                    )}
-                  </div>
-                </li>
-                <li className="post-install__step">
-                  <span
-                    className={`callout-banner__dot ${dashboard.firstPromptRequestSeen ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
-                    aria-hidden="true"
-                  />
-                  <div>
-                    <strong>First prompt sent</strong>
-                    {!dashboard.firstPromptRequestSeen && (
-                      <p>Ask it anything, or paste the starter prompt below.</p>
-                    )}
-                  </div>
-                </li>
-                <li className="post-install__step">
-                  <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
-                  <div>
-                    <strong>First savings recorded</strong>
-                    <p>Shows up right here, moments after your first prompt lands.</p>
-                  </div>
-                </li>
-              </ol>
-              {!dashboard.firstPromptRequestSeen && (
-                <div className="post-install__starter">
-                  <code>{STARTER_PROMPT}</code>
-                  <button
-                    className="secondary-button"
-                    onClick={() => {
-                      void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
-                        setStarterPromptCopied(true);
-                        window.setTimeout(() => setStarterPromptCopied(false), 2000);
-                      });
-                    }}
-                    type="button"
-                  >
-                    {starterPromptCopied ? "Copied" : "Copy prompt"}
-                  </button>
-                </div>
-              )}
-            </div>
+            <FirstSavingsChecklist dashboard={dashboard} />
           ) : (
             <>
               <p>
                 {dashboard.launchExperience === "first_run"
                   ? "That prompt went through Headroom — your first savings are in."
-                  : "It will trim prompt bloat whenever you use Claude Code or Codex."}
+                  : "It will trim prompt bloat whenever you use a connected coding agent."}
               </p>
               <div className="post-install__metrics">
                 <article className="soft-card stat-card">
@@ -5449,6 +5487,15 @@ export default function App() {
               })()}
             </section>
 
+            {dashboard.savingsHistoryLoaded &&
+              dashboard.lifetimeEstimatedTokensSaved <= 0 &&
+              dashboard.lifetimeEstimatedSavingsUsd <= 0 && (
+                <section className="soft-card first-savings-card">
+                  <h2>Get your first savings</h2>
+                  <FirstSavingsChecklist dashboard={dashboard} />
+                </section>
+              )}
+
             <section className="stat-grid stat-grid--2col">
               <article
                 className={`soft-card stat-card stat-card--clickable${chartMode === "usd" ? " is-active" : ""}`}
@@ -5536,7 +5583,7 @@ export default function App() {
                   </div>
                 ) : !claudeLearnEnabled && !codexLearnEnabled ? (
                   <p className="loading-copy">
-                    Enable the Claude Code or Codex connector to scan sessions for learnings.
+                    Enable a coding-agent connector to scan sessions for learnings.
                   </p>
                 ) : (
                   <div className="optimize-minimal">
@@ -5865,13 +5912,114 @@ export default function App() {
                           );
                         })()
                       : null}
+                    {[
+                      {
+                        key: "opencode" as const,
+                        enabled: opencodeLearnEnabled,
+                        title: "OpenCode sessions",
+                        subtitle: "Scans OpenCode's session database into agent memory"
+                      },
+                      {
+                        key: "grok" as const,
+                        enabled: grokLearnEnabled,
+                        title: "Grok sessions",
+                        subtitle: "Scans ~/.grok/sessions into agent memory"
+                      }
+                    ].map((row) => {
+                      if (!row.enabled) {
+                        return null;
+                      }
+                      const ready =
+                        headroomLearnPrereq.claudeCliAvailable ||
+                        (headroomLearnPrereq.codexCliAvailable &&
+                          headroomLearnPrereq.codexLoggedIn);
+                      const running =
+                        headroomLearnStatus.running &&
+                        headroomLearnStatus.projectPath === row.key;
+                      const isLatest = headroomLearnStatus.projectPath === row.key;
+                      const disable =
+                        !ready || headroomLearnBusy || (headroomLearnStatus.running && !running);
+                      const showResult =
+                        isLatest &&
+                        !headroomLearnStatus.running &&
+                        (headroomLearnStatus.success !== null ||
+                          Boolean(headroomLearnStatus.error) ||
+                          headroomLearnStatus.outputTail.length > 0);
+                      const resultTone =
+                        headroomLearnStatus.success === true
+                          ? "success"
+                          : headroomLearnStatus.success === false || headroomLearnStatus.error
+                            ? "failure"
+                            : "idle";
+                      const resultLabel =
+                        headroomLearnStatus.success === true
+                          ? "Run succeeded"
+                          : headroomLearnStatus.success === false || headroomLearnStatus.error
+                            ? "Last run failed"
+                            : "No completed run yet";
+                      return (
+                        <div className="optimize-projects" key={row.key}>
+                          <div
+                            className={`optimize-project-row${running || showResult ? " optimize-project-row--active" : ""}`}
+                          >
+                            <div className="optimize-project-row__main">
+                              <span className="optimize-project-row__name">
+                                <strong>{row.title}</strong>
+                                <small>
+                                  <span
+                                    className="optimize-project-row__training"
+                                    aria-live="polite"
+                                  >
+                                    {running
+                                      ? `Scanning sessions${
+                                          typeof headroomLearnStatus.elapsedSeconds === "number"
+                                            ? ` · ${headroomLearnStatus.elapsedSeconds}s`
+                                            : ""
+                                        }`
+                                      : ready
+                                        ? row.subtitle
+                                        : "Needs the Claude Code or a signed-in Codex CLI for analysis"}
+                                    <button
+                                      type="button"
+                                      className={`optimize-project-row__refresh${running ? " is-spinning" : ""}`}
+                                      onClick={() => void handleRunHeadroomLearn(row.key)}
+                                      disabled={disable}
+                                      aria-label={running ? "Scanning…" : "Scan now"}
+                                      title={running ? "Scanning…" : "Scan now"}
+                                    >
+                                      <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
+                                    </button>
+                                  </span>
+                                </small>
+                              </span>
+                              <div className="optimize-project-row__actions">
+                                {showResult ? (
+                                  <span
+                                    className={`optimize-project-row__status optimize-minimal__result--${resultTone}`}
+                                  >
+                                    {resultLabel}
+                                  </span>
+                                ) : null}
+                              </div>
+                            </div>
+                            {showResult && headroomLearnStatus.error ? (
+                              <div className="optimize-project-row__result">
+                                <p className="install-progress__error">
+                                  {headroomLearnStatus.error}
+                                </p>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
                 {claudeProjectsError ? (
                   <p className="install-progress__error">{claudeProjectsError}</p>
                 ) : null}
                 {headroomLearnStatus.error &&
-                headroomLearnStatus.projectPath !== "codex" &&
+                !["codex", "opencode", "grok"].includes(headroomLearnStatus.projectPath ?? "") &&
                 !claudeProjects.some((project) => project.projectPath === headroomLearnStatus.projectPath) ? (
                   <p className="install-progress__error">{headroomLearnStatus.error}</p>
                 ) : null}

@@ -46,7 +46,7 @@ const EMPTY_TILE_COPY: Record<
   transformation: {
     badgeClass: "activity-feed__badge--transformation",
     badgeLabel: "Recent Large Compression",
-    copy: "No large compressions yet — send more messages through Claude Code or Codex.",
+    copy: "No large compressions yet — send more messages through a connected coding agent.",
     itemModifier: "activity-feed__item--transformation"
   },
   rtkToday: {
