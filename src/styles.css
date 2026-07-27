@@ -3670,6 +3670,35 @@ details[open] .optimize-minimal__details summary::after {
   color: var(--chip-text);
 }
 
+/* Instant styled tooltip (native title has a ~1s delay). No transition on
+   purpose: visibility flips the moment the badge is hovered. */
+.callout-banner__badge {
+  position: relative;
+}
+
+.callout-banner__badge::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: normal;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 30;
+}
+
+.callout-banner__badge:hover::after {
+  opacity: 1;
+}
+
 .callout-banner__chip-dot--off {
   background: var(--chip-text);
 }

@@ -145,6 +145,7 @@ import {
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
+import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { TermsGate } from "./components/TermsGate";
@@ -5430,11 +5431,15 @@ export default function App() {
                         <span
                           className={`callout-banner__badge callout-banner__badge--${status.tone}`}
                           key={connector.clientId}
-                          title={`${connector.name}: ${status.label}`}
+                          data-tip={`${connector.name}: ${status.label}`}
                         >
-                          <span aria-hidden="true">
-                            {connectorMonograms[connector.clientId] ?? connector.name.slice(0, 2)}
-                          </span>
+                          {hasConnectorIcon(connector.clientId) ? (
+                            <ConnectorIcon clientId={connector.clientId} />
+                          ) : (
+                            <span aria-hidden="true">
+                              {connectorMonograms[connector.clientId] ?? connector.name.slice(0, 2)}
+                            </span>
+                          )}
                           <span className="visually-hidden">{`${connector.name}: ${status.label}`}</span>
                         </span>
                       );
