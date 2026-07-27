@@ -3679,7 +3679,9 @@ details[open] .optimize-minimal__details summary::after {
 .callout-banner__badge::after {
   content: attr(data-tip);
   position: absolute;
-  bottom: calc(100% + 6px);
+  /* Below the badge: the cluster sits at the banner's top edge, so an
+     upward tooltip clips against the window chrome. */
+  top: calc(100% + 6px);
   right: 0;
   padding: 4px 8px;
   border-radius: 6px;
