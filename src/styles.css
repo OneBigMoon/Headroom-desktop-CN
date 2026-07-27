@@ -3628,10 +3628,41 @@ details[open] .optimize-minimal__details summary::after {
   display: flex;
   flex-direction: row;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
-  gap: 4px 12px;
+  gap: 6px;
   margin-top: 2px;
+}
+
+/* Compact monogram badges: guaranteed single-line next to the banner
+   headline regardless of how many connectors are configured. */
+.callout-banner__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  flex: none;
+  cursor: default;
+}
+
+.callout-banner__badge--active {
+  background: var(--accent-tint);
+  color: var(--accent-strong);
+}
+
+.callout-banner__badge--pending {
+  background: var(--warning-tint);
+  color: var(--warning);
+}
+
+.callout-banner__badge--idle {
+  background: var(--danger-tint);
+  color: var(--danger);
 }
 
 .callout-banner__chip {

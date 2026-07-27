@@ -288,6 +288,15 @@ const connectorSetupDetails: Record<string, string> = {
 
 const connectorSupportWarnings: Record<string, string> = {};
 
+// Two-letter badges for the home-banner connector cluster: with three or
+// more connectors, full names push the banner headline onto a second line.
+const connectorMonograms: Record<string, string> = {
+  claude_code: "CC",
+  codex: "CX",
+  grok_build: "GK",
+  opencode: "OC"
+};
+
 const connectorUnavailableReasons: Record<string, string> = {
   claude_code:
     "Claude Code was not detected. Install Claude Code and restart Headroom.",
@@ -5419,16 +5428,14 @@ export default function App() {
                       const status = connectorDashboardStatus(connector);
                       return (
                         <span
-                          className="callout-banner__chip"
+                          className={`callout-banner__badge callout-banner__badge--${status.tone}`}
                           key={connector.clientId}
-                          title={status.label}
+                          title={`${connector.name}: ${status.label}`}
                         >
-                          <span
-                            className={`callout-banner__chip-dot callout-banner__chip-dot--${status.tone}`}
-                            aria-hidden="true"
-                          />
-                          <span className="callout-banner__chip-name">{connector.name}</span>
-                          <span className="visually-hidden">{status.label}</span>
+                          <span aria-hidden="true">
+                            {connectorMonograms[connector.clientId] ?? connector.name.slice(0, 2)}
+                          </span>
+                          <span className="visually-hidden">{`${connector.name}: ${status.label}`}</span>
                         </span>
                       );
                     })}
