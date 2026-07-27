@@ -3971,6 +3971,15 @@ case "$FIRST_TOKEN" in
     ;;
 esac
 
+# The pin above only fixes the LEADING token. `rtk rewrite` also emits `rtk`
+# embedded after a `&&`, `;`, or `|` (e.g. `cd web && rtk npx ...`), and those
+# stay bare -- they fail with "command not found: rtk" in the non-interactive,
+# non-login shell Claude Code's Bash tool spawns, which sources only ~/.zshenv
+# (never the .zprofile/.zshrc where the managed PATH export lands). Prepend the
+# managed bin dir to PATH for this one invocation so every `rtk`, at any
+# position, resolves regardless of which profile files the shell sourced.
+REWRITTEN="export PATH=\"$(dirname "$HEADROOM_RTK"):\$PATH\"; $REWRITTEN"
+
 HEADROOM_RTK_REWRITTEN="$REWRITTEN" "$HEADROOM_PYTHON" -c 'import json, os, sys; data = json.load(sys.stdin); tool_input = data.get("tool_input"); 
 if not isinstance(tool_input, dict):
     sys.exit(0)
@@ -5335,6 +5344,84 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             stdout.contains(&fake_rtk.to_string_lossy().replace('"', "\\\"")),
             "rewritten command should invoke the managed rtk by absolute path, got: {stdout:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_script_prepends_managed_path_so_embedded_rtk_resolves() {
+        // Regression for compound commands: `rtk rewrite` embeds a bare `rtk`
+        // after `&&`/`;`/`|`, which the leading-token pin never touches. The
+        // hook must prepend the managed bin dir to PATH so the embedded token
+        // resolves in the non-interactive, non-login shell Claude Code spawns.
+        let root = unique_temp_dir("headroom-hook-embedded-rtk");
+        fs::create_dir_all(&root).expect("create root");
+
+        // Fake rtk emits a compound command with rtk embedded mid-chain, like
+        // the real binary does for `cd x && <cmd>`. The leading token is `cd`.
+        let fake_rtk = root.join("rtk");
+        fs::write(
+            &fake_rtk,
+            "#!/usr/bin/env bash\nshift\necho \"cd /tmp && rtk $*\"\n",
+        )
+        .expect("write fake rtk");
+        fs::set_permissions(
+            &fake_rtk,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod rtk");
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
+        let hook_path = root.join("hook.sh");
+        fs::write(&hook_path, &hook_body).expect("write hook");
+        fs::set_permissions(
+            &hook_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod hook");
+
+        let stdin = r#"{"tool_input":{"command":"git status"}}"#;
+        let output = std::process::Command::new("bash")
+            .arg(&hook_path)
+            .env("PATH", "/usr/bin:/bin") // bare `rtk` unresolvable without the prepend
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .expect("run hook");
+
+        assert!(output.status.success(), "hook should exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Headroom RTK auto-rewrite"),
+            "compound rewrite should be emitted, got stdout: {stdout:?}, stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The emitted command must export the managed bin dir onto PATH so the
+        // embedded `rtk` resolves, and must preserve that embedded token.
+        assert!(
+            stdout.contains("export PATH="),
+            "rewrite must prepend a PATH export, got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains(&root.to_string_lossy().replace('"', "\\\"")),
+            "PATH export must point at the managed bin dir, got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("&& rtk "),
+            "embedded rtk token must be preserved, got: {stdout:?}"
         );
 
         let _ = fs::remove_dir_all(root);

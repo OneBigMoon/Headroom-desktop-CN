@@ -392,6 +392,7 @@ async fn handle(
     // Codex plan capture, Codex-only bypass, counters, and response handling.
     let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
     let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
+    let is_chatgpt_codex = is_codex && request_uses_chatgpt_auth(&buf);
 
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
@@ -462,8 +463,16 @@ async fn handle(
     // When the pricing gate has bypassed Headroom, the Python proxy on
     // `backend_addr` is intentionally stopped. Forward direct to Anthropic so
     // already-running CC sessions stay alive while optimization is off.
+    // ChatGPT-authenticated Codex cannot be sent to api.openai.com: its OAuth
+    // token is scoped for chatgpt.com/backend-api/codex and the Platform API
+    // rejects it with a misleading missing `api.responses.write` 401. Return a
+    // retryable response instead of misrouting the credential.
     if bypass.load(Ordering::Acquire) {
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        if is_chatgpt_codex {
+            write_retryable_service_unavailable(&mut client).await;
+        } else {
+            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        }
         return;
     }
 
@@ -476,13 +485,11 @@ async fn handle(
         return;
     }
 
-    // Codex-only gate: when a free user has crossed the weekly Codex limit,
-    // forward Codex traffic straight to OpenAI (unoptimized) while leaving the
-    // Python backend up for Claude. `forward_direct_to_anthropic` routes
-    // OpenAI paths to OPENAI_DIRECT_BASE, so it does the right thing here.
+    // Codex-only gate: keep Codex routed through the Python backend so it can
+    // preserve the correct upstream for either ChatGPT OAuth or an API key,
+    // but tell it to skip optimization for this request.
     if is_codex && codex_bypass.load(Ordering::Acquire) {
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
-        return;
+        stamp_headroom_bypass_header(&mut buf);
     }
 
     // Bound concurrent backend forwards. The bypass/direct paths above return
@@ -505,17 +512,18 @@ async fn handle(
     let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
         // Backend down or mid-restart (crash, gate transition, post-update
         // cold boot — which deliberately holds the bypass flags off for up to
-        // 10 minutes): fall back per-request to the native provider instead
-        // of a bare 502, so in-flight Claude Code / Codex sessions keep
-        // working, merely unoptimized and unmetered, until the watchdog
-        // brings the backend back. A deliberately-stopped backend (pricing
-        // gate) never reaches here — the bypass branches above handle it.
-        // `forward_direct_to_anthropic` routes OpenAI paths to
-        // OPENAI_DIRECT_BASE, so Codex degrades identically to Claude.
+        // 10 minutes): fall back per-request to the native provider for Claude
+        // and API-key Codex. ChatGPT-authenticated Codex must retry until the
+        // backend returns because its OAuth token is not valid at the Platform
+        // API used by the direct forwarder.
         // info, not warn: warn would ship to Sentry per request; the watchdog's
         // capture_watchdog_give_up already reports genuine down episodes.
         note_backend_reachability(false, backend_addr);
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        if is_chatgpt_codex {
+            write_retryable_service_unavailable(&mut client).await;
+        } else {
+            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        }
         return;
     };
     note_backend_reachability(true, backend_addr);
@@ -1199,11 +1207,10 @@ fn maybe_spawn_codex_usage_poll(buf: &[u8], codex_slot: &CodexRateLimitSlot) {
     });
 }
 
-/// Best-effort decode of the ChatGPT plan from a Codex OAuth bearer JWT. Reads
-/// the `chatgpt_plan_type` claim from the `https://api.openai.com/auth` payload
-/// object, mirroring the Python proxy's `_decode_openai_bearer_payload`. No
-/// signature verification — this is a recommendation hint only.
-fn decode_codex_plan_tier(token: &str) -> Option<CodexPlanTier> {
+/// Best-effort decode of one claim from the nested OpenAI auth object in a
+/// Codex OAuth bearer JWT. No signature verification: callers use this only
+/// to classify routing or show a local plan hint, never to grant access.
+fn decode_codex_auth_claim(token: &str, claim: &str) -> Option<String> {
     let payload_b64 = token.split('.').nth(1)?;
     // JWT payloads are base64url without padding; tolerate either form.
     let trimmed = payload_b64.trim_end_matches('=');
@@ -1211,11 +1218,24 @@ fn decode_codex_plan_tier(token: &str) -> Option<CodexPlanTier> {
         .decode(trimmed)
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let plan = json
-        .get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_plan_type"))
-        .and_then(|v| v.as_str())?;
-    Some(CodexPlanTier::from_claim(plan))
+    json.get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get(claim))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Best-effort decode of the ChatGPT plan from a Codex OAuth bearer JWT.
+fn decode_codex_plan_tier(token: &str) -> Option<CodexPlanTier> {
+    decode_codex_auth_claim(token, "chatgpt_plan_type").map(|plan| CodexPlanTier::from_claim(&plan))
+}
+
+/// ChatGPT subscription OAuth and Platform API keys use different upstreams.
+/// The account header is authoritative; the JWT claim covers clients that omit
+/// it on a particular request.
+fn request_uses_chatgpt_auth(buf: &[u8]) -> bool {
+    extract_header_value(buf, "chatgpt-account-id").is_some()
+        || extract_bearer(buf)
+            .is_some_and(|token| decode_codex_auth_claim(&token, "chatgpt_account_id").is_some())
 }
 
 /// Window label derived from a minute count, matching upstream's
@@ -1250,6 +1270,14 @@ fn upstream_client() -> &'static reqwest::Client {
             .build()
             .expect("reqwest client for bypass forwarder")
     })
+}
+
+async fn write_retryable_service_unavailable(client: &mut TcpStream) {
+    let _ = client
+        .write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
 }
 
 /// Forward the request that produced `header_buf` directly to api.anthropic.com.
@@ -1858,6 +1886,19 @@ fn stamp_codex_client_header(buf: &mut Vec<u8>) {
     buf.splice(insert_at..insert_at, *b"X-Client: codex\r\n");
 }
 
+/// Tell the Python backend to preserve routing/auth handling but skip Headroom
+/// optimization for this Codex request.
+fn stamp_headroom_bypass_header(buf: &mut Vec<u8>) {
+    if request_has_header(buf, "x-headroom-bypass") {
+        return;
+    }
+    let Some(end) = find_header_end(buf) else {
+        return;
+    };
+    let insert_at = end + 2;
+    buf.splice(insert_at..insert_at, *b"X-Headroom-Bypass: true\r\n");
+}
+
 /// Paths served by the local Python proxy (not Anthropic). Matches the prefix
 /// so sub-paths (e.g. `/transformations/feed`) and query strings are covered,
 /// while preventing partial matches (e.g. `/healthcheck` does not match
@@ -1984,9 +2025,9 @@ mod tests {
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
         parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
-        set_response_content_length, stamp_codex_client_header, strip_request_header, BypassFlag,
-        ModelsRewrite, SharedToken,
+        request_is_loopback_safe, request_uses_chatgpt_auth, rewrite_use_responses_lite, run,
+        sanitize_stale_tool_references, set_response_content_length, stamp_codex_client_header,
+        stamp_headroom_bypass_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2072,6 +2113,21 @@ mod tests {
     fn extracts_bearer_token_case_insensitively() {
         let request = b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n";
         assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn detects_chatgpt_codex_auth_from_header_or_jwt() {
+        assert!(request_uses_chatgpt_auth(
+            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id: acct_1\r\n\r\n"
+        ));
+
+        let jwt = jwt_with_plan("plus");
+        let request = format!("POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer {jwt}\r\n\r\n");
+        assert!(request_uses_chatgpt_auth(request.as_bytes()));
+
+        assert!(!request_uses_chatgpt_auth(
+            b"POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer sk-platform-key\r\n\r\n"
+        ));
     }
 
     #[test]
@@ -2400,6 +2456,38 @@ mod tests {
             "codex counter should not move for an Anthropic-path request"
         );
 
+        // ChatGPT-authenticated Codex cannot use the Platform API direct
+        // fallback. It must retry until the auth-aware Python backend returns.
+        let mut codex_client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("codex connect");
+        codex_client
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("write codex request");
+        let response = read_response(codex_client).await;
+        let response_str = std::str::from_utf8(&response).unwrap_or("");
+        assert!(
+            response_str.starts_with("HTTP/1.1 503"),
+            "expected retryable 503 for ChatGPT Codex, got: {response_str:?}"
+        );
+        assert!(
+            response_str.contains("\r\nRetry-After: 1\r\n"),
+            "ChatGPT Codex 503 should ask the client to retry: {response_str:?}"
+        );
+        let counts_after_codex = intercept_request_counts();
+        assert_eq!(
+            counts_after_codex["codex"] - counts_after_api["codex"],
+            1,
+            "codex counter should increment on retryable fallback"
+        );
+        assert_eq!(
+            counts_after_codex["claude-code"], counts_after_api["claude-code"],
+            "claude-code counter should not move for Codex request"
+        );
+
         // Local proxy paths (health probes, stats) must NOT leak upstream on
         // fallback: the boot-time readyz poll would otherwise flap green and
         // real probes would generate provider traffic every 250ms.
@@ -2501,6 +2589,26 @@ mod tests {
         let original = buf.clone();
         stamp_codex_client_header(&mut buf);
         assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn stamp_headroom_bypass_header_inserts_once_and_preserves_body() {
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        stamp_headroom_bypass_header(&mut buf);
+        stamp_headroom_bypass_header(&mut buf);
+
+        let parsed = parse_request_head(&buf).expect("still a valid request head");
+        assert_eq!(
+            parsed
+                .headers
+                .iter()
+                .filter(|(k, v)| {
+                    k.eq_ignore_ascii_case("x-headroom-bypass") && v.eq_ignore_ascii_case("true")
+                })
+                .count(),
+            1
+        );
+        assert!(buf.ends_with(b"\r\n\r\nhello"));
     }
 
     #[test]

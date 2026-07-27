@@ -54,6 +54,16 @@ pub const TERMS_URL: &str = "https://extraheadroom.com/terms";
 /// detection (below) normally fires long before this.
 pub const RUNTIME_UPGRADE_BOOT_MAX_SECS: u64 = 600;
 
+/// Hard ceiling that overrides the soft cap above *only* while the HF model
+/// cache is still actively growing — i.e. a first-run model download is in
+/// flight. A slow connection legitimately needs longer than 600s to pull the
+/// multi-GB ONNX weights; failing the upgrade at the soft cap rolled back a
+/// download that was still progressing and spammed an Error-level Sentry event
+/// (RUST-4A). The stall guard (silence window below) still catches a genuinely
+/// idle process long before this. `TimedOut` past this ceiling means the
+/// download itself is pathologically slow, not that the proxy hung.
+pub const RUNTIME_UPGRADE_BOOT_HARD_MAX_SECS: u64 = 1800;
+
 /// Once this much wall-time has elapsed without /livez success, start
 /// checking the proxy log's mtime (and the HF cache size) for progress.
 /// Before this, we stay quiet — most fast boots finish well under this
@@ -318,6 +328,21 @@ fn boot_validation_stalled(
     silence: std::time::Duration,
 ) -> bool {
     elapsed > grace && activity_age > silence
+}
+
+/// Pure decision for the boot-validation absolute timeout. The soft cap
+/// (`max`) applies normally, but while a first-run model download is still
+/// growing the HF cache we wait up to `hard_max` instead — a slow download is
+/// not a failed boot (Sentry RUST-4A). Extracted from the polling loop so the
+/// ceiling logic is testable without a clock or filesystem.
+fn boot_validation_timed_out(
+    elapsed: std::time::Duration,
+    max: std::time::Duration,
+    hard_max: std::time::Duration,
+    download_active: bool,
+) -> bool {
+    let ceiling = if download_active { hard_max } else { max };
+    elapsed >= ceiling
 }
 
 /// Newest mtime of any `headroom-proxy*.log` file in the logs directory, as
@@ -1571,12 +1596,16 @@ impl AppState {
         let mut last_hf_size = hf_cache
             .as_deref()
             .map(|p| total_dir_size_bytes(p, HF_CACHE_WALK_CAP));
+        // Last time the HF cache actually grew — the download-in-progress
+        // signal that lifts the soft timeout to the hard ceiling.
+        let mut last_hf_growth_at: Option<Instant> = None;
         let mut last_cpu_secs: Option<u64> = tracked_pid.and_then(tracked_process_cpu_time_secs);
         let mut last_progress = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .unwrap_or_else(Instant::now);
 
         let max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_MAX_SECS);
+        let hard_max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_HARD_MAX_SECS);
         let grace = Duration::from_secs(RUNTIME_UPGRADE_STALL_GRACE_SECS);
         let silence = Duration::from_secs(RUNTIME_UPGRADE_STALL_SILENCE_SECS);
         let progress_interval = Duration::from_secs(2);
@@ -1593,8 +1622,13 @@ impl AppState {
                 return BootValidationOutcome::ProcessExited;
             }
 
+            // A download is "active" if the HF cache grew within the silence
+            // window. `last_hf_growth_at` reflects the previous tick's HF
+            // observation (refreshed ~500ms below); the silence tolerance
+            // absorbs that staleness.
+            let download_active = last_hf_growth_at.is_some_and(|at| at.elapsed() < silence);
             let elapsed = start.elapsed();
-            if elapsed >= max {
+            if boot_validation_timed_out(elapsed, max, hard_max, download_active) {
                 return BootValidationOutcome::TimedOut;
             }
 
@@ -1612,6 +1646,7 @@ impl AppState {
                 let current_size = total_dir_size_bytes(cache_path, HF_CACHE_WALK_CAP);
                 if hf_cache_grew(last_hf_size, current_size) {
                     last_log_activity = Instant::now();
+                    last_hf_growth_at = Some(Instant::now());
                 }
                 last_hf_size = Some(current_size);
             }
@@ -6244,8 +6279,8 @@ mod tests {
 
     use super::{
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
-        boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
-        classify_startup_error, cpu_time_advanced, hf_cache_grew,
+        boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
+        bootstrap_failed_state, classify_startup_error, cpu_time_advanced, hf_cache_grew,
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
@@ -6357,6 +6392,42 @@ mod tests {
             Duration::from_secs(50),
             Duration::from_secs(60),
             Duration::from_secs(90),
+        ));
+    }
+
+    #[test]
+    fn boot_validation_timed_out_respects_download_ceiling() {
+        use std::time::Duration;
+        let max = Duration::from_secs(600);
+        let hard_max = Duration::from_secs(1800);
+        // Idle proxy at the soft cap → timed out (current behaviour preserved).
+        assert!(boot_validation_timed_out(
+            Duration::from_secs(600),
+            max,
+            hard_max,
+            false,
+        ));
+        // Slow first-run download still growing at the soft cap → keep waiting
+        // (this is RUST-4A: don't roll back a live download).
+        assert!(!boot_validation_timed_out(
+            Duration::from_secs(725),
+            max,
+            hard_max,
+            true,
+        ));
+        // Download that never finishes eventually hits the hard ceiling.
+        assert!(boot_validation_timed_out(
+            Duration::from_secs(1800),
+            max,
+            hard_max,
+            true,
+        ));
+        // Below the soft cap: never timed out regardless of download state.
+        assert!(!boot_validation_timed_out(
+            Duration::from_secs(120),
+            max,
+            hard_max,
+            false,
         ));
     }
 
