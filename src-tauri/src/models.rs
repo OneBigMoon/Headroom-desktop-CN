@@ -179,6 +179,10 @@ pub struct DashboardState {
     pub bootstrap_complete: bool,
     pub python_runtime_installed: bool,
     pub lifetime_requests: usize,
+    /// This process has forwarded a prompt-sized completion request (the
+    /// `first_prompt_request` funnel signal). Drives the post-install
+    /// checklist's "first prompt sent" row.
+    pub first_prompt_request_seen: bool,
     pub lifetime_estimated_savings_usd: f64,
     pub lifetime_estimated_tokens_saved: u64,
     pub session_requests: usize,

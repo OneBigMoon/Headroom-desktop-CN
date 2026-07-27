@@ -33,6 +33,7 @@ describe("install-wizard funnel steps", () => {
       "bootstrap_failed",
       "post_install_shown",
       "first_optimized_request",
+      "first_prompt_request",
       "first_savings_recorded"
     ]);
   });

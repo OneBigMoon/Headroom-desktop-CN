@@ -39,6 +39,7 @@ export const INSTALL_WIZARD_STEPS = [
   "bootstrap_failed",
   "post_install_shown",
   "first_optimized_request",
+  "first_prompt_request",
   "first_savings_recorded"
 ] as const;
 
