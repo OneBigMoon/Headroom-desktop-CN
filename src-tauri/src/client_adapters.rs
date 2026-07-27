@@ -601,8 +601,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             }
             if toml_ok {
-                checks
-                    .push("Found Headroom-managed proxy block in ~/.grok/config.toml.".into());
+                checks.push("Found Headroom-managed proxy block in ~/.grok/config.toml.".into());
             }
             if !toml_ok {
                 failures.push(
@@ -2582,7 +2581,7 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     }
 
     let backup = backup_if_exists(&path)?;
-    std::fs::write(&path, &updated).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, updated.as_bytes())?;
 
     let mut backup_files = Vec::new();
     if let Some(backup_path) = backup {
@@ -2599,7 +2598,11 @@ fn grok_proxy_block_matches() -> Result<bool> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let base_url = format!("base_url = \"{}\"", HEADROOM_GROK_PROXY_BASE_URL);
-    Ok(marker_block_contains(&content, GROK_PROXY_BLOCK_ID, &base_url))
+    Ok(marker_block_contains(
+        &content,
+        GROK_PROXY_BLOCK_ID,
+        &base_url,
+    ))
 }
 
 fn remove_grok_proxy_block() -> Result<()> {
@@ -2622,7 +2625,7 @@ fn remove_grok_proxy_block() -> Result<()> {
         return Ok(());
     }
     let _ = backup_if_exists(&path)?;
-    std::fs::write(&path, &normalized).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, normalized.as_bytes())?;
     Ok(())
 }
 
@@ -2646,7 +2649,10 @@ pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 
-    let target_line = format!("command = {}", toml_basic_string(&entrypoint.to_string_lossy()));
+    let target_line = format!(
+        "command = {}",
+        toml_basic_string(&entrypoint.to_string_lossy())
+    );
 
     let mut in_headroom_table = false;
     let mut replaced = false;
@@ -2682,7 +2688,7 @@ pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     let _ = backup_if_exists(&path)?;
-    std::fs::write(&path, rebuilt).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, rebuilt.as_bytes())?;
     Ok(Some(path.display().to_string()))
 }
 
@@ -4477,8 +4483,12 @@ fn grok_candidate_paths() -> Vec<PathBuf> {
     let mut candidates = vec![
         PathBuf::from("/usr/local/bin/grok"),
         PathBuf::from("/opt/homebrew/bin/grok"),
-        home.join(".grok").join("downloads").join("grok-macos-aarch64"),
-        home.join(".grok").join("downloads").join("grok-macos-x86_64"),
+        home.join(".grok")
+            .join("downloads")
+            .join("grok-macos-aarch64"),
+        home.join(".grok")
+            .join("downloads")
+            .join("grok-macos-x86_64"),
     ];
 
     let user_bin_dirs = vec![
@@ -6617,8 +6627,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
 
-        let result =
-            super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        let result = super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "grok_build");
 
@@ -6643,7 +6652,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let verification =
             super::verify_client_setup("grok_build").expect("verify_client_setup succeeds");
-        assert!(verification.failures.is_empty(), "{:?}", verification.failures);
+        assert!(
+            verification.failures.is_empty(),
+            "{:?}",
+            verification.failures
+        );
 
         super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
         let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
