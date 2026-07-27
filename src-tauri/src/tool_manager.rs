@@ -280,7 +280,13 @@ const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SERENA_MCP_HELPER: &str = r#"
 import sys
 
-from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, ServerSpec
+from headroom.mcp_registry import (
+    ClaudeRegistrar,
+    CodexRegistrar,
+    GrokRegistrar,
+    OpencodeRegistrar,
+    ServerSpec,
+)
 from headroom.mcp_registry.base import RegisterStatus
 from headroom.mcp_registry.ledger import (
     clear_install,
@@ -290,6 +296,8 @@ from headroom.mcp_registry.ledger import (
 
 action = sys.argv[1]
 failures = []
+# Claude/Codex only: serena's --context values are named profiles and no
+# grok/opencode context has been validated against serena yet.
 for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar(), "codex")):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
@@ -341,7 +349,13 @@ if failures:
 const CONTEXT7_MCP_HELPER: &str = r#"
 import sys
 
-from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, ServerSpec
+from headroom.mcp_registry import (
+    ClaudeRegistrar,
+    CodexRegistrar,
+    GrokRegistrar,
+    OpencodeRegistrar,
+    ServerSpec,
+)
 from headroom.mcp_registry.base import RegisterStatus
 from headroom.mcp_registry.ledger import (
     clear_install,
@@ -351,7 +365,7 @@ from headroom.mcp_registry.ledger import (
 
 action = sys.argv[1]
 failures = []
-for registrar in (ClaudeRegistrar(), CodexRegistrar()):
+for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue
@@ -394,7 +408,13 @@ if failures:
 const CODEBASE_MEMORY_MCP_HELPER: &str = r#"
 import sys
 
-from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, ServerSpec
+from headroom.mcp_registry import (
+    ClaudeRegistrar,
+    CodexRegistrar,
+    GrokRegistrar,
+    OpencodeRegistrar,
+    ServerSpec,
+)
 from headroom.mcp_registry.base import RegisterStatus
 from headroom.mcp_registry.ledger import (
     clear_install,
@@ -404,7 +424,7 @@ from headroom.mcp_registry.ledger import (
 
 action = sys.argv[1]
 failures = []
-for registrar in (ClaudeRegistrar(), CodexRegistrar()):
+for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue

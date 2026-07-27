@@ -1006,6 +1006,10 @@ pub fn perform_full_cleanup() -> Vec<String> {
     backup_targets.push(codex_hooks_json_path());
     backup_targets.push(codex_guard_hook_path());
     backup_targets.push(grok_config_toml_path());
+    // Both possible opencode config names: backups are created next to
+    // whichever file was active at apply/disable time.
+    backup_targets.push(opencode_config_dir().join("opencode.json"));
+    backup_targets.push(opencode_config_dir().join("opencode.jsonc"));
     backup_targets.push(
         home_dir()
             .join("Library")
