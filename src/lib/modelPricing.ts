@@ -31,6 +31,8 @@ const PRICE_RULES: PriceRule[] = [
   { match: /gpt-3\.5/i, usdPerMTokens: 0.5 },
   { match: /gemini.*pro/i, usdPerMTokens: 1.25 },
   { match: /gemini.*flash/i, usdPerMTokens: 0.1 },
+  { match: /grok.*fast/i, usdPerMTokens: 0.2 },
+  { match: /grok/i, usdPerMTokens: 3 },
 ];
 
 // Fallback when we have no idea what model this is — use Sonnet-class as a

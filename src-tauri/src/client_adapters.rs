@@ -682,7 +682,7 @@ pub fn is_opencode_enabled() -> bool {
 /// (or ChatGPT plan), so the Claude pricing gate must neither stop the Python
 /// backend nor bypass the proxy for it.
 pub fn any_gate_exempt_client_enabled() -> bool {
-    is_codex_enabled() || is_opencode_enabled()
+    is_codex_enabled() || is_opencode_enabled() || is_grok_build_enabled()
 }
 
 pub fn list_client_connectors(
@@ -5096,6 +5096,8 @@ fn detect_grok_build_client(configured: bool) -> ClientStatus {
 fn grok_candidate_paths() -> Vec<PathBuf> {
     let home = home_dir();
     let mut candidates = vec![
+        // Official installer target (verified against grok 0.2.112).
+        home.join(".grok").join("bin").join("grok"),
         PathBuf::from("/usr/local/bin/grok"),
         PathBuf::from("/opt/homebrew/bin/grok"),
         home.join(".grok")
@@ -5115,12 +5117,14 @@ fn grok_candidate_paths() -> Vec<PathBuf> {
     dedupe_paths(candidates)
 }
 
+/// Deliberately excludes config.toml: setup itself creates one, which would
+/// make detection self-fulfilling after disable (same rule as opencode).
 fn grok_user_state_exists() -> bool {
     let grok_root = grok_home();
-    grok_root.join("config.toml").exists()
-        || grok_root.join("auth.json").exists()
+    grok_root.join("auth.json").exists()
         || grok_root.join("sessions").exists()
         || grok_root.join("downloads").exists()
+        || grok_root.join("bin").exists()
 }
 
 fn codex_candidate_paths() -> Vec<PathBuf> {

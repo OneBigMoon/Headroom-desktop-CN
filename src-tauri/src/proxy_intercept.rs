@@ -102,6 +102,7 @@ fn stamp_backend_traffic() {
 static INTERCEPT_CLAUDE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_OPENCODE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static INTERCEPT_GROK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 /// One-shot guard: has the `first_optimized_request` funnel beacon been sent
 /// this process yet? Fires when a request is actually forwarded to the backend
@@ -213,6 +214,10 @@ pub fn intercept_request_counts() -> std::collections::HashMap<String, u64> {
         (
             "opencode".to_string(),
             INTERCEPT_OPENCODE_REQUESTS.load(Ordering::Acquire),
+        ),
+        (
+            "grok-build".to_string(),
+            INTERCEPT_GROK_REQUESTS.load(Ordering::Acquire),
         ),
     ])
 }
@@ -537,6 +542,13 @@ async fn handle(
     // against opencode 1.18.5), matching the backend's CLIENT_UA_MAP prefix.
     let is_opencode =
         extract_header_value(&buf, "user-agent").is_some_and(|ua| ua.starts_with("opencode/"));
+    // Grok Build posts OpenAI-format chat completions, so path classification
+    // says Codex; the UA disambiguates. Current builds send `grok-shell/`
+    // (verified against grok 0.2.112); the backend's own UA map expects the
+    // older `grok/`, so match both and rely on the explicit X-Client stamp
+    // below for backend classification.
+    let is_grok = extract_header_value(&buf, "user-agent")
+        .is_some_and(|ua| ua.starts_with("grok-shell/") || ua.starts_with("grok/"));
 
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
@@ -545,12 +557,31 @@ async fn handle(
         if !is_local_proxy_path(&head.path) {
             if is_opencode {
                 INTERCEPT_OPENCODE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+            } else if is_grok {
+                INTERCEPT_GROK_REQUESTS.fetch_add(1, Ordering::AcqRel);
             } else if is_codex {
                 INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel);
             } else {
                 INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel);
             }
         }
+    }
+
+    // Route Grok through the backend's per-request upstream selection: the
+    // backend's OpenAI handler honours `x-headroom-base-url` (verified live
+    // against api.x.ai with bearer passthrough), so grok traffic gets the
+    // full compression pipeline and the correct upstream from the shared
+    // backend instance. Stamped BEFORE the bypass branches below so the
+    // no-direct-upstream 503 guard covers grok too - the direct forwarder
+    // only knows the Anthropic/OpenAI bases, and forwarding an xAI key to
+    // api.openai.com is the exact misroute this connector was blocked on.
+    if is_grok {
+        stamp_request_header(
+            &mut buf,
+            "x-headroom-base-url",
+            b"x-headroom-base-url: https://api.x.ai\r\n",
+        );
+        stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
     }
 
     // Codex fetches its model catalog via `GET <base_url>/models` and caches it
@@ -561,7 +592,10 @@ async fn handle(
     // 2026-06-26). Detect the catalog fetch here so the response splice below
     // can force the flag to false, keeping Codex on the full Responses path —
     // which works through the proxy.
-    let is_models_fetch = parsed_head.as_ref().is_some_and(is_codex_models_fetch);
+    // Grok excluded: its GET /v1/models is an xAI catalog, and the Codex
+    // responses-lite rewrite would buffer it and emit Codex-labelled Sentry
+    // noise for traffic unrelated to that bug.
+    let is_models_fetch = !is_grok && parsed_head.as_ref().is_some_and(is_codex_models_fetch);
 
     // Scan headers for a Bearer token and capture it. When the token's
     // value differs from what was previously in the slot — or the slot was
@@ -575,14 +609,17 @@ async fn handle(
         // must never land in the Claude bearer slot: pricing would send it to
         // Anthropic's OAuth profile/usage endpoints (cross-provider credential
         // transmission) where it only earns 401s.
-        if is_codex && !is_opencode {
+        if is_codex && !is_opencode && !is_grok {
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        } else if !is_codex && !is_opencode {
-            // OpenCode bearers are the user's own provider keys (or OAuth
-            // tokens for a possibly different Anthropic account); landing
-            // them in the Claude identity slot would flap pricing/identity.
+        } else if !is_codex && !is_opencode && !is_grok {
+            // OpenCode/Grok bearers are the user's own provider keys (or
+            // OAuth tokens for a possibly different account); landing them in
+            // the Claude identity slot would transmit them to Anthropic's
+            // OAuth endpoints and flap pricing/identity. Grok matters here
+            // because its non-completion endpoints (/v1/api-key, ...) are not
+            // path-classified as Codex.
             let changed = bearer_value_changed(&token_slot, &token);
             *token_slot.lock() = Some(BearerToken::new(token));
             if changed {
@@ -595,7 +632,7 @@ async fn handle(
     // headers, so `splice_with_codex_capture` below comes up empty. Fetch the
     // live subscription window from the dedicated usage endpoint instead.
     // Throttled and fire-and-forget, so the request hot path is untouched.
-    if is_codex && !is_opencode {
+    if is_codex && !is_opencode && !is_grok {
         maybe_spawn_codex_usage_poll(&buf, &codex_slot);
         // Codex stamps `X-OpenAI-Internal-Codex-Responses-Lite` on the
         // `/responses` WS handshake. OpenAI tightened enforcement on 2026-06-26
@@ -642,7 +679,10 @@ async fn handle(
     // below. This keeps a Claude overage from pausing Codex optimization.
     // OpenCode is exempt: it runs on the user's own API keys, so a Claude
     // plan gate has nothing to do with its billing — keep it optimized.
-    if !is_codex && !is_opencode && claude_only_bypass.load(Ordering::Acquire) {
+    // !is_grok: a grok request on a non-OpenAI path must not be direct-
+    // forwarded to api.anthropic.com with its xAI bearer; the backend stays
+    // alive whenever grok is enabled, so falling through is always routable.
+    if !is_codex && !is_opencode && !is_grok && claude_only_bypass.load(Ordering::Acquire) {
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
@@ -650,7 +690,7 @@ async fn handle(
     // Codex-only gate: keep Codex routed through the Python backend so it can
     // preserve the correct upstream for either ChatGPT OAuth or an API key,
     // but tell it to skip optimization for this request.
-    if is_codex && !is_opencode && codex_bypass.load(Ordering::Acquire) {
+    if is_codex && !is_opencode && !is_grok && codex_bypass.load(Ordering::Acquire) {
         stamp_headroom_bypass_header(&mut buf);
     }
 
@@ -662,7 +702,11 @@ async fn handle(
     // permit is held in `_permit` until `handle` returns (through the splice).
     let Ok(_permit) = backend_inflight().clone().try_acquire_owned() else {
         log::info!("[proxy_intercept] backend in-flight cap reached; returning 503");
-        if is_codex && !is_opencode && should_report_throttled(&CODEX_INFLIGHT_503_LAST_REPORTED) {
+        if is_codex
+            && !is_opencode
+            && !is_grok
+            && should_report_throttled(&CODEX_INFLIGHT_503_LAST_REPORTED)
+        {
             report_codex_reconnect_incident("backend_inflight_cap", 1, None);
         }
         let _ = client
@@ -749,7 +793,7 @@ async fn handle(
     // the untouched zero-copy splice.
     if is_models_fetch {
         splice_with_models_lite_rewrite(client, backend).await;
-    } else if is_codex && !is_opencode {
+    } else if is_codex && !is_opencode && !is_grok {
         let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
         splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
     } else {
@@ -2105,7 +2149,13 @@ fn stamp_codex_client_header(buf: &mut Vec<u8>) {
 }
 
 fn stamp_client_header(buf: &mut Vec<u8>, header_line: &'static [u8]) {
-    if request_has_header(buf, "x-client") {
+    stamp_request_header(buf, "x-client", header_line);
+}
+
+/// Append `header_line` as the last request header unless a header named
+/// `guard_name` is already present. No-op if the terminator is missing.
+fn stamp_request_header(buf: &mut Vec<u8>, guard_name: &str, header_line: &'static [u8]) {
+    if request_has_header(buf, guard_name) {
         return;
     }
     let Some(end) = find_header_end(buf) else {
@@ -2286,8 +2336,9 @@ mod tests {
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
         rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, stamp_client_header,
-        stamp_codex_client_header, stamp_headroom_bypass_header, strip_request_header, BypassFlag,
-        CodexTerminalReader, ModelsRewrite, ParsedRequestHead, SharedToken,
+        stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
+        strip_request_header, BypassFlag, CodexTerminalReader, ModelsRewrite, ParsedRequestHead,
+        SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2890,9 +2941,44 @@ mod tests {
     #[test]
     fn intercept_request_counts_exposes_all_agent_keys() {
         let counts = intercept_request_counts();
-        for key in ["claude-code", "codex", "opencode"] {
+        for key in ["claude-code", "codex", "opencode", "grok-build"] {
             assert!(counts.contains_key(key), "missing agent key {key}");
         }
+    }
+
+    #[test]
+    fn stamp_request_header_grok_base_url_and_client() {
+        let mut buf =
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\n\r\n{}"
+                .to_vec();
+        stamp_request_header(
+            &mut buf,
+            "x-headroom-base-url",
+            b"x-headroom-base-url: https://api.x.ai\r\n",
+        );
+        stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
+        assert!(request_has_header(&buf, "x-headroom-base-url"));
+        assert!(request_has_header(&buf, "x-client"));
+        assert!(buf.ends_with(b"\r\n\r\n{}"), "body preserved");
+        // Re-stamping must not duplicate either header.
+        stamp_request_header(
+            &mut buf,
+            "x-headroom-base-url",
+            b"x-headroom-base-url: https://api.x.ai\r\n",
+        );
+        stamp_codex_client_header(&mut buf);
+        assert_eq!(
+            buf.windows(b"x-headroom-base-url".len())
+                .filter(|w| *w == b"x-headroom-base-url")
+                .count(),
+            1
+        );
+        assert_eq!(
+            buf.windows(b"X-Client".len())
+                .filter(|w| *w == b"X-Client")
+                .count(),
+            1
+        );
     }
 
     #[test]
