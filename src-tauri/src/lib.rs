@@ -3560,6 +3560,31 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
                 log::warn!("uninstall: removing {plugin_id} plugin failed: {err:#}");
             }
         }
+
+        // Same story for the other addon integrations: MarkItDown's managed
+        // blocks/permission and the MCP registrations (serena, context7,
+        // codebase-memory) live in the host agents' own configs. Unregister
+        // via the Python helpers while the runtime and MCP ledger still
+        // exist; perform_full_cleanup() strips whatever a broken runtime
+        // leaves behind. All best-effort.
+        let _ = client_adapters::disable_markitdown_integration(
+            &state.tool_manager.markitdown_shim_path(),
+        );
+        if state.tool_manager.serena_installed() {
+            if let Err(err) = state.tool_manager.uninstall_serena() {
+                log::warn!("uninstall: removing serena failed: {err:#}");
+            }
+        }
+        if state.tool_manager.context7_installed() {
+            if let Err(err) = state.tool_manager.uninstall_context7() {
+                log::warn!("uninstall: removing context7 failed: {err:#}");
+            }
+        }
+        if state.tool_manager.codebase_memory_installed() {
+            if let Err(err) = state.tool_manager.uninstall_codebase_memory() {
+                log::warn!("uninstall: removing codebase-memory failed: {err:#}");
+            }
+        }
     }
 
     // Turn off the login item if it was ever enabled, so the system stops

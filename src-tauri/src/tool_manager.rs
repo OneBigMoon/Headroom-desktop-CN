@@ -659,6 +659,10 @@ pub struct HeadroomLearnProjectSummary {
     pub pattern_count: Option<usize>,
 }
 
+/// HuggingFace hub cache directory name for the Kompress model. Shared with
+/// uninstall cleanup (client_adapters) so both sides track the same model.
+pub(crate) const KOMPRESS_HF_MODEL_DIR: &str = "models--chopratejas--kompress-v2-base";
+
 /// Result of a best-effort kompress model prefetch.
 pub enum KompressPrefetchOutcome {
     /// Model successfully downloaded and cached.
@@ -1797,7 +1801,7 @@ impl ToolManager {
 
     /// True if the Kompress model snapshot is already present in the
     /// HuggingFace hub cache (`$HOME/.cache/huggingface/hub/
-    /// models--chopratejas--kompress-v2-base/snapshots/<rev>`). Used as the
+    /// <KOMPRESS_HF_MODEL_DIR>/snapshots/<rev>`). Used as the
     /// prefetch idempotency guard so we never re-download an existing model.
     pub fn kompress_model_cached(&self) -> bool {
         let Some(home) = dirs::home_dir() else {
@@ -1807,7 +1811,7 @@ impl ToolManager {
             .join(".cache")
             .join("huggingface")
             .join("hub")
-            .join("models--chopratejas--kompress-v2-base")
+            .join(KOMPRESS_HF_MODEL_DIR)
             .join("snapshots");
         std::fs::read_dir(&snapshots)
             .map(|mut entries| entries.next().is_some())
