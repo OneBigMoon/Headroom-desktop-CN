@@ -3218,6 +3218,16 @@ impl AppState {
         if self.runtime_is_paused() || self.runtime_is_starting() {
             return;
         }
+        // Onboarding in progress: the launcher's "test your setup" step passes
+        // the idle heuristic (no traffic yet), but a restart here takes the
+        // backend down for the model-load boot exactly when the user sends
+        // their first test prompt. Lazy-load detection covers enablement.
+        if !self.setup_wizard_satisfied() {
+            log::info!(
+                "kompress prefetch: onboarding in progress, deferring restart to lazy-load detection"
+            );
+            return;
+        }
         let idle = newest_proxy_log_mtime(&self.tool_manager.logs_dir())
             .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
             .map(|age| age >= std::time::Duration::from_secs(20))

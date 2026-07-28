@@ -477,7 +477,7 @@ function FirstSavingsChecklist({ dashboard }: { dashboard: DashboardState }) {
           <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
           <div>
             <strong>First savings recorded</strong>
-            <p>Shows up right here, moments after your first prompt lands.</p>
+            <p>Builds as you work — a short test prompt saves little, a real coding session shows up fast.</p>
           </div>
         </li>
       </ol>
@@ -4189,6 +4189,7 @@ export default function App() {
         version={appSemver}
         showSpinner={bootstrapping}
       >
+        <div>
         <h1>
           Headroom cuts AI coding agents&apos; costs
            ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
@@ -4205,6 +4206,7 @@ export default function App() {
               {label}
             </span>
           ))}
+        </div>
         </div>
         <div className="intro-shell__checklist">
           <article>
@@ -5440,7 +5442,7 @@ export default function App() {
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
-                  <p className="callout-banner__subtitle">Now use your AI coding agents as normal, and check back later to see how much Headroom is saving you.</p>
+                  <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>
                 )}
                 {(calloutBanner.tone === "auto-paused" || calloutBanner.tone === "paused") && (
                   <div className="callout-banner__resume">
