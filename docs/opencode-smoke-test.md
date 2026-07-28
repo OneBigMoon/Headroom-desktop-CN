@@ -65,9 +65,9 @@ Expect: an error mentioning a Google API key (not an OpenAI or Anthropic error -
 
 Expect: an `opencode` entry after O2/O3 traffic. (Key shape has drifted between backend versions - if the jq path misses, inspect `.agent_usage` by hand before calling FAIL.)
 
-### O6. Dashboard shows blended rows (expected behavior, not a bug)
+### O6. Dashboard rows stay plain (expected behavior, not a bug)
 
-Open the dashboard savings chart tooltip. Expect the rows to read `Claude Code / OpenCode` and `Codex / OpenCode` while OpenCode is enabled. Backend rollups attribute by upstream provider only, so OpenCode savings blend into both rows by design until upstream grows an agent dimension. A dedicated OpenCode row appearing is a surprise; blended labels are the pass state.
+Open the dashboard savings chart tooltip. Expect the rows to read plain `Claude Code` and `Codex`. OpenCode savings silently blend into them - backend rollups attribute by upstream provider only, and per-connector rows arrive with upstream #2627 (`by_agent` rollups) plus a wheel bump. A dedicated OpenCode row appearing is a surprise, not a pass.
 
 ### O7. Learn row scans OpenCode sessions
 

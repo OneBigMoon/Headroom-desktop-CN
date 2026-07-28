@@ -554,22 +554,18 @@ async function loadDashboard(): Promise<DashboardState> {
 function SavingsChartTooltip({
   active,
   payload,
-  chartMode,
-  opencodeEnabled
+  chartMode
 }: {
   active?: boolean;
   payload?: ReadonlyArray<{ payload?: SavingsChartDatum }>;
   chartMode: SavingsChartMode;
-  opencodeEnabled?: boolean;
 }) {
   const point = payload?.[0]?.payload;
   if (!active || !point) {
     return null;
   }
 
-  const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? [], {
-    opencodeEnabled
-  });
+  const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
 
   return (
     <div className="savings-chart__tooltip">
@@ -741,15 +737,13 @@ function DailySavingsChart({
   hourlyData,
   resetSignal,
   chartMode,
-  setChartMode,
-  opencodeEnabled
+  setChartMode
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
   resetSignal: number;
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
-  opencodeEnabled?: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -915,7 +909,7 @@ function DailySavingsChart({
               />
               <YAxis hide yAxisId="usd" />
               <YAxis hide yAxisId="tokens" />
-              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} opencodeEnabled={opencodeEnabled} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
+              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
               {chartMode === "usd" && (
                 <>
                   <Bar
@@ -5547,9 +5541,6 @@ export default function App() {
                 resetSignal={chartResetSignal}
                 chartMode={chartMode}
                 setChartMode={setChartMode}
-                opencodeEnabled={connectors.some(
-                  (connector) => connector.clientId === "opencode" && connector.enabled
-                )}
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">

@@ -319,30 +319,4 @@ describe("mergeProviderSavingsForDisplay", () => {
     expect(mergeProviderSavingsForDisplay([])).toEqual([]);
   });
 
-  it("relabels blended rows while opencode is enabled", () => {
-    const merged = mergeProviderSavingsForDisplay(
-      [
-        {
-          provider: "anthropic",
-          estimatedSavingsUsd: 0.1,
-          estimatedTokensSaved: 100,
-          actualCostUsd: 0.24,
-          totalTokensSent: 120
-        },
-        {
-          provider: "openai",
-          estimatedSavingsUsd: 0.04,
-          estimatedTokensSaved: 40,
-          actualCostUsd: 0.16,
-          totalTokensSent: 80
-        }
-      ],
-      { opencodeEnabled: true }
-    );
-
-    expect(merged.map((group) => group.label)).toEqual([
-      "Claude Code / OpenCode",
-      "Codex / OpenCode"
-    ]);
-  });
 });
