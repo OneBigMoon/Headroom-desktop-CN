@@ -1445,6 +1445,13 @@ export default function App() {
 
   const isLastScreen =
     windowLabel === "launcher" && launcherStage === "post_install";
+  // While the post-install screen is still waiting on the first savings,
+  // a blur-hide would dismiss onboarding with no way back to it — the
+  // launcher never reopens. Autohide only arms once savings have landed.
+  const awaitingFirstSavings =
+    dashboard.launchExperience === "first_run" &&
+    dashboard.lifetimeEstimatedTokensSaved <= 0 &&
+    dashboard.lifetimeEstimatedSavingsUsd <= 0;
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;
@@ -2080,7 +2087,7 @@ export default function App() {
 
 
   useEffect(() => {
-    if (!isLastScreen) return;
+    if (!isLastScreen || awaitingFirstSavings) return;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
@@ -2090,7 +2097,7 @@ export default function App() {
         unlisten = fn;
       });
     return () => unlisten?.();
-  }, [isLastScreen]);
+  }, [isLastScreen, awaitingFirstSavings]);
 
   useEffect(() => {
     if (windowLabel !== "main" || !trayWindowFocused) {
@@ -4746,11 +4753,8 @@ export default function App() {
     // so a first-run user who sends a prompt sees this screen flip from
     // "waiting" to their first real savings without any interaction — the
     // payoff moment stays inside onboarding instead of being deferred to a
-    // later session that a third of signups never have.
-    const awaitingFirstSavings =
-      dashboard.launchExperience === "first_run" &&
-      dashboard.lifetimeEstimatedTokensSaved <= 0 &&
-      dashboard.lifetimeEstimatedSavingsUsd <= 0;
+    // later session that a third of signups never have. While waiting,
+    // blur-autohide is disarmed (see awaitingFirstSavings above).
     return (
       <LauncherShell
         shellClassName="intro-shell intro-shell--post-install"
@@ -5494,15 +5498,6 @@ export default function App() {
                 );
               })()}
             </section>
-
-            {dashboard.savingsHistoryLoaded &&
-              dashboard.lifetimeEstimatedTokensSaved <= 0 &&
-              dashboard.lifetimeEstimatedSavingsUsd <= 0 && (
-                <section className="soft-card first-savings-card">
-                  <h2>Get your first savings</h2>
-                  <FirstSavingsChecklist dashboard={dashboard} />
-                </section>
-              )}
 
             <section className="stat-grid stat-grid--2col">
               <article
