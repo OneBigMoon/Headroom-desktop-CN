@@ -1996,12 +1996,16 @@ impl ToolManager {
         loop {
             match child.try_wait().context("waiting for tiktoken prefetch")? {
                 Some(status) if status.success() => return Ok(()),
-                Some(status) => bail!("tiktoken prefetch exited with {status}"),
+                Some(status) => {
+                    let tail = log_tail(&log_path, 1024);
+                    bail!("tiktoken prefetch exited with {status}: {tail}");
+                }
                 None if started.elapsed() >= DEADLINE => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let tail = log_tail(&log_path, 1024);
                     bail!(
-                        "tiktoken prefetch timed out after {}s (stalled vocab download)",
+                        "tiktoken prefetch timed out after {}s (stalled vocab download): {tail}",
                         DEADLINE.as_secs()
                     );
                 }
@@ -5867,6 +5871,23 @@ fn extract_required_pydantic_core_version(log_tail: &str) -> Option<String> {
 /// Child-process logs are opened append-mode on every launch and otherwise
 /// grow unbounded. Rename to `.log.old` (keeping one prior generation, same
 /// scheme as logging.rs) once the file exceeds the cap, before reopening.
+/// Read the last `max_bytes` of a log file, for folding into an error message.
+/// Returns an empty string if the file is missing or unreadable — best-effort
+/// diagnostics, never a hard failure.
+fn log_tail(path: &Path, max_bytes: u64) -> String {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > max_bytes {
+        use std::io::Seek;
+        let _ = f.seek(std::io::SeekFrom::Start(len - max_bytes));
+    }
+    let mut buf = String::new();
+    let _ = f.read_to_string(&mut buf);
+    buf.trim().to_string()
+}
+
 fn rotate_log_if_large(path: &Path) {
     const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
     let too_big = std::fs::metadata(path)
@@ -7205,6 +7226,7 @@ mod tests {
 
     use chrono::Local;
 
+    use super::log_tail;
     use super::rotate_log_if_large;
     use super::{
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
@@ -7959,6 +7981,20 @@ mod tests {
                 .len(),
             5 * 1024 * 1024 + 1
         );
+    }
+
+    #[test]
+    fn log_tail_returns_last_bytes_and_handles_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("t.log");
+
+        assert_eq!(log_tail(&log, 1024), "", "missing file -> empty");
+
+        fs::write(&log, b"  hello  ").expect("write");
+        assert_eq!(log_tail(&log, 1024), "hello", "trims whitespace");
+
+        fs::write(&log, b"0123456789").expect("write");
+        assert_eq!(log_tail(&log, 4), "6789", "seeks to last N bytes");
     }
 
     #[test]
