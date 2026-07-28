@@ -183,7 +183,9 @@ fn note_backend_reachability(reachable: bool, backend_addr: SocketAddr) {
                     downtime.as_secs_f64()
                 );
                 let affected = BACKEND_DOWN_CODEX_RETRY_503S.swap(0, Ordering::AcqRel);
-                if affected > 0 {
+                // Sub-10s outages are routine restart blips (updates, gate
+                // transitions); only report episodes long enough to be felt.
+                if affected > 0 && downtime.as_secs() >= 10 {
                     report_codex_reconnect_incident(
                         "backend_unreachable",
                         affected,

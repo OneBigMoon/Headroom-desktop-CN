@@ -278,7 +278,7 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Token-saving add-ons like RTK are optional: install them from the add-ons list and Headroom wires up the PATH entry and auto-rewrite hook only then.",
+    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom.",
   codex:
     "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom. It also installs a guard hook that warns you inside Codex if routing ever breaks - run /hooks in Codex once to trust it (re-trust after a Headroom update).",
   grok_build:
@@ -4286,8 +4286,7 @@ export default function App() {
                     <code>ANTHROPIC_BASE_URL</code> in your shell profile and{" "}
                     <code>~/.claude/settings.json</code>, and Codex via <code>OPENAI_BASE_URL</code>{" "}
                     and a managed provider block in <code>~/.codex/config.toml</code>. A timestamped
-                    backup is written before any edit. Token-saving add-ons like RTK are optional and
-                    installed separately.
+                    backup is written before any edit.
                   </li>
                 </ul>
               </div>

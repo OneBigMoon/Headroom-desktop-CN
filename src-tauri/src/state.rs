@@ -3222,7 +3222,13 @@ impl AppState {
         // the idle heuristic (no traffic yet), but a restart here takes the
         // backend down for the model-load boot exactly when the user sends
         // their first test prompt. Lazy-load detection covers enablement.
-        if !self.setup_wizard_satisfied() {
+        // Must be the pure completion flag: `setup_wizard_satisfied()` flips
+        // true mid-onboarding via its legacy heuristic (launch_count > 1 +
+        // clients configured) the moment the client-setup step writes configs
+        // — exactly the state during the test step. Legacy installs that
+        // never ran the wizard keep the flag false forever; for them the
+        // restart stays deferred and Kompress enables via lazy-load instead.
+        if !self.setup_wizard_complete() {
             log::info!(
                 "kompress prefetch: onboarding in progress, deferring restart to lazy-load detection"
             );
