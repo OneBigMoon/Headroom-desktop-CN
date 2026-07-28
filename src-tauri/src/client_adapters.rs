@@ -960,6 +960,14 @@ pub fn perform_full_cleanup() -> Vec<String> {
         log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
     }
 
+    // MCP server registrations live in the agents' own configs, outside
+    // Headroom's footprint. uninstall_and_quit unregisters via the Python
+    // helpers first, but that needs a working runtime — strip anything left
+    // that provably launches from Headroom's install dirs (plus the
+    // `headroom` server itself), or every new agent session would spawn a
+    // failing MCP server against the deleted entrypoint.
+    removed.extend(remove_headroom_mcp_entries());
+
     // Also wipe the per-client setup-state file so a reinstall starts clean.
     let setup_state = setup_state_path();
     if setup_state.exists() {
@@ -982,6 +990,24 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
+    // Kompress model snapshot pulled into the shared HuggingFace hub cache by
+    // prefetch_kompress_model. Remove only our model's dirs (data + download
+    // locks), never the cache itself — other apps share it.
+    let hf_hub = home_dir().join(".cache").join("huggingface").join("hub");
+    for dir in [
+        hf_hub.join(crate::tool_manager::KOMPRESS_HF_MODEL_DIR),
+        hf_hub
+            .join(".locks")
+            .join(crate::tool_manager::KOMPRESS_HF_MODEL_DIR),
+    ] {
+        if dir.exists() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(_) => removed.push(dir.display().to_string()),
+                Err(err) => log::warn!("cleanup: removing {} failed: {err}", dir.display()),
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         removed.extend(remove_macos_launch_agents());
@@ -999,6 +1025,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     // ~/.codex, ~/Library/Application Support/Code/User, and the user's
     // shell rc directory after uninstall.
     let mut backup_targets: Vec<PathBuf> = claude_settings_candidates();
+    backup_targets.push(home_dir().join(".claude.json"));
     backup_targets.push(headroom_rtk_hook_path());
     backup_targets.push(headroom_markitdown_hook_path());
     backup_targets.push(claude_guard_hook_path());
@@ -1057,6 +1084,233 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
             Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
+    removed
+}
+
+/// True when an MCP server command launches from inside Headroom's install
+/// footprint (the app-support dir or `~/.headroom`). Uninstall deletes both,
+/// so a surviving entry could only ever spawn a failing server.
+fn mcp_command_in_headroom_footprint(command: &str) -> bool {
+    let app_dir = format!("{}/", app_data_dir().display());
+    let dot_headroom = format!("{}/", home_dir().join(".headroom").display());
+    command.starts_with(&app_dir) || command.starts_with(&dot_headroom)
+}
+
+/// Headroom-owned MCP entry: the `headroom` server itself (desktop owns that
+/// name — install always writes it with --force), or any entry whose command
+/// resolves into Headroom's install footprint (serena, codebase-memory).
+/// `command` is a string in Claude's config and an array in OpenCode's.
+fn mcp_json_entry_is_headroom(name: &str, entry: &Value) -> bool {
+    if name == "headroom" {
+        return true;
+    }
+    let command = match entry.get("command") {
+        Some(Value::String(command)) => Some(command.as_str()),
+        Some(Value::Array(items)) => items.first().and_then(Value::as_str),
+        _ => None,
+    };
+    command.is_some_and(mcp_command_in_headroom_footprint)
+}
+
+/// Drop Headroom-owned entries from a `mcpServers`/`mcp` JSON map in place.
+/// Returns whether anything was removed.
+fn remove_headroom_mcp_json_entries(servers: &mut serde_json::Map<String, Value>) -> bool {
+    let owned: Vec<String> = servers
+        .iter()
+        .filter(|(name, entry)| mcp_json_entry_is_headroom(name, entry))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in &owned {
+        servers.remove(name);
+    }
+    !owned.is_empty()
+}
+
+/// Strip Headroom-owned MCP servers from `mcpServers` in `~/.claude.json`.
+/// Parse failure ⇒ skip: the file holds OAuth state and per-project settings,
+/// so it must never be rewritten from a state we couldn't fully read.
+fn strip_headroom_mcp_from_claude_json() -> Option<String> {
+    let path = home_dir().join(".claude.json");
+    if !path.exists() {
+        return None;
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            log::warn!("cleanup: reading {} failed: {err}", path.display());
+            return None;
+        }
+    };
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let mut root: Value = match serde_json::from_str(&raw) {
+        Ok(root) => root,
+        Err(err) => {
+            log::warn!(
+                "cleanup: parsing {} failed; leaving it untouched: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let servers = root.get_mut("mcpServers")?.as_object_mut()?;
+    if !remove_headroom_mcp_json_entries(servers) {
+        return None;
+    }
+    let bytes = serde_json::to_vec_pretty(&root).ok()?;
+    if let Err(err) = backup_if_exists(&path) {
+        log::warn!("cleanup: backing up {} failed: {err}", path.display());
+    }
+    match atomic_write(&path, &bytes) {
+        Ok(()) => Some(path.display().to_string()),
+        Err(err) => {
+            log::warn!("cleanup: writing {} failed: {err}", path.display());
+            None
+        }
+    }
+}
+
+/// Strip Headroom-owned MCP servers from OpenCode's top-level `mcp` table.
+/// Same parse-failure contract as the Claude variant.
+fn strip_headroom_mcp_from_opencode() -> Option<String> {
+    let path = opencode_config_path();
+    if !path.exists() {
+        return None;
+    }
+    let mut config =
+        match read_opencode_config(&path).or_else(|_| read_opencode_config_lenient(&path)) {
+            Ok(config) => config,
+            Err(err) => {
+                log::warn!(
+                    "cleanup: parsing {} failed; leaving it untouched: {err}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+    let servers = config.get_mut("mcp")?.as_object_mut()?;
+    if !remove_headroom_mcp_json_entries(servers) {
+        return None;
+    }
+    if let Err(err) = backup_if_exists(&path) {
+        log::warn!("cleanup: backing up {} failed: {err}", path.display());
+    }
+    match write_opencode_config(&path, &config) {
+        Ok(()) => Some(path.display().to_string()),
+        Err(err) => {
+            log::warn!("cleanup: writing {} failed: {err}", path.display());
+            None
+        }
+    }
+}
+
+/// Pure-text removal of Headroom-owned `[mcp_servers.*]` tables (including
+/// subtables) and the Python registrar's
+/// `# --- [end ]Headroom MCP server[: name] ---` marker comments from a
+/// Codex-style TOML config. A table is ours when its name is `headroom` or
+/// its `command` launches from Headroom's install footprint; user-managed
+/// servers stay untouched.
+fn strip_headroom_mcp_toml(content: &str) -> String {
+    fn mcp_table_name(line: &str) -> Option<&str> {
+        let inner = line
+            .trim()
+            .strip_prefix("[mcp_servers.")?
+            .strip_suffix(']')?;
+        Some(inner.split('.').next().unwrap_or(inner))
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Pass 1: which server names are Headroom-owned.
+    let mut owned: BTreeSet<String> = BTreeSet::new();
+    let mut current: Option<&str> = None;
+    for line in &lines {
+        if line.trim().starts_with('[') {
+            current = mcp_table_name(line);
+        }
+        let Some(name) = current else { continue };
+        if name == "headroom" {
+            owned.insert(name.to_string());
+        } else if line
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "command")
+            && toml_line_value(line)
+                .as_deref()
+                .is_some_and(mcp_command_in_headroom_footprint)
+        {
+            owned.insert(name.to_string());
+        }
+    }
+
+    // Pass 2: rebuild without owned spans and marker comments. A span runs
+    // from its `[mcp_servers.<name>]`/`[...<name>.<sub>]` header to the next
+    // table header of any other name.
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut dropping = false;
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("# --- Headroom MCP server")
+            || trimmed.starts_with("# --- end Headroom MCP server")
+        {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            dropping = matches!(mcp_table_name(line), Some(name) if owned.contains(name));
+        }
+        if !dropping {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
+/// Strip Headroom-owned MCP tables from a Codex/Grok `config.toml`. Returns
+/// the path when the file changed.
+fn strip_headroom_mcp_from_toml_file(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(err) => {
+            log::warn!("cleanup: reading {} failed: {err}", path.display());
+            return None;
+        }
+    };
+    let stripped = strip_headroom_mcp_toml(&existing);
+    let normalized = {
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        }
+    };
+    if normalized == existing {
+        return None;
+    }
+    if let Err(err) = backup_if_exists(path) {
+        log::warn!("cleanup: backing up {} failed: {err}", path.display());
+    }
+    match atomic_write(path, normalized.as_bytes()) {
+        Ok(()) => Some(path.display().to_string()),
+        Err(err) => {
+            log::warn!("cleanup: writing {} failed: {err}", path.display());
+            None
+        }
+    }
+}
+
+/// Strip Headroom-registered MCP servers from every client config. Runs even
+/// when the Python unregister helpers in uninstall_and_quit already succeeded
+/// (then it's a no-op) so a broken runtime can't leave dead entries behind.
+fn remove_headroom_mcp_entries() -> Vec<String> {
+    let mut removed = Vec::new();
+    removed.extend(strip_headroom_mcp_from_claude_json());
+    removed.extend(strip_headroom_mcp_from_toml_file(&codex_config_toml_path()));
+    removed.extend(strip_headroom_mcp_from_toml_file(&grok_config_toml_path()));
+    removed.extend(strip_headroom_mcp_from_opencode());
     removed
 }
 
@@ -5280,6 +5534,71 @@ mod tests {
         ClientSetupState, ShellFamily,
     };
     use rusqlite::Connection;
+
+    #[test]
+    fn strip_headroom_mcp_toml_removes_owned_tables_keeps_user_tables() {
+        let app_dir = crate::storage::app_data_dir().display().to_string();
+        let content = format!(
+            "model = \"gpt-5\"\n\
+             \n\
+             # --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"{app_dir}/runtime/venv/bin/headroom\"\n\
+             args = [\"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n\
+             # --- end Headroom MCP server ---\n\
+             # --- Headroom MCP server: serena ---\n\
+             [mcp_servers.serena]\n\
+             command = \"{app_dir}/serena-venv/bin/serena\"\n\
+             \n\
+             [mcp_servers.context7]\n\
+             command = \"npx\"\n\
+             \n\
+             [mcp_servers.node_repl]\n\
+             command = \"/Applications/ChatGPT.app/bin/node_repl\"\n"
+        );
+        let stripped = super::strip_headroom_mcp_toml(&content);
+        assert!(!stripped.contains("mcp_servers.headroom"));
+        assert!(!stripped.contains("serena"));
+        assert!(!stripped.contains("Headroom MCP server"));
+        assert!(stripped.contains("[mcp_servers.context7]"));
+        assert!(stripped.contains("command = \"npx\""));
+        assert!(stripped.contains("[mcp_servers.node_repl]"));
+        assert!(stripped.contains("model = \"gpt-5\""));
+    }
+
+    #[test]
+    fn strip_headroom_mcp_toml_is_noop_without_headroom_entries() {
+        let content = "[mcp_servers.node_repl]\ncommand = \"/usr/local/bin/node_repl\"\n";
+        assert_eq!(
+            super::strip_headroom_mcp_toml(content),
+            content.trim_end_matches('\n')
+        );
+    }
+
+    #[test]
+    fn remove_headroom_mcp_json_entries_removes_by_name_and_footprint() {
+        let app_dir = crate::storage::app_data_dir().display().to_string();
+        let mut servers = json!({
+            "headroom": { "command": "python3", "args": ["mcp", "serve"] },
+            "serena": { "command": format!("{app_dir}/serena-venv/bin/serena") },
+            "codebase-memory": { "command": [format!("{app_dir}/runtime/bin/codebase-memory-mcp")] },
+            "context7": { "command": "npx" },
+        });
+        let map = servers.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("headroom").is_none());
+        assert!(map.get("serena").is_none());
+        assert!(map.get("codebase-memory").is_none());
+        assert!(map.get("context7").is_some());
+
+        let mut untouched = json!({ "context7": { "command": "npx" } });
+        assert!(!super::remove_headroom_mcp_json_entries(
+            untouched.as_object_mut().unwrap()
+        ));
+    }
 
     #[test]
     fn is_permission_denied_matches_only_permission_errors() {
