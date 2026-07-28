@@ -492,7 +492,7 @@ function FirstSavingsChecklist({
           <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
           <div>
             <strong>First savings recorded</strong>
-            <p>Use your AI coding agent as normal to see your first savings come in or paste the starter prompt below.</p>
+            <p>Use your AI coding agent as normal to see or paste the starter prompt below.</p>
           </div>
         </li>
       </ol>
