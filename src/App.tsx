@@ -438,7 +438,7 @@ const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
 // is a real drop-off cause between "agent connected" and "first prompt sent",
 // so hand the user something they can paste that works in any repo.
 const STARTER_PROMPT =
-  "Explain what this project does and point out one thing worth improving.";
+  "Read this project's main source file and its README in full, then explain what it does and one thing worth improving.";
 
 // Live first-savings checklist. Rendered on the launcher's post-install stage
 // AND as a Home card in the tray window: the launcher hides on click-away and
@@ -492,7 +492,7 @@ function FirstSavingsChecklist({
           <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
           <div>
             <strong>First savings recorded</strong>
-            <p>Use your AI coding agent as normal to see or paste the starter prompt below.</p>
+            <p>Use your AI coding agent as normal or paste the starter prompt below.</p>
           </div>
         </li>
       </ol>
@@ -1281,7 +1281,9 @@ export default function App() {
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
-  const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
+  const [proxyVerificationHint, setProxyVerificationHint] = useState<
+    { text: string; tone: "info" | "error" } | null
+  >(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
@@ -1986,21 +1988,22 @@ export default function App() {
           }
 
           if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
-            // First launch synchronously downloads the compression/embedder
-            // models before the backend binds, so `proxyReachable` is false for
-            // a minute or more on a perfectly healthy install. Don't tell the
-            // user to "start the runtime" — it's already coming up.
-            const bootingFirstTime =
-              !interceptOnlyVerify &&
-              runtime?.installed === true &&
-              runtime?.running !== true &&
-              !runtime?.startupError;
+            // On this screen the runtime is always app-managed and coming up
+            // (the pre-install case routes through interceptOnlyVerify). First
+            // launch synchronously downloads the compression/embedder models
+            // before the backend binds, so `proxyReachable` is false for a
+            // minute or more on a perfectly healthy install. Keep it calm and
+            // informational — only a hard startup fault is a real error.
+            const startupError = interceptOnlyVerify ? null : runtime?.startupError;
             setProxyVerificationHint(
               interceptOnlyVerify
-                ? "Waiting for setup traffic. Send a test message from your coding tool."
-                : bootingFirstTime
-                ? "Headroom is starting up. First launch downloads models, which can take a minute."
-                : "Headroom proxy is not reachable yet. Start Headroom runtime, then send a test message."
+                ? { text: "Waiting for setup traffic. Send a test message from your coding tool.", tone: "info" }
+                : startupError
+                ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
+                : {
+                    text: "Finishing setup - first launch downloads models and can take a minute.",
+                    tone: "info"
+                  }
             );
             return;
           }
@@ -2034,7 +2037,7 @@ export default function App() {
           );
         } catch {
           if (active) {
-            setProxyVerificationHint("Waiting for Headroom proxy activity...");
+            setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
           }
         }
       })();
@@ -4601,7 +4604,15 @@ export default function App() {
             </p>
           )}
           {proxyVerificationHint ? (
-            <p className="install-progress__error">{proxyVerificationHint}</p>
+            <p
+              className={
+                proxyVerificationHint.tone === "error"
+                  ? "install-progress__error"
+                  : "launcher-restart-hint"
+              }
+            >
+              {proxyVerificationHint.text}
+            </p>
           ) : null}
         </div>
         <div className="post-install__actions">
