@@ -479,6 +479,25 @@ select {
   width: auto;
 }
 
+.intro-shell__agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+
+.intro-shell__agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 .intro-shell__checklist {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

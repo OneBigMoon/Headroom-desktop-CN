@@ -4190,9 +4190,22 @@ export default function App() {
         showSpinner={bootstrapping}
       >
         <h1>
-          Headroom cuts Claude Code, Codex &amp; friends&apos; costs
+          Headroom cuts AI coding agents&apos; costs
            ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
         </h1>
+        <div className="intro-shell__agents" aria-label="Supported coding agents">
+          {[
+            ["claude_code", "Claude Code"],
+            ["codex", "Codex"],
+            ["grok_build", "Grok Build"],
+            ["opencode", "OpenCode"]
+          ].map(([clientId, label]) => (
+            <span className="intro-shell__agent" key={clientId}>
+              <ConnectorIcon clientId={clientId} size={14} />
+              {label}
+            </span>
+          ))}
+        </div>
         <div className="intro-shell__checklist">
           <article>
             <strong>Privacy first</strong>
@@ -5427,7 +5440,7 @@ export default function App() {
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
-                  <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>
+                  <p className="callout-banner__subtitle">Now use your AI coding agents as normal, and check back later to see how much Headroom is saving you.</p>
                 )}
                 {(calloutBanner.tone === "auto-paused" || calloutBanner.tone === "paused") && (
                   <div className="callout-banner__resume">
