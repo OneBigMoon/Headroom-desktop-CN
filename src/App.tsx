@@ -444,8 +444,23 @@ const STARTER_PROMPT =
 // AND as a Home card in the tray window: the launcher hides on click-away and
 // the menu bar icon reopens the tray window, so without the Home card there
 // is no way back to the checklist once it's been dismissed.
-function FirstSavingsChecklist({ dashboard }: { dashboard: DashboardState }) {
+function FirstSavingsChecklist({
+  dashboard,
+  onReopenSetup
+}: {
+  dashboard: DashboardState;
+  onReopenSetup: () => void;
+}) {
   const [copied, setCopied] = useState(false);
+  // A step stuck gray usually means traffic isn't reaching Headroom, not that
+  // the user hasn't acted yet. Offer a setup re-check, but only after a grace
+  // window: proxyReachable is false for ~1min on a healthy install while the
+  // backend binds, so an immediate prompt would nag on good installs.
+  const [showTroubleshoot, setShowTroubleshoot] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setShowTroubleshoot(true), 20000);
+    return () => window.clearTimeout(timer);
+  }, []);
   return (
     <div className="post-install__checklist">
       <ol className="post-install__steps">
@@ -477,11 +492,12 @@ function FirstSavingsChecklist({ dashboard }: { dashboard: DashboardState }) {
           <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
           <div>
             <strong>First savings recorded</strong>
-            <p>Builds as you work — a short test prompt saves little, a real coding session shows up fast.</p>
+            <p>Use your AI coding agent as normal to see your first savings come in or paste the starter prompt below.</p>
           </div>
         </li>
       </ol>
-      {!dashboard.firstPromptRequestSeen && (
+      {dashboard.lifetimeEstimatedTokensSaved <= 0 &&
+        dashboard.lifetimeEstimatedSavingsUsd <= 0 && (
         <div className="post-install__starter">
           <code>{STARTER_PROMPT}</code>
           <button
@@ -497,6 +513,15 @@ function FirstSavingsChecklist({ dashboard }: { dashboard: DashboardState }) {
             {copied ? "Copied" : "Copy prompt"}
           </button>
         </div>
+      )}
+      {showTroubleshoot && (
+        <button
+          type="button"
+          className="post-install__troubleshoot"
+          onClick={onReopenSetup}
+        >
+          Not turning green? Re-check setup.
+        </button>
       )}
     </div>
   );
@@ -4547,7 +4572,7 @@ export default function App() {
         <div className="post-install__lead">
           <h1>Test your setup</h1>
           <p>
-            Send a message in each connected tool to verify the connection is working. You may need to restart it first.
+            Send "Say hi" in each connected tool to verify the connection is working. You may need to restart it first.
           </p>
           {hasEnabledApps ? (
             <div className="connector-list">
@@ -4770,7 +4795,10 @@ export default function App() {
             in the background
           </h1>
           {awaitingFirstSavings ? (
-            <FirstSavingsChecklist dashboard={dashboard} />
+            <FirstSavingsChecklist
+              dashboard={dashboard}
+              onReopenSetup={() => setLauncherStage("client_setup")}
+            />
           ) : (
             <>
               <p>

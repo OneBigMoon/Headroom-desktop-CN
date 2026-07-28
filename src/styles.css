@@ -445,6 +445,21 @@ select {
   margin-top: 10px;
 }
 
+.post-install__troubleshoot {
+  margin-top: 14px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.post-install__troubleshoot:hover {
+  color: var(--accent);
+}
+
 .post-install__actions p {
   margin: 12px 0 0;
   font-size: var(--text-sm);
