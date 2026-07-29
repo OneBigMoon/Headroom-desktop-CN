@@ -278,6 +278,13 @@ impl<R> CodexTerminalReader<R> {
             b"response.completed",
             b"response.failed",
             b"response.incomplete",
+            // The backend synthesizes `event: error` and closes when the
+            // upstream connection drops mid-stream (streaming.py connection-
+            // error path) after the 200 status line already went out. That is
+            // a terminal signal the client acts on, not a silent truncation —
+            // without it this reader false-fired RUST-5N on error-terminated
+            // streams.
+            b"event: error",
         ];
         const TAIL_BYTES: usize = 32;
 
@@ -3039,6 +3046,13 @@ mod tests {
         let mut missing = CodexTerminalReader::new(tokio::io::empty());
         missing.observe(b"data: {\"type\":\"response.output_text.delta\"}\n\n");
         assert!(!missing.saw_terminal());
+
+        // A mid-stream `event: error` frame is a terminal signal (RUST-5N).
+        let mut errored = CodexTerminalReader::new(tokio::io::empty());
+        errored.observe(b"data: {\"type\":\"response.output_text.delta\"}\n\n");
+        assert!(!errored.saw_terminal());
+        errored.observe(b"event: error\ndata: {\"type\":\"error\"}\n\n");
+        assert!(errored.saw_terminal());
     }
 
     #[test]

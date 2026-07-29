@@ -240,10 +240,14 @@ const SPEND_SCHEMA_CUTOFF_DATE: &str = "2026-04-13";
 // keeps savings-with-zero-spend forever, and since ZERO_SPEND_ALERT_FIRED is
 // per-process, alerting on the whole history re-fired the same June days on
 // every app launch (Sentry RUST-3S/3V, 125 events). Only a recent day can be
-// a live pipeline anomaly worth an alert.
+// a live pipeline anomaly worth an alert. `max_date_exclusive` (exclusive)
+// then drops the still-accumulating live day, whose cost/token counters lag
+// its savings accumulator (Sentry RUST-4S) -- see the caller for how that
+// boundary is chosen across the UTC/local day-key split.
 fn zero_spend_affected_days<'a>(
     daily_savings: &'a [DailySavingsPoint],
     min_date: &str,
+    max_date_exclusive: &str,
 ) -> Vec<&'a str> {
     // Only meaningful when the proxy actually reports spend. `total_tokens_sent`
     // and `actual_cost_usd` come from Option fields on /stats; a proxy build
@@ -265,6 +269,7 @@ fn zero_spend_affected_days<'a>(
         .filter(|p| {
             p.date.as_str() >= SPEND_SCHEMA_CUTOFF_DATE
                 && p.date.as_str() >= min_date
+                && p.date.as_str() < max_date_exclusive
                 && p.estimated_savings_usd > 0.000_001
                 && p.actual_cost_usd == 0.0
                 && p.total_tokens_sent == 0
@@ -303,12 +308,25 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {
         return;
     }
-    // Yesterday-or-later: a zero-spend day can only be acted on while the
-    // pipeline that produced it is still the running one.
-    let min_date = (chrono::Local::now().date_naive() - chrono::Days::new(1))
+    // Alert only on the most recent *settled* day. The live day's rollup is
+    // mid-accumulation: the backend's cost/token counters flush a beat after
+    // its savings accumulator, so today can show savings with zero spend past
+    // the persist window during an idle stretch -- the RUST-4S false positive,
+    // not a pipeline bug. A day is still live if it equals "today" in *either*
+    // keying: backend daily rollups are UTC-day keyed, the local tracker's
+    // buckets are local-day keyed, and merge_daily_savings folds both into one
+    // date-keyed series. Take the earlier "today" as the settled boundary
+    // (exclusive) so neither live bucket is scanned, and the day before it as
+    // the lower bound so immutable history can't re-fire on launch (RUST-3S/3V).
+    let settled_boundary = chrono::Local::now()
+        .date_naive()
+        .min(chrono::Utc::now().date_naive());
+    let max_date_exclusive = settled_boundary.format("%Y-%m-%d").to_string();
+    let min_date = (settled_boundary - chrono::Days::new(1))
         .format("%Y-%m-%d")
         .to_string();
-    let affected_days = zero_spend_affected_days(&dashboard.daily_savings, &min_date);
+    let affected_days =
+        zero_spend_affected_days(&dashboard.daily_savings, &min_date, &max_date_exclusive);
     if !persistent_zero_spend(
         &mut ZERO_SPEND_FIRST_SEEN.lock(),
         &affected_days,
@@ -6059,7 +6077,7 @@ mod tests {
         // dollar figure (those tokens never reach a model request), so a day with
         // token savings but zero compression-USD is not an anomaly.
         let days = vec![daily_point("2026-06-16", 0.0, 5_000, 0.0, 0)];
-        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01", "2099-01-01").is_empty());
     }
 
     #[test]
@@ -6071,7 +6089,7 @@ mod tests {
             daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
         ];
         assert_eq!(
-            zero_spend_affected_days(&days, "2026-01-01"),
+            zero_spend_affected_days(&days, "2026-01-01", "2099-01-01"),
             vec!["2026-06-16"]
         );
     }
@@ -6084,13 +6102,13 @@ mod tests {
             daily_point("2026-06-15", 0.20, 9_000, 0.0, 0),
             daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
         ];
-        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01", "2099-01-01").is_empty());
     }
 
     #[test]
     fn zero_spend_ignores_compression_days_that_recorded_spend() {
         let days = vec![daily_point("2026-06-16", 0.12, 5_000, 0.34, 8_000)];
-        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01", "2099-01-01").is_empty());
     }
 
     #[test]
@@ -6101,7 +6119,7 @@ mod tests {
             daily_point("2026-06-16", 0.20, 9_000, 0.50, 12_000),
             daily_point("2026-04-12", 0.12, 5_000, 0.0, 0),
         ];
-        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01", "2099-01-01").is_empty());
     }
 
     #[test]
@@ -6115,8 +6133,26 @@ mod tests {
             daily_point("2026-07-03", 0.08, 2_000, 0.0, 0),
         ];
         assert_eq!(
-            zero_spend_affected_days(&days, "2026-07-02"),
+            zero_spend_affected_days(&days, "2026-07-02", "2099-01-01"),
             vec!["2026-07-03"]
+        );
+    }
+
+    #[test]
+    fn zero_spend_ignores_the_live_day() {
+        // RUST-4S: the current day's rollup is mid-accumulation (cost/token
+        // counters lag the savings accumulator), so its savings-with-zero-spend
+        // is not an anomaly. Only the most recent *settled* day (< the boundary)
+        // may flag; a desynced live day at/after the boundary is excluded.
+        let days = vec![
+            daily_point("2026-07-13", 0.20, 9_000, 0.50, 12_000),
+            daily_point("2026-07-14", 0.12, 5_000, 0.0, 0),
+            daily_point("2026-07-15", 0.08, 2_000, 0.0, 0),
+        ];
+        // Boundary = 2026-07-15 (today): 07-14 settled and flags, 07-15 excluded.
+        assert_eq!(
+            zero_spend_affected_days(&days, "2026-07-14", "2026-07-15"),
+            vec!["2026-07-14"]
         );
     }
 
