@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   describeInvokeError,
   forgoneSavingsLabel,
-  getIntroStepPricing,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
@@ -215,21 +214,6 @@ describe("app helpers", () => {
       expect(introSaleBadgeLabel(null)).toBeNull();
     });
 
-    it("prices the intro steps off the period sticker price", () => {
-      expect(getIntroStepPricing("max5x", "monthly", intro)).toEqual({
-        introLabel: "First 6 months",
-        intro: "$15",
-        after: "$30",
-      });
-      expect(getIntroStepPricing("max5x", "annual", intro)).toEqual({
-        introLabel: "First 6 months",
-        intro: "$10",
-        after: "$20",
-      });
-      expect(getIntroStepPricing("team", "monthly", intro)).toBeNull();
-      expect(getIntroStepPricing("max5x", "monthly", null)).toBeNull();
-    });
-
     it("drives discounted monthly prices from the intro offer", () => {
       const result = getUpgradePlans(
         "individual", "free", undefined, undefined, undefined, false, "monthly",
@@ -266,7 +250,7 @@ describe("app helpers", () => {
       );
 
       expect(result.plans.find((p) => p.id === "max5x")?.billingLines).toEqual([
-        "per month for your first 6 months",
+        "USD / month",
         "then $20/mo · billed annually",
       ]);
     });

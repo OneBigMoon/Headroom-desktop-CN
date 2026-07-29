@@ -84,26 +84,6 @@ export function introSaleBadgeLabel(introOffer: IntroOffer | null | undefined): 
   return `${pct}% off first ${introOffer.durationMonths} months`;
 }
 
-/// Intro-offer step prices for the plan matched to the user's Claude/Codex
-/// tier: the discounted intro rate and the list rate it reverts to. Returns
-/// null for plans without a fixed price (free / team / enterprise) or when
-/// the offer is off, so the promo panel can simply not render.
-export function getIntroStepPricing(
-  planId: UpgradePlanId,
-  billingPeriod: BillingPeriod,
-  introOffer: IntroOffer | null | undefined
-): { introLabel: string; intro: string; after: string } | null {
-  if (planId !== "pro" && planId !== "max5x" && planId !== "max20x") return null;
-  const pct = introPercentOff(introOffer);
-  if (pct <= 0 || !introOffer) return null;
-  const prices = PLAN_PRICES[planId][billingPeriod];
-  return {
-    introLabel: `First ${introOffer.durationMonths} months`,
-    intro: discountedPriceLabel(prices.fullCents, pct),
-    after: prices.full,
-  };
-}
-
 /// Average daily savings over the trailing `days` window (default 7), used to
 /// project realized/forgone savings for upgrade copy. Returns 0 with no history.
 export function recentDailySavingsUsd(daily: DailySavingsPoint[], days = 7): number {
@@ -369,10 +349,7 @@ export function getUpgradePlans(
         // can't be misread as the full-year rate.
         billingLines:
           showDiscount && introPct > 0 && introOffer
-            ? [
-                `per month for your first ${introOffer.durationMonths} months`,
-                `then ${prices.full}/mo · ${billingLabel}`,
-              ]
+            ? ["USD / month", `then ${prices.full}/mo · ${billingLabel}`]
             : ["USD / month", billingLabel],
         featureIntro,
         features,

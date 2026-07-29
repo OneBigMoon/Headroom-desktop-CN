@@ -66,8 +66,6 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   type UpgradePlan,
-  getIntroStepPricing,
-  introPercentOff,
   introSaleBadgeLabel,
   isTierDowngrade,
   forgoneSavingsLabel,
@@ -5169,7 +5167,9 @@ export default function App() {
       }
     }
 
-    return upgradePlansState.plans.slice(0, 2);
+    // Lead with the plan matched to the user's Claude/ChatGPT tier; the
+    // "show more plans" button reveals the rest.
+    return upgradePlansState.plans.slice(0, 1);
   })();
   const hasHiddenUpgradePlans = visibleUpgradePlans.length < upgradePlansState.plans.length;
   const pendingUpgradePlanLabel = upgradePlanIntentLabel(pendingUpgradePlanId);
@@ -6250,49 +6250,6 @@ export default function App() {
                 ) : null}
               </section>
 
-              {pricingStatus?.introOffer?.active
-                ? (() => {
-                    const intro = pricingStatus.introOffer;
-                    const stepPricing = getIntroStepPricing(
-                      upgradePlansState.featuredPlanId,
-                      billingPeriod,
-                      intro
-                    );
-                    return (
-                      <section className="founder-promo" aria-label="Intro offer">
-                        <div className="founder-promo__main">
-                          <p className="founder-promo__intro">
-                            <span className="founder-promo__live" aria-hidden="true" />
-                            Intro offer: {intro.percentOff}% off your first {intro.durationMonths}{" "}
-                            months, on every plan.
-                          </p>
-                        </div>
-                        <div className="founder-promo__offer">
-                          <div className="founder-promo__steps">
-                            <div className="founder-promo__step founder-promo__step--now">
-                              <span className="founder-promo__step-tag">
-                                {stepPricing?.introLabel ?? "Intro"}
-                              </span>
-                              <span className="founder-promo__step-pct">
-                                {introPercentOff(intro)}% OFF
-                              </span>
-                              {stepPricing ? (
-                                <span className="founder-promo__step-price">{stepPricing.intro} / month</span>
-                              ) : null}
-                            </div>
-                            <div className="founder-promo__step founder-promo__step--next">
-                              <span className="founder-promo__step-tag">Then</span>
-                              <span className="founder-promo__step-pct">Full price</span>
-                              {stepPricing ? (
-                                <span className="founder-promo__step-price">{stepPricing.after} / month</span>
-                              ) : null}
-                            </div>
-                          </div>
-                        </div>
-                      </section>
-                    );
-                  })()
-                : null}
             </>
           ) : null}
 
