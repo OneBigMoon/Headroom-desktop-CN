@@ -957,6 +957,13 @@ impl AppState {
         *self.runtime_upgrade_in_progress.lock() = true;
         self.invalidate_runtime_status_cache();
 
+        // We're about to stop the old backend and spawn a fresh one. Suppress
+        // Codex reconnect warnings across the whole reinstall+boot so the
+        // self-inflicted down->up transition isn't paged as `backend_unreachable`.
+        crate::proxy_intercept::suppress_codex_reconnect_reports_for(
+            std::time::Duration::from_secs(600),
+        );
+
         // Clear the flag on EVERY exit, including a panic anywhere in the
         // ~500-line body below. This runs on a bare spawned thread with no
         // catch_unwind and parking_lot mutexes don't poison, so without this

@@ -130,6 +130,30 @@ static CODEX_GLOBAL_BYPASS_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
 
+/// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
+/// runtime lifecycle when it *intentionally* stops+restarts the backend (an
+/// upgrade / requirements repair). A down window we caused ourselves is not an
+/// outage worth paging: the old backend is killed, the wheel reinstalled, then
+/// a fresh one spawned, and the down->up transition would otherwise fire a
+/// false `backend_unreachable`. Every observed instance of this warning came
+/// from a single rc-churn test box cycling release candidates.
+static SUPPRESS_RECONNECT_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Silence Codex reconnect warnings for `window` from now. Called around an
+/// app-initiated backend restart so the ensuing reconnect isn't misreported as
+/// an outage. `fetch_max` so overlapping restarts never shorten the window.
+// ponytail: fixed window (caller passes a generous ceiling covering
+// reinstall+boot); if upgrades ever routinely exceed it, gate on the live
+// `runtime_upgrade_in_progress` flag instead.
+pub fn suppress_codex_reconnect_reports_for(window: Duration) {
+    let until = now_epoch_secs().saturating_add(window.as_secs());
+    SUPPRESS_RECONNECT_UNTIL.fetch_max(until, Ordering::Relaxed);
+}
+
+fn codex_reconnect_reports_suppressed() -> bool {
+    now_epoch_secs() < SUPPRESS_RECONNECT_UNTIL.load(Ordering::Relaxed)
+}
+
 fn should_report_throttled(slot: &AtomicU64) -> bool {
     let now = now_epoch_secs();
     let mut last = slot.load(Ordering::Relaxed);
@@ -149,6 +173,9 @@ fn report_codex_reconnect_incident(
     affected_requests: u64,
     downtime: Option<Duration>,
 ) {
+    if codex_reconnect_reports_suppressed() {
+        return;
+    }
     sentry::with_scope(
         |scope| {
             scope.set_tag("codex_reconnect_cause", cause);
@@ -2361,6 +2388,17 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    #[serial]
+    fn codex_reconnect_reports_suppress_within_window() {
+        use std::sync::atomic::Ordering;
+        super::SUPPRESS_RECONNECT_UNTIL.store(0, Ordering::Release);
+        assert!(!super::codex_reconnect_reports_suppressed());
+        super::suppress_codex_reconnect_reports_for(Duration::from_secs(3600));
+        assert!(super::codex_reconnect_reports_suppressed());
+        super::SUPPRESS_RECONNECT_UNTIL.store(0, Ordering::Release);
+    }
 
     #[test]
     #[serial]
