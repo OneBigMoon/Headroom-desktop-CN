@@ -67,7 +67,7 @@ import {
   getUpgradePlans,
   type UpgradePlan,
   getIntroStepPricing,
-  introEffectivePercentOff,
+  introPercentOff,
   introSaleBadgeLabel,
   isTierDowngrade,
   forgoneSavingsLabel,
@@ -4733,7 +4733,7 @@ export default function App() {
                         {plan.originalPrice}
                       </s>
                       <span className="upgrade-plan-card__sale-badge">
-                        {introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
+                        {introSaleBadgeLabel(pricingStatus?.introOffer) ??
                           `${(pricingStatus?.activePercentOff ?? 0) || 50}% off`}
                       </span>
                     </span>
@@ -6274,7 +6274,7 @@ export default function App() {
                                 {stepPricing?.introLabel ?? "Intro"}
                               </span>
                               <span className="founder-promo__step-pct">
-                                {introEffectivePercentOff(intro, billingPeriod)}% OFF
+                                {introPercentOff(intro)}% OFF
                               </span>
                               {stepPricing ? (
                                 <span className="founder-promo__step-price">{stepPricing.intro} / month</span>
@@ -6340,7 +6340,7 @@ export default function App() {
                             <div className="upgrade-plan-card__sale-row">
                               <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
                               <span className="upgrade-plan-card__sale-badge">
-                                {introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
+                                {introSaleBadgeLabel(pricingStatus?.introOffer) ??
                                   `${pricingStatus?.activePercentOff ?? 50}% off`}
                               </span>
                             </div>
@@ -6427,6 +6427,27 @@ export default function App() {
                       >
                         {plan.ctaLabel}
                       </button>
+                    ) : isActivePlan ? (
+                      <div className="upgrade-plan-card__action-stack">
+                        <button
+                          className={buttonClassName}
+                          disabled={plan.disabled || upgradeActionBusy === plan.id}
+                          onClick={() => void handleUpgradeAction(plan.id)}
+                          type="button"
+                        >
+                          {upgradeActionBusy === plan.id ? "Opening..." : plan.ctaLabel}
+                        </button>
+                        {/* Only in-app entry to the billing portal (cancel/downgrade)
+                            now that the Free card is gone for active subscribers. */}
+                        <button
+                          className="upgrade-plan-card__manage-link"
+                          disabled={upgradeActionBusy === "free"}
+                          onClick={() => void handleUpgradeAction("free")}
+                          type="button"
+                        >
+                          {upgradeActionBusy === "free" ? "Opening..." : "Cancel or manage billing"}
+                        </button>
+                      </div>
                     ) : (
                       <button
                         className={buttonClassName}

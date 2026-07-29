@@ -7,7 +7,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
-  introEffectivePercentOff,
+  introPercentOff,
   introSaleBadgeLabel,
   isTierDowngrade,
   paybackLabel,
@@ -204,29 +204,26 @@ describe("app helpers", () => {
   describe("intro offer", () => {
     const intro: IntroOffer = { active: true, percentOff: 50, durationMonths: 6 };
 
-    it("computes the effective per-month percent per billing period", () => {
-      expect(introEffectivePercentOff(intro, "monthly")).toBe(50);
-      // 50% off 6 of 12 months = 25% off the yearly invoice.
-      expect(introEffectivePercentOff(intro, "annual")).toBe(25);
-      expect(introEffectivePercentOff({ ...intro, active: false }, "monthly")).toBe(0);
-      expect(introEffectivePercentOff(null, "monthly")).toBe(0);
+    it("returns the straight percent while the offer runs", () => {
+      expect(introPercentOff(intro)).toBe(50);
+      expect(introPercentOff({ ...intro, active: false })).toBe(0);
+      expect(introPercentOff(null)).toBe(0);
     });
 
     it("labels the sale badge with the offer duration", () => {
-      expect(introSaleBadgeLabel(intro, "monthly")).toBe("50% off first 6 months");
-      expect(introSaleBadgeLabel(intro, "annual")).toBe("25% off first year");
-      expect(introSaleBadgeLabel(null, "monthly")).toBeNull();
+      expect(introSaleBadgeLabel(intro)).toBe("50% off first 6 months");
+      expect(introSaleBadgeLabel(null)).toBeNull();
     });
 
-    it("prices the intro steps for fixed-price plans only", () => {
+    it("prices the intro steps off the period sticker price", () => {
       expect(getIntroStepPricing("max5x", "monthly", intro)).toEqual({
         introLabel: "First 6 months",
         intro: "$15",
         after: "$30",
       });
       expect(getIntroStepPricing("max5x", "annual", intro)).toEqual({
-        introLabel: "First year",
-        intro: "$15",
+        introLabel: "First 6 months",
+        intro: "$10",
         after: "$20",
       });
       expect(getIntroStepPricing("team", "monthly", intro)).toBeNull();
@@ -247,7 +244,7 @@ describe("app helpers", () => {
       ]);
     });
 
-    it("drives discounted annual prices from the intro offer at the spread percent", () => {
+    it("drives discounted annual prices at the straight percent off the sticker", () => {
       const result = getUpgradePlans(
         "individual", "free", undefined, undefined, undefined, false, "annual",
         undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, 0,
@@ -255,9 +252,22 @@ describe("app helpers", () => {
       );
 
       expect(result.plans.map((plan) => [plan.id, plan.price, plan.originalPrice])).toEqual([
-        ["max5x", "$15", "$20"],
-        ["pro", "$3.75", "$5"],
-        ["max20x", "$30", "$40"],
+        ["max5x", "$10", "$20"],
+        ["pro", "$2.50", "$5"],
+        ["max20x", "$20", "$40"],
+      ]);
+    });
+
+    it("spells out the reversion on intro billing lines", () => {
+      const result = getUpgradePlans(
+        "individual", "free", undefined, undefined, undefined, false, "annual",
+        undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, 0,
+        intro
+      );
+
+      expect(result.plans.find((p) => p.id === "max5x")?.billingLines).toEqual([
+        "USD / month for first 6 months",
+        "then $20/mo · billed annually",
       ]);
     });
 
@@ -269,7 +279,7 @@ describe("app helpers", () => {
         intro
       );
       const max5x = result.plans.find((p) => p.id === "max5x");
-      // 50% account discount beats the 25% annual intro spread: $20 -> $10.
+      // The account's own 50% beats the intro offer's 50%: $20 -> $10 either way.
       expect(max5x?.price).toBe("$10");
     });
   });

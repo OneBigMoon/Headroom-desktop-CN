@@ -69,29 +69,19 @@ export function getPlanRenewalPriceLabel(
   return `${formatCents(projectPerMonthCents(toTier, billingPeriod, options))} / month`;
 }
 
-/// Effective per-month intro percent for a billing period. Monthly gets the
-/// straight percent off; annual spreads the discounted months across the
-/// yearly invoice (50% off 6 of 12 months = 25% off), matching the Polar
-/// discounts the server attaches at checkout.
-export function introEffectivePercentOff(
-  introOffer: IntroOffer | null | undefined,
-  billingPeriod: BillingPeriod
-): number {
+/// The intro percent while the offer runs, else 0. Both billing periods show
+/// the straight percent off the period's sticker price; on annual the charge
+/// still works out identically (6 half-price + 6 full months per invoice).
+export function introPercentOff(introOffer: IntroOffer | null | undefined): number {
   if (!introOffer?.active || introOffer.percentOff <= 0) return 0;
-  if (billingPeriod === "monthly") return introOffer.percentOff;
-  return Math.round((introOffer.percentOff * Math.min(introOffer.durationMonths, 12)) / 12);
+  return introOffer.percentOff;
 }
 
 /// Sale-badge copy for the intro offer, or null when it is not running.
-export function introSaleBadgeLabel(
-  introOffer: IntroOffer | null | undefined,
-  billingPeriod: BillingPeriod
-): string | null {
-  const pct = introEffectivePercentOff(introOffer, billingPeriod);
+export function introSaleBadgeLabel(introOffer: IntroOffer | null | undefined): string | null {
+  const pct = introPercentOff(introOffer);
   if (pct <= 0 || !introOffer) return null;
-  return billingPeriod === "monthly"
-    ? `${pct}% off first ${introOffer.durationMonths} months`
-    : `${pct}% off first year`;
+  return `${pct}% off first ${introOffer.durationMonths} months`;
 }
 
 /// Intro-offer step prices for the plan matched to the user's Claude/Codex
@@ -104,12 +94,11 @@ export function getIntroStepPricing(
   introOffer: IntroOffer | null | undefined
 ): { introLabel: string; intro: string; after: string } | null {
   if (planId !== "pro" && planId !== "max5x" && planId !== "max20x") return null;
-  const pct = introEffectivePercentOff(introOffer, billingPeriod);
+  const pct = introPercentOff(introOffer);
   if (pct <= 0 || !introOffer) return null;
   const prices = PLAN_PRICES[planId][billingPeriod];
   return {
-    introLabel:
-      billingPeriod === "monthly" ? `First ${introOffer.durationMonths} months` : "First year",
+    introLabel: `First ${introOffer.durationMonths} months`,
     intro: discountedPriceLabel(prices.fullCents, pct),
     after: prices.full,
   };
@@ -358,7 +347,7 @@ export function getUpgradePlans(
       // own percent wins over the intro offer. The activePercentOff/50 fallback
       // serves legacy cohort servers that still signal launchDiscountActive.
       const accountDiscountPct = activePurchaseInfo?.discountPct ?? 0;
-      const introPct = introEffectivePercentOff(introOffer, billingPeriod);
+      const introPct = introPercentOff(introOffer);
       const effectivePercentOff = accountDiscountPct > 0
         ? accountDiscountPct
         : introPct > 0 ? introPct
@@ -376,7 +365,15 @@ export function getUpgradePlans(
         price,
         ...(showDiscount ? { originalPrice: prices.full } : {}),
         ...(id === activeHeadroomPlanId && activePurchaseInfo ? { purchaseInfo: activePurchaseInfo } : {}),
-        billingLines: ["USD / month", billingLabel],
+        // Intro cards spell out the reversion so "$10/mo billed annually"
+        // can't be misread as the full-year rate.
+        billingLines:
+          showDiscount && introPct > 0 && introOffer
+            ? [
+                `USD / month for first ${introOffer.durationMonths} months`,
+                `then ${prices.full}/mo · ${billingLabel}`,
+              ]
+            : ["USD / month", billingLabel],
         featureIntro,
         features,
         ctaLabel,
