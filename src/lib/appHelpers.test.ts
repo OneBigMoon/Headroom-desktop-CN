@@ -242,17 +242,16 @@ describe("app helpers", () => {
       ]);
     });
 
-    it("spells out the reversion on intro billing lines", () => {
+    it("spells out the reversion under the price on intro cards", () => {
       const result = getUpgradePlans(
         "individual", "free", undefined, undefined, undefined, false, "annual",
         undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, 0,
         intro
       );
 
-      expect(result.plans.find((p) => p.id === "max5x")?.billingLines).toEqual([
-        "USD / month",
-        "then $20/mo · billed annually",
-      ]);
+      const max5x = result.plans.find((p) => p.id === "max5x");
+      expect(max5x?.billingLines).toEqual(["USD / month", "billed annually"]);
+      expect(max5x?.reversionLine).toBe("then $20/mo after 6 months");
     });
 
     it("lets an account forever discount win over the intro offer", () => {

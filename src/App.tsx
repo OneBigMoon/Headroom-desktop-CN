@@ -6291,24 +6291,27 @@ export default function App() {
                     {plan.centeredPriceLabel ? (
                       <div className="upgrade-plan-card__price-note">{plan.centeredPriceLabel}</div>
                     ) : (
-                      <div className="upgrade-plan-card__price-block">
-                        <div>
-                          {plan.originalPrice && !activeHeadroomPlanId ? (
-                            <div className="upgrade-plan-card__sale-row">
-                              <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
-                              <span className="upgrade-plan-card__sale-badge">
-                                {introSaleBadgeLabel(pricingStatus?.introOffer) ??
-                                  `${pricingStatus?.activePercentOff ?? 50}% off`}
-                              </span>
-                            </div>
-                          ) : null}
+                      <div>
+                        {plan.originalPrice && !activeHeadroomPlanId ? (
+                          <div className="upgrade-plan-card__sale-row">
+                            <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
+                            <span className="upgrade-plan-card__sale-badge">
+                              {introSaleBadgeLabel(pricingStatus?.introOffer) ??
+                                `${pricingStatus?.activePercentOff ?? 50}% off`}
+                            </span>
+                          </div>
+                        ) : null}
+                        <div className="upgrade-plan-card__price-block">
                           <strong>{plan.price}</strong>
+                          <span>
+                            {plan.billingLines[0]}
+                            <br />
+                            {plan.billingLines[1]}
+                          </span>
                         </div>
-                        <span>
-                          {plan.billingLines[0]}
-                          <br />
-                          {plan.billingLines[1]}
-                        </span>
+                        {plan.reversionLine && !activeHeadroomPlanId ? (
+                          <p className="upgrade-plan-card__reversion">{plan.reversionLine}</p>
+                        ) : null}
                       </div>
                     )}
                     {plan.purchaseInfo ? (

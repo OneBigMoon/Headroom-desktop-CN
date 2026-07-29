@@ -143,6 +143,8 @@ export interface UpgradePlan {
   price: string;
   originalPrice?: string;
   billingLines: [string, string];
+  /// Full-width line under the price row spelling out the post-intro rate.
+  reversionLine?: string;
   centeredPriceLabel?: string;
   featureIntro: string;
   features: string[];
@@ -345,12 +347,12 @@ export function getUpgradePlans(
         price,
         ...(showDiscount ? { originalPrice: prices.full } : {}),
         ...(id === activeHeadroomPlanId && activePurchaseInfo ? { purchaseInfo: activePurchaseInfo } : {}),
-        // Intro cards spell out the reversion so "$10/mo billed annually"
-        // can't be misread as the full-year rate.
-        billingLines:
-          showDiscount && introPct > 0 && introOffer
-            ? ["USD / month", `then ${prices.full}/mo · ${billingLabel}`]
-            : ["USD / month", billingLabel],
+        billingLines: ["USD / month", billingLabel],
+        // Full-width line under the price so "$10/mo billed annually" can't
+        // be misread as the full-year rate; the badge names the duration.
+        ...(showDiscount && introPct > 0 && introOffer
+          ? { reversionLine: `then ${prices.full}/mo after ${introOffer.durationMonths} months` }
+          : {}),
         featureIntro,
         features,
         ctaLabel,

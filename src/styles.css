@@ -1250,10 +1250,17 @@ select {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.03em;
+  white-space: nowrap;
   color: #2a6b50;
   background: rgba(108, 191, 155, 0.22);
   padding: 0.1rem 0.4rem;
   border-radius: 0.3rem;
+}
+
+.upgrade-plan-card__reversion {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
 }
 
 .upgrade-plan-card__purchase-info {
