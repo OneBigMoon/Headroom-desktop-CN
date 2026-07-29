@@ -541,6 +541,7 @@ export interface HeadroomPricingStatus {
   launchDiscountActive: boolean;
   activePercentOff?: number;
   pricingCohorts?: PricingCohort[];
+  introOffer?: IntroOffer | null;
 }
 
 export interface PricingCohort {
@@ -550,6 +551,14 @@ export interface PricingCohort {
   capacity?: number | null;
   status: "sold_out" | "active" | "upcoming";
   spotsLeft?: number | null;
+}
+
+/// Slack-style intro offer surfaced by headroom-web: percentOff for the first
+/// durationMonths months on every plan.
+export interface IntroOffer {
+  active: boolean;
+  percentOff: number;
+  durationMonths: number;
 }
 
 export type TierRecommendationSource = "claude" | "codex" | "both";

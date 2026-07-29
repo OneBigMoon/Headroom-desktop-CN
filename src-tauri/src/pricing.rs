@@ -10,8 +10,8 @@ use crate::models::{
     headroom_tier_for_claude_plan, headroom_tier_for_codex_plan, BillingPeriod,
     ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow,
     CodexAccountProfile, CodexPlanTier, CodexRateLimitSnapshot, CodexUsage, HeadroomAccountProfile,
-    HeadroomAuthCodeRequest, HeadroomPricingStatus, HeadroomSubscriptionTier, PricingCohort,
-    PricingGateReason, TierMismatch, TierRecommendationSource,
+    HeadroomAuthCodeRequest, HeadroomPricingStatus, HeadroomSubscriptionTier, IntroOffer,
+    PricingCohort, PricingGateReason, TierMismatch, TierRecommendationSource,
 };
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
@@ -442,6 +442,8 @@ struct RemoteAccountEnvelope {
     active_percent_off: i64,
     #[serde(default)]
     pricing_ladder: Option<PricingLadderPayload>,
+    #[serde(default)]
+    intro_offer: Option<IntroOffer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -485,6 +487,8 @@ struct VerifyCodeResponse {
     active_percent_off: i64,
     #[serde(default)]
     pricing_ladder: Option<PricingLadderPayload>,
+    #[serde(default)]
+    intro_offer: Option<IntroOffer>,
 }
 
 /// The `pricingLadder` object headroom-web nests in account/config payloads.
@@ -497,22 +501,28 @@ struct PricingLadderPayload {
     cohorts: Vec<PricingCohort>,
 }
 
-/// Founder-pricing promo resolved from whichever payload the desktop fetched
-/// (authenticated envelope or public config). `launch_discount_active` is just
-/// `active_percent_off > 0`.
+/// Promo state resolved from whichever payload the desktop fetched
+/// (authenticated envelope or public config). The legacy founder-cohort
+/// fields stay for outdated servers; current servers send `intro_offer`.
 #[derive(Debug, Clone, Default)]
 struct PricingPromo {
     active_percent_off: i64,
     cohorts: Vec<PricingCohort>,
+    intro_offer: Option<IntroOffer>,
 }
 
-fn build_promo(active_percent_off: i64, ladder: &Option<PricingLadderPayload>) -> PricingPromo {
+fn build_promo(
+    active_percent_off: i64,
+    ladder: &Option<PricingLadderPayload>,
+    intro_offer: &Option<IntroOffer>,
+) -> PricingPromo {
     PricingPromo {
         active_percent_off,
         cohorts: ladder
             .as_ref()
             .map(|l| l.cohorts.clone())
             .unwrap_or_default(),
+        intro_offer: intro_offer.clone(),
     }
 }
 
@@ -546,6 +556,10 @@ struct VerifyCodePayload<'a> {
 struct CheckoutSessionPayload {
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
+    /// Always "intro": this build presents the intro offer, so the server
+    /// attaches its per-period discount even before the public flip. Legacy
+    /// builds omit the field and keep the cohort discount until then.
+    pricing_model: &'static str,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -582,14 +596,14 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
             let envelope_result = fetch_remote_account(token, &identity);
             let promo = envelope_result
                 .as_ref()
-                .map(|e| build_promo(e.active_percent_off, &e.pricing_ladder))
+                .map(|e| build_promo(e.active_percent_off, &e.pricing_ladder, &e.intro_offer))
                 .unwrap_or_default();
             let account_result = envelope_result.map(|e| e.account);
             let (auth, acc, err) = merge_background_account_sync(Some(token), account_result);
             (auth, acc, err, promo)
         } else {
             let promo = fetch_public_config()
-                .map(|c| build_promo(c.active_percent_off, &c.pricing_ladder))
+                .map(|c| build_promo(c.active_percent_off, &c.pricing_ladder, &c.intro_offer))
                 .unwrap_or_default();
             (false, None, None, promo)
         };
@@ -1010,7 +1024,7 @@ pub(crate) fn verify_auth_code_with_base_url(
         None,
         Some(account),
         claude,
-        build_promo(body.active_percent_off, &body.pricing_ladder),
+        build_promo(body.active_percent_off, &body.pricing_ladder, &body.intro_offer),
         last_known_good_plan_tier,
         tier_mismatch,
     ))
@@ -1112,7 +1126,7 @@ pub(crate) fn activate_account_with_base_url(
         None,
         Some(account),
         claude,
-        build_promo(body.active_percent_off, &body.pricing_ladder),
+        build_promo(body.active_percent_off, &body.pricing_ladder, &body.intro_offer),
         last_known_good_plan_tier,
         tier_mismatch,
     ))
@@ -1251,6 +1265,7 @@ pub(crate) fn create_checkout_session_with_base_url(
         .json(&CheckoutSessionPayload {
             subscription_tier,
             billing_period,
+            pricing_model: "intro",
         })
         .send()
         .map_err(|err| format!("Could not create checkout session: {err}"))?;
@@ -1298,6 +1313,7 @@ pub(crate) fn change_subscription_plan_with_base_url(
         .json(&CheckoutSessionPayload {
             subscription_tier,
             billing_period,
+            pricing_model: "intro",
         })
         .send()
         .map_err(|err| format!("Could not change subscription plan: {err}"))?;
@@ -1586,6 +1602,7 @@ fn evaluate_pricing_status_with_mismatch(
         launch_discount_active: promo.active_percent_off > 0,
         active_percent_off: promo.active_percent_off,
         pricing_cohorts: promo.cohorts,
+        intro_offer: promo.intro_offer,
     }
 }
 
@@ -2676,6 +2693,8 @@ struct PublicConfig {
     #[serde(default)]
     pricing_ladder: Option<PricingLadderPayload>,
     #[serde(default)]
+    intro_offer: Option<IntroOffer>,
+    #[serde(default)]
     paywall_first: bool,
 }
 
@@ -2889,6 +2908,7 @@ mod tests {
             PricingPromo {
                 active_percent_off: 50,
                 cohorts: vec![],
+                intro_offer: None,
             }
         } else {
             PricingPromo::default()

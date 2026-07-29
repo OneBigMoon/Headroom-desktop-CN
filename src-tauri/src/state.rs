@@ -7296,6 +7296,7 @@ mod tests {
             launch_discount_active: false,
             active_percent_off: 0,
             pricing_cohorts: Vec::new(),
+            intro_offer: None,
         }
     }
 

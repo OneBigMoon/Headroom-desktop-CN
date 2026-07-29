@@ -986,6 +986,19 @@ pub struct HeadroomPricingStatus {
     /// scarcity stepper. Empty when the server reports no ladder.
     #[serde(default)]
     pub pricing_cohorts: Vec<PricingCohort>,
+    /// Slack-style intro offer (50% off the first `duration_months` months on
+    /// every plan). `None` when the server doesn't advertise one.
+    #[serde(default)]
+    pub intro_offer: Option<IntroOffer>,
+}
+
+/// Intro-offer terms surfaced by headroom-web account/config payloads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IntroOffer {
+    pub active: bool,
+    pub percent_off: i64,
+    pub duration_months: i64,
 }
 
 /// One rung of the founder-pricing ladder, surfaced by headroom-web. `status`

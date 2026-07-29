@@ -66,7 +66,9 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   type UpgradePlan,
-  getFounderStepPricing,
+  getIntroStepPricing,
+  introEffectivePercentOff,
+  introSaleBadgeLabel,
   isTierDowngrade,
   forgoneSavingsLabel,
   paybackLabel,
@@ -1261,7 +1263,8 @@ export default function App() {
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
+  // Monthly first: the intro offer's 50% headline is the default presentation.
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -1459,7 +1462,8 @@ export default function App() {
     pricingStatus?.account?.subscriptionDiscountDurationInMonths,
     pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
     pricingStatus?.account?.subscriptionEndsAt,
-    pricingStatus?.activePercentOff ?? 0
+    pricingStatus?.activePercentOff ?? 0,
+    pricingStatus?.introOffer ?? null
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -4267,7 +4271,8 @@ export default function App() {
         </div>
         {installComplete ? (
           <>
-            {runtimeStatus?.running !== true && runtimeStatus?.bypassed !== true ? (
+            {bootstrapProgress.running ||
+            (runtimeStatus?.running !== true && runtimeStatus?.bypassed !== true) ? (
               <>
                 <p className="launcher-install-notice">Starting Headroom for the first time (this can take 1-2 minutes)…</p>
                 <button
@@ -4671,7 +4676,7 @@ export default function App() {
         <div className="paywall">
           <h1>Pick your Headroom plan</h1>
           <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
-            {(["annual", "monthly"] as const).map((period) => (
+            {(["monthly", "annual"] as const).map((period) => (
               <button
                 key={period}
                 className={`upgrade-billing-toggle__item${billingPeriod === period ? " is-active" : ""}`}
@@ -4684,10 +4689,10 @@ export default function App() {
               </button>
             ))}
           </div>
-          {pricingStatus?.launchDiscountActive ? (
+          {pricingStatus?.introOffer?.active ? (
             <p className="paywall__sale-banner">
-              🎉 Launch discount: {pricingStatus.activePercentOff || 50}% off •
-              locked in forever
+              🎉 Intro offer: {pricingStatus.introOffer.percentOff}% off your first{" "}
+              {pricingStatus.introOffer.durationMonths} months • on every plan
             </p>
           ) : null}
           <p className="paywall__detection">
@@ -4728,7 +4733,8 @@ export default function App() {
                         {plan.originalPrice}
                       </s>
                       <span className="upgrade-plan-card__sale-badge">
-                        {(pricingStatus?.activePercentOff ?? 0) || 50}% off
+                        {introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
+                          `${(pricingStatus?.activePercentOff ?? 0) || 50}% off`}
                       </span>
                     </span>
                   ) : null}
@@ -5128,19 +5134,13 @@ export default function App() {
     !!runtimeStatus &&
     !runtimeStatus.paused &&
     !runtimeStatus.starting;
-  // Launch-promotion nudge for unsubscribed users: surface the active discount
-  // (and remaining cohort spots) alongside the savings line so the upgrade
-  // moment carries the urgency the pricing page already shows.
+  // Intro-offer nudge for unsubscribed users: surface the offer alongside the
+  // savings line so the upgrade moment carries the same pitch as the pricing
+  // page.
   const launchPromoLine = (() => {
-    if (!inUpgradeMoment || !pricingStatus?.launchDiscountActive) return null;
-    const active = (pricingStatus.pricingCohorts ?? []).find((c) => c.status === "active");
-    const pct = pricingStatus.activePercentOff ?? active?.percentOff ?? 0;
-    if (pct <= 0) return null;
-    const spots =
-      active?.spotsLeft != null && active.spotsLeft > 0
-        ? ` Only ${active.spotsLeft} ${(active.label ?? "Founder").toLowerCase()} spots left.`
-        : "";
-    return `Launch promotion: ${pct}% off, locked in for good.${spots}`;
+    if (!inUpgradeMoment || !pricingStatus?.introOffer?.active) return null;
+    const { percentOff, durationMonths } = pricingStatus.introOffer;
+    return `Intro offer: ${percentOff}% off your first ${durationMonths} months.`;
   })();
   // When the banner is carrying an upgrade nudge (and isn't showing the Resume
   // control), let clicking the card jump straight to the upgrade view.
@@ -6212,7 +6212,7 @@ export default function App() {
             <h1>Plans based on your AI subscription</h1>
             {pricingAudience === "individual" ? (
               <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
-                {(["annual", "monthly"] as const).map((period) => (
+                {(["monthly", "annual"] as const).map((period) => (
                   <button
                     key={period}
                     className={`upgrade-billing-toggle__item${billingPeriod === period ? " is-active" : ""}`}
@@ -6250,83 +6250,44 @@ export default function App() {
                 ) : null}
               </section>
 
-              {pricingStatus?.launchDiscountActive
+              {pricingStatus?.introOffer?.active
                 ? (() => {
-                    const cohorts = pricingStatus.pricingCohorts ?? [];
-                    const active = cohorts.find((c) => c.status === "active");
-                    const activeLabel = active?.label ?? "Founder";
-                    const pct = pricingStatus.activePercentOff ?? active?.percentOff ?? 0;
-                    const spotsLeft = active?.spotsLeft ?? null;
-                    const capacity = active?.capacity ?? null;
-                    const totalCapacity = cohorts.reduce((sum, c) => sum + (c.capacity ?? 0), 0);
-                    const totalFilled = cohorts.reduce((sum, c) => {
-                      const cap = c.capacity ?? 0;
-                      if (c.status === "sold_out") return sum + cap;
-                      if (c.status === "active") return sum + Math.max(0, cap - (c.spotsLeft ?? 0));
-                      return sum;
-                    }, 0);
-                    const filledPct =
-                      totalCapacity > 0
-                        ? Math.min(100, Math.round(50 + 50 * (totalFilled / totalCapacity)))
-                        : null;
-                    const next = cohorts.find((c) => c.status === "upcoming") ?? null;
-                    const stepPricing = getFounderStepPricing(
+                    const intro = pricingStatus.introOffer;
+                    const stepPricing = getIntroStepPricing(
                       upgradePlansState.featuredPlanId,
                       billingPeriod,
-                      pct,
-                      next?.percentOff ?? 0
+                      intro
                     );
                     return (
-                      <section className="founder-promo" aria-label="Founder pricing">
+                      <section className="founder-promo" aria-label="Intro offer">
                         <div className="founder-promo__main">
                           <p className="founder-promo__intro">
                             <span className="founder-promo__live" aria-hidden="true" />
-                            Launch promotion active. Prices rise as {activeLabel.toLowerCase()} spots
-                            fill.
+                            Intro offer: {intro.percentOff}% off your first {intro.durationMonths}{" "}
+                            months, on every plan.
                           </p>
-                          <div className="founder-promo__urgency">
-                            <div className="founder-promo__count-row">
-                              {spotsLeft != null ? (
-                                <>
-                                  <span className="founder-promo__count">{spotsLeft}</span>
-                                  <span className="founder-promo__count-label">{activeLabel} spots left</span>
-                                </>
-                              ) : (
-                                <span className="founder-promo__count-label">{activeLabel} pricing</span>
-                              )}
-                            </div>
-                            {filledPct != null ? (
-                              <div className="founder-promo__bar" role="presentation">
-                                <span
-                                  className="founder-promo__bar-fill"
-                                  style={{ width: `${filledPct}%` }}
-                                />
-                              </div>
-                            ) : null}
-                          </div>
                         </div>
                         <div className="founder-promo__offer">
                           <div className="founder-promo__steps">
                             <div className="founder-promo__step founder-promo__step--now">
-                              <span className="founder-promo__step-tag">Now</span>
-                              <span className="founder-promo__step-pct">{pct}% OFF</span>
+                              <span className="founder-promo__step-tag">
+                                {stepPricing?.introLabel ?? "Intro"}
+                              </span>
+                              <span className="founder-promo__step-pct">
+                                {introEffectivePercentOff(intro, billingPeriod)}% OFF
+                              </span>
                               {stepPricing ? (
-                                <span className="founder-promo__step-price">{stepPricing.now} / month</span>
+                                <span className="founder-promo__step-price">{stepPricing.intro} / month</span>
                               ) : null}
                             </div>
-                            {next ? (
-                              <div className="founder-promo__step founder-promo__step--next">
-                                <span className="founder-promo__step-tag">Next</span>
-                                <span className="founder-promo__step-pct">
-                                  {next.percentOff > 0 ? `${next.percentOff}% OFF` : "Full price"}
-                                </span>
-                                {stepPricing ? (
-                                  <span className="founder-promo__step-price">{stepPricing.next} / month</span>
-                                ) : null}
-                              </div>
-                            ) : null}
+                            <div className="founder-promo__step founder-promo__step--next">
+                              <span className="founder-promo__step-tag">Then</span>
+                              <span className="founder-promo__step-pct">Full price</span>
+                              {stepPricing ? (
+                                <span className="founder-promo__step-price">{stepPricing.after} / month</span>
+                              ) : null}
+                            </div>
                           </div>
-                          <p className="founder-promo__lock">Your price is locked in for good.</p>
                         </div>
                       </section>
                     );
@@ -6378,7 +6339,10 @@ export default function App() {
                           {plan.originalPrice && !activeHeadroomPlanId ? (
                             <div className="upgrade-plan-card__sale-row">
                               <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
-                              <span className="upgrade-plan-card__sale-badge">{pricingStatus?.activePercentOff ?? 50}% off</span>
+                              <span className="upgrade-plan-card__sale-badge">
+                                {introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
+                                  `${pricingStatus?.activePercentOff ?? 50}% off`}
+                              </span>
                             </div>
                           ) : null}
                           <strong>{plan.price}</strong>

@@ -3,6 +3,7 @@ import type {
   DailySavingsPoint,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
+  IntroOffer,
   TierRecommendationSource,
 } from "./types";
 import { currencyExact } from "./dashboardHelpers";
@@ -68,21 +69,49 @@ export function getPlanRenewalPriceLabel(
   return `${formatCents(projectPerMonthCents(toTier, billingPeriod, options))} / month`;
 }
 
-/// Founder-promo step prices for the plan matched to the user's Claude/Codex
-/// tier: the current discounted price (`now`) and the price at the next cohort's
-/// percent (`next`). Returns null for plans without a fixed price (free / team /
-/// enterprise) so the promo can fall back to percent-only chips.
-export function getFounderStepPricing(
+/// Effective per-month intro percent for a billing period. Monthly gets the
+/// straight percent off; annual spreads the discounted months across the
+/// yearly invoice (50% off 6 of 12 months = 25% off), matching the Polar
+/// discounts the server attaches at checkout.
+export function introEffectivePercentOff(
+  introOffer: IntroOffer | null | undefined,
+  billingPeriod: BillingPeriod
+): number {
+  if (!introOffer?.active || introOffer.percentOff <= 0) return 0;
+  if (billingPeriod === "monthly") return introOffer.percentOff;
+  return Math.round((introOffer.percentOff * Math.min(introOffer.durationMonths, 12)) / 12);
+}
+
+/// Sale-badge copy for the intro offer, or null when it is not running.
+export function introSaleBadgeLabel(
+  introOffer: IntroOffer | null | undefined,
+  billingPeriod: BillingPeriod
+): string | null {
+  const pct = introEffectivePercentOff(introOffer, billingPeriod);
+  if (pct <= 0 || !introOffer) return null;
+  return billingPeriod === "monthly"
+    ? `${pct}% off first ${introOffer.durationMonths} months`
+    : `${pct}% off first year`;
+}
+
+/// Intro-offer step prices for the plan matched to the user's Claude/Codex
+/// tier: the discounted intro rate and the list rate it reverts to. Returns
+/// null for plans without a fixed price (free / team / enterprise) or when
+/// the offer is off, so the promo panel can simply not render.
+export function getIntroStepPricing(
   planId: UpgradePlanId,
   billingPeriod: BillingPeriod,
-  nowPercentOff: number,
-  nextPercentOff: number
-): { now: string; next: string } | null {
+  introOffer: IntroOffer | null | undefined
+): { introLabel: string; intro: string; after: string } | null {
   if (planId !== "pro" && planId !== "max5x" && planId !== "max20x") return null;
-  const fullCents = PLAN_PRICES[planId][billingPeriod].fullCents;
+  const pct = introEffectivePercentOff(introOffer, billingPeriod);
+  if (pct <= 0 || !introOffer) return null;
+  const prices = PLAN_PRICES[planId][billingPeriod];
   return {
-    now: discountedPriceLabel(fullCents, nowPercentOff),
-    next: discountedPriceLabel(fullCents, nextPercentOff),
+    introLabel:
+      billingPeriod === "monthly" ? `First ${introOffer.durationMonths} months` : "First year",
+    intro: discountedPriceLabel(prices.fullCents, pct),
+    after: prices.full,
   };
 }
 
@@ -241,7 +270,8 @@ export function getUpgradePlans(
   subscriptionDiscountDurationInMonths?: number | null,
   subscriptionCancelAtPeriodEnd: boolean = false,
   subscriptionEndsAt?: string | null,
-  activePercentOff: number = 0
+  activePercentOff: number = 0,
+  introOffer: IntroOffer | null = null
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -320,20 +350,22 @@ export function getUpgradePlans(
       ctaLabel: string
     ): UpgradePlan {
       const prices = PLAN_PRICES[id][billingPeriod];
-      // Upgrade-target cards show the discounted price because checkout always
-      // attaches the active cohort discount; the active plan card uses
-      // purchaseInfo (actual paid amount) instead of a generic discount badge.
-      // Percent is driven live by the cohort ladder; fall back to 50% for legacy
-      // callers that only signal launchDiscountActive without a percent.
+      // Upgrade-target cards show the discounted price because checkout
+      // attaches the matching Polar discount server-side; the active plan card
+      // uses purchaseInfo (actual paid amount) instead of a generic badge.
       // Subscribers with a discount that survives renewal (forever, or repeating
       // still in window) keep it on plan swaps (Polar carries it over), so their
-      // own percent wins over the cohort promo.
+      // own percent wins over the intro offer. The activePercentOff/50 fallback
+      // serves legacy cohort servers that still signal launchDiscountActive.
       const accountDiscountPct = activePurchaseInfo?.discountPct ?? 0;
+      const introPct = introEffectivePercentOff(introOffer, billingPeriod);
       const effectivePercentOff = accountDiscountPct > 0
         ? accountDiscountPct
+        : introPct > 0 ? introPct
         : activePercentOff > 0 ? activePercentOff : 50;
       const showDiscount =
-        (launchDiscountActive || accountDiscountPct > 0) && id !== activeHeadroomPlanId;
+        (introPct > 0 || launchDiscountActive || accountDiscountPct > 0) &&
+        id !== activeHeadroomPlanId;
       const price = showDiscount
         ? discountedPriceLabel(prices.fullCents, effectivePercentOff)
         : prices.full;
