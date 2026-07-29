@@ -266,7 +266,7 @@ describe("app helpers", () => {
       );
 
       expect(result.plans.find((p) => p.id === "max5x")?.billingLines).toEqual([
-        "USD / month for first 6 months",
+        "per month for your first 6 months",
         "then $20/mo · billed annually",
       ]);
     });

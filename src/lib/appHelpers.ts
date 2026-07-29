@@ -370,7 +370,7 @@ export function getUpgradePlans(
         billingLines:
           showDiscount && introPct > 0 && introOffer
             ? [
-                `USD / month for first ${introOffer.durationMonths} months`,
+                `per month for your first ${introOffer.durationMonths} months`,
                 `then ${prices.full}/mo · ${billingLabel}`,
               ]
             : ["USD / month", billingLabel],
