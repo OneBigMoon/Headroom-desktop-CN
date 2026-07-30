@@ -1408,6 +1408,8 @@ export default function App() {
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [rtkBusy, setRtkBusy] = useState(false);
+  const [autoLearnEnabled, setAutoLearnEnabled] = useState<boolean | null>(null);
+  const [autoLearnBusy, setAutoLearnBusy] = useState(false);
   const [showUninstallDialog, setShowUninstallDialog] = useState(false);
   const [uninstallBusy, setUninstallBusy] = useState(false);
   const [uninstallError, setUninstallError] = useState<string | null>(null);
@@ -2285,6 +2287,28 @@ export default function App() {
       .then((enabled) => setAutostartEnabled(enabled))
       .catch(() => setAutostartEnabled(false));
   }, [activeView]);
+
+  useEffect(() => {
+    if (activeView !== "optimization") {
+      return;
+    }
+    void invoke<boolean>("get_auto_learn_enabled")
+      .then((enabled) => setAutoLearnEnabled(enabled))
+      .catch(() => setAutoLearnEnabled(true));
+  }, [activeView]);
+
+  async function handleAutoLearnToggle(nextEnabled: boolean) {
+    setAutoLearnBusy(true);
+    try {
+      // The proxy restarts inside this command, so it can take a moment.
+      const enabled = await invoke<boolean>("set_auto_learn_enabled", { enabled: nextEnabled });
+      setAutoLearnEnabled(enabled);
+    } catch (error) {
+      console.error("Failed to update auto-learning", error);
+    } finally {
+      setAutoLearnBusy(false);
+    }
+  }
 
   async function handleAutostartToggle(nextEnabled: boolean) {
     setAutostartBusy(true);
@@ -5608,6 +5632,33 @@ export default function App() {
                   <h1>Project learnings</h1>
                 </div>
                 <p className="optimize-card__blurb">{learnBlurb}</p>
+                {headroomLearnSupported ? (
+                  <div className="optimize-card__auto-learn">
+                    <div className="optimize-card__auto-learn-text">
+                      <span className="optimize-card__auto-learn-label">
+                        Auto-learning
+                      </span>
+                      <span className="optimize-card__auto-learn-meta">
+                        {autoLearnEnabled === false
+                          ? "Off — only manual scans add learnings."
+                          : "Learns from live traffic in the background."}
+                      </span>
+                    </div>
+                    <button
+                      aria-checked={autoLearnEnabled ?? true}
+                      aria-label={`${autoLearnEnabled === false ? "Enable" : "Disable"} auto-learning`}
+                      className={`connector-switch${autoLearnEnabled === false ? "" : " is-on"}`}
+                      disabled={autoLearnEnabled === null || autoLearnBusy}
+                      onClick={() =>
+                        void handleAutoLearnToggle(autoLearnEnabled === false)
+                      }
+                      role="switch"
+                      type="button"
+                    >
+                      <span className="connector-switch__thumb" />
+                    </button>
+                  </div>
+                ) : null}
               </header>
               <div className="optimize-card__body">
                 {!headroomLearnSupported ? (

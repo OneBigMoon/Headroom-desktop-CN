@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.32.1";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/23/1d/2a99a3256f0e4966886dd8617e2624df764c360db32fd44b0c5e0d3b4eeb/headroom_ai-0.32.1-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.33.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/4a/85/dbe382e0166b24dddba88f49664a2af31af085dd80e611b281f673a73c00/headroom_ai-0.33.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "267ac8c7b8ddfdc92b51a3f7fca42f336b75b63ec6ff468fbcf0c796031c2b2d";
+    "bd4402d4d29356e76393822f7d163ad32b92134dcc93bd1007d39833de8f6265";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -187,6 +187,17 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   dropped from the lock are pure-Python orphans left on disk by the in-place
 ///   `--upgrade` (pip does not prune removed requirements); harmless. The
 ///   0.20.x+ cohort upgrades in place.
+/// - 0.7.x (0.32.1 → 0.33.0 bundle): floor stays at 0.20.0. The lock is
+///   unchanged — 0.33.0's requires_dist only *tightens* three existing
+///   constraints (ast-grep-cli !=0.44.1, mcp >=1.28.1,<2.0.0 on the mcp/proxy
+///   extras, ruff on the dev extra), and the shipped lock already satisfies all
+///   of them (ast-grep-cli==0.44.0, mcp==1.28.1; dev isn't installed). No
+///   package is added or removed from the core/extra set we install, so the
+///   in-place path is a single `pip install --no-deps --force-reinstall` of the
+///   abi3 wheel with zero dep churn. The new Rust ports (CodeCompressor,
+///   Kompress — upstream #1154/#1153) live inside headroom-ai's own
+///   `headroom_core` abi3 extension, which pip uninstalls via RECORD before
+///   unpacking the replacement, so no stale `.so` is layered.
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating
@@ -1265,6 +1276,7 @@ impl ToolManager {
                         entrypoint,
                         headroom_entrypoint_startup_args(
                             self.installed_headroom_version().as_deref(),
+                            !crate::client_adapters::is_auto_learn_disabled(),
                         ),
                     ),
                     (python.clone(), headroom_python_startup_args()),
@@ -5751,7 +5763,10 @@ fn savings_profile_for_runtime(installed_version: Option<&str>) -> &'static str 
     }
 }
 
-fn headroom_entrypoint_startup_args(installed_version: Option<&str>) -> Vec<String> {
+fn headroom_entrypoint_startup_args(
+    installed_version: Option<&str>,
+    learn_enabled: bool,
+) -> Vec<String> {
     // HTTP/2 to upstream is disabled both ways: the explicit --no-http2 flag
     // AND the HEADROOM_HTTP2=false env var (set in the spawn env). Either alone
     // suffices, but older bundled runtimes ignored the env var and ran HTTP/2
@@ -5770,22 +5785,28 @@ fn headroom_entrypoint_startup_args(installed_version: Option<&str>) -> Vec<Stri
         args.push("--no-http2".to_string());
     }
     args.push("--log-messages".to_string());
-    args.extend(headroom_learn_startup_args());
+    if learn_enabled {
+        args.extend(headroom_learn_startup_args());
+    }
     args
 }
 
 /// Flags whose presence in the running proxy's argv we treat as proof that it
 /// was started by this build. If any of these are missing, the proxy was
 /// spawned by an older desktop (or by something else) and we restart it.
-fn expected_proxy_arg_signature() -> Vec<&'static str> {
-    vec![
-        "--port",
-        "--log-messages",
-        "--learn",
-        "--no-memory-tools",
-        "--no-memory-context",
-        "--memory-db-path",
-    ]
+/// With auto-learning off the learn flags are not passed, so they drop out of
+/// the signature too.
+fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
+    let mut flags = vec!["--port", "--log-messages"];
+    if learn_enabled {
+        flags.extend([
+            "--learn",
+            "--no-memory-tools",
+            "--no-memory-context",
+            "--memory-db-path",
+        ]);
+    }
+    flags
 }
 
 /// Returns the full command line of whatever process is currently listening on
@@ -5801,11 +5822,16 @@ pub fn running_proxy_matches_expected_args() -> bool {
     let Some(argv) = running_proxy_argv() else {
         return false;
     };
-    proxy_argv_contains_expected_flags(&argv)
+    proxy_argv_contains_expected_flags(&argv, !crate::client_adapters::is_auto_learn_disabled())
 }
 
-fn proxy_argv_contains_expected_flags(argv: &str) -> bool {
-    expected_proxy_arg_signature()
+fn proxy_argv_contains_expected_flags(argv: &str, learn_enabled: bool) -> bool {
+    // A proxy still carrying --learn after the user turned auto-learning off is
+    // as stale as one missing a flag: restart it so the opt-out takes effect.
+    if !learn_enabled && argv_contains_flag(argv, "--learn") {
+        return false;
+    }
+    expected_proxy_arg_signature(learn_enabled)
         .iter()
         .all(|flag| argv_contains_flag(argv, flag))
 }
@@ -7858,7 +7884,21 @@ mod tests {
     fn proxy_argv_matches_when_all_expected_flags_present() {
         let argv = "/usr/bin/nice -n 5 /Users/x/headroom proxy --port 6768 --log-messages \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
-        assert!(proxy_argv_contains_expected_flags(argv));
+        assert!(proxy_argv_contains_expected_flags(argv, true));
+    }
+
+    #[test]
+    fn proxy_argv_matches_without_learn_flags_when_auto_learn_off() {
+        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages";
+        assert!(proxy_argv_contains_expected_flags(argv, false));
+    }
+
+    #[test]
+    fn proxy_argv_mismatch_when_learn_present_but_auto_learn_off() {
+        // Leftover learn-enabled proxy from before the toggle flipped: restart.
+        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --learn \
+                    --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
+        assert!(!proxy_argv_contains_expected_flags(argv, false));
     }
 
     #[test]
@@ -7866,14 +7906,14 @@ mod tests {
         // The exact orphan-from-old-build case: a v0.2.x proxy still running
         // with just `proxy --port 6768`.
         let argv = "/Users/x/headroom proxy --port 6768";
-        assert!(!proxy_argv_contains_expected_flags(argv));
+        assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_mismatch_when_learn_missing() {
         let argv = "headroom proxy --port 6768 --log-messages --no-memory-tools \
                     --no-memory-context --memory-db-path /tmp/m.db";
-        assert!(!proxy_argv_contains_expected_flags(argv));
+        assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
@@ -7882,7 +7922,7 @@ mod tests {
         // ensures we don't false-positive on it.
         let argv = "headroom proxy --port 6768 --log-messages --no-learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
-        assert!(!proxy_argv_contains_expected_flags(argv));
+        assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
@@ -7890,7 +7930,7 @@ mod tests {
         let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
                     --no-http2 --log-messages --learn --no-memory-tools --no-memory-context \
                     --memory-db-path /tmp/m.db";
-        assert!(proxy_argv_contains_expected_flags(argv));
+        assert!(proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
@@ -8253,7 +8293,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     fn managed_headroom_startup_uses_supported_proxy_args() {
         backend_port::reset_for_tests();
         let default_port = backend_port::DEFAULT_BACKEND_PORT.to_string();
-        let entrypoint_args = headroom_entrypoint_startup_args(Some("0.28.0"));
+        let entrypoint_args = headroom_entrypoint_startup_args(Some("0.28.0"), true);
         assert!(entrypoint_args.starts_with(&[
             "proxy".to_string(),
             "--port".to_string(),
@@ -8296,21 +8336,18 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     fn entrypoint_args_gate_no_http2_on_runtime_version() {
         backend_port::reset_for_tests();
 
-        assert!(
-            !headroom_entrypoint_startup_args(Some("0.26.0")).contains(&"--no-http2".to_string())
-        );
-        assert!(
-            !headroom_entrypoint_startup_args(Some("0.27.0")).contains(&"--no-http2".to_string())
-        );
-        assert!(
-            headroom_entrypoint_startup_args(Some("0.28.0")).contains(&"--no-http2".to_string())
-        );
-        assert!(headroom_entrypoint_startup_args(Some("1.0.0")).contains(&"--no-http2".to_string()));
+        assert!(!headroom_entrypoint_startup_args(Some("0.26.0"), true)
+            .contains(&"--no-http2".to_string()));
+        assert!(!headroom_entrypoint_startup_args(Some("0.27.0"), true)
+            .contains(&"--no-http2".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("0.28.0"), true)
+            .contains(&"--no-http2".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("1.0.0"), true)
+            .contains(&"--no-http2".to_string()));
         // Unknown or malformed receipt version: assume pinned runtime.
-        assert!(headroom_entrypoint_startup_args(None).contains(&"--no-http2".to_string()));
-        assert!(
-            headroom_entrypoint_startup_args(Some("garbage")).contains(&"--no-http2".to_string())
-        );
+        assert!(headroom_entrypoint_startup_args(None, true).contains(&"--no-http2".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("garbage"), true)
+            .contains(&"--no-http2".to_string()));
         // The python -m argparse variant has defined --no-http2 since 0.10.0
         // and must keep it unconditionally.
         assert!(headroom_python_startup_args().contains(&"--no-http2".to_string()));
@@ -8344,7 +8381,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
         backend_port::set(6770);
 
-        let entrypoint_args = headroom_entrypoint_startup_args(None);
+        let entrypoint_args = headroom_entrypoint_startup_args(None, true);
         let port_idx = entrypoint_args
             .iter()
             .position(|a| a == "--port")

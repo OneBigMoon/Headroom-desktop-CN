@@ -6,16 +6,19 @@
 # Versions kept in sync with headroom-requirements.lock where the package
 # overlaps. 0.32.0 adds two new hard deps to headroom-ai's core/proxy
 # requires_dist that this subset installs -- tomlkit (core) and orjson (proxy) --
-# so both are added here too (leaf packages, no transitive deps). We do not
-# currently ship Linux from release-macos.yml; when Linux is added, re-validate
-# this lock against a real Linux minimal install before relying on it.
+# so both are added here too (leaf packages, no transitive deps). 0.33.0 raises
+# the proxy extra's mcp floor to >=1.28.1,<2.0.0 (upstream #2642: mcp 2.x
+# crashes the MCP server at startup), so mcp moves 1.27.1 -> 1.28.1 here to
+# match the macOS lock. We do not currently ship Linux from release-macos.yml;
+# when Linux is added, re-validate this lock against a real Linux minimal
+# install before relying on it.
 ast-grep-cli==0.42.2
 click==8.4.0
 fastapi==0.136.1
 httpx[http2,socks]==0.28.1
 litellm==1.88.1
 magika==1.0.3
-mcp==1.27.1
+mcp==1.28.1
 onnxruntime==1.26.0
 opentelemetry-api==1.41.1
 openai==2.37.0

@@ -5,7 +5,13 @@
 #
 # Resolution lineage: 0.25.0 freeze -> carried to 0.26.0/0.27.0 -> regenerated
 # for 0.28.0 (base of the current pin set) -> carried through 0.29.0-0.31.0
-# point-version churn -> 0.32.0.
+# point-version churn -> 0.32.0 -> carried unchanged to 0.33.0.
+#   - 0.33.0: no pin moves. Its requires_dist only tightens three existing
+#     constraints, all already satisfied here: ast-grep-cli !=0.44.1 (we pin
+#     0.44.0), mcp >=1.28.1,<2.0.0 on the mcp/proxy extras (we pin 1.28.1), and
+#     ruff on the dev extra (not installed). No package is added to or removed
+#     from the installed [all,vector] set, so the upgrade is a wheel-only
+#     --no-deps reinstall for every existing user.
 #   - 0.32.0: two new hard deps landed in 0.32.0's requires_dist for the
 #     installed [all,vector] set: tomlkit (unconditional core) and orjson
 #     (proxy extra, CPython-only via `platform_python_implementation != "PyPy"`).

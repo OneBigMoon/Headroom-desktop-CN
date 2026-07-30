@@ -3566,6 +3566,28 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn get_auto_learn_enabled() -> bool {
+    !client_adapters::is_auto_learn_disabled()
+}
+
+/// Toggle passive traffic learning. The flag is only read when the proxy is
+/// spawned, so restart it here to make the change take effect immediately.
+/// Manual Learn scans are unaffected either way.
+#[tauri::command]
+async fn set_auto_learn_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let state: tauri::State<'_, AppState> = app.state();
+    client_adapters::set_auto_learn_enabled(enabled).map_err(|err| err.to_string())?;
+    state.stop_headroom();
+    if let Err(err) = state.ensure_headroom_running() {
+        log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+    }
+    state.invalidate_runtime_status_cache();
+    let action = if enabled { "enabled" } else { "disabled" };
+    analytics::track_event(&app, &format!("auto_learn_{action}"), None);
+    Ok(!client_adapters::is_auto_learn_disabled())
+}
+
+#[tauri::command]
 async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
@@ -4013,6 +4035,8 @@ pub fn run() {
             get_autostart_enabled,
             set_autostart_enabled,
             set_rtk_enabled,
+            get_auto_learn_enabled,
+            set_auto_learn_enabled,
             uninstall_and_quit,
             quit_headroom,
             #[cfg(debug_assertions)]

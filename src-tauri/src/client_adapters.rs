@@ -168,6 +168,21 @@ pub fn is_rtk_disabled() -> bool {
     load_setup_state().rtk_disabled
 }
 
+/// True when the user turned auto-learning off in the Optimize view. The proxy
+/// then runs without the passive traffic-learning flags; manual Learn scans are
+/// unaffected.
+pub fn is_auto_learn_disabled() -> bool {
+    load_setup_state().auto_learn_disabled
+}
+
+/// Persist the auto-learning opt-out. Only read when the proxy is spawned, so
+/// the caller restarts the backend for it to take effect.
+pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
+    let mut state = load_setup_state();
+    state.auto_learn_disabled = !enabled;
+    write_setup_state(&state)
+}
+
 /// Enable or disable RTK from the tool status toggle. Disabling tears down the
 /// RTK PATH export, the Claude Code hook, and the Codex AGENTS.md nudge (without
 /// touching `ANTHROPIC_BASE_URL` routing) and persists the opt-out so bootstrap
@@ -1556,6 +1571,10 @@ struct ClientSetupState {
     /// client setup skip re-adding the RTK PATH export and Claude Code hook.
     #[serde(default)]
     rtk_disabled: bool,
+    /// User turned auto-learning off in the Optimize view. When true the proxy
+    /// is spawned without the passive traffic-learning flags.
+    #[serde(default)]
+    auto_learn_disabled: bool,
 }
 
 fn is_configured(state: &ClientSetupState, client_id: &str) -> bool {
@@ -5649,6 +5668,7 @@ mod tests {
             ]),
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
+            auto_learn_disabled: false,
         };
 
         let normalized = normalize_setup_state(state);
