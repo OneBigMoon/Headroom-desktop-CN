@@ -243,6 +243,55 @@ fn pre_upstream_concurrency() -> usize {
     (cores * 2).clamp(8, 64)
 }
 
+/// Interval estimate of OpenAI's prompt-cache TTL from the backend's
+/// `cache_ttl_observations.jsonl` (written under HEADROOM_CACHE_TTL_LEARN):
+/// hit idles bound the TTL from below (cache proven alive), `ttl_expiry` miss
+/// idles bound it from above (cache proven dead). Returns the smallest
+/// observed death-idle beyond the largest observed life-idle, so an estimation
+/// error can only skip a recompaction, never bust a warm cache; None when the
+/// bounds overlap or samples are thin (< 3 hits or < 3 expiry misses).
+/// Mirrors the upstream `headroom-cache-ttl` estimator (headroom PR #2670);
+/// delete once a wheel ships it and a scheduled run replaces this.
+fn learned_openai_ttl_seconds(obs_path: &Path) -> Option<u64> {
+    let data = std::fs::read_to_string(obs_path).ok()?;
+    let mut hit_idles: Vec<f64> = Vec::new();
+    let mut expiry_idles: Vec<f64> = Vec::new();
+    for line in data.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("provider").and_then(|v| v.as_str()) != Some("openai") {
+            continue;
+        }
+        let idle = row
+            .get("idle_seconds")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if idle <= 0.0 {
+            continue;
+        }
+        if row.get("is_miss").and_then(|v| v.as_bool()) == Some(true) {
+            if row.get("reason").and_then(|v| v.as_str()) == Some("ttl_expiry") {
+                expiry_idles.push(idle);
+            }
+        } else {
+            hit_idles.push(idle);
+        }
+    }
+    if hit_idles.len() < 3 || expiry_idles.len() < 3 {
+        return None;
+    }
+    let max_hit_idle = hit_idles.into_iter().fold(0.0f64, f64::max);
+    let learned = expiry_idles
+        .into_iter()
+        .filter(|&idle| idle > max_hit_idle)
+        .fold(f64::INFINITY, f64::min);
+    if !learned.is_finite() {
+        return None;
+    }
+    Some((learned as u64).clamp(300, 3600))
+}
+
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
     let head = s.split(|c: char| c == '-' || c == '+').next()?;
     let mut parts = head.split('.');
@@ -1315,6 +1364,44 @@ impl ToolManager {
                 // synthetic-control estimate instead of a broken "measured" one.
                 purge_output_savings_control_arm();
 
+                // Cross-turn dedup + cold-prefix recompaction (headroom-ai
+                // 0.33.0; older fallback runtimes ignore unknown envs).
+                // DEDUPE is prefix-monotonic/cache-safe in every handler, so
+                // it is unconditional. COLD_RECOMPACT rewrites the prefix only
+                // when the prompt cache is confirmed dead. The anthropic
+                // handler reads Claude Code's real TTL from cache_control; the
+                // openai-format handler (Codex/OpenCode/Grok) would fall back
+                // to a static 300s guess that busts still-warm caches on
+                // 6-60min resumes, so we seed its learned-TTL table (below)
+                // with OpenAI's documented worst-case instead of gating the
+                // flag off for those connectors. CACHE_TTL_LEARN is
+                // observation-only (size-capped local JSONL) and feeds the
+                // future TTL learner that can replace the seed with measured
+                // values. Connector state is read once per spawn; toggles
+                // apply on the next backend restart.
+                let cold_recompact = crate::client_adapters::is_claude_code_enabled();
+                let cache_ttl_learn = crate::client_adapters::is_codex_enabled();
+
+                // Seed value: a TTL learned from this user's own cache
+                // observations when enough have accumulated, else 3600s =
+                // OpenAI's "caches are always evicted within 1h" upper bound.
+                // Either way Codex-path recompaction only fires on a provably
+                // dead cache. Best-effort like sitecustomize.py: if the write
+                // fails, resolve_learned_ttl returns None and the proxy uses
+                // its 300s static guess — recompact still works, just with
+                // the aggressive threshold.
+                let ttl_seed_path = self.runtime.root_dir.join("cache_ttl_seed.json");
+                let openai_ttl = dirs::home_dir()
+                    .map(|h| h.join(".headroom").join("cache_ttl_observations.jsonl"))
+                    .and_then(|p| learned_openai_ttl_seconds(&p))
+                    .unwrap_or(3600);
+                if let Err(err) = crate::client_adapters::atomic_write(
+                    &ttl_seed_path,
+                    format!(r#"{{"openai": {{"ttl_seconds": {openai_ttl}}}}}"#).as_bytes(),
+                ) {
+                    log::warn!("[tool_manager] writing cache_ttl_seed.json failed: {err}");
+                }
+
                 // Wrap with `nice` so headroom yields CPU to foreground apps
                 // (Claude Code, terminal, etc.) when the machine is contended.
                 // On idle systems headroom still runs at full speed.
@@ -1373,6 +1460,16 @@ impl ToolManager {
                     // is 100% client-driven; cache mode only avoids busting it and
                     // adds no compression), leaving the savings chart flat.
                     .env("HEADROOM_MODE", "token")
+                    .env("HEADROOM_DEDUPE", "1")
+                    .env(
+                        "HEADROOM_COLD_RECOMPACT",
+                        if cold_recompact { "1" } else { "0" },
+                    )
+                    .env(
+                        "HEADROOM_CACHE_TTL_LEARN",
+                        if cache_ttl_learn { "1" } else { "0" },
+                    )
+                    .env("HEADROOM_CACHE_TTL_LEARNED_PATH", &ttl_seed_path)
                     // Off-path background compression (#1171). The Kompress ML pass
                     // over the stable prefix is CPU-bound Rust that releases the GIL,
                     // so 3+ concurrent Claude Code sessions run their passes in true
@@ -4533,6 +4630,7 @@ impl ToolManager {
         )
         .context("serena installed but failed its smoke test")?;
         self.register_serena_mcp()?;
+        set_serena_global_gitignore(true);
         self.write_tool_receipt(
             "serena",
             json!({ "version": SERENA_PINNED_VERSION, "enabled": true }),
@@ -4561,6 +4659,7 @@ impl ToolManager {
         // leftover MCP entry pointing at a deleted binary would make every new
         // agent session spawn a failing server.
         self.unregister_serena_mcp()?;
+        set_serena_global_gitignore(false);
         let venv = self.serena_venv_dir();
         if venv.exists() {
             std::fs::remove_dir_all(&venv)
@@ -5274,6 +5373,110 @@ fn count_serena_tool_calls_in_dir(dir: &Path) -> Option<u64> {
             .count() as u64;
     }
     (count > 0).then_some(count)
+}
+
+/// Serena writes a `.serena/` dir (config, cache, memories) into the root of
+/// every project it is pointed at. It self-ignores the noisy parts but leaves
+/// `project.yml` and its own `.gitignore` tracked, so every repo the user
+/// touches picks up two unrequested files.
+const SERENA_GITIGNORE_MARKER: &str =
+    "# Headroom-managed: serena writes .serena/ into every project root";
+const SERENA_GITIGNORE_PATTERN: &str = ".serena/";
+
+/// Git reads `$XDG_CONFIG_HOME/git/ignore` (default `~/.config/git/ignore`)
+/// when `core.excludesfile` is unset, so the pattern can be added without
+/// rewriting the user's global git config.
+fn global_git_excludes_path() -> Option<PathBuf> {
+    let configured = Command::new("git")
+        .args(["config", "--global", "--get", "core.excludesfile"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|path| !path.is_empty());
+    let home = dirs::home_dir()?;
+    Some(match configured {
+        Some(path) => match path.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(path),
+        },
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("git")
+            .join("ignore"),
+    })
+}
+
+/// `None` when the file already says what it should - nothing to write.
+/// Removal only strips the block Headroom added: a hand-written `.serena/`
+/// with no marker above it is the user's, not ours.
+fn apply_serena_gitignore(existing: &str, present: bool) -> Option<String> {
+    if present {
+        if existing
+            .lines()
+            .any(|line| line.trim() == SERENA_GITIGNORE_PATTERN)
+        {
+            return None;
+        }
+        let mut updated = existing.to_string();
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(SERENA_GITIGNORE_MARKER);
+        updated.push('\n');
+        updated.push_str(SERENA_GITIGNORE_PATTERN);
+        updated.push('\n');
+        return Some(updated);
+    }
+    if !existing.lines().any(|line| line == SERENA_GITIGNORE_MARKER) {
+        return None;
+    }
+    let mut updated = String::new();
+    let mut after_marker = false;
+    for line in existing.lines() {
+        if line == SERENA_GITIGNORE_MARKER {
+            after_marker = true;
+            continue;
+        }
+        if after_marker {
+            after_marker = false;
+            if line.trim() == SERENA_GITIGNORE_PATTERN {
+                continue;
+            }
+        }
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    Some(updated)
+}
+
+/// Best-effort: a user with an unwritable git config still gets a working
+/// serena, so failures are logged at info (never Sentry-escalated) and the
+/// install continues.
+fn set_serena_global_gitignore(present: bool) {
+    let Some(path) = global_git_excludes_path() else {
+        return;
+    };
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let Some(updated) = apply_serena_gitignore(&existing, present) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            log::info!("serena: creating {} failed: {err:#}", parent.display());
+            return;
+        }
+    }
+    if let Err(err) = crate::client_adapters::atomic_write(&path, updated.as_bytes()) {
+        log::info!("serena: updating {} failed: {err:#}", path.display());
+    } else {
+        log::info!(
+            "serena: {} .serena/ in {}",
+            if present { "ignoring" } else { "un-ignoring" },
+            path.display()
+        );
+    }
 }
 
 fn installed_plugin_version(plugin: &PluginAddon) -> Option<String> {
@@ -7259,23 +7462,136 @@ mod tests {
     use super::log_tail;
     use super::rotate_log_if_large;
     use super::{
-        bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
+        apply_serena_gitignore, bootstrap_requirements_lock_for_target,
+        classify_kompress_prefetch_failure, diagnose_proxy_port,
+        extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
-        is_outdated_codex, ledger_bytes_without_control, looks_like_corrupt_venv_error,
-        parse_major_minor_patch, parse_pid_from_lsof_detail, path_with_binary_dir,
-        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
-        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, PLUGIN_ADDONS, RTK_VERSION,
+        is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
+        looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
+        path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
+        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
+        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
+        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        PLUGIN_ADDONS, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    fn write_ttl_obs(dir: &Path, rows: &[(&str, f64, bool, &str)]) -> PathBuf {
+        let path = dir.join("cache_ttl_observations.jsonl");
+        let mut lines: Vec<String> = rows
+            .iter()
+            .map(|(provider, idle, is_miss, reason)| {
+                format!(
+                    r#"{{"ts":1000,"provider":"{provider}","model":"gpt-5.5","reason":"{reason}","idle_seconds":{idle},"ttl_assumed":300,"is_miss":{is_miss},"cache_read":0,"expected_cached":1000}}"#
+                )
+            })
+            .collect();
+        lines.push("not-json".into());
+        fs::write(&path, lines.join("\n")).expect("write obs");
+        path
+    }
+
+    #[test]
+    fn learned_openai_ttl_picks_smallest_death_beyond_largest_life() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_ttl_obs(
+            dir.path(),
+            &[
+                ("openai", 120.0, false, "hit"),
+                ("openai", 300.0, false, "hit"),
+                ("openai", 480.0, false, "hit"),
+                // Death below the max hit says nothing; 600 is the safe bound.
+                ("openai", 400.0, true, "ttl_expiry"),
+                ("openai", 600.0, true, "ttl_expiry"),
+                ("openai", 900.0, true, "ttl_expiry"),
+                // Non-openai rows and non-ttl_expiry misses are ignored.
+                ("anthropic", 2000.0, false, "hit"),
+                ("openai", 550.0, true, "prefix_change"),
+            ],
+        );
+        assert_eq!(learned_openai_ttl_seconds(&path), Some(600));
+    }
+
+    #[test]
+    fn learned_openai_ttl_none_without_safe_upper_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Every observed death overlaps the life range.
+        let overlap = write_ttl_obs(
+            dir.path(),
+            &[
+                ("openai", 120.0, false, "hit"),
+                ("openai", 480.0, false, "hit"),
+                ("openai", 900.0, false, "hit"),
+                ("openai", 400.0, true, "ttl_expiry"),
+                ("openai", 450.0, true, "ttl_expiry"),
+                ("openai", 600.0, true, "ttl_expiry"),
+            ],
+        );
+        assert_eq!(learned_openai_ttl_seconds(&overlap), None);
+        // Thin samples (2 hits < 3) and a missing file also yield None.
+        let thin = write_ttl_obs(
+            dir.path(),
+            &[
+                ("openai", 120.0, false, "hit"),
+                ("openai", 480.0, false, "hit"),
+                ("openai", 600.0, true, "ttl_expiry"),
+                ("openai", 700.0, true, "ttl_expiry"),
+                ("openai", 800.0, true, "ttl_expiry"),
+            ],
+        );
+        assert_eq!(learned_openai_ttl_seconds(&thin), None);
+        assert_eq!(
+            learned_openai_ttl_seconds(&dir.path().join("missing.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn learned_openai_ttl_clamps_to_documented_bounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Observed death beyond OpenAI's documented 1h max: clamp to 3600.
+        let path = write_ttl_obs(
+            dir.path(),
+            &[
+                ("openai", 120.0, false, "hit"),
+                ("openai", 300.0, false, "hit"),
+                ("openai", 480.0, false, "hit"),
+                ("openai", 5000.0, true, "ttl_expiry"),
+                ("openai", 6000.0, true, "ttl_expiry"),
+                ("openai", 7000.0, true, "ttl_expiry"),
+            ],
+        );
+        assert_eq!(learned_openai_ttl_seconds(&path), Some(3600));
+    }
+
+    #[test]
+    fn serena_gitignore_add_remove_roundtrip() {
+        // Empty file -> block appended; missing trailing newline is repaired.
+        let added = apply_serena_gitignore("", true).expect("append to empty");
+        assert!(added.ends_with(".serena/\n"));
+        let from_existing = apply_serena_gitignore("*.log", true).expect("append after content");
+        assert!(from_existing.starts_with("*.log\n"));
+        assert!(from_existing.ends_with(".serena/\n"));
+
+        // Idempotent: already present -> no rewrite.
+        assert!(apply_serena_gitignore(&added, true).is_none());
+        assert!(apply_serena_gitignore(".serena/\n", true).is_none());
+
+        // Removal restores the original bytes exactly.
+        assert_eq!(
+            apply_serena_gitignore(&from_existing, false).expect("remove block"),
+            "*.log\n"
+        );
+
+        // A hand-written pattern with no marker is the user's - left alone.
+        assert!(apply_serena_gitignore(".serena/\n*.log\n", false).is_none());
+    }
 
     #[test]
     fn ledger_purge_clears_nonempty_control_only() {

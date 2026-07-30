@@ -1024,7 +1024,11 @@ pub(crate) fn verify_auth_code_with_base_url(
         None,
         Some(account),
         claude,
-        build_promo(body.active_percent_off, &body.pricing_ladder, &body.intro_offer),
+        build_promo(
+            body.active_percent_off,
+            &body.pricing_ladder,
+            &body.intro_offer,
+        ),
         last_known_good_plan_tier,
         tier_mismatch,
     ))
@@ -1126,7 +1130,11 @@ pub(crate) fn activate_account_with_base_url(
         None,
         Some(account),
         claude,
-        build_promo(body.active_percent_off, &body.pricing_ladder, &body.intro_offer),
+        build_promo(
+            body.active_percent_off,
+            &body.pricing_ladder,
+            &body.intro_offer,
+        ),
         last_known_good_plan_tier,
         tier_mismatch,
     ))
