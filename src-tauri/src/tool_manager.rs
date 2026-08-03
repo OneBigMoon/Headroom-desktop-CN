@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -570,6 +571,35 @@ const PYTHON_SHA256_LINUX_X86_64: &str =
 const PYTHON_SHA256_LINUX_AARCH64: &str =
     "d2a6c0d4ceea088f635b309a59d5d700a256656423225f96ddfb71d532adb1aa";
 
+/// Venv layout differs per platform: Unix venvs place interpreters and
+/// console-script entrypoints in `bin/` (python3, no extension); Windows venvs
+/// use `Scripts/` with `.exe`-suffixed names. The standalone python extracted
+/// by `install_python_distribution` is the exception: on Windows the
+/// interpreter is `python.exe` at the extraction root.
+fn python_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "python.exe"
+    } else {
+        "python3"
+    }
+}
+
+fn pip_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "pip.exe"
+    } else {
+        "pip"
+    }
+}
+
+fn bin_subdir() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Scripts"
+    } else {
+        "bin"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapStepUpdate {
     pub step: &'static str,
@@ -625,15 +655,19 @@ impl ManagedRuntime {
     }
 
     pub fn standalone_python(&self) -> PathBuf {
-        self.python_dir.join("bin").join("python3")
+        if cfg!(target_os = "windows") {
+            self.python_dir.join("python.exe")
+        } else {
+            self.python_dir.join("bin").join("python3")
+        }
     }
 
     pub fn managed_python(&self) -> PathBuf {
-        self.venv_dir.join("bin").join("python3")
+        self.venv_dir.join(bin_subdir()).join(python_exe_name())
     }
 
     pub fn managed_pip(&self) -> PathBuf {
-        self.venv_dir.join("bin").join("pip")
+        self.venv_dir.join(bin_subdir()).join(pip_exe_name())
     }
 
     pub fn ready_flag(&self) -> PathBuf {
@@ -1067,7 +1101,12 @@ impl ToolManager {
     }
 
     pub fn headroom_entrypoint(&self) -> PathBuf {
-        self.runtime.venv_dir.join("bin").join("headroom")
+        let name = if cfg!(target_os = "windows") {
+            "headroom.exe"
+        } else {
+            "headroom"
+        };
+        self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
     pub fn managed_python(&self) -> PathBuf {
@@ -1075,7 +1114,8 @@ impl ToolManager {
     }
 
     pub fn rtk_entrypoint(&self) -> PathBuf {
-        self.runtime.bin_dir.join("rtk")
+        let name = if cfg!(target_os = "windows") { "rtk.exe" } else { "rtk" };
+        self.runtime.bin_dir.join(name)
     }
 
     /// Seed the output-shaper savings baseline by mining the user's Claude Code
@@ -4439,14 +4479,24 @@ impl ToolManager {
     }
 
     pub fn markitdown_entrypoint(&self) -> PathBuf {
-        self.runtime.venv_dir.join("bin").join("markitdown")
+        let name = if cfg!(target_os = "windows") {
+            "markitdown.exe"
+        } else {
+            "markitdown"
+        };
+        self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
     /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
     /// permission both reference this absolute path, so it works whether or not
     /// the bin dir is on PATH (RTK, which exports it, is now opt-in).
     pub fn markitdown_shim_path(&self) -> PathBuf {
-        self.runtime.bin_dir.join("markitdown")
+        let name = if cfg!(target_os = "windows") {
+            "markitdown.cmd"
+        } else {
+            "markitdown"
+        };
+        self.runtime.bin_dir.join(name)
     }
 
     fn markitdown_conversion_counter_path(&self) -> PathBuf {
@@ -4579,7 +4629,8 @@ impl ToolManager {
     }
 
     pub fn serena_entrypoint(&self) -> PathBuf {
-        self.serena_venv_dir().join("bin").join("serena")
+        let name = if cfg!(target_os = "windows") { "serena.exe" } else { "serena" };
+        self.serena_venv_dir().join(bin_subdir()).join(name)
     }
 
     pub fn serena_installed(&self) -> bool {
@@ -4600,7 +4651,10 @@ impl ToolManager {
             Duration::from_secs(120),
         )
         .context("creating serena venv")?;
-        let serena_python = self.serena_venv_dir().join("bin").join("python3");
+        let serena_python = self
+            .serena_venv_dir()
+            .join(bin_subdir())
+            .join(python_exe_name());
         run_pip_install_with_retries_streaming(
             &serena_python,
             &[
@@ -7866,6 +7920,28 @@ mod tests {
         assert!(runtime.standalone_python().starts_with(&runtime.root_dir));
         assert!(runtime.managed_pip().starts_with(&runtime.root_dir));
         assert!(runtime.bin_dir.starts_with(&runtime.root_dir));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn managed_runtime_uses_windows_layout() {
+        let runtime =
+            ManagedRuntime::bootstrap_root(&std::env::temp_dir().join("headroom-layout-test"));
+        assert!(runtime.standalone_python().ends_with("python\\python.exe"));
+        assert!(runtime.managed_python().ends_with("Scripts\\python.exe"));
+        assert!(runtime.managed_pip().ends_with("Scripts\\pip.exe"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tool_manager_entrypoints_use_windows_layout() {
+        let runtime = ManagedRuntime::bootstrap_root(
+            &std::env::temp_dir().join("headroom-entrypoints-test"),
+        );
+        let manager = ToolManager::new(runtime);
+        assert!(manager.headroom_entrypoint().ends_with("Scripts\\headroom.exe"));
+        assert!(manager.rtk_entrypoint().ends_with("bin\\rtk.exe"));
+        assert!(manager.markitdown_shim_path().ends_with("bin\\markitdown.cmd"));
     }
 
     #[test]
