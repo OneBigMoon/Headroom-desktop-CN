@@ -570,6 +570,8 @@ const PYTHON_SHA256_LINUX_X86_64: &str =
     "c74addcd1b033a6e4d60ead3ab47fcc995569027e01d3061c4a934f363c4a0cf";
 const PYTHON_SHA256_LINUX_AARCH64: &str =
     "d2a6c0d4ceea088f635b309a59d5d700a256656423225f96ddfb71d532adb1aa";
+const PYTHON_SHA256_WINDOWS_X86_64: &str =
+    "3c8b9b10a933909c98b9916297e2093b24a9c2abaa23df1c2622c2bfe052cb94";
 
 /// Venv layout differs per platform: Unix venvs place interpreters and
 /// console-script entrypoints in `bin/` (python3, no extension); Windows venvs
@@ -6364,6 +6366,13 @@ fn python_distribution_artifact() -> Result<DownloadArtifact> {
             ),
             sha256: Some(PYTHON_SHA256_LINUX_AARCH64),
         }),
+        ("windows", "x86_64") => Ok(DownloadArtifact {
+            url: format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{}/cpython-3.12.12+20251014-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+                PYTHON_STANDALONE_RELEASE
+            ),
+            sha256: Some(PYTHON_SHA256_WINDOWS_X86_64),
+        }),
         (os, arch) => bail!("unsupported Headroom managed Python target: {os}/{arch}"),
     }
 }
@@ -7942,6 +7951,15 @@ mod tests {
         assert!(manager.headroom_entrypoint().ends_with("Scripts\\headroom.exe"));
         assert!(manager.rtk_entrypoint().ends_with("bin\\rtk.exe"));
         assert!(manager.markitdown_shim_path().ends_with("bin\\markitdown.cmd"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn python_distribution_artifact_supports_windows_x86_64() {
+        let artifact = python_distribution_artifact().expect("windows python target");
+        assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
+        assert!(artifact.url.ends_with(".tar.gz"));
+        assert!(artifact.sha256.is_some(), "python checksum should be pinned");
     }
 
     #[test]
