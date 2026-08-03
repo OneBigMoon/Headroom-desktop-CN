@@ -2611,12 +2611,18 @@ impl ToolManager {
             .unpack(&staging_dir)
             .with_context(|| format!("extracting into {}", staging_dir.display()))?;
 
-        // The tarball's single root is `python/`.
+        // The tarball's single root is `python/`. On Windows the interpreter is
+        // `python.exe` at the root; on Unix it is `bin/python3`.
         let extracted_root = staging_dir.join("python");
-        if !extracted_root.join("bin").join("python3").exists() {
+        let expected_python = if cfg!(target_os = "windows") {
+            extracted_root.join("python.exe")
+        } else {
+            extracted_root.join("bin").join("python3")
+        };
+        if !expected_python.exists() {
             bail!(
                 "standalone python extraction completed but {} was not found",
-                extracted_root.join("bin/python3").display()
+                expected_python.display()
             );
         }
         if self.runtime.python_dir.exists() {
