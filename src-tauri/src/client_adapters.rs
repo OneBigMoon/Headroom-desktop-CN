@@ -1032,6 +1032,37 @@ pub fn perform_full_cleanup() -> Vec<String> {
         removed.extend(remove_macos_bundle_dirs());
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // Remove the autostart Run key tauri-plugin-autostart creates
+        // (HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Headroom).
+        let _ = std::process::Command::new("reg")
+            .args([
+                "delete",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "Headroom",
+                "/f",
+            ])
+            .status();
+
+        // Windows app-data dirs not covered by app_data_dir() (which resolves
+        // to %APPDATA%\Headroom already) and the huggingface cache (local).
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            for candidate in [base.join("Headroom"), base.join("headroom")] {
+                if candidate.exists() {
+                    match remove_dir_all_retry(&candidate) {
+                        Ok(_) => removed.push(candidate.display().to_string()),
+                        Err(err) => log::warn!(
+                            "cleanup: removing {} failed: {err}",
+                            candidate.display()
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     remove_known_keychain_entries();
 
     // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
