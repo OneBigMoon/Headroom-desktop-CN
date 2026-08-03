@@ -4573,6 +4573,28 @@ impl ToolManager {
                 format!("marking markitdown shim executable {}", shim.display())
             })?;
         }
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                "@echo off\r\n\
+                 setlocal\r\n\
+                 rem Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\r\n\
+                 if \"%~1\"==\"\" goto :run\r\n\
+                 if \"%~1\"==\"--help\" goto :run\r\n\
+                 set \"C={counter}\"\r\n\
+                 set /p n=<\"%C%\" 2>nul\r\n\
+                 if not defined n set n=0\r\n\
+                 set /a n+=1 >nul 2>nul\r\n\
+                 echo %n%>\"%C%.tmp\"\r\n\
+                 move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
+                 :run\r\n\
+                 \"{real}\" %*\r\n",
+                counter = self.markitdown_conversion_counter_path().display(),
+                real = self.markitdown_entrypoint().display(),
+            );
+            crate::client_adapters::atomic_write(&shim, script.as_bytes())
+                .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
+        }
         Ok(())
     }
 
