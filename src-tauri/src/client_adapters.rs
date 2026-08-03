@@ -1727,7 +1727,7 @@ fn resolve_client_shell_targets(state: &ClientSetupState, client_id: &str) -> Re
         }
     }
 
-    Ok(dedupe_paths(targets))
+    Ok(dedupe_shell_targets(targets))
 }
 
 fn resolve_client_shell_targets_for_cleanup(
@@ -1736,7 +1736,7 @@ fn resolve_client_shell_targets_for_cleanup(
 ) -> Result<Vec<PathBuf>> {
     let mut targets = resolve_client_shell_targets(state, client_id)?;
     targets.extend(all_shell_paths());
-    Ok(dedupe_paths(targets))
+    Ok(dedupe_shell_targets(targets))
 }
 
 fn configure_shell_block(
@@ -4691,7 +4691,7 @@ fn resolve_default_shell_targets() -> Vec<PathBuf> {
     if targets.is_empty() {
         targets = default_shell_targets_for_family(detect_shell_family());
     }
-    dedupe_paths(targets)
+    dedupe_shell_targets(targets)
 }
 
 fn detect_shell_family() -> ShellFamily {
@@ -4718,7 +4718,7 @@ fn detect_shell_family() -> ShellFamily {
     let has_zsh_files = [ZSH_PROFILE_FILE, ZSH_RC_FILE]
         .into_iter()
         .map(shell_path)
-        .any(|path| path.exists());
+        .any(|path| path.is_file());
     let has_bash_files = [
         BASH_PROFILE_FILE,
         BASH_LOGIN_FILE,
@@ -4727,7 +4727,7 @@ fn detect_shell_family() -> ShellFamily {
     ]
     .into_iter()
     .map(shell_path)
-    .any(|path| path.exists());
+    .any(|path| path.is_file());
 
     match (has_zsh_files, has_bash_files) {
         (true, false) => ShellFamily::Zsh,
@@ -4740,13 +4740,13 @@ fn detect_shell_family() -> ShellFamily {
 fn default_shell_targets_for_family(shell_family: ShellFamily) -> Vec<PathBuf> {
     match shell_family {
         ShellFamily::Zsh => {
-            dedupe_paths(vec![shell_path(ZSH_PROFILE_FILE), shell_path(ZSH_RC_FILE)])
+            dedupe_shell_targets(vec![shell_path(ZSH_PROFILE_FILE), shell_path(ZSH_RC_FILE)])
         }
-        ShellFamily::Bash => dedupe_paths(vec![
+        ShellFamily::Bash => dedupe_shell_targets(vec![
             preferred_bash_profile_path(),
             shell_path(BASH_RC_FILE),
         ]),
-        ShellFamily::Posix => vec![shell_path(POSIX_PROFILE_FILE)],
+        ShellFamily::Posix => dedupe_shell_targets(vec![shell_path(POSIX_PROFILE_FILE)]),
     }
 }
 
@@ -4754,7 +4754,7 @@ fn preferred_bash_profile_path() -> PathBuf {
     [BASH_PROFILE_FILE, BASH_LOGIN_FILE, POSIX_PROFILE_FILE]
         .into_iter()
         .map(shell_path)
-        .find(|path| path.exists())
+        .find(|path| path.is_file())
         .unwrap_or_else(|| shell_path(BASH_PROFILE_FILE))
 }
 
@@ -4804,13 +4804,23 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     deduped
 }
 
+/// Dedupe a shell-target list and drop anything that already exists as a
+/// directory. Such a path is neither readable nor rewritable: `read_to_string`
+/// fails with `EISDIR` ("Is a directory", os error 21), which aborted the whole
+/// client setup for a user whose `~/.profile` is a directory (RUST-5X/5Y/5Z —
+/// it broke claude_code, codex and grok_build alike). Paths that do not exist
+/// yet stay eligible; we create those.
+fn dedupe_shell_targets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    dedupe_paths(paths.into_iter().filter(|path| !path.is_dir()).collect())
+}
+
 fn dedupe_strings(values: &mut Vec<String>) {
     let mut seen = BTreeSet::new();
     values.retain(|value| seen.insert(value.clone()));
 }
 
 fn all_shell_paths() -> Vec<PathBuf> {
-    ALL_SHELL_FILES.into_iter().map(shell_path).collect()
+    dedupe_shell_targets(ALL_SHELL_FILES.into_iter().map(shell_path).collect())
 }
 
 fn is_profile_file(path: &Path) -> bool {
@@ -8509,6 +8519,46 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "another file's backup should survive"
         );
         assert!(target.exists(), "target file itself should survive");
+    }
+
+    #[test]
+    fn dedupe_shell_targets_drops_directories_keeps_files_and_missing_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile_dir = tmp.path().join(".profile");
+        fs::create_dir(&profile_dir).unwrap();
+        let zshrc = tmp.path().join(".zshrc");
+        fs::write(&zshrc, "# user config\n").unwrap();
+        let not_created_yet = tmp.path().join(".bash_profile");
+
+        let kept = super::dedupe_shell_targets(vec![
+            profile_dir.clone(),
+            zshrc.clone(),
+            not_created_yet.clone(),
+            zshrc.clone(),
+        ]);
+
+        assert_eq!(kept, vec![zshrc, not_created_yet]);
+        assert!(
+            !kept.contains(&profile_dir),
+            "a directory named .profile must never become a shell target (RUST-5X)"
+        );
+    }
+
+    #[test]
+    fn upsert_managed_block_never_sees_a_directory_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile_dir = tmp.path().join(".profile");
+        fs::create_dir(&profile_dir).unwrap();
+
+        // Ground truth for the bug: reading a directory is EISDIR, and that
+        // error used to abort setup for every client.
+        let err = super::upsert_managed_block(&profile_dir, "claude_code", "export FOO=1")
+            .expect_err("reading a directory must fail");
+        assert!(
+            format!("{err:#}").contains("Is a directory"),
+            "unexpected error: {err:#}"
+        );
+        assert!(super::dedupe_shell_targets(vec![profile_dir]).is_empty());
     }
 
     #[test]

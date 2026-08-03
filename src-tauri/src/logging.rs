@@ -114,6 +114,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // report_codex_upstream_error logs the RAW upstream body locally and then
+    // captures a separate, status-fingerprinted event with only the structural
+    // summary. The bridge defeated both halves (RUST-5Q): the raw body — which
+    // quotes the user's request fields — left the machine, and because this
+    // line carries no fingerprint Sentry parameterized it into one grab-bag
+    // mixing 400/403/503/507. The capture at the emit site is the Sentry path.
+    if target.starts_with("headroom_desktop_lib::proxy_intercept")
+        && msg.starts_with("codex upstream error ")
+    {
+        return true;
+    }
     // Kompress prefetch is best-effort; the proxy lazy-loads the model on first
     // request if this fails. These two variants carry no actionable detail (the
     // spawn error is rare and the restart self-heals on next request), so they
@@ -406,6 +417,25 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "cleanup: removing /Users/x/Library/Application Support/Headroom failed: Directory not empty (os error 66)"
+        ));
+    }
+
+    #[test]
+    fn skips_codex_upstream_error_raw_body_warning() {
+        // RUST-5Q: this line carries the raw upstream body (user request fields)
+        // and no fingerprint, so Sentry grab-bagged 400/403/503/507 together.
+        // The status-fingerprinted capture at the emit site is the Sentry path.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "codex upstream error 400 on /v1/responses: {\"error\":{\"message\":\"Unsupported value\"}}"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "codex upstream error 503 on /v1/responses: upstream connect error"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "some other proxy_intercept warning"
         ));
     }
 

@@ -3082,6 +3082,18 @@ impl AppState {
 
     pub fn stop_headroom(&self) {
         let _lifecycle_guard = self.lifecycle_lock.lock();
+        // Every app-initiated stop is a down window we caused: a watchdog
+        // restart, a pricing-gate pause, a port rebind, quit. The down->up
+        // transition that follows is not an outage worth paging, and when the
+        // stop came from the watchdog auto-pause it duplicates
+        // `proxy_unreachable_post_boot` with none of its diagnostics
+        // (RUST-5J/5D). A backend that dies on its own never routes through
+        // here, so genuine crashes still report. The window has to outlast a
+        // cold boot (tiktoken prefetch alone gets 120s); the upgrade path
+        // above uses 600s for a reinstall+boot.
+        crate::proxy_intercept::suppress_codex_reconnect_reports_for(
+            std::time::Duration::from_secs(300),
+        );
         self.set_runtime_starting(false);
         let mut process = self.headroom_process.lock();
 

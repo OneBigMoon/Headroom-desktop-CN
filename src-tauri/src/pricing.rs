@@ -1179,6 +1179,14 @@ pub struct WeeklyLimitNudge {
 /// de-duplication are the server's job (headroom-web
 /// `POST /api/v1/desktop/weekly_limit`), so this stays a pure mapping.
 pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimitNudge> {
+    // A trial-ended hard block is not a weekly-cap event: there is no free plan
+    // to be close to, and the branch sets `should_nudge` purely to surface the
+    // upgrade prompt. Reporting it would email "you're close to your weekly
+    // limit on the free plan" to someone whose trial simply expired.
+    if matches!(status.gate_reason, Some(PricingGateReason::TrialEnded)) {
+        return None;
+    }
+
     let claude_cap = status.effective_disable_threshold_percent;
     let codex_cap = Some(CODEX_WEEKLY_DISABLE_THRESHOLD_PCT);
 
@@ -1193,10 +1201,10 @@ pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimit
             cap_percent: claude_cap,
         });
     }
-    let codex_reached = status
-        .codex
-        .as_ref()
-        .is_some_and(|codex| !codex.optimization_allowed);
+    let codex_reached = status.codex.as_ref().is_some_and(|codex| {
+        !codex.optimization_allowed
+            && !matches!(codex.gate_reason, Some(PricingGateReason::TrialEnded))
+    });
     if codex_reached {
         return Some(WeeklyLimitNudge {
             status: "reached",
@@ -3721,6 +3729,69 @@ mod tests {
             free.optimization_allowed,
             "grandfathered Free is never paused"
         );
+    }
+
+    #[test]
+    fn trial_ended_hard_block_reports_no_weekly_limit_nudge() {
+        // The hard block sets should_nudge purely to surface the upgrade prompt;
+        // reporting it would email "close to your weekly limit on the free plan"
+        // to someone whose trial simply expired. Codex hard-block likewise.
+        let (start, end) = grace();
+        let mut status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            pro_profile_with_weekly(30.0),
+            false,
+            None,
+        );
+        assert!(status.should_nudge);
+        assert!(super::weekly_limit_signal(&status).is_none());
+
+        status.codex = Some(super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(80.0),
+            crate::models::CodexPlanTier::Pro,
+            super::CodexActivation::HardBlock,
+            0.0,
+        ));
+        assert!(super::weekly_limit_signal(&status).is_none());
+    }
+
+    #[test]
+    fn grandfathered_weekly_cap_still_reports_nudges() {
+        let (start, end) = grace();
+        let paused = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            pro_profile_with_weekly(60.0),
+            false,
+            None,
+        );
+        let reached = super::weekly_limit_signal(&paused).expect("paused free tier reports");
+        assert_eq!(reached.status, "reached");
+        assert_eq!(reached.cap_percent, Some(50.0));
+
+        let nudging = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            pro_profile_with_weekly(30.0),
+            false,
+            None,
+        );
+        let approaching = super::weekly_limit_signal(&nudging).expect("nudging free tier reports");
+        assert_eq!(approaching.status, "approaching");
+        assert_eq!(approaching.cap_percent, Some(50.0));
     }
 
     #[test]

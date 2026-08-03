@@ -27,6 +27,12 @@ stat -f '%Sm' ~/Library/Application\ Support/Headroom/config/activity-facts.json
 Expect: mtime within the last minute. `lastTransformation` inside the file is a "Recent large compression" tile pick (gated on >=1000 tokens saved and >20% savings, see `activity_facts.rs`), not a per-request heartbeat — don't use it as a liveness signal.
 
 ### 3. RTK is on PATH and reports savings (Claude Code only — RTK does not rewrite Codex)
+First check whether RTK is installed at all. It is an opt-in addon and can be turned off from the Optimize view, which sets `rtkDisabled` in the setup state; `ensure_rtk_integrations` then writes no PATH block and no Claude Code hook (see `is_rtk_disabled` in `client_adapters.rs`). Skip the check when it is off — a missing `rtk` is the correct state, not a regression.
+```bash
+jq -r 'if .rtkDisabled then "RTK DISABLED — skip this check" else "RTK enabled — run check" end' \
+  ~/Library/Application\ Support/Headroom/config/client-setup.json
+```
+If enabled:
 ```bash
 zsh -lc 'rtk --version && rtk gain | head -5'
 ```
@@ -43,7 +49,13 @@ If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small q
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
 
 ### 6. Pause / resume cleanly strips and restores interception
-In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`. This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
+In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
+```bash
+grep -c 'headroom:claude_code' ~/.zprofile ~/.zshrc
+```
+Expect: after Pause both files print `0`; after Resume both print `2` (the `# >>> headroom:claude_code >>>` and `# <<< headroom:claude_code <<<` marker lines). Do *not* grep `~/.claude/settings.json` for `headroom-rtk-rewrite` — that hook only exists when the RTK addon is installed, so on an install with RTK off (check 3) it reads `0` in both states and the check looks like a FAIL on a healthy build. The managed shell block is the RTK-independent marker. If RTK *is* installed, `grep -c headroom-rtk-rewrite ~/.claude/settings.json` is a valid extra signal: `0` after Pause, `1` after Resume.
+
+This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
 
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
 The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded — cache mode and the old auth-based mode auto-switch were removed; see `tool_manager.rs`). So `.summary.mode` reports `token` for *every* session, including a Claude Code subscription/OAuth one — don't branch on it. What actually differs per request is the **compression policy**, chosen by the auth-mode classifier (`classify_auth_mode` in the proxy) from the client `User-Agent`:
@@ -110,14 +122,18 @@ echo "livez=$code"
 lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk -v IGNORECASE=1 '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
 kill $BLOCK_PID 2>/dev/null
 ```
-Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). After the test, restore the default port with the same wait-for-exit pattern (this relaunch loses the teardown race even more often, because the fallback instance was just cold-booted):
+Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). A second confirmation is the proxy log *filename*, which embeds the chosen port — a successful fallback leaves a `headroom-proxy---port-6769---....log` next to the usual `...port-6768...` one:
+```bash
+ls -t ~/Library/Application\ Support/Headroom/headroom/logs/ | grep -m3 'headroom-proxy---port-'
+```
+After the test, restore the default port with the same wait-for-exit pattern (this relaunch loses the teardown race even more often, because the fallback instance was just cold-booted):
 ```bash
 osascript -e 'quit app "Headroom"' 2>/dev/null
 for _ in $(seq 1 30); do pgrep -xq headroom-desktop || break; sleep 0.5; done
 open -a Headroom
 ```
 
-If the fallback is missing, check `~/Library/Application Support/Headroom/headroom/logs/` for a `[backend_port]` warning line that names the occupant and the chosen fallback port.
+If the fallback is missing, check the desktop log (`logging::log_path()`) for a `[backend_port]` warning line naming the occupant and the chosen fallback port. Note that the *proxy* logs under `.../headroom/logs/` never carry that line — it is emitted by the Rust side, so grepping the proxy log directory for `backend_port` comes back empty even on a successful fallback.
 
 ### 10. Auth / pricing state is intact
 The session token lives in the macOS keychain under service `com.extraheadroom.headroom.account`, account `session-token`; the local pricing state lives next to `activity-facts.json`.

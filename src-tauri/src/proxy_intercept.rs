@@ -198,7 +198,21 @@ fn report_codex_reconnect_incident(
 /// every request from both the connect-failed and connect-succeeded paths.
 fn note_backend_reachability(reachable: bool, backend_addr: SocketAddr) {
     let new_state = if reachable { 1u8 } else { 2u8 };
-    if BACKEND_REACHABILITY_STATE.swap(new_state, Ordering::Relaxed) == new_state {
+    let previous_state = BACKEND_REACHABILITY_STATE.swap(new_state, Ordering::Relaxed);
+    if previous_state == new_state {
+        return;
+    }
+    if !reachable && previous_state == 0 {
+        // First observation of this process: the app just launched and the
+        // backend is still booting (Python + litellm import, tiktoken prefetch
+        // — tens of seconds on a cold machine). An agent that was already
+        // running sends into that window and gets direct-fallback, which is
+        // expected, not an outage. Arming the down-timer here reported every
+        // launch as `backend_unreachable` (RUST-5J: ~11 hosts, 20-210s
+        // "downtime", 1-2 events per host). A backend that never comes up is
+        // the actionable case and has its own signal — the watchdog's
+        // `proxy_unreachable_post_boot` auto-pause (RUST-5D).
+        log::info!("backend {backend_addr} not up yet at launch; using per-request fallback");
         return;
     }
     if reachable {
@@ -1060,10 +1074,20 @@ async fn splice_with_codex_capture(
     let (mut client_rd, mut client_wr) = client.split();
     let (mut backend_rd, mut backend_wr) = backend.split();
 
+    // Set once the client stops sending — EOF or error on its read half. When
+    // that happens *before* the backend finishes streaming, the client walked
+    // away (Codex cancels a turn with ESC) and the truncated SSE stream is the
+    // consequence, not a Headroom fault. See the terminal-event check below.
+    let client_gone = Arc::new(AtomicBool::new(false));
+
     // client -> backend: opaque copy (request body / pipelined requests).
-    let upstream = async {
-        let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
-        let _ = backend_wr.shutdown().await;
+    let upstream = {
+        let client_gone = Arc::clone(&client_gone);
+        async move {
+            let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+            client_gone.store(true, Ordering::Relaxed);
+            let _ = backend_wr.shutdown().await;
+        }
     };
 
     // backend -> client: capture the response head, then stream the remainder.
@@ -1117,8 +1141,17 @@ async fn splice_with_codex_capture(
             streamed.observe(&head[body_start..]);
         }
         let copy_result = tokio::io::copy(&mut streamed, &mut client_wr).await;
+        // A cancelled turn reaches here with `copy_result == Ok`: the client
+        // closed first, the backend then EOF'd the stream, and our writes to the
+        // half-dead socket never errored. Without the `client_gone` guard every
+        // ESC produced a RUST-5N event (276 in 7 days, streamed_bytes scattered
+        // from 5 KB to 140 KB — the signature of arbitrary user aborts, not a
+        // buffer-boundary truncation). A client that half-closes its write side
+        // while still reading will now be missed too; a canary that only fires
+        // on real truncation is worth that.
         if monitor_terminal
             && copy_result.is_ok()
+            && !client_gone.load(Ordering::Relaxed)
             && !streamed.saw_terminal()
             && should_report_throttled(&CODEX_STREAM_NO_TERMINAL_LAST_REPORTED)
         {
@@ -2398,6 +2431,27 @@ mod tests {
         super::suppress_codex_reconnect_reports_for(Duration::from_secs(3600));
         assert!(super::codex_reconnect_reports_suppressed());
         super::SUPPRESS_RECONNECT_UNTIL.store(0, Ordering::Release);
+    }
+
+    #[test]
+    #[serial]
+    fn launch_time_unreachable_does_not_arm_the_down_timer() {
+        use std::sync::atomic::Ordering;
+        let addr: SocketAddr = "127.0.0.1:6768".parse().unwrap();
+        super::BACKEND_REACHABILITY_STATE.store(0, Ordering::Release);
+        *super::BACKEND_DOWN_SINCE.lock() = None;
+
+        // Backend still booting when the first request lands: no down window.
+        super::note_backend_reachability(false, addr);
+        assert!(super::BACKEND_DOWN_SINCE.lock().is_none());
+
+        // A later drop, once we have seen it up, is a real outage.
+        super::note_backend_reachability(true, addr);
+        super::note_backend_reachability(false, addr);
+        assert!(super::BACKEND_DOWN_SINCE.lock().is_some());
+
+        super::BACKEND_REACHABILITY_STATE.store(0, Ordering::Release);
+        *super::BACKEND_DOWN_SINCE.lock() = None;
     }
 
     #[test]
