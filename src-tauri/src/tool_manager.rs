@@ -6928,12 +6928,10 @@ fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 /// `workspace_dir()` default of `~/.headroom` (neither the proxy nor the
 /// seeding run sets `HEADROOM_WORKSPACE_DIR`, so both resolve here).
 fn output_savings_ledger_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".headroom")
-            .join("output_savings.json"),
-    )
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".headroom").join("output_savings.json"))
 }
 
 /// Core of [`purge_output_savings_control_arm`]: given the ledger bytes, return
