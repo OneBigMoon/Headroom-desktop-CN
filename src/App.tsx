@@ -31,6 +31,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { platformPreviewNoticeFor } from "./lib/platform";
 import {
   Bar,
   BarChart,
@@ -4931,12 +4932,10 @@ export default function App() {
       runtimeStatus.mcpConfigured !== false &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
-  const platformPreviewNotice =
-    runtimeStatus?.supportTier === "experimental"
-      ? runtimeStatus.platform === "linux"
-        ? "Linux is currently a preview build. Core proxy routing is supported, but Headroom Learn and secure API key storage are disabled while the platform is hardened."
-        : "This platform is currently in preview."
-      : null;
+  const platformPreviewNotice = platformPreviewNoticeFor(
+    runtimeStatus?.platform,
+    runtimeStatus?.supportTier,
+  );
   const headroomLearnSupported = runtimeStatus?.headroomLearnSupported !== false;
   const headroomLearnDisabledReason =
     runtimeStatus?.headroomLearnDisabledReason ??

@@ -3520,8 +3520,12 @@ pub(crate) fn current_platform() -> &'static str {
 }
 
 pub(crate) fn current_platform_support_tier() -> &'static str {
-    match current_platform() {
-        "linux" => "experimental",
+    support_tier_for_platform(current_platform())
+}
+
+pub(crate) fn support_tier_for_platform(os: &str) -> &'static str {
+    match os {
+        "linux" | "windows" => "experimental",
         _ => "stable",
     }
 }
@@ -6344,8 +6348,9 @@ mod tests {
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, tcp_port_accepts_connection, total_dir_size_bytes,
-        AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
+        support_tier_for_platform, AppState, BootValidationOutcome, ClaudeProjectScan,
+        DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        PersistedSavingsState,
         SavingsObservation, SavingsRecord, SavingsTracker,
     };
 
@@ -9454,5 +9459,12 @@ mod tests {
         let next = bootstrap_failed_state(&idle_progress(), "early failure".into());
         assert_eq!(next.overall_percent, 1);
         assert!(next.failed);
+    }
+
+    #[test]
+    fn support_tier_for_platform_marks_windows_experimental() {
+        assert_eq!(support_tier_for_platform("linux"), "experimental");
+        assert_eq!(support_tier_for_platform("windows"), "experimental");
+        assert_eq!(support_tier_for_platform("macos"), "stable");
     }
 }
