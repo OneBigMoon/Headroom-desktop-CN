@@ -3080,6 +3080,12 @@ const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
 
 fn opencode_config_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".config"))
+            .join("opencode");
+    }
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -3103,6 +3109,12 @@ fn opencode_config_path() -> PathBuf {
 }
 
 fn opencode_data_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".local").join("share"))
+            .join("opencode");
+    }
     std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -8052,6 +8064,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn guard_commands_do_not_hardcode_unix_python() {
         assert!(claude_guard_command().starts_with("python "));
         assert!(codex_guard_command().starts_with("python "));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn opencode_dirs_resolve_under_appdata_on_windows() {
+        let config = super::opencode_config_dir();
+        let data = super::opencode_data_dir();
+        assert!(config.ends_with("opencode"));
+        assert!(data.ends_with("opencode"));
+        // XDG vars are unset in a clean cmd.exe session; APPDATA must be used.
+        let appdata = std::env::var("APPDATA").expect("APPDATA should be set on Windows");
+        let local_appdata =
+            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA should be set on Windows");
+        assert!(config.starts_with(PathBuf::from(appdata)));
+        assert!(data.starts_with(PathBuf::from(local_appdata)));
     }
 
     #[test]
