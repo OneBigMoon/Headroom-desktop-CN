@@ -92,6 +92,8 @@ const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
     include_str!("../python/headroom-linux-requirements.lock");
+const HEADROOM_WINDOWS_REQUIREMENTS_LOCK: &str =
+    include_str!("../python/headroom-windows-requirements.lock");
 
 /// Full-file SHA-256 values of historical headroom-requirements.lock shipments
 /// whose pinned versions are byte-for-byte identical to the current lock.
@@ -6869,6 +6871,10 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
         // headroom-ai[all] stack pulls optional native packages like hnswlib
         // that fail on many fresh Linux systems.
         "linux" => HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        // Windows uses the full stack: every optional native package ships a
+        // win_amd64 wheel. The pin set is its own file so a Windows-only
+        // resolution change never perturbs the macOS lock.
+        "windows" => HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
         _ => HEADROOM_REQUIREMENTS_LOCK,
     }
 }
@@ -7545,7 +7551,8 @@ mod tests {
         savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
         verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
         PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        PLUGIN_ADDONS, RTK_VERSION,
+        PLUGIN_ADDONS, RTK_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -7966,6 +7973,22 @@ mod tests {
         assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
         assert!(artifact.url.ends_with(".tar.gz"));
         assert!(artifact.sha256.is_some(), "python checksum should be pinned");
+    }
+
+    #[test]
+    fn bootstrap_requirements_lock_targets_windows() {
+        assert_eq!(
+            bootstrap_requirements_lock_for_target("windows"),
+            HEADROOM_WINDOWS_REQUIREMENTS_LOCK
+        );
+        assert_eq!(
+            bootstrap_requirements_lock_for_target("linux"),
+            HEADROOM_LINUX_REQUIREMENTS_LOCK
+        );
+        assert_eq!(
+            bootstrap_requirements_lock_for_target("macos"),
+            HEADROOM_REQUIREMENTS_LOCK
+        );
     }
 
     #[test]
