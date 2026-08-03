@@ -563,6 +563,8 @@ const RTK_SHA256_LINUX_AARCH64: &str =
     "cc2b91c064eb670c097c184913c8fbcb1a943d53d7fe505375e96ba0c5b6459f";
 const RTK_SHA256_LINUX_X86_64: &str =
     "34975116da11e09e502501daf758143e0b22ed3a42a10eb67fb693a6270d9e36";
+const RTK_SHA256_WINDOWS_X86_64: &str =
+    "f0ec18963581657173bd6a51f5ba012b093823f844db749fec218581af30a568";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -6386,18 +6388,19 @@ fn python_distribution_artifact() -> Result<DownloadArtifact> {
 }
 
 fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
-    let (target, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("aarch64-apple-darwin", RTK_SHA256_MACOS_AARCH64),
-        ("macos", "x86_64") => ("x86_64-apple-darwin", RTK_SHA256_MACOS_X86_64),
-        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", RTK_SHA256_LINUX_AARCH64),
-        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", RTK_SHA256_LINUX_X86_64),
+    let (target, sha256, extension) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("aarch64-apple-darwin", RTK_SHA256_MACOS_AARCH64, "tar.gz"),
+        ("macos", "x86_64") => ("x86_64-apple-darwin", RTK_SHA256_MACOS_X86_64, "tar.gz"),
+        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", RTK_SHA256_LINUX_AARCH64, "tar.gz"),
+        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", RTK_SHA256_LINUX_X86_64, "tar.gz"),
+        ("windows", "x86_64") => ("x86_64-pc-windows-msvc", RTK_SHA256_WINDOWS_X86_64, "zip"),
         (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
     };
 
     Ok(DownloadArtifact {
         url: format!(
-            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.tar.gz",
-            RTK_VERSION, target
+            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.{}",
+            RTK_VERSION, target, extension
         ),
         sha256: Some(sha256),
     })
@@ -7973,6 +7976,15 @@ mod tests {
         assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
         assert!(artifact.url.ends_with(".tar.gz"));
         assert!(artifact.sha256.is_some(), "python checksum should be pinned");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rtk_distribution_artifact_supports_windows_x86_64() {
+        let artifact = rtk_distribution_artifact().expect("windows rtk target");
+        assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
+        assert!(artifact.url.ends_with(".zip"));
+        assert!(artifact.sha256.is_some(), "rtk checksum should be pinned");
     }
 
     #[test]
