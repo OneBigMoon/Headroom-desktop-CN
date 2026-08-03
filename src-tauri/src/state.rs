@@ -3099,10 +3099,7 @@ impl AppState {
 
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
-            let _ = std::process::Command::new("/bin/kill")
-                .arg("-TERM")
-                .arg(format!("-{pid}"))
-                .status();
+            terminate_process_tree(pid, false);
             // Bounded wait: a backend that ignores SIGTERM (mid-request, stuck
             // shutdown) must not block this caller forever. stop_headroom runs
             // on the UI thread during restart_app, so an unbounded child.wait()
@@ -3114,10 +3111,7 @@ impl AppState {
                     Ok(Some(_)) | Err(_) => break,
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
-                            let _ = std::process::Command::new("/bin/kill")
-                                .arg("-KILL")
-                                .arg(format!("-{pid}"))
-                                .status();
+                            terminate_process_tree(pid, true);
                             let _ = child.wait();
                             break;
                         }
@@ -3545,10 +3539,7 @@ impl Drop for AppState {
         let mut process = self.headroom_process.lock();
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
-            let _ = std::process::Command::new("/bin/kill")
-                .arg("-TERM")
-                .arg(format!("-{pid}"))
-                .status();
+            terminate_process_tree(pid, false);
             let _ = child.wait();
         }
     }
@@ -6150,6 +6141,25 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Terminate a process tree. Windows uses taskkill /T (subtree); Unix signals
+/// the process group by negating the pid.
+fn terminate_process_tree(pid: i32, force: bool) {
+    if cfg!(target_os = "windows") {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.status();
+    } else {
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(signal)
+            .arg(format!("-{pid}"))
+            .status();
+    }
+}
+
 fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -6169,7 +6179,28 @@ fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
         ));
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{pattern}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .with_context(|| format!("running powershell kill for pattern '{pattern}'"))?;
+
+        if status.success() {
+            return Ok(());
+        }
+
+        return Err(anyhow!(
+            "powershell exited with status {:?} for pattern '{}'",
+            status.code(),
+            pattern
+        ));
+    }
+
+    #[cfg(all(not(unix), not(target_os = "windows")))]
     {
         let _ = pattern;
         Ok(())
