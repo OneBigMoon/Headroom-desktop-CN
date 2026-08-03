@@ -2126,10 +2126,18 @@ fn ensure_claude_settings_hook(
         content = Value::Object(Default::default());
     }
 
-    let hook_command = hook_path
-        .to_str()
-        .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))?;
-    let already_present = claude_hook_present_in_value(&content, hook_command);
+    let hook_command = if cfg!(target_os = "windows") {
+        format!(
+            "bash {}",
+            shell_double_quote(&hook_path.to_string_lossy())
+        )
+    } else {
+        hook_path
+            .to_str()
+            .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))?
+            .to_string()
+    };
+    let already_present = claude_hook_present_in_value(&content, &hook_command);
     if already_present {
         return Ok((Vec::new(), Vec::new()));
     }
