@@ -85,6 +85,13 @@
       "minimumSystemVersion": "14.0",
       "infoPlist": "Info.plist",
       "entitlements": "Entitlements.plist"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "compression": "lzma"
+      }
     }
   }
 }
