@@ -3691,7 +3691,8 @@ fn codex_guard_hook_path() -> PathBuf {
 }
 
 fn codex_guard_command() -> String {
-    format!("/usr/bin/python3 {}", codex_guard_hook_path().display())
+    let python = if cfg!(target_os = "windows") { "python" } else { "/usr/bin/python3" };
+    format!("{python} {}", codex_guard_hook_path().display())
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -3734,6 +3735,8 @@ DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
+    if sys.platform == "win32":
+        return
     try:
         if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
             return
@@ -4080,7 +4083,8 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    format!("/usr/bin/python3 {}", claude_guard_hook_path().display())
+    let python = if cfg!(target_os = "windows") { "python" } else { "/usr/bin/python3" };
+    format!("{python} {}", claude_guard_hook_path().display())
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -4114,6 +4118,8 @@ DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
+    if sys.platform == "win32":
+        return
     try:
         if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
             return
@@ -5562,6 +5568,8 @@ mod tests {
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily,
     };
+    #[cfg(target_os = "windows")]
+    use super::{claude_guard_command, codex_guard_command};
     use rusqlite::Connection;
 
     #[test]
@@ -8029,6 +8037,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             hooks["hooks"]["SessionStart"][0]["matcher"],
             "startup|resume|clear|compact"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn guard_commands_do_not_hardcode_unix_python() {
+        assert!(claude_guard_command().starts_with("python "));
+        assert!(codex_guard_command().starts_with("python "));
     }
 
     #[test]
