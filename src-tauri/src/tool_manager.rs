@@ -4337,11 +4337,13 @@ impl ToolManager {
 
     pub fn install_rtk(&self) -> Result<()> {
         let artifact = rtk_distribution_artifact()?;
+        let extension = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
         let archive_path = self.runtime.downloads_dir.join(format!(
-            "rtk-v{}-{}-{}.tar.gz",
+            "rtk-v{}-{}-{}.{}",
             RTK_VERSION,
             std::env::consts::OS,
-            std::env::consts::ARCH
+            std::env::consts::ARCH,
+            extension
         ));
         download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
 
@@ -4353,15 +4355,29 @@ impl ToolManager {
         std::fs::create_dir_all(&extract_dir)
             .with_context(|| format!("creating {}", extract_dir.display()))?;
 
-        let file = std::fs::File::open(&archive_path)
-            .with_context(|| format!("opening {}", archive_path.display()))?;
-        let decoder = GzDecoder::new(file);
-        let mut archive = Archive::new(decoder);
-        archive
-            .unpack(&extract_dir)
-            .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+        #[cfg(target_os = "windows")]
+        {
+            let file = std::fs::File::open(&archive_path)
+                .with_context(|| format!("opening {}", archive_path.display()))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .with_context(|| format!("reading zip {}", archive_path.display()))?;
+            archive
+                .extract(&extract_dir)
+                .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let file = std::fs::File::open(&archive_path)
+                .with_context(|| format!("opening {}", archive_path.display()))?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = Archive::new(decoder);
+            archive
+                .unpack(&extract_dir)
+                .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+        }
 
-        let extracted_binary = extract_dir.join("rtk");
+        let binary_name = if cfg!(target_os = "windows") { "rtk.exe" } else { "rtk" };
+        let extracted_binary = extract_dir.join(binary_name);
         if !extracted_binary.exists() {
             bail!(
                 "rtk extraction completed but {} was not found",
