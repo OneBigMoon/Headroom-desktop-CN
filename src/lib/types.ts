@@ -77,6 +77,18 @@ export interface OutputReduction {
   requests: number;
 }
 
+// Lifetime savings decomposition behind the headline card. cacheSavingsUsd is
+// the provider cache discount earned by the client's own prompt caching --
+// shown as its own labelled row, never summed into Headroom's savings.
+export interface SavingsBreakdown {
+  compressionSavingsUsd: number;
+  outputSavingsUsd: number;
+  cacheSavingsUsd: number;
+  cacheReadTokens: number;
+  totalInputTokens: number;
+  totalInputCostUsd: number;
+}
+
 export interface ProviderSavingsPoint {
   provider: string;
   estimatedSavingsUsd: number;
@@ -108,6 +120,7 @@ export interface DashboardState {
   sessionEstimatedTokensSaved: number;
   sessionSavingsPct: number;
   outputReduction: OutputReduction | null;
+  savingsBreakdown: SavingsBreakdown | null;
   dailySavings: DailySavingsPoint[];
   hourlySavings: HourlySavingsPoint[];
   savingsHistoryLoaded: boolean;

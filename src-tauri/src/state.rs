@@ -2315,6 +2315,8 @@ impl AppState {
             }
         }
 
+        let savings_breakdown = history.as_ref().and_then(|h| h.lifetime.clone());
+
         let output_reduction = stats
             .as_ref()
             .and_then(|s| s.output_reduction.as_ref())
@@ -2419,6 +2421,7 @@ impl AppState {
                 session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
+                savings_breakdown,
                 daily_savings,
                 hourly_savings,
                 savings_history_loaded: self
@@ -4992,6 +4995,10 @@ struct HeadroomSavingsRollupPoint {
 struct HeadroomSavingsHistoryResponse {
     hourly: Vec<HeadroomSavingsRollupPoint>,
     daily: Vec<HeadroomSavingsRollupPoint>,
+    /// The payload's top-level `lifetime` block, when present. Carries the
+    /// compression / output-shaping / cache-discount decomposition shown in
+    /// the savings drill-down.
+    lifetime: Option<crate::models::SavingsBreakdown>,
 }
 
 impl HeadroomSavingsHistoryResponse {
@@ -5372,11 +5379,39 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
         drop_oldest_rollup_bucket(&mut hourly);
     }
 
-    if hourly.is_empty() && daily.is_empty() {
+    let lifetime = parse_savings_breakdown(&root);
+
+    if hourly.is_empty() && daily.is_empty() && lifetime.is_none() {
         None
     } else {
-        Some(HeadroomSavingsHistoryResponse { hourly, daily })
+        Some(HeadroomSavingsHistoryResponse {
+            hourly,
+            daily,
+            lifetime,
+        })
     }
+}
+
+/// Parse the `/stats-history` top-level `lifetime` block into the savings
+/// decomposition. Requires `compression_savings_usd` (schema v3+); everything
+/// else defaults to zero so older backends missing a field still show the
+/// rows they do report. Cache savings stay a separate labelled figure — they
+/// are the client's provider-cache discount, never Headroom's claim.
+fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdown> {
+    let compression_savings_usd = value_at_path_f64(root, &["lifetime", "compression_savings_usd"])?;
+    Some(crate::models::SavingsBreakdown {
+        compression_savings_usd,
+        output_savings_usd: value_at_path_f64(root, &["lifetime", "output_savings_usd"])
+            .unwrap_or(0.0),
+        cache_savings_usd: value_at_path_f64(root, &["lifetime", "cache_savings_usd"])
+            .unwrap_or(0.0),
+        cache_read_tokens: value_at_path_u64(root, &["lifetime", "cache_read_tokens"])
+            .unwrap_or(0),
+        total_input_tokens: value_at_path_u64(root, &["lifetime", "total_input_tokens"])
+            .unwrap_or(0),
+        total_input_cost_usd: value_at_path_f64(root, &["lifetime", "total_input_cost_usd"])
+            .unwrap_or(0.0),
+    })
 }
 
 fn value_at_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
@@ -8244,6 +8279,59 @@ mod tests {
         assert!((hourly_points[0].estimated_savings_usd - 0.15).abs() < 1e-9);
         // No by_provider in this fixture -> empty breakdown.
         assert!(hourly_points[0].by_provider.is_empty());
+    }
+
+    #[test]
+    fn parse_headroom_stats_history_reads_lifetime_savings_breakdown() {
+        // The lifetime block decomposes savings for the drill-down. Cache
+        // savings must come through as their own labelled figure -- they are
+        // the client's provider-cache discount, never folded into Headroom's
+        // compression number.
+        let parsed = parse_headroom_stats_history_from_json(
+            r#"{
+                "lifetime": {
+                    "tokens_saved": 1000,
+                    "compression_savings_usd": 5147.32,
+                    "output_savings_usd": 4.87,
+                    "cache_read_tokens": 1690483122,
+                    "cache_savings_usd": 10859.4,
+                    "total_input_tokens": 7703977209,
+                    "total_input_cost_usd": 24912.66
+                },
+                "series": {
+                    "daily": [
+                        {
+                            "timestamp": "2026-03-27T00:00:00Z",
+                            "tokens_saved": 175,
+                            "compression_savings_usd_delta": 0.175
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parsed history");
+
+        let breakdown = parsed.lifetime.expect("lifetime breakdown present");
+        assert!((breakdown.compression_savings_usd - 5147.32).abs() < 1e-9);
+        assert!((breakdown.output_savings_usd - 4.87).abs() < 1e-9);
+        assert!((breakdown.cache_savings_usd - 10859.4).abs() < 1e-9);
+        assert_eq!(breakdown.cache_read_tokens, 1690483122);
+        assert_eq!(breakdown.total_input_tokens, 7703977209);
+        assert!((breakdown.total_input_cost_usd - 24912.66).abs() < 1e-9);
+
+        // Older backend without the cache fields: breakdown still parses with
+        // zeroed extras instead of disappearing.
+        let sparse = parse_headroom_stats_history_from_json(
+            r#"{
+                "lifetime": { "tokens_saved": 205, "compression_savings_usd": 0.205 },
+                "series": { "daily": [] }
+            }"#,
+        )
+        .expect("parsed sparse history");
+        let sparse_breakdown = sparse.lifetime.expect("sparse breakdown present");
+        assert!((sparse_breakdown.compression_savings_usd - 0.205).abs() < 1e-9);
+        assert_eq!(sparse_breakdown.cache_savings_usd, 0.0);
+        assert_eq!(sparse_breakdown.cache_read_tokens, 0);
     }
 
     #[test]

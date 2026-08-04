@@ -3074,6 +3074,49 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.4;
 }
 
+/* Savings drill-down rows inside the "How savings are calculated" modal. */
+.savings-breakdown {
+  display: grid;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-default);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.savings-breakdown__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.savings-breakdown__row strong {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The client's cache discount: context, not a Headroom claim. Visually set
+   apart from the Headroom rows above it. */
+.savings-breakdown__row--context {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-default);
+  color: var(--text-muted);
+}
+
+.savings-breakdown__row--context strong {
+  color: var(--text-secondary);
+}
+
+.savings-breakdown__note {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin: 0;
+}
+
 .modal-card label {
   font-size: var(--text-xs);
   color: var(--text-secondary);

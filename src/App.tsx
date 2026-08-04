@@ -6868,9 +6868,34 @@ export default function App() {
                 <h3>How savings are calculated</h3>
                 <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
-                <p>This is an optimistic estimate.</p>
-                <p>Without Headroom, when tokens are sent to Claude for the first time they would be stored in their cache. Once in the cache, whenever these same tokens are sent again Claude applies a 90% discount to their cost. In our testing, this can reduce the actual savings by at most 50%.</p>
-                <p>Even accounting for caching, you've likely saved at least <strong>{currency(dashboard.lifetimeEstimatedSavingsUsd * 0.5)}</strong>.</p>
+                {dashboard.savingsBreakdown ? (
+                  <div className="savings-breakdown">
+                    <div className="savings-breakdown__row">
+                      <span>Input compression (Headroom)</span>
+                      <strong>{currency(dashboard.savingsBreakdown.compressionSavingsUsd)}</strong>
+                    </div>
+                    {dashboard.savingsBreakdown.outputSavingsUsd >= 0.005 ? (
+                      <div className="savings-breakdown__row">
+                        <span>Output shaping (Headroom)</span>
+                        <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
+                      </div>
+                    ) : null}
+                    {dashboard.savingsBreakdown.cacheSavingsUsd >= 0.005 ? (
+                      <>
+                        <div className="savings-breakdown__row savings-breakdown__row--context">
+                          <span>Prompt caching (your AI client)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.cacheSavingsUsd)}</strong>
+                        </div>
+                        <p className="savings-breakdown__note">
+                          Cache discounts are earned by your client's own prompt caching, so Headroom
+                          never counts them in its savings. Headroom's compression is cache-aligned:
+                          it only touches content outside the cached prefix, keeping that discount intact.
+                        </p>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
+                <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(dashboard.lifetimeEstimatedSavingsUsd * 0.5)}</strong>.</p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"

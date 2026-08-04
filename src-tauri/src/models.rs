@@ -135,6 +135,22 @@ pub struct OutputReduction {
     pub requests: u64,
 }
 
+/// Lifetime savings decomposition parsed from the backend's `/stats-history`
+/// `lifetime` block. Powers the "How savings are calculated" drill-down.
+/// `cache_savings_usd` is the provider cache discount earned by the *client's*
+/// own prompt caching — deliberately never summed into any Headroom savings
+/// figure (Headroom preserves that discount; it does not cause it).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SavingsBreakdown {
+    pub compression_savings_usd: f64,
+    pub output_savings_usd: f64,
+    pub cache_savings_usd: f64,
+    pub cache_read_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_input_cost_usd: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailySavingsPoint {
@@ -193,6 +209,9 @@ pub struct DashboardState {
     /// `None` until a verbosity baseline is seeded (the dashboard hides the stat
     /// until then). Always honestly labelled (`method` + confidence band).
     pub output_reduction: Option<OutputReduction>,
+    /// Lifetime decomposition behind the headline savings card. `None` until
+    /// the backend's `/stats-history` has been fetched at least once.
+    pub savings_breakdown: Option<SavingsBreakdown>,
     pub daily_savings: Vec<DailySavingsPoint>,
     pub hourly_savings: Vec<HourlySavingsPoint>,
     /// True once native savings history has loaded at least once this process.
