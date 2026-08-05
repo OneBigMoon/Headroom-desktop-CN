@@ -2369,6 +2369,12 @@ select {
   line-height: 1.2;
 }
 
+.savings-chart__overlay-rate {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
 .savings-chart__overlay-label {
   font-size: 0.7rem;
   color: #9e948e;

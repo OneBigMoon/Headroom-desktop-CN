@@ -108,6 +108,7 @@ import {
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
+  savingsRate,
   sortClientConnectors,
   startOfDay,
   startOfMonth,
@@ -796,6 +797,19 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
+  const chartSaved = Math.max(
+    0,
+    chartMode === "usd"
+      ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
+        ? savingsTodayUsd
+        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0)
+  );
+  const chartSpent = chartData.reduce(
+    (s, d) => s + (chartMode === "usd" ? d.actualCostUsd : d.totalTokensSent),
+    0
+  );
+  const chartSavingsRate = savingsRate(chartSaved, chartSpent);
 
   useEffect(() => {
     const now = new Date();
@@ -882,16 +896,10 @@ function DailySavingsChart({
         <div className="savings-chart__canvas savings-chart__canvas--combined">
           <div className="savings-chart__overlay" aria-hidden="true">
             <span className="savings-chart__overlay-total">
-              {chartMode === "usd"
-                ? currency(
-                    Math.max(
-                      0,
-                      view === "day" && visibleDay >= today && savingsTodayUsd !== null
-                        ? savingsTodayUsd
-                        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
-                    )
-                  )
-                : compactNumber(Math.max(0, chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0)))}
+              {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
+              {chartSavingsRate !== null && (
+                <span className="savings-chart__overlay-rate"> ({chartSavingsRate}%)</span>
+              )}
             </span>
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}

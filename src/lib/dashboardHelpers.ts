@@ -62,6 +62,13 @@ export function percent1(value: number) {
   }).format(value);
 }
 
+/** Share of the would-be total that was saved, as a whole percent. Null when there is nothing to compare. */
+export function savingsRate(saved: number, spent: number) {
+  const baseline = Math.max(0, saved) + Math.max(0, spent);
+  if (baseline <= 0) return null;
+  return Math.round((Math.max(0, saved) / baseline) * 100);
+}
+
 export function formatDayLabel(dayKey: string) {
   const parsed = new Date(`${dayKey}T00:00:00`);
   if (Number.isNaN(parsed.getTime())) {
