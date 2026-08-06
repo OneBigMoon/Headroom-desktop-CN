@@ -1193,17 +1193,16 @@ fn strip_headroom_mcp_from_opencode() -> Option<String> {
     if !path.exists() {
         return None;
     }
-    let mut config =
-        match read_opencode_config(&path).or_else(|_| read_opencode_config_lenient(&path)) {
-            Ok(config) => config,
-            Err(err) => {
-                log::warn!(
-                    "cleanup: parsing {} failed; leaving it untouched: {err}",
-                    path.display()
-                );
-                return None;
-            }
-        };
+    let mut config = match read_opencode_config(&path) {
+        Ok(config) => config,
+        Err(err) => {
+            log::warn!(
+                "cleanup: parsing {} failed; leaving it untouched: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
     let servers = config.get_mut("mcp")?.as_object_mut()?;
     if !remove_headroom_mcp_json_entries(servers) {
         return None;
@@ -3111,12 +3110,27 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
     if raw.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    let value: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "parsing {} (JSONC comments are not supported by Headroom setup yet - remove them and retry)",
-            path.display()
-        )
-    })?;
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            let value: serde_json::Value =
+                serde_json::from_str(&strip_jsonc(&raw)).with_context(|| {
+                    format!(
+                        "parsing {} failed (JSON/JSONC); refusing to overwrite potentially valid user config",
+                        path.display()
+                    )
+                })?;
+            // Same contract as parse_json_object's JSON5 fallback: writers
+            // re-serialize with serde_json (comment-free), the byte-for-byte
+            // .headroom-backup keeps the original. Local info only - expected,
+            // benign behavior (RUST-61 was setup refusing valid .jsonc files).
+            log::info!(
+                "{} contains JSONC syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON - the original is kept as a .headroom-backup file",
+                path.display()
+            );
+            value
+        }
+    };
     if !value.is_object() {
         return Err(anyhow!("{} is not a JSON object", path.display()));
     }
@@ -3199,20 +3213,6 @@ fn strip_jsonc(text: &str) -> String {
         }
     }
     out
-}
-
-/// Lenient fallback for disable/cleanup: a JSONC config must never strand the
-/// user on a dead proxy URL just because it contains comments. The write-back
-/// is comment-free; the byte-for-byte `.headroom-backup` keeps the original.
-fn read_opencode_config_lenient(path: &Path) -> Result<serde_json::Value> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw))
-        .with_context(|| format!("parsing {} (even ignoring JSONC comments)", path.display()))?;
-    if !value.is_object() {
-        return Err(anyhow!("{} is not a JSON object", path.display()));
-    }
-    Ok(value)
 }
 
 fn opencode_provider_base_url(config: &serde_json::Value, provider: &str) -> Option<String> {
@@ -3424,10 +3424,7 @@ fn disable_opencode(state: &ClientSetupState) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let mut config = match read_opencode_config(&path) {
-        Ok(config) => config,
-        Err(_) => read_opencode_config_lenient(&path)?,
-    };
+    let mut config = read_opencode_config(&path)?;
     let mut changed = false;
     for provider in OPENCODE_MANAGED_PROVIDERS {
         if opencode_provider_base_url(&config, provider).as_deref()
@@ -7782,6 +7779,36 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             serde_json::json!("value with // not a comment")
         );
         assert_eq!(parsed["b"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_apply_tolerates_jsonc_config() {
+        let home = TestHome::new();
+        let config_path = home
+            .path()
+            .join(".config")
+            .join("opencode")
+            .join("opencode.jsonc");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "{\n  // user comment (RUST-61: setup used to refuse this file)\n  \"theme\": \"dark\",\n}\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("opencode").expect("apply succeeds on .jsonc with comments");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap())
+                .expect("apply wrote strict json");
+        assert_eq!(after["theme"], serde_json::json!("dark"), "user key kept");
+        for provider in super::OPENCODE_MANAGED_PROVIDERS {
+            assert_eq!(
+                super::opencode_provider_base_url(&after, provider).as_deref(),
+                Some(super::HEADROOM_OPENCODE_BASE_URL),
+                "provider {provider} routed"
+            );
+        }
     }
 
     #[test]
