@@ -2315,7 +2315,7 @@ impl AppState {
             }
         }
 
-        let savings_breakdown = history.as_ref().and_then(|h| h.lifetime.clone());
+        let mut savings_breakdown = history.as_ref().and_then(|h| h.lifetime.clone());
 
         let output_reduction = stats
             .as_ref()
@@ -2331,8 +2331,16 @@ impl AppState {
         if let Some(history) = history.as_ref() {
             let cutoff_date = savings_history_cutoff_date();
             let cutoff_hour = format!("{cutoff_date}T00:00");
-            let native_daily = history.daily_savings();
-            let native_hourly = history.hourly_savings();
+            let native_daily = drop_rollup_backfill(
+                history.daily_savings(),
+                daily_savings.iter().map(|p| p.date.as_str()).min(),
+                |p| p.date.as_str(),
+            );
+            let native_hourly = drop_rollup_backfill(
+                history.hourly_savings(),
+                hourly_savings.iter().map(|p| p.hour.as_str()).min(),
+                |p| p.hour.as_str(),
+            );
 
             // Lock the backend's authoritative settled rollups into the local
             // archive so they survive its history trimming and fill gaps from
@@ -2377,6 +2385,25 @@ impl AppState {
             .iter()
             .map(|point| point.estimated_tokens_saved)
             .sum();
+
+        // The drill-down has to add up to the headline it explains, so both
+        // Headroom rows come from those same buckets rather than the backend's
+        // `lifetime` block. That block is stitched differently (it counts the
+        // rollup's backfill bucket for a period the tracker also covers), and
+        // its output figure is process-scoped besides: it restarts at zero on
+        // every backend restart, reporting $0.72 against $105 of daily deltas
+        // on 2026-08-06. Cache and spend rows below stay as reported -- they are
+        // context, never summed into a Headroom total.
+        if let Some(breakdown) = savings_breakdown.as_mut() {
+            breakdown.compression_savings_usd = daily_savings
+                .iter()
+                .map(|point| point.estimated_savings_usd)
+                .sum();
+            breakdown.output_savings_usd = daily_savings
+                .iter()
+                .map(|point| point.output_savings_usd)
+                .sum();
+        }
 
         // Token milestones fire off the displayed lifetime total via a persisted
         // high-water mark, so they can't double-fire when a day's bucket is
@@ -5426,7 +5453,11 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
         value_at_path_f64(root, &["lifetime", "compression_savings_usd"])?;
     Some(crate::models::SavingsBreakdown {
         compression_savings_usd,
-        output_savings_usd: lifetime_output_savings_usd(root),
+        // Overwritten at render time from the merged daily buckets (see
+        // `dashboard_snapshot`); this process-scoped field resets with the
+        // backend and is only the fallback when no rollups exist yet.
+        output_savings_usd: value_at_path_f64(root, &["lifetime", "output_savings_usd"])
+            .unwrap_or(0.0),
         cache_savings_usd: value_at_path_f64(root, &["lifetime", "cache_savings_usd"])
             .unwrap_or(0.0),
         cache_read_tokens: value_at_path_u64(root, &["lifetime", "cache_read_tokens"]).unwrap_or(0),
@@ -5435,35 +5466,6 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
         total_input_cost_usd: value_at_path_f64(root, &["lifetime", "total_input_cost_usd"])
             .unwrap_or(0.0),
     })
-}
-
-/// Lifetime output-shaping savings, reconstructed by summing the daily rollup
-/// deltas rather than reading `lifetime.output_savings_usd`.
-///
-/// The backend's cumulative output counter is process-scoped: it restarts at
-/// zero every time the backend restarts, so the `lifetime` field only reports
-/// savings since the last restart (observed 2026-08-06: $0.72 reported against
-/// $105.23 of daily deltas over the same window). The daily deltas survive the
-/// restarts. Cross-checked on compression, where the counter never resets and
-/// the two agree exactly, so summing deltas is the right reconstruction and not
-/// a thumb on the scale.
-///
-/// Falls back to the `lifetime` field when there is no daily series — an older
-/// backend, or a fresh install that has not rolled up a bucket yet.
-fn lifetime_output_savings_usd(root: &Value) -> f64 {
-    let reported = value_at_path_f64(root, &["lifetime", "output_savings_usd"]).unwrap_or(0.0);
-    let Some(Value::Array(daily)) = value_at_path(root, &["series", "daily"]) else {
-        return reported;
-    };
-    if daily.is_empty() {
-        return reported;
-    }
-    let summed: f64 = daily
-        .iter()
-        .filter_map(|point| value_at_path_f64(point, &["output_savings_usd_delta"]))
-        .map(|delta| delta.max(0.0))
-        .sum();
-    summed.max(reported)
 }
 
 fn value_at_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
@@ -6273,6 +6275,37 @@ fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
 }
 
 /// Merge daily savings from tracker (pre-cutoff) and native headroom history (post-cutoff).
+/// Drop the first bucket of a backend rollup series when the local tracker
+/// already covers an earlier period.
+///
+/// The backend's rollups start accumulating the day the feature lands, and the
+/// first bucket's delta is measured against zero — so it carries every request
+/// that predates the series. Observed 2026-08-06: a single daily bucket holding
+/// $5,134 of compression savings, against $5,382 of lifetime. Counting it
+/// alongside the tracker's own per-day record of the same period would nearly
+/// double the headline total (the series is also re-trimmed over time, so that
+/// backfill bucket moves forward and the double count follows it).
+///
+/// A tracker with no earlier coverage means the bucket is the only record of
+/// that history, so it stays. When the tracker does hold the same date, the
+/// merge falls back to its value, so nothing is lost.
+fn drop_rollup_backfill<T>(
+    native: Vec<T>,
+    earliest_local: Option<&str>,
+    key: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    let Some(earliest_local) = earliest_local else {
+        return native;
+    };
+    let Some(first) = native.iter().map(|p| key(p).to_string()).min() else {
+        return native;
+    };
+    if earliest_local >= first.as_str() {
+        return native;
+    }
+    native.into_iter().filter(|p| key(p) != first).collect()
+}
+
 /// For days before `cutoff_date` (exclusive), the tracker is preferred.
 /// For days on/after `cutoff_date`, native history is preferred.
 /// Falls back to whichever source has data when the preferred one is absent.
@@ -6438,10 +6471,10 @@ mod tests {
     use super::{
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
-        bootstrap_failed_state, classify_startup_error, cpu_time_advanced, hf_cache_grew,
-        lifetime_output_savings_usd, lifetime_token_milestones_crossed, log_mtime_advanced,
-        merge_daily_savings, merge_hourly_savings, most_recent_monday,
-        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
+        hf_cache_grew, lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
+        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
+        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, tcp_port_accepts_connection, total_dir_size_bytes,
         AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
@@ -6450,31 +6483,34 @@ mod tests {
     };
 
     #[test]
-    fn lifetime_output_savings_sums_daily_deltas_over_reset_prone_counter() {
-        // The `lifetime` field only covers the current backend process, so it
-        // reads far lower than the daily deltas it is supposed to total.
-        let root = serde_json::json!({
-            "lifetime": { "output_savings_usd": 0.72 },
-            "series": { "daily": [
-                { "output_savings_usd_delta": 28.65 },
-                { "output_savings_usd_delta": 1.84 },
-                { "output_savings_usd_delta": 9.70 },
-            ]},
-        });
-        assert!((lifetime_output_savings_usd(&root) - 40.19).abs() < 1e-9);
+    fn drop_rollup_backfill_removes_first_bucket_the_tracker_already_covers() {
+        // The rollup's first delta is measured against zero, so it carries all
+        // pre-series history -- counting it next to the tracker's own record of
+        // the same period nearly doubles the lifetime total (2026-08-06: a
+        // $5,134 bucket against $5,382 of lifetime savings).
+        let native = vec![
+            daily("2026-08-02", 900_000, 5134.28),
+            daily("2026-08-03", 500, 3.35),
+        ];
+        let tracker_covers_earlier = ["2026-07-15"];
+        let kept = drop_rollup_backfill(
+            native.clone(),
+            tracker_covers_earlier.iter().copied().min(),
+            |p| p.date.as_str(),
+        );
+        assert_eq!(
+            kept.iter().map(|p| p.date.as_str()).collect::<Vec<_>>(),
+            vec!["2026-08-03"]
+        );
 
-        // No series (older backend, or nothing rolled up yet): report what the
-        // backend reports rather than zero.
-        let bare = serde_json::json!({ "lifetime": { "output_savings_usd": 0.72 } });
-        assert!((lifetime_output_savings_usd(&bare) - 0.72).abs() < 1e-9);
+        // Fresh install: the backfill bucket is the only record of that
+        // history, so it has to stay.
+        let kept = drop_rollup_backfill(native.clone(), None, |p| p.date.as_str());
+        assert_eq!(kept.len(), 2);
 
-        // Series present but not yet carrying the field: never show less than
-        // the backend's own figure.
-        let no_field = serde_json::json!({
-            "lifetime": { "output_savings_usd": 3.0 },
-            "series": { "daily": [{ "compression_savings_usd_delta": 1.0 }] },
-        });
-        assert!((lifetime_output_savings_usd(&no_field) - 3.0).abs() < 1e-9);
+        // Tracker starts with the series: nothing predates it, nothing to drop.
+        let kept = drop_rollup_backfill(native, Some("2026-08-02"), |p| p.date.as_str());
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]
