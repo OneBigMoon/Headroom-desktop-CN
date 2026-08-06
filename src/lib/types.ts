@@ -88,6 +88,10 @@ export interface OutputReduction {
 export interface SavingsBreakdown {
   compressionSavingsUsd: number;
   outputSavingsUsd: number;
+  // Optional: older payloads predate the tool-schema layer, matching the
+  // container-level serde default on the Rust side.
+  toolSchemaSavingsUsd?: number;
+  toolSchemaTokensSaved?: number;
   cacheSavingsUsd: number;
   cacheReadTokens: number;
   totalInputTokens: number;

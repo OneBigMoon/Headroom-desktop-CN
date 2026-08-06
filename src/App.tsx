@@ -6979,6 +6979,23 @@ export default function App() {
                         </p>
                       </>
                     ) : null}
+                    {(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0) >= 0.005 ? (
+                      <>
+                        <div className="savings-breakdown__row">
+                          <span>Tool schemas deferred (Headroom)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
+                        </div>
+                        {/* Priced at the cache-read rate, not the input rate --
+                            see tool_schema_savings_usd in state.rs. */}
+                        <p className="savings-breakdown__note">
+                          {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
+                          of tool definitions Headroom kept out of your requests until they were
+                          needed. These sit at the front of the cached prefix, so they are priced at
+                          the provider's cache-read rate rather than the full input rate. Counted from
+                          the day this build started tracking the layer.
+                        </p>
+                      </>
+                    ) : null}
                     {dashboard.savingsBreakdown.cacheSavingsUsd >= 0.005 ? (
                       <>
                         <div className="savings-breakdown__row savings-breakdown__row--context">
@@ -6994,13 +7011,15 @@ export default function App() {
                     ) : null}
                   </div>
                 ) : null}
-                {/* The cache-discount haircut applies to input compression only:
-                    output tokens are never served from a prompt cache, so
-                    halving the combined total would understate the floor. */}
+                {/* The cache-discount haircut applies to input compression only.
+                    Output tokens are never served from a prompt cache, and the
+                    tool-schema row already carries the cache-read price, so
+                    halving either would understate the floor. */}
                 <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed input tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(
                   dashboard.savingsBreakdown
                     ? dashboard.savingsBreakdown.compressionSavingsUsd * 0.5 +
-                        dashboard.savingsBreakdown.outputSavingsUsd
+                        dashboard.savingsBreakdown.outputSavingsUsd +
+                        (dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)
                     : dashboard.lifetimeEstimatedSavingsUsd * 0.5
                 )}</strong>.</p>
                 <div className="modal-actions">

@@ -2384,8 +2384,15 @@ impl AppState {
             &daily_savings,
             stats.as_ref().and_then(|s| s.output_reduction.as_ref()),
         );
-        let lifetime_estimated_savings_usd =
-            lifetime_compression_savings_usd + lifetime_output_savings_usd;
+        let lifetime_tool_schema_tokens_saved = self
+            .savings_tracker
+            .lock()
+            .lifetime_tool_schema_tokens_saved;
+        let lifetime_tool_schema_savings_usd =
+            tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
+        let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
+            + lifetime_output_savings_usd
+            + lifetime_tool_schema_savings_usd;
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
         // must not jump when a new savings layer starts reporting.
@@ -2405,6 +2412,8 @@ impl AppState {
         if let Some(breakdown) = savings_breakdown.as_mut() {
             breakdown.compression_savings_usd = lifetime_compression_savings_usd;
             breakdown.output_savings_usd = lifetime_output_savings_usd;
+            breakdown.tool_schema_savings_usd = lifetime_tool_schema_savings_usd;
+            breakdown.tool_schema_tokens_saved = lifetime_tool_schema_tokens_saved;
         }
 
         // Token milestones fire off the displayed lifetime total via a persisted
@@ -4016,6 +4025,10 @@ struct PersistedSavingsState {
     /// before this field existed, so milestones for already-earned savings are
     /// seeded (suppressed) on first load rather than firing all at once.
     lifetime_token_milestone_high_water: Option<u64>,
+    /// Running total of tool-definition tokens the proxy deferred, accumulated
+    /// from the poll-over-poll delta of a process-cumulative `/stats` counter
+    /// the backend never persists itself.
+    lifetime_tool_schema_tokens_saved: u64,
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
@@ -4042,6 +4055,15 @@ struct SavingsTracker {
     /// were last fired. Seeded from the current bucket sum on first load after
     /// upgrade so already-earned savings don't re-fire every milestone.
     lifetime_token_milestone_high_water: u64,
+    /// See `PersistedSavingsState::lifetime_tool_schema_tokens_saved`.
+    lifetime_tool_schema_tokens_saved: u64,
+    /// Last raw reading of the backend's process-cumulative counter. `None`
+    /// until the first poll seeds it: that first reading is a baseline, never a
+    /// delta, so a backend that outlived the app can't be counted twice. A
+    /// later reading below the watermark means a restart, which reseeds the
+    /// same way. Deliberately not persisted -- it describes a backend process,
+    /// not the user's history.
+    tool_schema_process_total: Option<u64>,
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
@@ -4124,6 +4146,10 @@ impl SavingsTracker {
                 .as_ref()
                 .map_or(0, |state| state.lifetime_requests),
             lifetime_token_milestone_high_water,
+            lifetime_tool_schema_tokens_saved: persisted_state
+                .as_ref()
+                .map_or(0, |state| state.lifetime_tool_schema_tokens_saved),
+            tool_schema_process_total: None,
             last_observation: persisted_state
                 .as_ref()
                 .and_then(|state| state.last_observation.clone()),
@@ -4318,7 +4344,30 @@ impl SavingsTracker {
         crossed
     }
 
+    /// Fold this poll's reading of the backend's process-cumulative
+    /// tool-schema counter into the lifetime total.
+    ///
+    /// The backend reports this layer in `/stats` but never writes it to the
+    /// rollups, so unlike compression there is no durable server-side total to
+    /// read -- accumulating the deltas here is the only record of it. The first
+    /// reading of any backend process is a baseline, so a backend that was
+    /// already running (or that restarted and reset its counter) contributes
+    /// only what it does from that point on. That under-counts by at most one
+    /// poll interval, which is the safe direction.
+    fn accumulate_tool_schema_tokens(&mut self, reading: u64) {
+        let delta = match self.tool_schema_process_total {
+            Some(previous) => reading.saturating_sub(previous),
+            None => 0,
+        };
+        self.tool_schema_process_total = Some(reading);
+        self.lifetime_tool_schema_tokens_saved =
+            self.lifetime_tool_schema_tokens_saved.saturating_add(delta);
+    }
+
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
+        if let Some(reading) = stats.tool_schema_tokens_saved {
+            self.accumulate_tool_schema_tokens(reading);
+        }
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -4743,6 +4792,7 @@ impl SavingsTracker {
             session_savings_pct: self.session_savings_pct,
             lifetime_requests: self.lifetime_requests,
             lifetime_token_milestone_high_water: Some(self.lifetime_token_milestone_high_water),
+            lifetime_tool_schema_tokens_saved: self.lifetime_tool_schema_tokens_saved,
             last_observation: self.last_observation.clone(),
             display_session_baseline: self.display_session_baseline.clone(),
             session_savings_history: self.session_savings_history.clone(),
@@ -4998,6 +5048,11 @@ struct HeadroomDashboardStats {
     session_total_tokens_sent: Option<u64>,
     savings_history: Vec<HeadroomSavingsHistoryPoint>,
     output_reduction: Option<OutputReduction>,
+    /// Tool-definition tokens the proxy kept out of the model's context by
+    /// deferring heavy tool schemas. Process-cumulative (it resets when the
+    /// backend restarts), and the backend never writes it to its rollups, so
+    /// the tracker accumulates the poll-over-poll delta itself.
+    tool_schema_tokens_saved: Option<u64>,
 }
 
 /// Counterfactual output-token reduction from the proxy's output shaper,
@@ -5377,6 +5432,19 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
         .unwrap_or_default();
 
     let output_reduction = parse_output_reduction(&root);
+    // `summary.compression` carries the process-cumulative counter. The
+    // `savings.by_layer` block reports the same layer but only over the recent
+    // request window, so it is a fallback for shape, not a preferred source.
+    let tool_schema_tokens_saved = value_at_path_u64(
+        &root,
+        &["summary", "compression", "tool_schema_tokens_saved"],
+    )
+    .or_else(|| {
+        value_at_path_u64(
+            &root,
+            &["savings", "by_layer", "tool_search", "tokens_saved"],
+        )
+    });
 
     if requests.is_none()
         && tokens.is_none()
@@ -5396,6 +5464,7 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             session_total_tokens_sent,
             savings_history,
             output_reduction,
+            tool_schema_tokens_saved,
         })
     }
 }
@@ -5469,6 +5538,11 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
         // backend and is only the fallback when no rollups exist yet.
         output_savings_usd: value_at_path_f64(root, &["lifetime", "output_savings_usd"])
             .unwrap_or(0.0),
+        // The backend has no lifetime figure for this layer at all -- it only
+        // reports a process-cumulative counter, which the local tracker
+        // accumulates. Filled in at render time, same as the row above.
+        tool_schema_savings_usd: 0.0,
+        tool_schema_tokens_saved: 0,
         cache_savings_usd: value_at_path_f64(root, &["lifetime", "cache_savings_usd"])
             .unwrap_or(0.0),
         cache_read_tokens: value_at_path_u64(root, &["lifetime", "cache_read_tokens"]).unwrap_or(0),
@@ -6317,6 +6391,36 @@ fn drop_rollup_backfill<T>(
     native.into_iter().filter(|p| key(p) != first).collect()
 }
 
+/// What a cached prefix token costs relative to a fresh input token.
+///
+/// Anthropic bills a cache read at 10% of the input rate; OpenAI's discount is
+/// shallower, so 10% is the conservative choice across providers.
+const CACHE_READ_PRICE_RATIO: f64 = 0.10;
+
+/// Lifetime dollars saved by tool-schema deferral.
+///
+/// Tool definitions are re-sent on every request and sit at the very front of
+/// the prompt, so on all but the first request of a session they would have
+/// been billed as cache reads, not fresh input. Pricing them at the full input
+/// rate -- the way compression is priced -- would overstate this layer roughly
+/// tenfold, so it gets the cache-read rate instead.
+///
+/// The per-token input rate is the one the compression layer already implies
+/// from the same buckets, so a user on cheaper models is priced at their own
+/// models' rates. Returns 0 until there are enough compression buckets to
+/// derive a rate from.
+fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u64) -> f64 {
+    if tokens_saved == 0 {
+        return 0.0;
+    }
+    let usd: f64 = daily_savings.iter().map(|p| p.estimated_savings_usd).sum();
+    let tokens: u64 = daily_savings.iter().map(|p| p.estimated_tokens_saved).sum();
+    if tokens == 0 || usd <= 0.0 {
+        return 0.0;
+    }
+    (usd / tokens as f64) * CACHE_READ_PRICE_RATIO * tokens_saved as f64
+}
+
 /// Lifetime dollars saved by output shaping.
 ///
 /// The daily buckets only carry this layer from the day the backend's rollups
@@ -6519,14 +6623,13 @@ mod tests {
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
         hf_cache_grew, lifetime_output_savings_usd, lifetime_token_milestones_crossed,
-        log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        log_mtime_advanced, merge_daily_savings, merge_hourly_savings, most_recent_monday,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
-        rebuild_persisted_savings_from_records, tcp_port_accepts_connection, total_dir_size_bytes,
-        AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, OutputReduction,
-        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        rebuild_persisted_savings_from_records, tcp_port_accepts_connection,
+        tool_schema_savings_usd, total_dir_size_bytes, AppState, BootValidationOutcome,
+        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        OutputReduction, PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
     };
 
     #[test]
@@ -6595,6 +6698,54 @@ mod tests {
         let empty = vec![daily("2026-08-04", 0, 0.0)];
         assert_eq!(
             lifetime_output_savings_usd(&empty, Some(&reduction(1_000_000))),
+            0.0
+        );
+    }
+
+    #[test]
+    fn tool_schema_tokens_accumulate_across_backend_restarts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("config")).expect("config dir");
+        let mut tracker = SavingsTracker::load_or_create(dir.path()).expect("tracker");
+
+        // First reading of a process is a baseline, never a delta: a backend
+        // that was already running when the app attached must not have its
+        // whole counter counted as new savings.
+        tracker.accumulate_tool_schema_tokens(30_000);
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 0);
+
+        tracker.accumulate_tool_schema_tokens(50_000);
+        tracker.accumulate_tool_schema_tokens(90_000);
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 60_000);
+
+        // Backend restart: the counter drops. Reseed rather than underflow or
+        // re-add the whole new total.
+        tracker.accumulate_tool_schema_tokens(1_000);
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 60_000);
+        tracker.accumulate_tool_schema_tokens(4_000);
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 63_000);
+
+        // The lifetime total survives a reload; the process watermark does not,
+        // so the next backend's first reading is a baseline again.
+        tracker.persist_state().expect("persist");
+        let reloaded = SavingsTracker::load_or_create(dir.path()).expect("reload");
+        assert_eq!(reloaded.lifetime_tool_schema_tokens_saved, 63_000);
+        assert_eq!(reloaded.tool_schema_process_total, None);
+    }
+
+    #[test]
+    fn tool_schema_savings_are_priced_at_the_cache_read_rate() {
+        // 1M compression tokens for $5 -> $5/M input, so deferred tool tokens
+        // are priced at $0.50/M.
+        let buckets = vec![daily("2026-08-05", 1_000_000, 5.0)];
+        let usd = tool_schema_savings_usd(&buckets, 2_000_000);
+        assert!((usd - 1.0).abs() < 1e-9, "{usd}");
+
+        // Nothing deferred, or no compression buckets to derive a rate from.
+        assert_eq!(tool_schema_savings_usd(&buckets, 0), 0.0);
+        assert_eq!(tool_schema_savings_usd(&[], 2_000_000), 0.0);
+        assert_eq!(
+            tool_schema_savings_usd(&[daily("2026-08-05", 0, 0.0)], 2_000_000),
             0.0
         );
     }
@@ -7282,6 +7433,8 @@ mod tests {
             session_savings_pct: 0.0,
             lifetime_requests: 0,
             lifetime_token_milestone_high_water: 0,
+            lifetime_tool_schema_tokens_saved: 0,
+            tool_schema_process_total: None,
             last_observation: None,
             display_session_baseline: None,
             session_savings_history: Vec::new(),
@@ -7992,6 +8145,7 @@ mod tests {
         // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
             output_reduction: None,
+            tool_schema_tokens_saved: None,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_500_000),
@@ -8035,6 +8189,7 @@ mod tests {
         let first = tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.2),
                 session_estimated_tokens_saved: Some(1_200),
@@ -8053,6 +8208,7 @@ mod tests {
         let second = tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(12),
                 session_estimated_savings_usd: Some(1.5),
                 session_estimated_tokens_saved: Some(1_500),
@@ -8075,6 +8231,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.0),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8088,6 +8245,7 @@ mod tests {
         let reset = tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(200),
@@ -8109,6 +8267,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8175,6 +8334,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8818,6 +8978,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8839,6 +9000,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8856,6 +9018,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8883,6 +9046,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(1),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(400),
@@ -8899,6 +9063,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -8985,6 +9150,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(10.1),
                 session_estimated_tokens_saved: Some(10_200),
@@ -9011,6 +9177,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -9028,6 +9195,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(3),
                 session_estimated_savings_usd: Some(0.6),
                 session_estimated_tokens_saved: Some(1_200),
@@ -9054,6 +9222,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(1),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(400),
@@ -9075,6 +9244,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(5),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -9136,6 +9306,7 @@ mod tests {
             tracker
                 .observe(&HeadroomDashboardStats {
                     output_reduction: None,
+                    tool_schema_tokens_saved: None,
                     session_requests: Some(requests),
                     session_estimated_savings_usd: Some(saved as f64 / 1000.0),
                     session_estimated_tokens_saved: Some(saved),
@@ -9162,6 +9333,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(5),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -9179,6 +9351,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(6),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -9206,6 +9379,7 @@ mod tests {
         tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.0),
                 session_estimated_tokens_saved: Some(1_000),
@@ -9219,6 +9393,7 @@ mod tests {
         let second = tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(1.2),
                 session_estimated_tokens_saved: Some(1_200),
@@ -9266,6 +9441,7 @@ mod tests {
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
                 output_reduction: None,
+                tool_schema_tokens_saved: None,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(5.5),
                 session_estimated_tokens_saved: Some(1_100),
@@ -9324,6 +9500,7 @@ mod tests {
             session_savings_pct: 18.0,
             lifetime_requests: 12,
             lifetime_token_milestone_high_water: None,
+            lifetime_tool_schema_tokens_saved: 0,
             last_observation: Some(SavingsObservation {
                 observed_at: Utc::now(),
                 last_activity_at: Some(Utc::now()),
@@ -9629,6 +9806,7 @@ mod tests {
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
             output_reduction: None,
+            tool_schema_tokens_saved: None,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_000),
@@ -9646,6 +9824,7 @@ mod tests {
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
             output_reduction: None,
+            tool_schema_tokens_saved: None,
             session_requests: Some(3),
             session_estimated_savings_usd: Some(3.0),
             session_estimated_tokens_saved: Some(3_000),

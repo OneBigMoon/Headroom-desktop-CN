@@ -145,6 +145,12 @@ pub struct OutputReduction {
 pub struct SavingsBreakdown {
     pub compression_savings_usd: f64,
     pub output_savings_usd: f64,
+    /// Tool-definition tokens the proxy deferred out of the request, priced at
+    /// the provider's cache-read rate rather than the full input rate: tool
+    /// schemas sit at the front of the cached prefix, so what they actually
+    /// cost on a repeat request is a cache read.
+    pub tool_schema_savings_usd: f64,
+    pub tool_schema_tokens_saved: u64,
     pub cache_savings_usd: f64,
     pub cache_read_tokens: u64,
     pub total_input_tokens: u64,
