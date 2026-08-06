@@ -500,6 +500,8 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             estimated_tokens_saved: 0,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
+            output_savings_usd: 0.0,
+            output_tokens_saved: 0,
         })
         .collect();
     // Keep the headline card in sync with the buckets it derives from.
@@ -5536,7 +5538,8 @@ fn spawn_tray_savings_updater(app: AppHandle) {
             .hourly_savings
             .iter()
             .filter(|p| p.hour.starts_with(&today_key))
-            .map(|p| p.estimated_savings_usd)
+            // Both Headroom layers, matching the home chart's headline total.
+            .map(|p| p.estimated_savings_usd + p.output_savings_usd)
             .sum();
         let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
         *savings_state.0.lock() = savings;
@@ -6092,6 +6095,8 @@ mod tests {
             estimated_tokens_saved: tokens_saved,
             actual_cost_usd: cost_usd,
             total_tokens_sent: tokens_sent,
+            output_savings_usd: 0.0,
+            output_tokens_saved: 0,
         }
     }
 

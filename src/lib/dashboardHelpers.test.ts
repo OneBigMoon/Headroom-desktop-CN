@@ -75,7 +75,9 @@ describe("dashboard helpers", () => {
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
-      totalTokensSent: 0
+      totalTokensSent: 0,
+      outputSavingsUsd: 0,
+      outputTokensSaved: 0
     });
     expect(windowed[1]).toEqual(data[0]);
     expect(windowed[28].date).toBe("2024-02-29");

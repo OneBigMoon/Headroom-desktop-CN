@@ -64,6 +64,11 @@ export interface DailySavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  // Output-shaping layer, tracked separately from compression because it is a
+  // counterfactual estimate. Zero for buckets the backend rolled up before the
+  // layer existed, or that came from the local tracker.
+  outputSavingsUsd?: number;
+  outputTokensSaved?: number;
 }
 
 // Counterfactual output-token reduction from the proxy's output shaper.
@@ -103,6 +108,8 @@ export interface HourlySavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  outputSavingsUsd?: number;
+  outputTokensSaved?: number;
   byProvider: ProviderSavingsPoint[];
 }
 

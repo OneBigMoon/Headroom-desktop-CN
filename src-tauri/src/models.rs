@@ -159,6 +159,14 @@ pub struct DailySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// Output-shaping savings for the bucket, kept separate from the
+    /// compression figures above because it is a counterfactual estimate
+    /// (synthetic control vs a learned baseline) rather than a measured diff.
+    /// Zero for buckets from the local tracker, which has no output dimension.
+    #[serde(default)]
+    pub output_savings_usd: f64,
+    #[serde(default)]
+    pub output_tokens_saved: u64,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly
@@ -183,6 +191,11 @@ pub struct HourlySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// See `DailySavingsPoint::output_savings_usd`.
+    #[serde(default)]
+    pub output_savings_usd: f64,
+    #[serde(default)]
+    pub output_tokens_saved: u64,
     #[serde(default)]
     pub by_provider: Vec<ProviderSavingsPoint>,
 }

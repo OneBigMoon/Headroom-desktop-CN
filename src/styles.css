@@ -2467,6 +2467,13 @@ select {
   box-sizing: border-box;
 }
 
+/* Output shaping is the lighter shade of whichever savings colour is active,
+   matching the second stacked bar segment. Opacity instead of a new colour so
+   the two layers stay visibly the same metric. */
+.savings-chart__tooltip-dot--output {
+  opacity: 0.65;
+}
+
 .panel-card__header,
 .content-header {
   display: flex;

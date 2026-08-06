@@ -3955,11 +3955,16 @@ impl SavingsObservation {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 struct DailySavingsBucket {
     estimated_savings_usd: f64,
     estimated_tokens_saved: u64,
     actual_cost_usd: f64,
     total_tokens_sent: u64,
+    // Output-shaping layer, added after the compression fields existed: buckets
+    // persisted by older builds must keep parsing, hence container `default`.
+    output_savings_usd: f64,
+    output_tokens_saved: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4169,6 +4174,8 @@ impl SavingsTracker {
                 estimated_tokens_saved: bucket.estimated_tokens_saved,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
+                output_savings_usd: bucket.output_savings_usd,
+                output_tokens_saved: bucket.output_tokens_saved,
             })
             .collect()
     }
@@ -4182,6 +4189,8 @@ impl SavingsTracker {
                 estimated_tokens_saved: bucket.estimated_tokens_saved,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
+                output_savings_usd: bucket.output_savings_usd,
+                output_tokens_saved: bucket.output_tokens_saved,
                 // The local pre-cutoff tracker has no provider dimension.
                 by_provider: Vec::new(),
             })
@@ -4234,6 +4243,8 @@ impl SavingsTracker {
                 estimated_tokens_saved: point.estimated_tokens_saved,
                 actual_cost_usd: point.actual_cost_usd,
                 total_tokens_sent: point.total_tokens_sent,
+                output_savings_usd: point.output_savings_usd,
+                output_tokens_saved: point.output_tokens_saved,
             };
             if self.daily_savings.get(&point.date) != Some(&bucket) {
                 self.daily_savings.insert(point.date.clone(), bucket);
@@ -4251,6 +4262,8 @@ impl SavingsTracker {
                 estimated_tokens_saved: point.estimated_tokens_saved,
                 actual_cost_usd: point.actual_cost_usd,
                 total_tokens_sent: point.total_tokens_sent,
+                output_savings_usd: point.output_savings_usd,
+                output_tokens_saved: point.output_tokens_saved,
             };
             if self.hourly_savings.get(&point.hour) != Some(&bucket) {
                 self.hourly_savings.insert(point.hour.clone(), bucket);
@@ -4988,6 +5001,10 @@ struct HeadroomSavingsRollupPoint {
     compression_savings_usd_delta: f64,
     total_input_tokens_delta: u64,
     total_input_cost_usd_delta: f64,
+    // Output-shaping deltas; absent on backends older than the layer, which
+    // then read as zero and simply contribute nothing to the bucket.
+    output_savings_usd_delta: f64,
+    output_tokens_saved_delta: u64,
     by_provider: Vec<ProviderRollupDelta>,
 }
 
@@ -5019,6 +5036,8 @@ impl HeadroomSavingsHistoryResponse {
                 estimated_tokens_saved: point.tokens_saved,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
+                output_savings_usd: point.output_savings_usd_delta,
+                output_tokens_saved: point.output_tokens_saved_delta,
             })
             .collect()
     }
@@ -5032,6 +5051,8 @@ impl HeadroomSavingsHistoryResponse {
                 estimated_tokens_saved: point.tokens_saved,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
+                output_savings_usd: point.output_savings_usd_delta,
+                output_tokens_saved: point.output_tokens_saved_delta,
                 by_provider: point
                     .by_provider
                     .iter()
@@ -5398,15 +5419,15 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
 /// rows they do report. Cache savings stay a separate labelled figure — they
 /// are the client's provider-cache discount, never Headroom's claim.
 fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdown> {
-    let compression_savings_usd = value_at_path_f64(root, &["lifetime", "compression_savings_usd"])?;
+    let compression_savings_usd =
+        value_at_path_f64(root, &["lifetime", "compression_savings_usd"])?;
     Some(crate::models::SavingsBreakdown {
         compression_savings_usd,
         output_savings_usd: value_at_path_f64(root, &["lifetime", "output_savings_usd"])
             .unwrap_or(0.0),
         cache_savings_usd: value_at_path_f64(root, &["lifetime", "cache_savings_usd"])
             .unwrap_or(0.0),
-        cache_read_tokens: value_at_path_u64(root, &["lifetime", "cache_read_tokens"])
-            .unwrap_or(0),
+        cache_read_tokens: value_at_path_u64(root, &["lifetime", "cache_read_tokens"]).unwrap_or(0),
         total_input_tokens: value_at_path_u64(root, &["lifetime", "total_input_tokens"])
             .unwrap_or(0),
         total_input_cost_usd: value_at_path_f64(root, &["lifetime", "total_input_cost_usd"])
@@ -5517,6 +5538,15 @@ fn parse_savings_rollup_point(value: &Value) -> Option<HeadroomSavingsRollupPoin
             .and_then(parse_f64_value)
             .unwrap_or_default()
             .max(0.0),
+        output_savings_usd_delta: map
+            .get("output_savings_usd_delta")
+            .and_then(parse_f64_value)
+            .unwrap_or_default()
+            .max(0.0),
+        output_tokens_saved_delta: map
+            .get("output_tokens_saved_delta")
+            .and_then(parse_u64_value)
+            .unwrap_or_default(),
         by_provider: parse_rollup_by_provider(map.get("by_provider")),
     })
 }
@@ -5763,6 +5793,10 @@ fn diff_hourly_buckets(
                 total_tokens_sent: bucket
                     .total_tokens_sent
                     .saturating_sub(prior.total_tokens_sent),
+                output_savings_usd: (bucket.output_savings_usd - prior.output_savings_usd).max(0.0),
+                output_tokens_saved: bucket
+                    .output_tokens_saved
+                    .saturating_sub(prior.output_tokens_saved),
             };
             if delta.estimated_savings_usd <= 0.0
                 && delta.estimated_tokens_saved == 0
@@ -7150,6 +7184,8 @@ mod tests {
                 estimated_tokens_saved: 50,
                 actual_cost_usd: 0.0,
                 total_tokens_sent: 0,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         daily.insert(
@@ -7159,6 +7195,8 @@ mod tests {
                 estimated_tokens_saved: 200,
                 actual_cost_usd: 0.0,
                 total_tokens_sent: 0,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         daily.insert(
@@ -7168,6 +7206,8 @@ mod tests {
                 estimated_tokens_saved: 100,
                 actual_cost_usd: 0.0,
                 total_tokens_sent: 0,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         daily.insert(
@@ -7177,6 +7217,8 @@ mod tests {
                 estimated_tokens_saved: 0, // zero activity day — not counted
                 actual_cost_usd: 0.0,
                 total_tokens_sent: 0,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         daily.insert(
@@ -7186,6 +7228,8 @@ mod tests {
                 estimated_tokens_saved: 9999,
                 actual_cost_usd: 0.0,
                 total_tokens_sent: 0,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         let start = chrono::NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
@@ -8730,6 +8774,8 @@ mod tests {
                 estimated_tokens_saved: 6_000_000,
                 actual_cost_usd: 0.01,
                 total_tokens_sent: 600_000,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         tracker.hourly_savings.insert(
@@ -8739,6 +8785,8 @@ mod tests {
                 estimated_tokens_saved: 6_000_000,
                 actual_cost_usd: 0.01,
                 total_tokens_sent: 600_000,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
         tracker.daily_savings.insert(
@@ -8748,6 +8796,8 @@ mod tests {
                 estimated_tokens_saved: 6_000_000,
                 actual_cost_usd: 0.01,
                 total_tokens_sent: 600_000,
+                output_savings_usd: 0.0,
+                output_tokens_saved: 0,
             },
         );
 
@@ -9129,6 +9179,8 @@ mod tests {
             estimated_savings_usd: usd,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
+            output_savings_usd: 0.0,
+            output_tokens_saved: 0,
         }
     }
 
@@ -9140,6 +9192,8 @@ mod tests {
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
             by_provider: Vec::new(),
+            output_savings_usd: 0.0,
+            output_tokens_saved: 0,
         }
     }
 
@@ -9300,6 +9354,8 @@ mod tests {
             estimated_savings_usd: 1.5,
             actual_cost_usd: 9.0,
             total_tokens_sent: 123_456,
+            output_savings_usd: 0.0,
+            output_tokens_saved: 0,
         }];
         let result = merge_daily_savings(tracker, history, "2026-04-20");
         assert_eq!(result.len(), 1);

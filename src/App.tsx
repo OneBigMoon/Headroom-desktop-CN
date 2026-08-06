@@ -665,6 +665,24 @@ function SavingsChartTooltip({
             </span>
           </div>
         )}
+      {/* Output shaping has no per-provider breakdown, so it always renders as a
+          single bucket-level row under whichever branch ran above. */}
+      {(chartMode === "usd" ? point.outputSavingsUsd : point.outputTokensSaved) > 0 && (
+        <div className="savings-chart__tooltip-group">
+          <span className="savings-chart__tooltip-label">Output shaping</span>
+          <span className="savings-chart__tooltip-item">
+            <i
+              aria-hidden="true"
+              className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
+                chartMode === "usd" ? "saved-usd" : "saved-tokens"
+              } savings-chart__tooltip-dot--output`}
+            />
+            {chartMode === "usd"
+              ? `Saved ${currencyExact(point.outputSavingsUsd)}`
+              : `Saved ${compactNumber(point.outputTokensSaved)} tokens`}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -797,13 +815,17 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
+  // Headline totals cover both Headroom layers -- input compression plus
+  // output shaping -- matching the breakdown rows in the savings modal and the
+  // segments stacked in the bars below. The live tray figure for today already
+  // sums both, so it can stand in for the bucket sum while today is still open.
   const chartSaved = Math.max(
     0,
     chartMode === "usd"
       ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
         ? savingsTodayUsd
-        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
-      : chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0)
+        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
   const chartSpent = chartData.reduce(
     (s, d) => s + (chartMode === "usd" ? d.actualCostUsd : d.totalTokensSent),
@@ -929,6 +951,17 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#d4b832" stopOpacity="0.35" />
                   <stop offset="100%" stopColor="#EBCC6E" stopOpacity="0.25" />
                 </linearGradient>
+                {/* Output shaping sits on top of compression in the same hue
+                    family, one shade lighter, so it reads as a second layer of
+                    the same thing rather than a separate metric. */}
+                <linearGradient id="outputUsdGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#63b3a4" />
+                  <stop offset="100%" stopColor="#8CCCBE" />
+                </linearGradient>
+                <linearGradient id="outputTokensGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#e2cf6a" stopOpacity="0.3" />
+                  <stop offset="100%" stopColor="#F3E2A4" stopOpacity="0.22" />
+                </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
               <XAxis
@@ -955,6 +988,17 @@ function DailySavingsChart({
                   <Bar
                     dataKey="estimatedSavingsUsd"
                     fill="url(#savingsUsdGradient)"
+                    maxBarSize={16}
+                    // Kept on both savings segments: the output bar is empty on
+                    // buckets that predate the layer, and a 1px cap under a
+                    // present output segment is invisible anyway.
+                    radius={[1, 1, 0, 0]}
+                    stackId="usd"
+                    yAxisId="usd"
+                  />
+                  <Bar
+                    dataKey="outputSavingsUsd"
+                    fill="url(#outputUsdGradient)"
                     maxBarSize={16}
                     radius={[1, 1, 0, 0]}
                     stackId="usd"
@@ -989,6 +1033,30 @@ function DailySavingsChart({
                           height={Math.max(0, height - sw)}
                           fill={fill}
                           stroke="#EBCC6E"
+                          strokeWidth={sw}
+                          rx={1}
+                        />
+                      );
+                    }}
+                  />
+                  <Bar
+                    dataKey="outputTokensSaved"
+                    fill="url(#outputTokensGradient)"
+                    maxBarSize={16}
+                    stackId="tokens"
+                    yAxisId="tokens"
+                    shape={(props: any) => {
+                      const { x, y, width, height, fill } = props;
+                      if (!width || !height) return <g />;
+                      const sw = 1.5;
+                      return (
+                        <rect
+                          x={x + sw / 2}
+                          y={y + sw / 2}
+                          width={Math.max(0, width - sw)}
+                          height={Math.max(0, height - sw)}
+                          fill={fill}
+                          stroke="#F3E2A4"
                           strokeWidth={sw}
                           rx={1}
                         />
