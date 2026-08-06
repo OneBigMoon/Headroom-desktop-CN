@@ -20,6 +20,7 @@ import {
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
+  savingsRate,
   sortClientConnectors
 } from "./dashboardHelpers";
 import type {
@@ -39,6 +40,13 @@ describe("dashboard helpers", () => {
     expect(currency(15_432)).toContain("K");
     expect(compactNumber(12_345)).toBe("12.3K");
     expect(percent1(18)).toBe("18.0");
+  });
+
+  it("computes savings rate against the would-be total", () => {
+    expect(savingsRate(15, 85)).toBe(15);
+    expect(savingsRate(0, 0)).toBeNull();
+    expect(savingsRate(0, 100)).toBe(0);
+    expect(savingsRate(-5, 100)).toBe(0);
   });
 
   it("renders near-zero negatives as clean zero, not -$0", () => {
@@ -67,7 +75,9 @@ describe("dashboard helpers", () => {
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
-      totalTokensSent: 0
+      totalTokensSent: 0,
+      outputSavingsUsd: 0,
+      outputTokensSaved: 0
     });
     expect(windowed[1]).toEqual(data[0]);
     expect(windowed[28].date).toBe("2024-02-29");

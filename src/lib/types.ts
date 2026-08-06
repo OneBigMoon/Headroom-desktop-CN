@@ -64,6 +64,11 @@ export interface DailySavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  // Output-shaping layer, tracked separately from compression because it is a
+  // counterfactual estimate. Zero for buckets the backend rolled up before the
+  // layer existed, or that came from the local tracker.
+  outputSavingsUsd?: number;
+  outputTokensSaved?: number;
 }
 
 // Counterfactual output-token reduction from the proxy's output shaper.
@@ -75,6 +80,33 @@ export interface OutputReduction {
   ciLowPercent: number;
   ciHighPercent: number;
   requests: number;
+}
+
+// Lifetime savings decomposition behind the headline card. cacheSavingsUsd is
+// the provider cache discount earned by the client's own prompt caching --
+// shown as its own labelled row, never summed into Headroom's savings.
+export interface SavingsBreakdown {
+  compressionSavingsUsd: number;
+  outputSavingsUsd: number;
+  // Optional: older payloads predate the tool-schema layer, matching the
+  // container-level serde default on the Rust side.
+  toolSchemaSavingsUsd?: number;
+  toolSchemaTokensSaved?: number;
+  cacheSavingsUsd: number;
+  cacheReadTokens: number;
+  totalInputTokens: number;
+  totalInputCostUsd: number;
+  // Optional for the same reason as the tool-schema fields above.
+  modelRates?: ModelSavingsRate[];
+}
+
+// Rate only, no dollars: by_model tracking started well after the lifetime
+// counters, so its totals cover a fraction of history. See ModelSavingsRate in
+// models.rs.
+export interface ModelSavingsRate {
+  model: string;
+  requests: number;
+  savingsPercent: number;
 }
 
 export interface ProviderSavingsPoint {
@@ -91,6 +123,8 @@ export interface HourlySavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  outputSavingsUsd?: number;
+  outputTokensSaved?: number;
   byProvider: ProviderSavingsPoint[];
 }
 
@@ -108,6 +142,7 @@ export interface DashboardState {
   sessionEstimatedTokensSaved: number;
   sessionSavingsPct: number;
   outputReduction: OutputReduction | null;
+  savingsBreakdown: SavingsBreakdown | null;
   dailySavings: DailySavingsPoint[];
   hourlySavings: HourlySavingsPoint[];
   savingsHistoryLoaded: boolean;

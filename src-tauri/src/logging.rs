@@ -114,6 +114,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // A foreign squatter on the intercept port reaches Sentry via the explicit
+    // once-per-error capture at the emit site (RUST-62); this warn repeats on
+    // every 15s bind retry and only duplicated it (RUST-5R). Local log only.
+    if target.starts_with("headroom_desktop_lib::proxy_intercept")
+        && msg.starts_with("[proxy_intercept] port")
+        && msg.contains("held by foreign process")
+    {
+        return true;
+    }
     // report_codex_upstream_error logs the RAW upstream body locally and then
     // captures a separate, status-fingerprinted event with only the structural
     // summary. The bridge defeated both halves (RUST-5Q): the raw body — which
@@ -338,6 +347,19 @@ mod tests {
         assert!(!skip_sentry(
             "tauri_plugin_updater",
             "invalid release manifest"
+        ));
+    }
+
+    #[test]
+    fn skips_foreign_port_bind_retry_warns() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] port 6767 held by foreign process; retrying in 15s (Address already in use (os error 48))"
+        ));
+        // Other bind/loop errors from proxy_intercept stay in Sentry.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] error: some other failure; retrying in 15s"
         ));
     }
 

@@ -2369,6 +2369,12 @@ select {
   line-height: 1.2;
 }
 
+.savings-chart__overlay-rate {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
 .savings-chart__overlay-label {
   font-size: 0.7rem;
   color: #9e948e;
@@ -2459,6 +2465,13 @@ select {
   background: rgba(235, 204, 110, 0.3);
   border: 1.5px solid #EBCC6E;
   box-sizing: border-box;
+}
+
+/* Output shaping is the lighter shade of whichever savings colour is active,
+   matching the second stacked bar segment. Opacity instead of a new colour so
+   the two layers stay visibly the same metric. */
+.savings-chart__tooltip-dot--output {
+  opacity: 0.65;
 }
 
 .panel-card__header,
@@ -3055,6 +3068,11 @@ details[open] .optimize-minimal__details summary::after {
   padding: 14px;
   display: grid;
   gap: 8px;
+  /* The default window is 560px tall and the savings explainer is several
+     times that. Without this the card grows past the viewport and takes its
+     own dismiss button off-screen with it. */
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
 }
 
 .modal-card h3 {
@@ -3072,6 +3090,79 @@ details[open] .optimize-minimal__details summary::after {
   color: var(--text-muted);
   font-size: var(--text-xs);
   line-height: 1.4;
+}
+
+/* Savings drill-down rows inside the "How savings are calculated" modal. */
+.savings-breakdown {
+  display: grid;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-default);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.savings-breakdown__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.savings-breakdown__row strong {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The client's cache discount: context, not a Headroom claim. Visually set
+   apart from the Headroom rows above it. */
+.savings-breakdown__row--context {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-default);
+  color: var(--text-muted);
+}
+
+.savings-breakdown__row--context strong {
+  color: var(--text-secondary);
+}
+
+/* Collapsed by default. The explainer already runs past a 560px window, and
+   the per-model split is supporting detail rather than part of the claim, so
+   it should cost nothing until someone asks for it. */
+.savings-breakdown__models {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-default);
+}
+
+.savings-breakdown__models summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Contents wrapped rather than laid out on the <details> itself: WebKit is
+   unreliable about grid applied directly to a disclosure element. */
+.savings-breakdown__models-body {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* Sample size behind a per-model rate: present so the number can be judged,
+   subordinate so it does not compete with the model name. */
+.savings-breakdown__sample {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.savings-breakdown__note {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin: 0;
 }
 
 .modal-card label {

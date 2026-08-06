@@ -135,6 +135,45 @@ pub struct OutputReduction {
     pub requests: u64,
 }
 
+/// Lifetime savings decomposition parsed from the backend's `/stats-history`
+/// `lifetime` block. Powers the "How savings are calculated" drill-down.
+/// `cache_savings_usd` is the provider cache discount earned by the *client's*
+/// own prompt caching — deliberately never summed into any Headroom savings
+/// figure (Headroom preserves that discount; it does not cause it).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SavingsBreakdown {
+    pub compression_savings_usd: f64,
+    pub output_savings_usd: f64,
+    /// Tool-definition tokens the proxy deferred out of the request, priced at
+    /// the provider's cache-read rate rather than the full input rate: tool
+    /// schemas sit at the front of the cached prefix, so what they actually
+    /// cost on a repeat request is a cache read.
+    pub tool_schema_savings_usd: f64,
+    pub tool_schema_tokens_saved: u64,
+    pub cache_savings_usd: f64,
+    pub cache_read_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_input_cost_usd: f64,
+    /// Per-model compression rates, best first. Empty on backends that predate
+    /// `by_model` tracking.
+    pub model_rates: Vec<ModelSavingsRate>,
+}
+
+/// One row of the backend's `/stats-history` `by_model` block.
+///
+/// Only the rate travels, never the dollars: `by_model` started being tracked
+/// long after the lifetime counters, so its totals cover a fraction of lifetime
+/// history and would visibly fail to add up next to the rows above it. A rate
+/// stays meaningful on a partial sample; a dollar total does not.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelSavingsRate {
+    pub model: String,
+    pub requests: u64,
+    pub savings_percent: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailySavingsPoint {
@@ -143,6 +182,14 @@ pub struct DailySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// Output-shaping savings for the bucket, kept separate from the
+    /// compression figures above because it is a counterfactual estimate
+    /// (synthetic control vs a learned baseline) rather than a measured diff.
+    /// Zero for buckets from the local tracker, which has no output dimension.
+    #[serde(default)]
+    pub output_savings_usd: f64,
+    #[serde(default)]
+    pub output_tokens_saved: u64,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly
@@ -167,6 +214,11 @@ pub struct HourlySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// See `DailySavingsPoint::output_savings_usd`.
+    #[serde(default)]
+    pub output_savings_usd: f64,
+    #[serde(default)]
+    pub output_tokens_saved: u64,
     #[serde(default)]
     pub by_provider: Vec<ProviderSavingsPoint>,
 }
@@ -193,6 +245,9 @@ pub struct DashboardState {
     /// `None` until a verbosity baseline is seeded (the dashboard hides the stat
     /// until then). Always honestly labelled (`method` + confidence band).
     pub output_reduction: Option<OutputReduction>,
+    /// Lifetime decomposition behind the headline savings card. `None` until
+    /// the backend's `/stats-history` has been fetched at least once.
+    pub savings_breakdown: Option<SavingsBreakdown>,
     pub daily_savings: Vec<DailySavingsPoint>,
     pub hourly_savings: Vec<HourlySavingsPoint>,
     /// True once native savings history has loaded at least once this process.

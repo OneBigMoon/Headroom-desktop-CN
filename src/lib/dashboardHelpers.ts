@@ -12,6 +12,10 @@ export interface SavingsChartDatum {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  // Output-shaping savings, stacked on top of compression in the chart. Zero
+  // for buckets predating the layer, so the bar simply shows one segment.
+  outputSavingsUsd: number;
+  outputTokensSaved: number;
   totalCostBeforeOptimization: number;
   totalTokensBeforeOptimization: number;
   // Per-provider attribution, only populated for hourly buckets (day view).
@@ -60,6 +64,13 @@ export function percent1(value: number) {
     minimumFractionDigits: 1,
     maximumFractionDigits: 1
   }).format(value);
+}
+
+/** Share of the would-be total that was saved, as a whole percent. Null when there is nothing to compare. */
+export function savingsRate(saved: number, spent: number) {
+  const baseline = Math.max(0, saved) + Math.max(0, spent);
+  if (baseline <= 0) return null;
+  return Math.round((Math.max(0, saved) / baseline) * 100);
 }
 
 export function formatDayLabel(dayKey: string) {
@@ -152,7 +163,9 @@ export function buildMonthlySavingsWindow(data: DailySavingsPoint[], month: Date
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
-      totalTokensSent: 0
+      totalTokensSent: 0,
+      outputSavingsUsd: 0,
+      outputTokensSaved: 0
     };
   });
 }
@@ -169,6 +182,8 @@ export function buildHourlySavingsWindow(data: HourlySavingsPoint[], day: Date) 
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
       totalTokensSent: 0,
+      outputSavingsUsd: 0,
+      outputTokensSaved: 0,
       byProvider: []
     };
   });
@@ -182,6 +197,8 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
     estimatedTokensSaved: point.estimatedTokensSaved,
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
+    outputSavingsUsd: point.outputSavingsUsd ?? 0,
+    outputTokensSaved: point.outputTokensSaved ?? 0,
     totalCostBeforeOptimization: point.actualCostUsd + point.estimatedSavingsUsd,
     totalTokensBeforeOptimization: point.totalTokensSent + point.estimatedTokensSaved
   }));
@@ -262,6 +279,8 @@ export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): Savings
     estimatedTokensSaved: point.estimatedTokensSaved,
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
+    outputSavingsUsd: point.outputSavingsUsd ?? 0,
+    outputTokensSaved: point.outputTokensSaved ?? 0,
     totalCostBeforeOptimization: point.actualCostUsd + point.estimatedSavingsUsd,
     totalTokensBeforeOptimization: point.totalTokensSent + point.estimatedTokensSaved,
     byProvider: point.byProvider ?? []

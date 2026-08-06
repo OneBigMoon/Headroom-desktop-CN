@@ -109,6 +109,7 @@ import {
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
+  savingsRate,
   sortClientConnectors,
   startOfDay,
   startOfMonth,
@@ -665,6 +666,24 @@ function SavingsChartTooltip({
             </span>
           </div>
         )}
+      {/* Output shaping has no per-provider breakdown, so it always renders as a
+          single bucket-level row under whichever branch ran above. */}
+      {(chartMode === "usd" ? point.outputSavingsUsd : point.outputTokensSaved) > 0 && (
+        <div className="savings-chart__tooltip-group">
+          <span className="savings-chart__tooltip-label">Output shaping</span>
+          <span className="savings-chart__tooltip-item">
+            <i
+              aria-hidden="true"
+              className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
+                chartMode === "usd" ? "saved-usd" : "saved-tokens"
+              } savings-chart__tooltip-dot--output`}
+            />
+            {chartMode === "usd"
+              ? `Saved ${currencyExact(point.outputSavingsUsd)}`
+              : `Saved ${compactNumber(point.outputTokensSaved)} tokens`}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -797,6 +816,23 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
+  // Headline totals cover both Headroom layers -- input compression plus
+  // output shaping -- matching the breakdown rows in the savings modal and the
+  // segments stacked in the bars below. The live tray figure for today already
+  // sums both, so it can stand in for the bucket sum while today is still open.
+  const chartSaved = Math.max(
+    0,
+    chartMode === "usd"
+      ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
+        ? savingsTodayUsd
+        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
+  );
+  const chartSpent = chartData.reduce(
+    (s, d) => s + (chartMode === "usd" ? d.actualCostUsd : d.totalTokensSent),
+    0
+  );
+  const chartSavingsRate = savingsRate(chartSaved, chartSpent);
 
   useEffect(() => {
     const now = new Date();
@@ -883,16 +919,19 @@ function DailySavingsChart({
         <div className="savings-chart__canvas savings-chart__canvas--combined">
           <div className="savings-chart__overlay" aria-hidden="true">
             <span className="savings-chart__overlay-total">
-              {chartMode === "usd"
-                ? currency(
-                    Math.max(
-                      0,
-                      view === "day" && visibleDay >= today && savingsTodayUsd !== null
-                        ? savingsTodayUsd
-                        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
-                    )
-                  )
-                : compactNumber(Math.max(0, chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0)))}
+              {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
+              {chartSavingsRate !== null && (
+                // Denominator is savings + input spend. Output spend is not in
+                // the backend's rollups at all, so the rate is explicitly a
+                // share of input cost rather than of the whole bill.
+                <span
+                  className="savings-chart__overlay-rate"
+                  title={`${chartSavingsRate}% of what this ${view === "day" ? "day" : "month"}'s input would have cost without Headroom`}
+                >
+                  {" "}
+                  ({chartSavingsRate}%)
+                </span>
+              )}
             </span>
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
@@ -922,6 +961,17 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#d4b832" stopOpacity="0.35" />
                   <stop offset="100%" stopColor="#EBCC6E" stopOpacity="0.25" />
                 </linearGradient>
+                {/* Output shaping sits on top of compression in the same hue
+                    family, one shade lighter, so it reads as a second layer of
+                    the same thing rather than a separate metric. */}
+                <linearGradient id="outputUsdGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#63b3a4" />
+                  <stop offset="100%" stopColor="#8CCCBE" />
+                </linearGradient>
+                <linearGradient id="outputTokensGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#e2cf6a" stopOpacity="0.3" />
+                  <stop offset="100%" stopColor="#F3E2A4" stopOpacity="0.22" />
+                </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
               <XAxis
@@ -948,6 +998,17 @@ function DailySavingsChart({
                   <Bar
                     dataKey="estimatedSavingsUsd"
                     fill="url(#savingsUsdGradient)"
+                    maxBarSize={16}
+                    // Kept on both savings segments: the output bar is empty on
+                    // buckets that predate the layer, and a 1px cap under a
+                    // present output segment is invisible anyway.
+                    radius={[1, 1, 0, 0]}
+                    stackId="usd"
+                    yAxisId="usd"
+                  />
+                  <Bar
+                    dataKey="outputSavingsUsd"
+                    fill="url(#outputUsdGradient)"
                     maxBarSize={16}
                     radius={[1, 1, 0, 0]}
                     stackId="usd"
@@ -982,6 +1043,30 @@ function DailySavingsChart({
                           height={Math.max(0, height - sw)}
                           fill={fill}
                           stroke="#EBCC6E"
+                          strokeWidth={sw}
+                          rx={1}
+                        />
+                      );
+                    }}
+                  />
+                  <Bar
+                    dataKey="outputTokensSaved"
+                    fill="url(#outputTokensGradient)"
+                    maxBarSize={16}
+                    stackId="tokens"
+                    yAxisId="tokens"
+                    shape={(props: any) => {
+                      const { x, y, width, height, fill } = props;
+                      if (!width || !height) return <g />;
+                      const sw = 1.5;
+                      return (
+                        <rect
+                          x={x + sw / 2}
+                          y={y + sw / 2}
+                          width={Math.max(0, width - sw)}
+                          height={Math.max(0, height - sw)}
+                          fill={fill}
+                          stroke="#F3E2A4"
                           strokeWidth={sw}
                           rx={1}
                         />
@@ -6865,11 +6950,105 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex, and shapes the replies that come back.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
-                <p>This is an optimistic estimate.</p>
-                <p>Without Headroom, when tokens are sent to Claude for the first time they would be stored in their cache. Once in the cache, whenever these same tokens are sent again Claude applies a 90% discount to their cost. In our testing, this can reduce the actual savings by at most 50%.</p>
-                <p>Even accounting for caching, you've likely saved at least <strong>{currency(dashboard.lifetimeEstimatedSavingsUsd * 0.5)}</strong>.</p>
+                {dashboard.savingsBreakdown ? (
+                  <div className="savings-breakdown">
+                    <div className="savings-breakdown__row">
+                      <span>Input compression (Headroom)</span>
+                      <strong>{currency(dashboard.savingsBreakdown.compressionSavingsUsd)}</strong>
+                    </div>
+                    {dashboard.savingsBreakdown.outputSavingsUsd >= 0.005 ? (
+                      <>
+                        <div className="savings-breakdown__row">
+                          <span>Output shaping (Headroom)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
+                        </div>
+                        {/* This row is a lifetime figure from the shaper's own
+                            estimator, which predates per-day tracking of the
+                            layer -- so the daily bars can add up to less. */}
+                        <p className="savings-breakdown__note">
+                          Output shaping is a counterfactual: Headroom compares each reply against a
+                          baseline learned from your own past replies
+                          {dashboard.outputReduction
+                            ? `, across ${compactNumber(dashboard.outputReduction.requests)} requests`
+                            : ""}
+                          . It covers every request since that baseline was built, so it can exceed
+                          what the daily bars show.
+                        </p>
+                      </>
+                    ) : null}
+                    {(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0) >= 0.005 ? (
+                      <>
+                        <div className="savings-breakdown__row">
+                          <span>Tool schemas deferred (Headroom)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
+                        </div>
+                        {/* Priced at the cache-read rate, not the input rate --
+                            see tool_schema_savings_usd in state.rs. */}
+                        <p className="savings-breakdown__note">
+                          {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
+                          of tool definitions Headroom kept out of your requests until they were
+                          needed. These sit at the front of the cached prefix, so they are priced at
+                          the provider's cache-read rate rather than the full input rate. Counted from
+                          the day this build started tracking the layer.
+                        </p>
+                      </>
+                    ) : null}
+                    {dashboard.savingsBreakdown.cacheSavingsUsd >= 0.005 ? (
+                      <>
+                        <div className="savings-breakdown__row savings-breakdown__row--context">
+                          <span>Prompt caching (your AI client)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.cacheSavingsUsd)}</strong>
+                        </div>
+                        <p className="savings-breakdown__note">
+                          Cache discounts are earned by your client's own prompt caching, so Headroom
+                          never counts them in its savings. Headroom's compression is cache-aligned:
+                          it only touches content outside the cached prefix, keeping that discount intact.
+                        </p>
+                      </>
+                    ) : null}
+                    {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 1 ? (
+                      <details className="savings-breakdown__models">
+                        <summary>Compression rate by model</summary>
+                        <div className="savings-breakdown__models-body">
+                          {dashboard.savingsBreakdown.modelRates?.map((row) => (
+                            <div className="savings-breakdown__row" key={row.model}>
+                              <span>
+                                {row.model}{" "}
+                                <span className="savings-breakdown__sample">
+                                  {compactNumber(row.requests)} requests
+                                </span>
+                              </span>
+                              <strong>{percent1(row.savingsPercent)}%</strong>
+                            </div>
+                          ))}
+                          {/* Rates only -- by_model covers a fraction of lifetime
+                              history, so its dollars would not add up to the rows
+                              above. See ModelSavingsRate in models.rs. */}
+                          <p className="savings-breakdown__note">
+                            How much of each model's input Headroom removed. The spread is mostly
+                            workload, not model: long tool output and logs compress far better than
+                            prose, so the blended figure tracks whichever models you use most rather
+                            than how hard Headroom is working. Models with under 100 requests are
+                            left out.
+                          </p>
+                        </div>
+                      </details>
+                    ) : null}
+                  </div>
+                ) : null}
+                {/* The cache-discount haircut applies to input compression only.
+                    Output tokens are never served from a prompt cache, and the
+                    tool-schema row already carries the cache-read price, so
+                    halving either would understate the floor. */}
+                <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed input tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(
+                  dashboard.savingsBreakdown
+                    ? dashboard.savingsBreakdown.compressionSavingsUsd * 0.5 +
+                        dashboard.savingsBreakdown.outputSavingsUsd +
+                        (dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)
+                    : dashboard.lifetimeEstimatedSavingsUsd * 0.5
+                )}</strong>.</p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"
