@@ -6190,6 +6190,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
         // Windows username containing `'` could break out of it).
         fn escape_like(value: &str) -> String {
             value
+                .replace('`', "``")
                 .replace('\'', "''")
                 .replace('[', "`[")
                 .replace(']', "`]")

@@ -1,8 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -1455,13 +1453,25 @@ impl ToolManager {
                 // agents a too-niced backend gets starved enough that even the
                 // watchdog's tolerant 5s re-probe misses, triggering spurious
                 // auto-pause. +2 still yields, without the starvation.
-                let mut child = Command::new("/usr/bin/nice")
-                    .arg("-n")
-                    .arg("2")
-                    .arg(executable)
-                    .args(args)
-                    .current_dir(&self.runtime.root_dir)
-                    .process_group(0)
+                #[cfg(unix)]
+                let mut command = {
+                    let mut c = Command::new("/usr/bin/nice");
+                    c.arg("-n").arg("2").arg(executable).args(args);
+                    c
+                };
+                #[cfg(windows)]
+                let mut command = {
+                    let mut c = Command::new(executable);
+                    c.args(args);
+                    c
+                };
+                command.current_dir(&self.runtime.root_dir);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
+                let mut child = command
                     .env("PYTHONNOUSERSITE", "1")
                     .env("PYTHONPATH", &inject_dir)
                     .env("PYTHONUNBUFFERED", "1")
@@ -4585,7 +4595,7 @@ impl ToolManager {
                  set /p n=<\"%C%\" 2>nul\r\n\
                  if not defined n set n=0\r\n\
                  set /a n+=1 >nul 2>nul\r\n\
-                 echo %n%>\"%C%.tmp\"\r\n\
+                 >\"%C%.tmp\" echo %n%\r\n\
                  move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
                  :run\r\n\
                  \"{real}\" %*\r\n",
@@ -4917,6 +4927,7 @@ impl ToolManager {
         };
         std::fs::rename(&extracted_binary, &staged)
             .with_context(|| format!("staging {}", staged.display()))?;
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut permissions = std::fs::metadata(&staged)
@@ -6371,6 +6382,7 @@ pub(crate) struct InPlaceUpgradeContext {
 
 /// Best-effort free-bytes query for the volume backing `path`. Returns None
 /// on error — callers should treat that as "don't block on disk space".
+#[cfg(unix)]
 fn available_disk_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -6382,6 +6394,35 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(windows)]
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    let mut free_bytes_available: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            existing.as_ptr(),
+            &mut free_bytes_available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(free_bytes_available)
 }
 
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
@@ -7567,6 +7608,7 @@ impl std::error::Error for HeadroomStartupFailure {}
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7584,7 +7626,8 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
         path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        proxy_argv_contains_expected_flags, python_distribution_artifact,
+        read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
@@ -9175,9 +9218,12 @@ after
             fs::create_dir_all(parent).expect("create parent");
         }
         fs::write(path, body).expect("write script");
-        let mut perms = fs::metadata(path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("chmod");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).expect("chmod");
+        }
     }
 
     fn seed_test_runtime(prefix: &str) -> (PathBuf, ManagedRuntime, ToolManager) {

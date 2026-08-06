@@ -1767,6 +1767,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "uuid",
+ "windows-sys 0.45.0",
  "zip 2.4.2",
 ]
 

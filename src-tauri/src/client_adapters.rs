@@ -3741,9 +3741,24 @@ fn codex_guard_hook_path() -> PathBuf {
     codex_home().join("hooks").join("headroom-codex-guard.py")
 }
 
+/// Interpreter used by the Claude/Codex session-start guard hooks. On macOS
+/// and Linux the system `/usr/bin/python3` (>=3.9) is always present. On
+/// Windows there's no such guarantee -- bare `python` on a stock box is
+/// either absent from PATH or the Microsoft Store stub that opens the Store
+/// instead of running -- so point at the managed runtime's own bundled
+/// interpreter, which this app installs regardless of what's on PATH.
+fn guard_python_command() -> String {
+    if cfg!(target_os = "windows") {
+        let managed = crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir())
+            .managed_python();
+        format!("\"{}\"", managed.display())
+    } else {
+        "/usr/bin/python3".to_string()
+    }
+}
+
 fn codex_guard_command() -> String {
-    let python = if cfg!(target_os = "windows") { "python" } else { "/usr/bin/python3" };
-    format!("{python} {}", codex_guard_hook_path().display())
+    format!("{} {}", guard_python_command(), codex_guard_hook_path().display())
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -4134,8 +4149,7 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    let python = if cfg!(target_os = "windows") { "python" } else { "/usr/bin/python3" };
-    format!("{python} {}", claude_guard_hook_path().display())
+    format!("{} {}", guard_python_command(), claude_guard_hook_path().display())
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -6441,6 +6455,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_falls_through_when_rewritten_first_token_missing_from_path() {
         // The hook has an OR guard that exits 0 when the binaries are missing,
         // so we give it real paths and verify the PATH-resolution check kicks in
@@ -6506,6 +6521,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_passes_through_check_commands() {
         // `rtk git diff --check` swallows the whitespace report; the hook must
         // leave any --check command unrewritten even when rtk would rewrite it.
@@ -6565,6 +6581,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_emits_rewrite_when_first_token_is_valid_absolute_path() {
         let root = unique_temp_dir("headroom-hook-bash-ok");
         fs::create_dir_all(&root).expect("create root");
@@ -6631,6 +6648,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_pins_bare_rtk_token_to_managed_absolute_path() {
         let root = unique_temp_dir("headroom-hook-pin-rtk");
         fs::create_dir_all(&root).expect("create root");
@@ -6694,6 +6712,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_prepends_managed_path_so_embedded_rtk_resolves() {
         // Regression for compound commands: `rtk rewrite` embeds a bare `rtk`
         // after `&&`/`;`/`|`, which the leading-token pin never touches. The
@@ -6772,6 +6791,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_emits_rewrite_even_when_rtk_rewrite_exits_nonzero() {
         let root = unique_temp_dir("headroom-hook-bash-nonzero");
         fs::create_dir_all(&root).expect("create root");
@@ -8093,8 +8113,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[cfg(target_os = "windows")]
     #[test]
     fn guard_commands_do_not_hardcode_unix_python() {
-        assert!(claude_guard_command().starts_with("python "));
-        assert!(codex_guard_command().starts_with("python "));
+        assert!(claude_guard_command().contains("python.exe"));
+        assert!(codex_guard_command().contains("python.exe"));
+        assert!(!claude_guard_command().starts_with("/usr/bin/python3"));
+        assert!(!codex_guard_command().starts_with("/usr/bin/python3"));
     }
 
     #[cfg(target_os = "windows")]

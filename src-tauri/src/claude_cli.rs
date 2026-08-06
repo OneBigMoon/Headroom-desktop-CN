@@ -108,6 +108,7 @@ fn read_path_from_shell(mut command: Command, timeout: Duration) -> Option<PathB
     }
 }
 
+#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let meta = match std::fs::metadata(path) {
@@ -118,6 +119,14 @@ fn is_executable(path: &Path) -> bool {
         return false;
     }
     meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn is_executable(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => true,
+        _ => false,
+    }
 }
 
 /// `is_executable` only checks the POSIX exec bit; on dual-architecture Macs
@@ -189,6 +198,7 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
@@ -214,11 +224,17 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn make_executable(path: &Path) {
         fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn make_executable(path: &Path) {
+        fs::write(path, "").unwrap();
     }
 
     #[test]
@@ -230,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn is_executable_rejects_non_executable_files() {
         let tmp = ScopedTempDir::new("is_exec_no");
         let path = tmp.path().join("not_exec");
@@ -260,6 +277,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn is_runnable_rejects_executable_that_fails_to_spawn() {
         // Regression: an x86_64-only Homebrew leftover at /usr/local/bin/claude
         // on an arm64 Mac satisfied the POSIX exec bit but the kernel returned
@@ -276,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn is_runnable_rejects_executable_that_exits_non_zero() {
         let tmp = ScopedTempDir::new("runnable_exit1");
         let path = tmp.path().join("claude");
@@ -296,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn first_runnable_walks_past_broken_candidates() {
         // Reproduces the production scenario: an Intel-only `/usr/local/bin/claude`
         // remnant on an arm64 Mac is the second candidate examined; the first
@@ -325,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn first_runnable_returns_none_when_all_candidates_broken() {
         let tmp = ScopedTempDir::new("first_runnable_none");
         let broken = tmp.path().join("broken");
@@ -356,6 +377,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn is_runnable_finds_colocated_interpreter_via_augmented_path() {
         // Regression: nvm/volta/bun/asdf installs of `claude` are
         // `#!/usr/bin/env <interp>` scripts with the interpreter colocated in
@@ -393,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn is_runnable_kills_and_rejects_a_hung_executable() {
         // A binary that hangs forever must not stall detection. We override
         // the timeout indirectly by invoking wait_with_timeout directly with
