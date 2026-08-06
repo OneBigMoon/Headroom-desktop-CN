@@ -920,7 +920,16 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-total">
               {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
               {chartSavingsRate !== null && (
-                <span className="savings-chart__overlay-rate"> ({chartSavingsRate}%)</span>
+                // Denominator is savings + input spend. Output spend is not in
+                // the backend's rollups at all, so the rate is explicitly a
+                // share of input cost rather than of the whole bill.
+                <span
+                  className="savings-chart__overlay-rate"
+                  title={`${chartSavingsRate}% of what this ${view === "day" ? "day" : "month"}'s input would have cost without Headroom`}
+                >
+                  {" "}
+                  ({chartSavingsRate}%)
+                </span>
               )}
             </span>
             <span className="savings-chart__overlay-label">
@@ -6942,7 +6951,7 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex, and shapes the replies that come back.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
@@ -6971,7 +6980,15 @@ export default function App() {
                     ) : null}
                   </div>
                 ) : null}
-                <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(dashboard.lifetimeEstimatedSavingsUsd * 0.5)}</strong>.</p>
+                {/* The cache-discount haircut applies to input compression only:
+                    output tokens are never served from a prompt cache, so
+                    halving the combined total would understate the floor. */}
+                <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed input tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(
+                  dashboard.savingsBreakdown
+                    ? dashboard.savingsBreakdown.compressionSavingsUsd * 0.5 +
+                        dashboard.savingsBreakdown.outputSavingsUsd
+                    : dashboard.lifetimeEstimatedSavingsUsd * 0.5
+                )}</strong>.</p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"

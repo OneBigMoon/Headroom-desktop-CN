@@ -2368,8 +2368,11 @@ impl AppState {
         // chart renders, so the headline card and the chart can never disagree.
         let lifetime_estimated_savings_usd = daily_savings
             .iter()
-            .map(|point| point.estimated_savings_usd)
+            .map(|point| point.estimated_savings_usd + point.output_savings_usd)
             .sum();
+        // Tokens stay input-only: the card is labelled "Total input tokens
+        // saved", and this total also drives the milestone notifications, which
+        // must not jump when a new savings layer starts reporting.
         let lifetime_estimated_tokens_saved: u64 = daily_savings
             .iter()
             .map(|point| point.estimated_tokens_saved)
@@ -5423,8 +5426,7 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
         value_at_path_f64(root, &["lifetime", "compression_savings_usd"])?;
     Some(crate::models::SavingsBreakdown {
         compression_savings_usd,
-        output_savings_usd: value_at_path_f64(root, &["lifetime", "output_savings_usd"])
-            .unwrap_or(0.0),
+        output_savings_usd: lifetime_output_savings_usd(root),
         cache_savings_usd: value_at_path_f64(root, &["lifetime", "cache_savings_usd"])
             .unwrap_or(0.0),
         cache_read_tokens: value_at_path_u64(root, &["lifetime", "cache_read_tokens"]).unwrap_or(0),
@@ -5433,6 +5435,35 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
         total_input_cost_usd: value_at_path_f64(root, &["lifetime", "total_input_cost_usd"])
             .unwrap_or(0.0),
     })
+}
+
+/// Lifetime output-shaping savings, reconstructed by summing the daily rollup
+/// deltas rather than reading `lifetime.output_savings_usd`.
+///
+/// The backend's cumulative output counter is process-scoped: it restarts at
+/// zero every time the backend restarts, so the `lifetime` field only reports
+/// savings since the last restart (observed 2026-08-06: $0.72 reported against
+/// $105.23 of daily deltas over the same window). The daily deltas survive the
+/// restarts. Cross-checked on compression, where the counter never resets and
+/// the two agree exactly, so summing deltas is the right reconstruction and not
+/// a thumb on the scale.
+///
+/// Falls back to the `lifetime` field when there is no daily series — an older
+/// backend, or a fresh install that has not rolled up a bucket yet.
+fn lifetime_output_savings_usd(root: &Value) -> f64 {
+    let reported = value_at_path_f64(root, &["lifetime", "output_savings_usd"]).unwrap_or(0.0);
+    let Some(Value::Array(daily)) = value_at_path(root, &["series", "daily"]) else {
+        return reported;
+    };
+    if daily.is_empty() {
+        return reported;
+    }
+    let summed: f64 = daily
+        .iter()
+        .filter_map(|point| value_at_path_f64(point, &["output_savings_usd_delta"]))
+        .map(|delta| delta.max(0.0))
+        .sum();
+    summed.max(reported)
 }
 
 fn value_at_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
@@ -6408,15 +6439,43 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, hf_cache_grew,
-        lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        lifetime_output_savings_usd, lifetime_token_milestones_crossed, log_mtime_advanced,
+        merge_daily_savings, merge_hourly_savings, most_recent_monday,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, tcp_port_accepts_connection, total_dir_size_bytes,
         AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
         HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
         SavingsObservation, SavingsRecord, SavingsTracker,
     };
+
+    #[test]
+    fn lifetime_output_savings_sums_daily_deltas_over_reset_prone_counter() {
+        // The `lifetime` field only covers the current backend process, so it
+        // reads far lower than the daily deltas it is supposed to total.
+        let root = serde_json::json!({
+            "lifetime": { "output_savings_usd": 0.72 },
+            "series": { "daily": [
+                { "output_savings_usd_delta": 28.65 },
+                { "output_savings_usd_delta": 1.84 },
+                { "output_savings_usd_delta": 9.70 },
+            ]},
+        });
+        assert!((lifetime_output_savings_usd(&root) - 40.19).abs() < 1e-9);
+
+        // No series (older backend, or nothing rolled up yet): report what the
+        // backend reports rather than zero.
+        let bare = serde_json::json!({ "lifetime": { "output_savings_usd": 0.72 } });
+        assert!((lifetime_output_savings_usd(&bare) - 0.72).abs() < 1e-9);
+
+        // Series present but not yet carrying the field: never show less than
+        // the backend's own figure.
+        let no_field = serde_json::json!({
+            "lifetime": { "output_savings_usd": 3.0 },
+            "series": { "daily": [{ "compression_savings_usd_delta": 1.0 }] },
+        });
+        assert!((lifetime_output_savings_usd(&no_field) - 3.0).abs() < 1e-9);
+    }
 
     #[test]
     fn readyz_404_counts_as_reachable_but_503_does_not() {
