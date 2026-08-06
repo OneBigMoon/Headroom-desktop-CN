@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.33.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/4a/85/dbe382e0166b24dddba88f49664a2af31af085dd80e611b281f673a73c00/headroom_ai-0.33.0-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.34.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/82/f8/d9416f0fd07cf1da050853fd84ab0b85261c94f0bb40e6ed0a3d214a74ca/headroom_ai-0.34.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "bd4402d4d29356e76393822f7d163ad32b92134dcc93bd1007d39833de8f6265";
+    "381391ab816daf0894a40fd6523f54abf55c30a57273879c2f6e6b501ab997c3";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -198,6 +198,13 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   Kompress — upstream #1154/#1153) live inside headroom-ai's own
 ///   `headroom_core` abi3 extension, which pip uninstalls via RECORD before
 ///   unpacking the replacement, so no stale `.so` is layered.
+/// - 0.7.x (0.33.0 → 0.34.0 bundle): floor stays at 0.20.0. requires_dist is
+///   byte-identical to 0.33.0. The lock tops up two transitive pins to match
+///   upstream's #2753 CVE clearance (aiohttp 3.14.1 → 3.14.3, cryptography
+///   49.0.0 → 50.0.0). Both are version *changes* of native wheels, so pip
+///   uninstalls the old wheel via RECORD before unpacking the new one — no
+///   same-version relayering. The lock-sha change triggers a dep top-up for
+///   existing users, which is intended (they need the CVE-fixed wheels).
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating
@@ -1441,7 +1448,13 @@ impl ToolManager {
                     .env("HEADROOM_SDK", "headroom-desktop-proxy")
                     // Anonymous aggregate telemetry (opt-in in the package,
                     // off by default). Desktop opts in on the user's behalf.
+                    // This is LOCAL collection only (feeds /stats); keep it on.
                     .env("HEADROOM_TELEMETRY", "on")
+                    // headroom-ai 0.34.0 added an upstream phone-home beacon
+                    // (session summaries uploaded to Headroom Labs), on by
+                    // default. Desktop has its own telemetry; keep the
+                    // upstream upload off.
+                    .env("HEADROOM_BEACON", "off")
                     .env("HEADROOM_HTTP2", "false")
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
