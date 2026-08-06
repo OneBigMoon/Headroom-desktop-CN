@@ -1721,16 +1721,29 @@ fn default_headroom_root_dir() -> PathBuf {
     app_data_dir().join("headroom")
 }
 
+// Windows layout mirrors tool_manager: `rtk.exe` in bin, venv interpreters
+// under `Scripts\` with `.exe`. Without this, `managed_rtk_path.exists()` is
+// always false on Windows and the RTK shell/hook integration silently skips.
 fn default_headroom_rtk_path() -> PathBuf {
-    default_headroom_root_dir().join("bin").join("rtk")
+    let name = if cfg!(target_os = "windows") {
+        "rtk.exe"
+    } else {
+        "rtk"
+    };
+    default_headroom_root_dir().join("bin").join(name)
 }
 
 fn default_headroom_managed_python_path() -> PathBuf {
+    let (dir, name) = if cfg!(target_os = "windows") {
+        ("Scripts", "python.exe")
+    } else {
+        ("bin", "python3")
+    };
     default_headroom_root_dir()
         .join("runtime")
         .join("venv")
-        .join("bin")
-        .join("python3")
+        .join(dir)
+        .join(name)
 }
 
 fn resolve_client_shell_targets(state: &ClientSetupState, client_id: &str) -> Result<Vec<PathBuf>> {
@@ -6888,6 +6901,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_xdg_config: Option<std::ffi::OsString>,
         prev_opencode_config: Option<std::ffi::OsString>,
         prev_grok_home: Option<std::ffi::OsString>,
+        prev_headroom_data_dir: Option<std::ffi::OsString>,
         // Held for the guard's lifetime: env vars are process-global, so two
         // TestHome tests running on parallel threads corrupt each other's HOME
         // (and can leak writes into the developer's real profile). serial_test
@@ -6910,8 +6924,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
             let prev_opencode_config = std::env::var_os("OPENCODE_CONFIG");
             let prev_grok_home = std::env::var_os("GROK_HOME");
+            let prev_headroom_data_dir = std::env::var_os("HEADROOM_DATA_DIR");
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+            // Pin the app data dir into the temp home. dirs::data_local_dir()
+            // ignores HOME/XDG on macOS and Windows, so without this the setup
+            // state, seeded rtk, and cleanup sweeps all hit the REAL profile —
+            // and under nextest (process per test) the env lock below cannot
+            // serialize that sharing across processes.
+            std::env::set_var(
+                "HEADROOM_DATA_DIR",
+                home.join(".local").join("share").join("Headroom"),
+            );
             // Pin XDG_CONFIG_HOME into the temp home and clear the opencode /
             // grok override vars: a dev machine with any of these set would
             // otherwise have the opencode/grok tests write the developer's
@@ -6943,6 +6967,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_xdg_config,
                 prev_opencode_config,
                 prev_grok_home,
+                prev_headroom_data_dir,
                 _env_lock: env_lock,
             }
         }
@@ -6985,6 +7010,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             match self.prev_zdotdir.take() {
                 Some(v) => std::env::set_var("ZDOTDIR", v),
                 None => std::env::remove_var("ZDOTDIR"),
+            }
+            match self.prev_headroom_data_dir.take() {
+                Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
+                None => std::env::remove_var("HEADROOM_DATA_DIR"),
             }
         }
     }
@@ -7185,18 +7214,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .join(".claude")
             .join("hooks")
             .join("headroom-claude-guard.py");
+        // Build via serde_json so the script path is JSON-escaped: raw format!
+        // interpolation of a Windows path writes lone backslashes that json5
+        // parsing silently eats, leaving a command the strip can never match.
+        let old_command = format!("/usr/bin/python3 {}", script.display());
+        let seeded = serde_json::json!({"hooks":{
+            "SessionStart":[{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command": old_command.as_str()}]}],
+            "UserPromptSubmit":[
+                {"hooks":[{"type":"command","command": old_command.as_str()}]},
+                {"hooks":[{"type":"command","command":"echo mine"}]}
+            ]
+        }});
         fs::write(
             home.path().join(".claude").join("settings.json"),
-            format!(
-                r#"{{"hooks":{{
-                    "SessionStart":[{{"matcher":"startup|resume|clear|compact","hooks":[{{"type":"command","command":"/usr/bin/python3 {script}"}}]}}],
-                    "UserPromptSubmit":[
-                        {{"hooks":[{{"type":"command","command":"/usr/bin/python3 {script}"}}]}},
-                        {{"hooks":[{{"type":"command","command":"echo mine"}}]}}
-                    ]
-                }}}}"#,
-                script = script.display()
-            ),
+            serde_json::to_string(&seeded).unwrap(),
         )
         .unwrap();
         seed_installed_rtk();
@@ -8308,16 +8339,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .display()
         );
         // Old install: guard registered on both SessionStart and UserPromptSubmit.
-        fs::write(
-            &hooks_path,
-            format!(
-                r#"{{"hooks":{{
-                    "SessionStart":[{{"matcher":"startup|resume|clear|compact","hooks":[{{"type":"command","command":"{cmd}"}}]}}],
-                    "UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]
-                }}}}"#
-            ),
-        )
-        .unwrap();
+        // Built via serde_json so the path is JSON-escaped on Windows (raw
+        // format! would write lone backslashes the parser mangles).
+        let seeded = serde_json::json!({"hooks":{
+            "SessionStart":[{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command": cmd.as_str()}]}],
+            "UserPromptSubmit":[{"hooks":[{"type":"command","command": cmd.as_str()}]}]
+        }});
+        fs::write(&hooks_path, serde_json::to_string(&seeded).unwrap()).unwrap();
 
         super::ensure_codex_guard_hook().unwrap();
 
