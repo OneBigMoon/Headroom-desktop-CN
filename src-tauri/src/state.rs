@@ -3128,15 +3128,13 @@ impl AppState {
         // and the python module path / entrypoint subcommand is unique enough
         // to identify our proxies regardless of port.
         let managed_python = self.tool_manager.managed_python();
+        let headroom_entrypoint = self.tool_manager.headroom_entrypoint();
         let command_patterns = [
-            format!("{} -m headroom.proxy.server", managed_python.display()),
-            format!(
-                "{} proxy --port",
-                self.tool_manager.headroom_entrypoint().display()
-            ),
+            (managed_python.as_path(), "-m headroom.proxy.server"),
+            (headroom_entrypoint.as_path(), "proxy --port"),
         ];
-        for pattern in command_patterns {
-            if let Err(err) = kill_processes_by_command_pattern(&pattern) {
+        for (exe, args_pattern) in command_patterns {
+            if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
                 log::warn!("failed to clean detached headroom proxy processes: {err}");
             }
         }
@@ -6160,11 +6158,12 @@ fn terminate_process_tree(pid: i32, force: bool) {
     }
 }
 
-fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
+fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     #[cfg(unix)]
     {
+        let pattern = format!("{} {args_pattern}", exe.display());
         let status = Command::new("pkill")
-            .args(["-f", pattern])
+            .args(["-f", &pattern])
             .status()
             .with_context(|| format!("running pkill for pattern '{pattern}'"))?;
 
@@ -6181,28 +6180,47 @@ fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        // `Win32_Process.CommandLine` wraps the executable in double quotes
+        // (e.g. `"C:\...\python.exe" -m headroom.proxy.server`), so matching
+        // "{exe} {args_pattern}" as one substring never hits -- the quote
+        // right after the exe breaks the adjacency. Match the exe and the
+        // args as two independent `-like` clauses instead. Escape `[`/`]`
+        // (wildcard metacharacters to `-like`) and any embedded `'` (would
+        // otherwise close the single-quoted PowerShell literal early -- a
+        // Windows username containing `'` could break out of it).
+        fn escape_like(value: &str) -> String {
+            value
+                .replace('\'', "''")
+                .replace('[', "`[")
+                .replace(']', "`]")
+        }
+        let exe_pattern = escape_like(&exe.display().to_string());
+        let args_escaped = escape_like(args_pattern);
         let script = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{pattern}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
         );
         let status = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
-            .with_context(|| format!("running powershell kill for pattern '{pattern}'"))?;
+            .with_context(|| {
+                format!("running powershell kill for exe '{}' args '{args_pattern}'", exe.display())
+            })?;
 
         if status.success() {
             return Ok(());
         }
 
         return Err(anyhow!(
-            "powershell exited with status {:?} for pattern '{}'",
+            "powershell exited with status {:?} for exe '{}' args '{}'",
             status.code(),
-            pattern
+            exe.display(),
+            args_pattern
         ));
     }
 
     #[cfg(all(not(unix), not(target_os = "windows")))]
     {
-        let _ = pattern;
+        let _ = (exe, args_pattern);
         Ok(())
     }
 }
