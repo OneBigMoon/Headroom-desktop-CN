@@ -96,6 +96,17 @@ export interface SavingsBreakdown {
   cacheReadTokens: number;
   totalInputTokens: number;
   totalInputCostUsd: number;
+  // Optional for the same reason as the tool-schema fields above.
+  modelRates?: ModelSavingsRate[];
+}
+
+// Rate only, no dollars: by_model tracking started well after the lifetime
+// counters, so its totals cover a fraction of history. See ModelSavingsRate in
+// models.rs.
+export interface ModelSavingsRate {
+  model: string;
+  requests: number;
+  savingsPercent: number;
 }
 
 export interface ProviderSavingsPoint {

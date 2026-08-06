@@ -155,6 +155,23 @@ pub struct SavingsBreakdown {
     pub cache_read_tokens: u64,
     pub total_input_tokens: u64,
     pub total_input_cost_usd: f64,
+    /// Per-model compression rates, best first. Empty on backends that predate
+    /// `by_model` tracking.
+    pub model_rates: Vec<ModelSavingsRate>,
+}
+
+/// One row of the backend's `/stats-history` `by_model` block.
+///
+/// Only the rate travels, never the dollars: `by_model` started being tracked
+/// long after the lifetime counters, so its totals cover a fraction of lifetime
+/// history and would visibly fail to add up next to the rows above it. A rate
+/// stays meaningful on a partial sample; a dollar total does not.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelSavingsRate {
+    pub model: String,
+    pub requests: u64,
+    pub savings_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

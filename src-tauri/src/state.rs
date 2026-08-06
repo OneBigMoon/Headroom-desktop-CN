@@ -5550,7 +5550,46 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
             .unwrap_or(0),
         total_input_cost_usd: value_at_path_f64(root, &["lifetime", "total_input_cost_usd"])
             .unwrap_or(0.0),
+        model_rates: parse_model_rates(root),
     })
+}
+
+/// Below this many requests a model's rate says more about which handful of
+/// prompts it happened to see than about how well compression works on it.
+const MIN_MODEL_RATE_REQUESTS: u64 = 100;
+
+/// Per-model compression rates from the `by_model` block, best rate first.
+///
+/// `passthrough:*` entries are dropped: they are token-count and model-list
+/// probes that carry no compressible content, so they always sit at 0% and
+/// would read as failures rather than as the non-events they are.
+fn parse_model_rates(root: &Value) -> Vec<crate::models::ModelSavingsRate> {
+    let Some(entries) = value_at_path(root, &["by_model"]).and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut rates: Vec<_> = entries
+        .iter()
+        .filter(|(model, _)| !model.starts_with("passthrough:"))
+        .filter_map(|(model, node)| {
+            let requests = value_at_path_u64(node, &["requests"])?;
+            if requests < MIN_MODEL_RATE_REQUESTS {
+                return None;
+            }
+            Some(crate::models::ModelSavingsRate {
+                model: model.clone(),
+                requests,
+                savings_percent: value_at_path_f64(node, &["savings_percent"])?,
+            })
+        })
+        .collect();
+    // Ties break on sample size so the sturdier row leads.
+    rates.sort_by(|a, b| {
+        b.savings_percent
+            .partial_cmp(&a.savings_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.requests.cmp(&a.requests))
+    });
+    rates
 }
 
 fn value_at_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
@@ -8667,6 +8706,31 @@ mod tests {
     }
 
     #[test]
+    fn model_rates_rank_by_rate_and_drop_unrepresentative_rows() {
+        let parsed = parse_headroom_stats_history_from_json(
+            r#"{
+                "lifetime": { "compression_savings_usd": 100.0 },
+                "by_model": {
+                    "claude-opus-5": { "requests": 4823, "savings_percent": 2.67 },
+                    "claude-sonnet-5": { "requests": 5663, "savings_percent": 37.86 },
+                    "claude-fable-5": { "requests": 7014, "savings_percent": 4.37 },
+                    "gpt-5.5": { "requests": 38, "savings_percent": 8.74 },
+                    "passthrough:count_tokens": { "requests": 9001, "savings_percent": 0.0 }
+                }
+            }"#,
+        )
+        .expect("parsed history");
+
+        let rates = parsed.lifetime.expect("lifetime breakdown").model_rates;
+        let names: Vec<&str> = rates.iter().map(|r| r.model.as_str()).collect();
+        // Best rate first; gpt-5.5 is under the 100-request floor and the
+        // passthrough probe is excluded however many requests it racked up.
+        assert_eq!(names, ["claude-sonnet-5", "claude-fable-5", "claude-opus-5"]);
+        assert_eq!(rates[0].requests, 5663);
+        assert!((rates[0].savings_percent - 37.86).abs() < 1e-9);
+    }
+
+    #[test]
     fn parse_headroom_stats_history_reads_lifetime_savings_breakdown() {
         // The lifetime block decomposes savings for the drill-down. Cache
         // savings must come through as their own labelled figure -- they are
@@ -8703,6 +8767,8 @@ mod tests {
         assert_eq!(breakdown.cache_read_tokens, 1690483122);
         assert_eq!(breakdown.total_input_tokens, 7703977209);
         assert!((breakdown.total_input_cost_usd - 24912.66).abs() < 1e-9);
+        // No by_model block in this fixture -> no rows, not a panic.
+        assert!(breakdown.model_rates.is_empty());
 
         // Older backend without the cache fields: breakdown still parses with
         // zeroed extras instead of disappearing.

@@ -7009,6 +7009,34 @@ export default function App() {
                         </p>
                       </>
                     ) : null}
+                    {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 1 ? (
+                      <details className="savings-breakdown__models">
+                        <summary>Compression rate by model</summary>
+                        <div className="savings-breakdown__models-body">
+                          {dashboard.savingsBreakdown.modelRates?.map((row) => (
+                            <div className="savings-breakdown__row" key={row.model}>
+                              <span>
+                                {row.model}{" "}
+                                <span className="savings-breakdown__sample">
+                                  {compactNumber(row.requests)} requests
+                                </span>
+                              </span>
+                              <strong>{percent1(row.savingsPercent)}%</strong>
+                            </div>
+                          ))}
+                          {/* Rates only -- by_model covers a fraction of lifetime
+                              history, so its dollars would not add up to the rows
+                              above. See ModelSavingsRate in models.rs. */}
+                          <p className="savings-breakdown__note">
+                            How much of each model's input Headroom removed. The spread is mostly
+                            workload, not model: long tool output and logs compress far better than
+                            prose, so the blended figure tracks whichever models you use most rather
+                            than how hard Headroom is working. Models with under 100 requests are
+                            left out.
+                          </p>
+                        </div>
+                      </details>
+                    ) : null}
                   </div>
                 ) : null}
                 {/* The cache-discount haircut applies to input compression only.

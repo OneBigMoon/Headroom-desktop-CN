@@ -3068,6 +3068,11 @@ details[open] .optimize-minimal__details summary::after {
   padding: 14px;
   display: grid;
   gap: 8px;
+  /* The default window is 560px tall and the savings explainer is several
+     times that. Without this the card grows past the viewport and takes its
+     own dismiss button off-screen with it. */
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
 }
 
 .modal-card h3 {
@@ -3121,6 +3126,36 @@ details[open] .optimize-minimal__details summary::after {
 
 .savings-breakdown__row--context strong {
   color: var(--text-secondary);
+}
+
+/* Collapsed by default. The explainer already runs past a 560px window, and
+   the per-model split is supporting detail rather than part of the claim, so
+   it should cost nothing until someone asks for it. */
+.savings-breakdown__models {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-default);
+}
+
+.savings-breakdown__models summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Contents wrapped rather than laid out on the <details> itself: WebKit is
+   unreliable about grid applied directly to a disclosure element. */
+.savings-breakdown__models-body {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* Sample size behind a per-model rate: present so the number can be judged,
+   subordinate so it does not compete with the model name. */
+.savings-breakdown__sample {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
 }
 
 .savings-breakdown__note {
