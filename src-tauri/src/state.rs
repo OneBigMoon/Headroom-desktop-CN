@@ -2373,11 +2373,19 @@ impl AppState {
         };
 
         // Lifetime totals are derived from the same per-day buckets the history
-        // chart renders, so the headline card and the chart can never disagree.
-        let lifetime_estimated_savings_usd = daily_savings
+        // chart renders, so the headline card and the chart can never disagree
+        // on compression. Output shaping is the one exception -- see
+        // `lifetime_output_savings_usd`.
+        let lifetime_compression_savings_usd: f64 = daily_savings
             .iter()
-            .map(|point| point.estimated_savings_usd + point.output_savings_usd)
+            .map(|point| point.estimated_savings_usd)
             .sum();
+        let lifetime_output_savings_usd = lifetime_output_savings_usd(
+            &daily_savings,
+            stats.as_ref().and_then(|s| s.output_reduction.as_ref()),
+        );
+        let lifetime_estimated_savings_usd =
+            lifetime_compression_savings_usd + lifetime_output_savings_usd;
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
         // must not jump when a new savings layer starts reporting.
@@ -2395,14 +2403,8 @@ impl AppState {
         // on 2026-08-06. Cache and spend rows below stay as reported -- they are
         // context, never summed into a Headroom total.
         if let Some(breakdown) = savings_breakdown.as_mut() {
-            breakdown.compression_savings_usd = daily_savings
-                .iter()
-                .map(|point| point.estimated_savings_usd)
-                .sum();
-            breakdown.output_savings_usd = daily_savings
-                .iter()
-                .map(|point| point.output_savings_usd)
-                .sum();
+            breakdown.compression_savings_usd = lifetime_compression_savings_usd;
+            breakdown.output_savings_usd = lifetime_output_savings_usd;
         }
 
         // Token milestones fire off the displayed lifetime total via a persisted
@@ -5010,6 +5012,11 @@ struct OutputReduction {
     ci_low_percent: f64,
     ci_high_percent: f64,
     requests: u64,
+    /// Lifetime output tokens the shaper's durable estimator says were never
+    /// emitted. Unlike the rollup's `output_tokens_saved_delta` this survives
+    /// backend restarts and covers every request since the baseline was seeded,
+    /// including the period before the rollups carried the layer at all.
+    tokens_saved: u64,
 }
 
 /// One provider's slice of a rollup bucket's delta, parsed from the upstream
@@ -5208,6 +5215,10 @@ fn parse_output_reduction(root: &Value) -> Option<OutputReduction> {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         requests: node.get("requests").and_then(Value::as_u64).unwrap_or(0),
+        tokens_saved: node
+            .get("tokens_saved")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -6306,6 +6317,41 @@ fn drop_rollup_backfill<T>(
     native.into_iter().filter(|p| key(p) != first).collect()
 }
 
+/// Lifetime dollars saved by output shaping.
+///
+/// The daily buckets only carry this layer from the day the backend's rollups
+/// started reporting it, which is far later than the shaper itself started
+/// working: on 2026-08-06 the buckets held 2.66M output tokens across 4 days
+/// while the shaper's own durable estimator held 17.38M across 48,638 requests.
+/// Summing the buckets therefore understates the layer roughly six-fold.
+///
+/// The estimator has no timestamps -- it is a set of stratified running sums --
+/// so its total can only be a lifetime figure, and it is priced with the
+/// blended $/token the tracked buckets already imply rather than a hardcoded
+/// rate, so a user on cheaper models is priced at their own models' rates.
+///
+/// Falls back to the bucket sum whenever the estimator is absent, is smaller
+/// (a re-seeded baseline), or the buckets carry no rate to price with. The two
+/// sources measure the same layer, so this replaces the bucket sum, never adds
+/// to it.
+fn lifetime_output_savings_usd(
+    daily_savings: &[DailySavingsPoint],
+    reduction: Option<&OutputReduction>,
+) -> f64 {
+    let bucket_usd: f64 = daily_savings.iter().map(|p| p.output_savings_usd).sum();
+    let bucket_tokens: u64 = daily_savings.iter().map(|p| p.output_tokens_saved).sum();
+
+    let Some(reduction) = reduction else {
+        return bucket_usd;
+    };
+    if bucket_tokens == 0 || bucket_usd <= 0.0 || reduction.tokens_saved <= bucket_tokens {
+        return bucket_usd;
+    }
+
+    let usd_per_token = bucket_usd / bucket_tokens as f64;
+    usd_per_token * reduction.tokens_saved as f64
+}
+
 /// For days before `cutoff_date` (exclusive), the tracker is preferred.
 /// For days on/after `cutoff_date`, native history is preferred.
 /// Falls back to whichever source has data when the preferred one is absent.
@@ -6472,14 +6518,15 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
-        hf_cache_grew, lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
+        hf_cache_grew, lifetime_output_savings_usd, lifetime_token_milestones_crossed,
+        log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, tcp_port_accepts_connection, total_dir_size_bytes,
         AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
-        SavingsObservation, SavingsRecord, SavingsTracker,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, OutputReduction,
+        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
     };
 
     #[test]
@@ -6511,6 +6558,45 @@ mod tests {
         // Tracker starts with the series: nothing predates it, nothing to drop.
         let kept = drop_rollup_backfill(native, Some("2026-08-02"), |p| p.date.as_str());
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn lifetime_output_savings_prices_the_estimators_full_history() {
+        // Buckets: 2 days, 100k tokens for $2.50 -> $25/M blended.
+        let mut buckets = vec![daily("2026-08-04", 0, 0.0), daily("2026-08-05", 0, 0.0)];
+        buckets[0].output_tokens_saved = 40_000;
+        buckets[0].output_savings_usd = 1.0;
+        buckets[1].output_tokens_saved = 60_000;
+        buckets[1].output_savings_usd = 1.5;
+
+        let reduction = |tokens_saved| OutputReduction {
+            method: "estimated".into(),
+            reduction_percent: 37.1,
+            ci_low_percent: 34.3,
+            ci_high_percent: 39.8,
+            requests: 48_638,
+            tokens_saved,
+        };
+
+        // The estimator covers history the rollups never carried: price all of
+        // it at the buckets' own rate.
+        let usd = lifetime_output_savings_usd(&buckets, Some(&reduction(1_000_000)));
+        assert!((usd - 25.0).abs() < 1e-9, "{usd}");
+
+        // Re-seeded / lagging estimator: never go below what we can see.
+        let usd = lifetime_output_savings_usd(&buckets, Some(&reduction(10_000)));
+        assert!((usd - 2.5).abs() < 1e-9, "{usd}");
+
+        // No estimate at all (old backend, unseeded baseline).
+        let usd = lifetime_output_savings_usd(&buckets, None);
+        assert!((usd - 2.5).abs() < 1e-9, "{usd}");
+
+        // No priced buckets yet: nothing to extrapolate a rate from.
+        let empty = vec![daily("2026-08-04", 0, 0.0)];
+        assert_eq!(
+            lifetime_output_savings_usd(&empty, Some(&reduction(1_000_000))),
+            0.0
+        );
     }
 
     #[test]

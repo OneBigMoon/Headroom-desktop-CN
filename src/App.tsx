@@ -6960,10 +6960,24 @@ export default function App() {
                       <strong>{currency(dashboard.savingsBreakdown.compressionSavingsUsd)}</strong>
                     </div>
                     {dashboard.savingsBreakdown.outputSavingsUsd >= 0.005 ? (
-                      <div className="savings-breakdown__row">
-                        <span>Output shaping (Headroom)</span>
-                        <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
-                      </div>
+                      <>
+                        <div className="savings-breakdown__row">
+                          <span>Output shaping (Headroom)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
+                        </div>
+                        {/* This row is a lifetime figure from the shaper's own
+                            estimator, which predates per-day tracking of the
+                            layer -- so the daily bars can add up to less. */}
+                        <p className="savings-breakdown__note">
+                          Output shaping is a counterfactual: Headroom compares each reply against a
+                          baseline learned from your own past replies
+                          {dashboard.outputReduction
+                            ? `, across ${compactNumber(dashboard.outputReduction.requests)} requests`
+                            : ""}
+                          . It covers every request since that baseline was built, so it can exceed
+                          what the daily bars show.
+                        </p>
+                      </>
                     ) : null}
                     {dashboard.savingsBreakdown.cacheSavingsUsd >= 0.005 ? (
                       <>
