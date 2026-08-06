@@ -1053,10 +1053,9 @@ pub fn perform_full_cleanup() -> Vec<String> {
                 if candidate.exists() {
                     match remove_dir_all_retry(&candidate) {
                         Ok(_) => removed.push(candidate.display().to_string()),
-                        Err(err) => log::warn!(
-                            "cleanup: removing {} failed: {err}",
-                            candidate.display()
-                        ),
+                        Err(err) => {
+                            log::warn!("cleanup: removing {} failed: {err}", candidate.display())
+                        }
                     }
                 }
             }
@@ -2157,10 +2156,7 @@ fn ensure_claude_settings_hook(
     }
 
     let hook_command = if cfg!(target_os = "windows") {
-        format!(
-            "bash {}",
-            shell_double_quote(&hook_path.to_string_lossy())
-        )
+        format!("bash {}", shell_double_quote(&hook_path.to_string_lossy()))
     } else {
         hook_path
             .to_str()
@@ -3746,8 +3742,8 @@ fn codex_guard_hook_path() -> PathBuf {
 /// interpreter, which this app installs regardless of what's on PATH.
 fn guard_python_command() -> String {
     if cfg!(target_os = "windows") {
-        let managed = crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir())
-            .managed_python();
+        let managed =
+            crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir()).managed_python();
         format!("\"{}\"", managed.display())
     } else {
         "/usr/bin/python3".to_string()
@@ -3755,7 +3751,11 @@ fn guard_python_command() -> String {
 }
 
 fn codex_guard_command() -> String {
-    format!("{} {}", guard_python_command(), codex_guard_hook_path().display())
+    format!(
+        "{} {}",
+        guard_python_command(),
+        codex_guard_hook_path().display()
+    )
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -4146,7 +4146,11 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    format!("{} {}", guard_python_command(), claude_guard_hook_path().display())
+    format!(
+        "{} {}",
+        guard_python_command(),
+        claude_guard_hook_path().display()
+    )
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -7114,7 +7118,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let settings_path = home.path().join(".claude").join("settings.json");
         let settings = read_settings_json(&settings_path);
-        let command = format!("/usr/bin/python3 {}", script.display());
+        // The registered command is platform-dependent (/usr/bin/python3 vs the
+        // quoted managed python.exe), so assert against the real builder.
+        let command = super::claude_guard_command();
         let guard_count = |event: &str| {
             settings["hooks"][event]
                 .as_array()
@@ -8115,7 +8121,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let hooks: serde_json::Value =
             read_settings_json(&home.path().join(".codex").join("hooks.json"));
-        let command = format!("/usr/bin/python3 {}", script.display());
+        // The registered command is platform-dependent (/usr/bin/python3 vs the
+        // quoted managed python.exe), so assert against the real builder.
+        let command = super::codex_guard_command();
         // SessionStart only: on UserPromptSubmit a nonzero exit blocks the prompt.
         let session_registered = hooks["hooks"]["SessionStart"]
             .as_array()
