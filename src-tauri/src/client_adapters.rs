@@ -5188,10 +5188,17 @@ json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDe
     )
 }
 
+/// `HOME` is checked before `dirs::home_dir()`: on Windows the dirs crate
+/// resolves the profile via the known-folder API and ignores `HOME`, so an
+/// env override (TestHome in tests, Git Bash parity in production) would be
+/// silently bypassed and writes would land in the real profile. On Unix the
+/// two sources agree, so the order change is a no-op there.
 fn home_dir() -> PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| std::env::temp_dir())
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Codex's home directory. Mirrors the Codex CLI and the upstream Headroom

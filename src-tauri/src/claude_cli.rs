@@ -188,9 +188,16 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<ExitStatus> 
     }
 }
 
+/// `HOME` is checked before `dirs::home_dir()`: on Windows the dirs crate
+/// resolves the profile via the known-folder API and ignores `HOME`, so an
+/// env override (TestHome in tests, Git Bash parity in production) would be
+/// silently bypassed and writes would land in the real profile. On Unix the
+/// two sources agree, so the order change is a no-op there.
 fn home_dir() -> PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir)
 }
 
@@ -269,6 +276,10 @@ mod tests {
     }
 
     #[test]
+    // On Windows make_executable writes a plain file with no runnable format,
+    // so the spawn inside is_runnable can only fail; the positive path is
+    // covered by the real-Windows smoke test instead.
+    #[cfg(unix)]
     fn is_runnable_accepts_working_executable() {
         let tmp = ScopedTempDir::new("runnable_ok");
         let path = tmp.path().join("claude");
@@ -446,6 +457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_path_from_shell_returns_path_before_shell_exits() {
         // Regression: interactive shells print the `command -v claude` output
         // immediately but keep running through `.zshrc`. Previously we waited
@@ -471,6 +483,9 @@ mod tests {
     }
 
     #[test]
+    // On Windows the /bin/sh spawn fails outright, returning None immediately
+    // and passing both asserts without exercising the timeout at all.
+    #[cfg(unix)]
     fn read_path_from_shell_times_out_when_no_output() {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg("sleep 30");
