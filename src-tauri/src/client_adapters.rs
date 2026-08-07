@@ -6902,6 +6902,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_opencode_config: Option<std::ffi::OsString>,
         prev_grok_home: Option<std::ffi::OsString>,
         prev_headroom_data_dir: Option<std::ffi::OsString>,
+        prev_appdata: Option<std::ffi::OsString>,
+        prev_localappdata: Option<std::ffi::OsString>,
         // Held for the guard's lifetime: env vars are process-global, so two
         // TestHome tests running on parallel threads corrupt each other's HOME
         // (and can leak writes into the developer's real profile). serial_test
@@ -6925,7 +6927,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_opencode_config = std::env::var_os("OPENCODE_CONFIG");
             let prev_grok_home = std::env::var_os("GROK_HOME");
             let prev_headroom_data_dir = std::env::var_os("HEADROOM_DATA_DIR");
+            let prev_appdata = std::env::var_os("APPDATA");
+            let prev_localappdata = std::env::var_os("LOCALAPPDATA");
             std::env::set_var("HOME", &home);
+            // Pin the Windows profile dirs into the temp home: opencode_config_dir
+            // and perform_full_cleanup read these on Windows, and the runner's
+            // real AppData is otherwise shared across all parallel test
+            // processes. No-ops on Unix (only read under cfg windows).
+            std::env::set_var("APPDATA", home.join("AppData").join("Roaming"));
+            std::env::set_var("LOCALAPPDATA", home.join("AppData").join("Local"));
             std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
             // Pin the app data dir into the temp home. dirs::data_local_dir()
             // ignores HOME/XDG on macOS and Windows, so without this the setup
@@ -6968,6 +6978,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_opencode_config,
                 prev_grok_home,
                 prev_headroom_data_dir,
+                prev_appdata,
+                prev_localappdata,
                 _env_lock: env_lock,
             }
         }
@@ -7014,6 +7026,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             match self.prev_headroom_data_dir.take() {
                 Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
                 None => std::env::remove_var("HEADROOM_DATA_DIR"),
+            }
+            match self.prev_appdata.take() {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
+            }
+            match self.prev_localappdata.take() {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
             }
         }
     }
@@ -7743,17 +7763,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn apply_then_verify_then_disable_opencode_round_trip() {
-        let home = TestHome::new();
+        let _home = TestHome::new(); // env guard
 
         let result = super::apply_client_setup("opencode").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "opencode");
 
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json");
+        // Resolve via the same function the apply path uses: the config lands
+        // under XDG_CONFIG_HOME on Unix but %APPDATA% on Windows.
+        let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).expect("config written"))
                 .expect("valid json");
@@ -7786,8 +7804,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_preserves_existing_base_url_and_restores_on_disable() {
-        let home = TestHome::new();
-        let config_dir = home.path().join(".config").join("opencode");
+        let _home = TestHome::new(); // env guard
+        let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("opencode.json");
         fs::write(
@@ -7835,8 +7853,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_refuses_wrap_managed_config() {
-        let home = TestHome::new();
-        let config_dir = home.path().join(".config").join("opencode");
+        let _home = TestHome::new(); // env guard
+        let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("opencode.json"),
@@ -7854,17 +7872,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_installs_transport_plugin_and_disable_removes_it() {
-        let home = TestHome::new();
+        let _home = TestHome::new(); // env guard
 
         super::apply_client_setup("opencode").expect("apply succeeds");
 
         let plugin_path = super::opencode_plugin_install_path();
         assert!(plugin_path.is_file(), "vendored plugin written to app data");
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json");
+        let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let plugins = config["plugin"].as_array().expect("plugin array present");
