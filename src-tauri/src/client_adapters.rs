@@ -5725,12 +5725,21 @@ mod tests {
 
     #[test]
     fn is_permission_denied_matches_only_permission_errors() {
-        let denied = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
-            .context("writing /Users/x/.zshrc");
+        // Construct by ErrorKind, not raw errno: 13 is EACCES on Unix but
+        // ERROR_INVALID_DATA on Windows, where it does not map to
+        // PermissionDenied.
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .context("writing /Users/x/.zshrc");
         assert!(is_permission_denied(&denied));
 
-        let not_found = anyhow::Error::new(std::io::Error::from_raw_os_error(2))
-            .context("writing /Users/x/.zshrc");
+        let not_found = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not found",
+        ))
+        .context("writing /Users/x/.zshrc");
         assert!(!is_permission_denied(&not_found));
 
         assert!(!is_permission_denied(&anyhow::anyhow!("Permission denied")));
