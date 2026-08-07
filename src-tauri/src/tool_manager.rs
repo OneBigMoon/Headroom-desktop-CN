@@ -7629,6 +7629,8 @@ mod tests {
     use chrono::Local;
 
     use super::log_tail;
+    #[cfg(windows)]
+    use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::{
         apply_serena_gitignore, bootstrap_requirements_lock_for_target,
@@ -7639,7 +7641,7 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
         path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, python_distribution_artifact,
+        proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
@@ -8000,6 +8002,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn run_command_failure_carries_structured_output() {
         let tmp = std::env::temp_dir();
         let err = run_command(
@@ -8182,12 +8185,12 @@ mod tests {
 
     #[test]
     fn rtk_installed_requires_binary_and_receipt() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-installed");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-installed");
 
         assert!(!manager.rtk_installed(), "no binary or receipt yet");
 
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nexit 0\n",
         );
         assert!(
@@ -8205,9 +8208,9 @@ mod tests {
 
     #[test]
     fn installed_rtk_version_reads_receipt() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-version");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-version");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nexit 0\n",
         );
         manager
@@ -8248,9 +8251,9 @@ mod tests {
 
     #[test]
     fn rtk_needs_install_false_when_current() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-needs-install-current");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-needs-install-current");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nexit 0\n",
         );
         manager
@@ -8300,9 +8303,9 @@ mod tests {
 
     #[test]
     fn read_rtk_activity_returns_last_lines_from_session_output() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-activity");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-activity");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"session\" ]; then\n  printf 'line-1\\nline-2\\nline-3\\nline-4\\n';\n  exit 0\nfi\nexit 9\n",
         );
         manager
@@ -8317,9 +8320,9 @@ mod tests {
 
     #[test]
     fn read_rtk_activity_surfaces_session_failures() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-activity-fail");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-activity-fail");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"session\" ]; then\n  echo 'session stdout';\n  echo 'session stderr' 1>&2;\n  exit 7\nfi\nexit 9\n",
         );
         manager
@@ -8337,6 +8340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn rtk_today_stats_returns_matching_daily_row() {
         let (root, runtime, manager) = seed_test_runtime("rtk-today");
         let today = Local::now().date_naive().to_string();
@@ -8745,6 +8749,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn reclaim_orphan_proxy_never_kills_foreign_http_server() {
         let port = {
             let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -9291,6 +9296,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn markitdown_shim_counts_file_conversions_but_not_flag_calls() {
         let (_root, _runtime, manager) = seed_test_runtime("markitdown-shim");
         write_executable(
@@ -9780,6 +9786,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn recover_from_interrupted_upgrade_handles_wheel_only_marker() {
         // In-place marker without a lock backup (wheel-only interrupted
         // upgrade). A stub python stands in for a successful pip reinstall;
@@ -9820,6 +9827,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn recover_from_interrupted_upgrade_handles_in_place_marker_with_lock_backup() {
         // In-place marker with a lock backup. Recovery should: copy the lock
         // backup back to the active lock path, remove the backup, restore the
@@ -10140,6 +10148,7 @@ after
 
     #[test]
     #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn repair_stale_requirements_updates_receipt_and_emits_progress() {
         let (root, runtime, manager) = seed_test_runtime("repair-requirements");
         let _home = HomeGuard::new(&root);
@@ -10176,6 +10185,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_succeeds_with_executable_python() {
         let (root, runtime, manager) = seed_test_runtime("smoke-ok");
         write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
@@ -10188,6 +10198,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_returns_command_failure_output_on_nonzero_exit() {
         let (root, runtime, manager) = seed_test_runtime("smoke-fail");
         write_executable(
@@ -10355,6 +10366,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_markitdown_succeeds_when_entrypoint_runs() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-ok");
         fs::write(
@@ -10389,6 +10401,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_repairs_pydantic_core_skew_and_retries() {
         let (root, runtime, manager) = seed_test_runtime("smoke-pydantic-skew");
         let state_file = root.join("smoke-attempts");
@@ -10447,6 +10460,7 @@ exit 0
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_does_not_repair_unrelated_failures() {
         let (root, runtime, manager) = seed_test_runtime("smoke-unrelated-fail");
         let state_file = root.join("attempts");
@@ -10476,6 +10490,7 @@ exit 0
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_times_out() {
         let (root, runtime, manager) = seed_test_runtime("smoke-timeout");
         write_executable(&runtime.managed_python(), "#!/bin/sh\nsleep 1\n");

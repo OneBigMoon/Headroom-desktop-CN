@@ -4684,6 +4684,7 @@ mod tests {
         _scratch: tempfile::TempDir,
         prev_home: Option<std::ffi::OsString>,
         prev_xdg: Option<std::ffi::OsString>,
+        prev_data_dir: Option<std::ffi::OsString>,
     }
 
     impl AuthedTestEnv {
@@ -4691,8 +4692,17 @@ mod tests {
             let scratch = tempfile::tempdir().expect("scratch tempdir");
             let prev_home = std::env::var_os("HOME");
             let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+            let prev_data_dir = std::env::var_os("HEADROOM_DATA_DIR");
             std::env::set_var("HOME", scratch.path());
             std::env::set_var("XDG_DATA_HOME", scratch.path().join(".local").join("share"));
+            // Pin app_data_dir into the scratch dir: the debug keychain store
+            // lives under it, and dirs::data_local_dir() ignores HOME/XDG on
+            // macOS/Windows — under nextest (process per test) parallel tests
+            // would otherwise share and race one real dev-secrets store.
+            std::env::set_var(
+                "HEADROOM_DATA_DIR",
+                scratch.path().join(".local").join("share").join("Headroom"),
+            );
             crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
                 .expect("ensure_data_dirs in scratch");
             crate::keychain::write_secret(
@@ -4705,6 +4715,7 @@ mod tests {
                 _scratch: scratch,
                 prev_home,
                 prev_xdg,
+                prev_data_dir,
             }
         }
     }
@@ -4718,6 +4729,10 @@ mod tests {
             match self.prev_xdg.take() {
                 Some(v) => std::env::set_var("XDG_DATA_HOME", v),
                 None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            match self.prev_data_dir.take() {
+                Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
+                None => std::env::remove_var("HEADROOM_DATA_DIR"),
             }
         }
     }
@@ -4825,8 +4840,16 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch");
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        let prev_data_dir = std::env::var_os("HEADROOM_DATA_DIR");
         std::env::set_var("HOME", scratch.path());
         std::env::set_var("XDG_DATA_HOME", scratch.path().join(".local").join("share"));
+        // Pin app_data_dir too: the debug keychain store lives under it, and on
+        // macOS/Windows dirs::data_local_dir() ignores HOME/XDG — a token
+        // written by a parallel test process would otherwise be visible here.
+        std::env::set_var(
+            "HEADROOM_DATA_DIR",
+            scratch.path().join(".local").join("share").join("Headroom"),
+        );
         crate::storage::ensure_data_dirs(&crate::storage::app_data_dir()).unwrap();
         let (state, dir) = temp_app_state();
 
@@ -4835,6 +4858,10 @@ mod tests {
         assert!(err.contains("Sign in"));
 
         drop_state(dir);
+        match prev_data_dir {
+            Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
+            None => std::env::remove_var("HEADROOM_DATA_DIR"),
+        }
         match prev_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),

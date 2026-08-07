@@ -8742,10 +8742,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // error used to abort setup for every client.
         let err = super::upsert_managed_block(&profile_dir, "claude_code", "export FOO=1")
             .expect_err("reading a directory must fail");
+        // The invariant is that it errors instead of clobbering; the OS wording
+        // differs (EISDIR on Unix, "Access is denied" os error 5 on Windows).
+        #[cfg(unix)]
         assert!(
             format!("{err:#}").contains("Is a directory"),
             "unexpected error: {err:#}"
         );
+        let _ = err;
         assert!(super::dedupe_shell_targets(vec![profile_dir]).is_empty());
     }
 
