@@ -88,7 +88,13 @@ fn read_hardware_uuid() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn read_hardware_uuid() -> Option<String> {
-    let output = Command::new("reg")
+    // Absolute path, mirroring /usr/sbin/ioreg on macOS: a `reg` shim earlier
+    // in PATH would silently change every device id in the fleet.
+    let reg = std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("reg.exe"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("reg"));
+    let output = Command::new(reg)
         .args([
             "query",
             "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
