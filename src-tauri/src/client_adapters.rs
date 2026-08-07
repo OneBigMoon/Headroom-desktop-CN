@@ -7930,12 +7930,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_tolerates_jsonc_config() {
-        let home = TestHome::new();
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.jsonc");
+        let _home = TestHome::new(); // env guard
+        let config_path = super::opencode_config_dir().join("opencode.jsonc");
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(
             &config_path,
@@ -7960,14 +7956,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_disable_tolerates_comments_added_after_apply() {
-        let home = TestHome::new();
+        let _home = TestHome::new(); // env guard
 
         super::apply_client_setup("opencode").expect("apply succeeds");
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json");
+        let config_path = super::opencode_config_path();
         let mut contents = fs::read_to_string(&config_path).unwrap();
         contents.insert_str(0, "// routed through headroom\n");
         fs::write(&config_path, &contents).unwrap();
@@ -7985,8 +7977,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_config_path_prefers_jsonc_when_present() {
-        let home = TestHome::new();
-        let config_dir = home.path().join(".config").join("opencode");
+        let _home = TestHome::new(); // env guard
+        let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(config_dir.join("opencode.jsonc"), "{}").unwrap();
 
