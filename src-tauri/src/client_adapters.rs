@@ -8998,8 +8998,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let after = std::fs::read_to_string(&config).unwrap();
         let abs = entrypoint.display().to_string();
-        assert!(
-            after.contains(&format!("command = \"{abs}\"")),
+        // Compare parsed values, not raw text: TOML escapes Windows path
+        // backslashes on write, so the raw file never contains `abs` verbatim.
+        let parsed: toml::Value = toml::from_str(&after).expect("rewritten config parses");
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["command"].as_str(),
+            Some(abs.as_str()),
             "headroom command pinned to absolute path, got:\n{after}"
         );
         // The unrelated server's command must be untouched.
