@@ -96,4 +96,6 @@ jobs:
 
       - name: Run desktop tests
         shell: bash
-        run: cargo nextest run --manifest-path src-tauri/Cargo.toml
+        # --no-fail-fast: enumerate every Windows failure in one run instead of
+        # one class per approve/fix round while the platform is being hardened.
+        run: cargo nextest run --no-fail-fast --manifest-path src-tauri/Cargo.toml
