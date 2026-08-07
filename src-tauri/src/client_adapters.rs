@@ -1032,6 +1032,36 @@ pub fn perform_full_cleanup() -> Vec<String> {
         removed.extend(remove_macos_bundle_dirs());
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // Remove the autostart Run key tauri-plugin-autostart creates
+        // (HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Headroom).
+        let _ = std::process::Command::new("reg")
+            .args([
+                "delete",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "Headroom",
+                "/f",
+            ])
+            .status();
+
+        // Windows app-data dirs not covered by app_data_dir() (which resolves
+        // to %APPDATA%\Headroom already) and the huggingface cache (local).
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            for candidate in [base.join("Headroom"), base.join("headroom")] {
+                if candidate.exists() {
+                    match remove_dir_all_retry(&candidate) {
+                        Ok(_) => removed.push(candidate.display().to_string()),
+                        Err(err) => {
+                            log::warn!("cleanup: removing {} failed: {err}", candidate.display())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     remove_known_keychain_entries();
 
     // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
@@ -1691,16 +1721,29 @@ fn default_headroom_root_dir() -> PathBuf {
     app_data_dir().join("headroom")
 }
 
+// Windows layout mirrors tool_manager: `rtk.exe` in bin, venv interpreters
+// under `Scripts\` with `.exe`. Without this, `managed_rtk_path.exists()` is
+// always false on Windows and the RTK shell/hook integration silently skips.
 fn default_headroom_rtk_path() -> PathBuf {
-    default_headroom_root_dir().join("bin").join("rtk")
+    let name = if cfg!(target_os = "windows") {
+        "rtk.exe"
+    } else {
+        "rtk"
+    };
+    default_headroom_root_dir().join("bin").join(name)
 }
 
 fn default_headroom_managed_python_path() -> PathBuf {
+    let (dir, name) = if cfg!(target_os = "windows") {
+        ("Scripts", "python.exe")
+    } else {
+        ("bin", "python3")
+    };
     default_headroom_root_dir()
         .join("runtime")
         .join("venv")
-        .join("bin")
-        .join("python3")
+        .join(dir)
+        .join(name)
 }
 
 fn resolve_client_shell_targets(state: &ClientSetupState, client_id: &str) -> Result<Vec<PathBuf>> {
@@ -2125,10 +2168,15 @@ fn ensure_claude_settings_hook(
         content = Value::Object(Default::default());
     }
 
-    let hook_command = hook_path
-        .to_str()
-        .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))?;
-    let already_present = claude_hook_present_in_value(&content, hook_command);
+    let hook_command = if cfg!(target_os = "windows") {
+        format!("bash {}", shell_double_quote(&hook_path.to_string_lossy()))
+    } else {
+        hook_path
+            .to_str()
+            .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))?
+            .to_string()
+    };
+    let already_present = claude_hook_present_in_value(&content, &hook_command);
     if already_present {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -3071,6 +3119,12 @@ const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
 
 fn opencode_config_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".config"))
+            .join("opencode");
+    }
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -3094,6 +3148,12 @@ fn opencode_config_path() -> PathBuf {
 }
 
 fn opencode_data_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".local").join("share"))
+            .join("opencode");
+    }
     std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -3687,8 +3747,28 @@ fn codex_guard_hook_path() -> PathBuf {
     codex_home().join("hooks").join("headroom-codex-guard.py")
 }
 
+/// Interpreter used by the Claude/Codex session-start guard hooks. On macOS
+/// and Linux the system `/usr/bin/python3` (>=3.9) is always present. On
+/// Windows there's no such guarantee -- bare `python` on a stock box is
+/// either absent from PATH or the Microsoft Store stub that opens the Store
+/// instead of running -- so point at the managed runtime's own bundled
+/// interpreter, which this app installs regardless of what's on PATH.
+fn guard_python_command() -> String {
+    if cfg!(target_os = "windows") {
+        let managed =
+            crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir()).managed_python();
+        format!("\"{}\"", managed.display())
+    } else {
+        "/usr/bin/python3".to_string()
+    }
+}
+
 fn codex_guard_command() -> String {
-    format!("/usr/bin/python3 {}", codex_guard_hook_path().display())
+    format!(
+        "{} {}",
+        guard_python_command(),
+        codex_guard_hook_path().display()
+    )
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -3731,6 +3811,8 @@ DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
+    if sys.platform == "win32":
+        return
     try:
         if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
             return
@@ -4077,7 +4159,11 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    format!("/usr/bin/python3 {}", claude_guard_hook_path().display())
+    format!(
+        "{} {}",
+        guard_python_command(),
+        claude_guard_hook_path().display()
+    )
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -4111,6 +4197,8 @@ DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
+    if sys.platform == "win32":
+        return
     try:
         if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
             return
@@ -5117,10 +5205,17 @@ json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDe
     )
 }
 
+/// `HOME` is checked before `dirs::home_dir()`: on Windows the dirs crate
+/// resolves the profile via the known-folder API and ignores `HOME`, so an
+/// env override (TestHome in tests, Git Bash parity in production) would be
+/// silently bypassed and writes would land in the real profile. On Unix the
+/// two sources agree, so the order change is a no-op there.
 fn home_dir() -> PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| std::env::temp_dir())
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Codex's home directory. Mirrors the Codex CLI and the upstream Headroom
@@ -5559,6 +5654,8 @@ mod tests {
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily,
     };
+    #[cfg(target_os = "windows")]
+    use super::{claude_guard_command, codex_guard_command};
     use rusqlite::Connection;
 
     #[test]
@@ -5628,12 +5725,21 @@ mod tests {
 
     #[test]
     fn is_permission_denied_matches_only_permission_errors() {
-        let denied = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
-            .context("writing /Users/x/.zshrc");
+        // Construct by ErrorKind, not raw errno: 13 is EACCES on Unix but
+        // ERROR_INVALID_DATA on Windows, where it does not map to
+        // PermissionDenied.
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .context("writing /Users/x/.zshrc");
         assert!(is_permission_denied(&denied));
 
-        let not_found = anyhow::Error::new(std::io::Error::from_raw_os_error(2))
-            .context("writing /Users/x/.zshrc");
+        let not_found = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not found",
+        ))
+        .context("writing /Users/x/.zshrc");
         assert!(!is_permission_denied(&not_found));
 
         assert!(!is_permission_denied(&anyhow::anyhow!("Permission denied")));
@@ -6379,6 +6485,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_falls_through_when_rewritten_first_token_missing_from_path() {
         // The hook has an OR guard that exits 0 when the binaries are missing,
         // so we give it real paths and verify the PATH-resolution check kicks in
@@ -6444,6 +6551,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_passes_through_check_commands() {
         // `rtk git diff --check` swallows the whitespace report; the hook must
         // leave any --check command unrewritten even when rtk would rewrite it.
@@ -6503,6 +6611,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_emits_rewrite_when_first_token_is_valid_absolute_path() {
         let root = unique_temp_dir("headroom-hook-bash-ok");
         fs::create_dir_all(&root).expect("create root");
@@ -6569,6 +6678,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_pins_bare_rtk_token_to_managed_absolute_path() {
         let root = unique_temp_dir("headroom-hook-pin-rtk");
         fs::create_dir_all(&root).expect("create root");
@@ -6632,6 +6742,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_prepends_managed_path_so_embedded_rtk_resolves() {
         // Regression for compound commands: `rtk rewrite` embeds a bare `rtk`
         // after `&&`/`;`/`|`, which the leading-token pin never touches. The
@@ -6710,6 +6821,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_emits_rewrite_even_when_rtk_rewrite_exits_nonzero() {
         let root = unique_temp_dir("headroom-hook-bash-nonzero");
         fs::create_dir_all(&root).expect("create root");
@@ -6798,6 +6910,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_xdg_config: Option<std::ffi::OsString>,
         prev_opencode_config: Option<std::ffi::OsString>,
         prev_grok_home: Option<std::ffi::OsString>,
+        prev_headroom_data_dir: Option<std::ffi::OsString>,
+        prev_appdata: Option<std::ffi::OsString>,
+        prev_localappdata: Option<std::ffi::OsString>,
         // Held for the guard's lifetime: env vars are process-global, so two
         // TestHome tests running on parallel threads corrupt each other's HOME
         // (and can leak writes into the developer's real profile). serial_test
@@ -6820,8 +6935,26 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
             let prev_opencode_config = std::env::var_os("OPENCODE_CONFIG");
             let prev_grok_home = std::env::var_os("GROK_HOME");
+            let prev_headroom_data_dir = std::env::var_os("HEADROOM_DATA_DIR");
+            let prev_appdata = std::env::var_os("APPDATA");
+            let prev_localappdata = std::env::var_os("LOCALAPPDATA");
             std::env::set_var("HOME", &home);
+            // Pin the Windows profile dirs into the temp home: opencode_config_dir
+            // and perform_full_cleanup read these on Windows, and the runner's
+            // real AppData is otherwise shared across all parallel test
+            // processes. No-ops on Unix (only read under cfg windows).
+            std::env::set_var("APPDATA", home.join("AppData").join("Roaming"));
+            std::env::set_var("LOCALAPPDATA", home.join("AppData").join("Local"));
             std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+            // Pin the app data dir into the temp home. dirs::data_local_dir()
+            // ignores HOME/XDG on macOS and Windows, so without this the setup
+            // state, seeded rtk, and cleanup sweeps all hit the REAL profile —
+            // and under nextest (process per test) the env lock below cannot
+            // serialize that sharing across processes.
+            std::env::set_var(
+                "HEADROOM_DATA_DIR",
+                home.join(".local").join("share").join("Headroom"),
+            );
             // Pin XDG_CONFIG_HOME into the temp home and clear the opencode /
             // grok override vars: a dev machine with any of these set would
             // otherwise have the opencode/grok tests write the developer's
@@ -6853,6 +6986,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_xdg_config,
                 prev_opencode_config,
                 prev_grok_home,
+                prev_headroom_data_dir,
+                prev_appdata,
+                prev_localappdata,
                 _env_lock: env_lock,
             }
         }
@@ -6895,6 +7031,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             match self.prev_zdotdir.take() {
                 Some(v) => std::env::set_var("ZDOTDIR", v),
                 None => std::env::remove_var("ZDOTDIR"),
+            }
+            match self.prev_headroom_data_dir.take() {
+                Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
+                None => std::env::remove_var("HEADROOM_DATA_DIR"),
+            }
+            match self.prev_appdata.take() {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
+            }
+            match self.prev_localappdata.take() {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
             }
         }
     }
@@ -7028,7 +7176,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let settings_path = home.path().join(".claude").join("settings.json");
         let settings = read_settings_json(&settings_path);
-        let command = format!("/usr/bin/python3 {}", script.display());
+        // The registered command is platform-dependent (/usr/bin/python3 vs the
+        // quoted managed python.exe), so assert against the real builder.
+        let command = super::claude_guard_command();
         let guard_count = |event: &str| {
             settings["hooks"][event]
                 .as_array()
@@ -7093,18 +7243,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .join(".claude")
             .join("hooks")
             .join("headroom-claude-guard.py");
+        // Build via serde_json so the script path is JSON-escaped: raw format!
+        // interpolation of a Windows path writes lone backslashes that json5
+        // parsing silently eats, leaving a command the strip can never match.
+        let old_command = format!("/usr/bin/python3 {}", script.display());
+        let seeded = serde_json::json!({"hooks":{
+            "SessionStart":[{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command": old_command.as_str()}]}],
+            "UserPromptSubmit":[
+                {"hooks":[{"type":"command","command": old_command.as_str()}]},
+                {"hooks":[{"type":"command","command":"echo mine"}]}
+            ]
+        }});
         fs::write(
             home.path().join(".claude").join("settings.json"),
-            format!(
-                r#"{{"hooks":{{
-                    "SessionStart":[{{"matcher":"startup|resume|clear|compact","hooks":[{{"type":"command","command":"/usr/bin/python3 {script}"}}]}}],
-                    "UserPromptSubmit":[
-                        {{"hooks":[{{"type":"command","command":"/usr/bin/python3 {script}"}}]}},
-                        {{"hooks":[{{"type":"command","command":"echo mine"}}]}}
-                    ]
-                }}}}"#,
-                script = script.display()
-            ),
+            serde_json::to_string(&seeded).unwrap(),
         )
         .unwrap();
         seed_installed_rtk();
@@ -7620,17 +7772,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn apply_then_verify_then_disable_opencode_round_trip() {
-        let home = TestHome::new();
+        let _home = TestHome::new(); // env guard
 
         let result = super::apply_client_setup("opencode").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "opencode");
 
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json");
+        // Resolve via the same function the apply path uses: the config lands
+        // under XDG_CONFIG_HOME on Unix but %APPDATA% on Windows.
+        let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).expect("config written"))
                 .expect("valid json");
@@ -7663,8 +7813,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_preserves_existing_base_url_and_restores_on_disable() {
-        let home = TestHome::new();
-        let config_dir = home.path().join(".config").join("opencode");
+        let _home = TestHome::new(); // env guard
+        let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("opencode.json");
         fs::write(
@@ -7712,8 +7862,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_refuses_wrap_managed_config() {
-        let home = TestHome::new();
-        let config_dir = home.path().join(".config").join("opencode");
+        let _home = TestHome::new(); // env guard
+        let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("opencode.json"),
@@ -7731,17 +7881,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_installs_transport_plugin_and_disable_removes_it() {
-        let home = TestHome::new();
+        let _home = TestHome::new(); // env guard
 
         super::apply_client_setup("opencode").expect("apply succeeds");
 
         let plugin_path = super::opencode_plugin_install_path();
         assert!(plugin_path.is_file(), "vendored plugin written to app data");
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json");
+        let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let plugins = config["plugin"].as_array().expect("plugin array present");
@@ -7784,12 +7930,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_apply_tolerates_jsonc_config() {
-        let home = TestHome::new();
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.jsonc");
+        let _home = TestHome::new(); // env guard
+        let config_path = super::opencode_config_dir().join("opencode.jsonc");
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(
             &config_path,
@@ -7814,14 +7956,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_disable_tolerates_comments_added_after_apply() {
-        let home = TestHome::new();
+        let _home = TestHome::new(); // env guard
 
         super::apply_client_setup("opencode").expect("apply succeeds");
-        let config_path = home
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json");
+        let config_path = super::opencode_config_path();
         let mut contents = fs::read_to_string(&config_path).unwrap();
         contents.insert_str(0, "// routed through headroom\n");
         fs::write(&config_path, &contents).unwrap();
@@ -7839,8 +7977,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn opencode_config_path_prefers_jsonc_when_present() {
-        let home = TestHome::new();
-        let config_dir = home.path().join(".config").join("opencode");
+        let _home = TestHome::new(); // env guard
+        let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(config_dir.join("opencode.jsonc"), "{}").unwrap();
 
@@ -8029,7 +8167,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let hooks: serde_json::Value =
             read_settings_json(&home.path().join(".codex").join("hooks.json"));
-        let command = format!("/usr/bin/python3 {}", script.display());
+        // The registered command is platform-dependent (/usr/bin/python3 vs the
+        // quoted managed python.exe), so assert against the real builder.
+        let command = super::codex_guard_command();
         // SessionStart only: on UserPromptSubmit a nonzero exit blocks the prompt.
         let session_registered = hooks["hooks"]["SessionStart"]
             .as_array()
@@ -8056,6 +8196,30 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             hooks["hooks"]["SessionStart"][0]["matcher"],
             "startup|resume|clear|compact"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn guard_commands_do_not_hardcode_unix_python() {
+        assert!(claude_guard_command().contains("python.exe"));
+        assert!(codex_guard_command().contains("python.exe"));
+        assert!(!claude_guard_command().starts_with("/usr/bin/python3"));
+        assert!(!codex_guard_command().starts_with("/usr/bin/python3"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn opencode_dirs_resolve_under_appdata_on_windows() {
+        let config = super::opencode_config_dir();
+        let data = super::opencode_data_dir();
+        assert!(config.ends_with("opencode"));
+        assert!(data.ends_with("opencode"));
+        // XDG vars are unset in a clean cmd.exe session; APPDATA must be used.
+        let appdata = std::env::var("APPDATA").expect("APPDATA should be set on Windows");
+        let local_appdata =
+            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA should be set on Windows");
+        assert!(config.starts_with(PathBuf::from(appdata)));
+        assert!(data.starts_with(PathBuf::from(local_appdata)));
     }
 
     #[test]
@@ -8190,16 +8354,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .display()
         );
         // Old install: guard registered on both SessionStart and UserPromptSubmit.
-        fs::write(
-            &hooks_path,
-            format!(
-                r#"{{"hooks":{{
-                    "SessionStart":[{{"matcher":"startup|resume|clear|compact","hooks":[{{"type":"command","command":"{cmd}"}}]}}],
-                    "UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]
-                }}}}"#
-            ),
-        )
-        .unwrap();
+        // Built via serde_json so the path is JSON-escaped on Windows (raw
+        // format! would write lone backslashes the parser mangles).
+        let seeded = serde_json::json!({"hooks":{
+            "SessionStart":[{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command": cmd.as_str()}]}],
+            "UserPromptSubmit":[{"hooks":[{"type":"command","command": cmd.as_str()}]}]
+        }});
+        fs::write(&hooks_path, serde_json::to_string(&seeded).unwrap()).unwrap();
 
         super::ensure_codex_guard_hook().unwrap();
 
@@ -8581,10 +8742,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // error used to abort setup for every client.
         let err = super::upsert_managed_block(&profile_dir, "claude_code", "export FOO=1")
             .expect_err("reading a directory must fail");
+        // The invariant is that it errors instead of clobbering; the OS wording
+        // differs (EISDIR on Unix, "Access is denied" os error 5 on Windows).
+        #[cfg(unix)]
         assert!(
             format!("{err:#}").contains("Is a directory"),
             "unexpected error: {err:#}"
         );
+        let _ = err;
         assert!(super::dedupe_shell_targets(vec![profile_dir]).is_empty());
     }
 
@@ -8837,8 +9002,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let after = std::fs::read_to_string(&config).unwrap();
         let abs = entrypoint.display().to_string();
-        assert!(
-            after.contains(&format!("command = \"{abs}\"")),
+        // Compare parsed values, not raw text: TOML escapes Windows path
+        // backslashes on write, so the raw file never contains `abs` verbatim.
+        let parsed: toml::Value = toml::from_str(&after).expect("rewritten config parses");
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["command"].as_str(),
+            Some(abs.as_str()),
             "headroom command pinned to absolute path, got:\n{after}"
         );
         // The unrelated server's command must be untouched.

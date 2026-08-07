@@ -6542,7 +6542,10 @@ mod tests {
 
     #[test]
     fn macos_notifications_do_not_wait_for_clicks() {
-        let source = include_str!("lib.rs");
+        // Normalize CRLF: Windows checkouts embed \r\n, breaking the \n-joined
+        // patterns below.
+        let source = include_str!("lib.rs").replace('\r', "");
+        let source = source.as_str();
         let start = source
             .find("#[cfg(target_os = \"macos\")]\nfn show_notification_impl")
             .expect("macOS notification implementation exists");

@@ -86,7 +86,44 @@ fn read_hardware_uuid() -> Option<String> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn read_hardware_uuid() -> Option<String> {
+    // Absolute path, mirroring /usr/sbin/ioreg on macOS: a `reg` shim earlier
+    // in PATH would silently change every device id in the fleet.
+    let reg = std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("reg.exe"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("reg"));
+    let output = Command::new(reg)
+        .args([
+            "query",
+            "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
+            "/v",
+            "MachineGuid",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if !line.contains("MachineGuid") {
+            continue;
+        }
+        // Sample line:
+        //   MachineGuid    REG_SZ    cbb05f42-c573-4037-b9c2-4a1a8b0e9a1b
+        if let Some(guid) = line.split_whitespace().last() {
+            let trimmed = guid.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn read_hardware_uuid() -> Option<String> {
     std::fs::read_to_string("/etc/machine-id")
         .ok()
@@ -118,10 +155,14 @@ fn fallback_identifier() -> String {
         "Device hardware UUID unavailable — falling back to hostname-based identifier",
         sentry::Level::Warning,
     );
-    let hostname = Command::new("/bin/hostname")
-        .output()
+    let hostname = std::env::var("COMPUTERNAME")
         .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+        })
         .map(|value| value.trim().to_string())
         .unwrap_or_else(|| "unknown-host".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| "unknown-home".to_string());
@@ -197,5 +238,13 @@ mod tests {
             std::env::set_var("HOME", value);
         }
         assert!(result.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_machine_guid_is_readable() {
+        let uuid = read_hardware_uuid();
+        assert!(uuid.is_some(), "MachineGuid should exist on Windows");
+        assert_eq!(uuid.as_deref().unwrap().len(), 36);
     }
 }

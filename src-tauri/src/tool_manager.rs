@@ -1,7 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -91,6 +90,8 @@ const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
     include_str!("../python/headroom-linux-requirements.lock");
+const HEADROOM_WINDOWS_REQUIREMENTS_LOCK: &str =
+    include_str!("../python/headroom-windows-requirements.lock");
 
 /// Full-file SHA-256 values of historical headroom-requirements.lock shipments
 /// whose pinned versions are byte-for-byte identical to the current lock.
@@ -567,6 +568,8 @@ const RTK_SHA256_LINUX_AARCH64: &str =
     "cc2b91c064eb670c097c184913c8fbcb1a943d53d7fe505375e96ba0c5b6459f";
 const RTK_SHA256_LINUX_X86_64: &str =
     "34975116da11e09e502501daf758143e0b22ed3a42a10eb67fb693a6270d9e36";
+const RTK_SHA256_WINDOWS_X86_64: &str =
+    "f0ec18963581657173bd6a51f5ba012b093823f844db749fec218581af30a568";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -576,6 +579,37 @@ const PYTHON_SHA256_LINUX_X86_64: &str =
     "c74addcd1b033a6e4d60ead3ab47fcc995569027e01d3061c4a934f363c4a0cf";
 const PYTHON_SHA256_LINUX_AARCH64: &str =
     "d2a6c0d4ceea088f635b309a59d5d700a256656423225f96ddfb71d532adb1aa";
+const PYTHON_SHA256_WINDOWS_X86_64: &str =
+    "3c8b9b10a933909c98b9916297e2093b24a9c2abaa23df1c2622c2bfe052cb94";
+
+/// Venv layout differs per platform: Unix venvs place interpreters and
+/// console-script entrypoints in `bin/` (python3, no extension); Windows venvs
+/// use `Scripts/` with `.exe`-suffixed names. The standalone python extracted
+/// by `install_python_distribution` is the exception: on Windows the
+/// interpreter is `python.exe` at the extraction root.
+fn python_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "python.exe"
+    } else {
+        "python3"
+    }
+}
+
+fn pip_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "pip.exe"
+    } else {
+        "pip"
+    }
+}
+
+fn bin_subdir() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Scripts"
+    } else {
+        "bin"
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapStepUpdate {
@@ -632,15 +666,19 @@ impl ManagedRuntime {
     }
 
     pub fn standalone_python(&self) -> PathBuf {
-        self.python_dir.join("bin").join("python3")
+        if cfg!(target_os = "windows") {
+            self.python_dir.join("python.exe")
+        } else {
+            self.python_dir.join("bin").join("python3")
+        }
     }
 
     pub fn managed_python(&self) -> PathBuf {
-        self.venv_dir.join("bin").join("python3")
+        self.venv_dir.join(bin_subdir()).join(python_exe_name())
     }
 
     pub fn managed_pip(&self) -> PathBuf {
-        self.venv_dir.join("bin").join("pip")
+        self.venv_dir.join(bin_subdir()).join(pip_exe_name())
     }
 
     pub fn ready_flag(&self) -> PathBuf {
@@ -1074,7 +1112,12 @@ impl ToolManager {
     }
 
     pub fn headroom_entrypoint(&self) -> PathBuf {
-        self.runtime.venv_dir.join("bin").join("headroom")
+        let name = if cfg!(target_os = "windows") {
+            "headroom.exe"
+        } else {
+            "headroom"
+        };
+        self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
     pub fn managed_python(&self) -> PathBuf {
@@ -1082,7 +1125,8 @@ impl ToolManager {
     }
 
     pub fn rtk_entrypoint(&self) -> PathBuf {
-        self.runtime.bin_dir.join("rtk")
+        let name = if cfg!(target_os = "windows") { "rtk.exe" } else { "rtk" };
+        self.runtime.bin_dir.join(name)
     }
 
     /// Seed the output-shaper savings baseline by mining the user's Claude Code
@@ -1416,13 +1460,25 @@ impl ToolManager {
                 // agents a too-niced backend gets starved enough that even the
                 // watchdog's tolerant 5s re-probe misses, triggering spurious
                 // auto-pause. +2 still yields, without the starvation.
-                let mut child = Command::new("/usr/bin/nice")
-                    .arg("-n")
-                    .arg("2")
-                    .arg(executable)
-                    .args(args)
-                    .current_dir(&self.runtime.root_dir)
-                    .process_group(0)
+                #[cfg(unix)]
+                let mut command = {
+                    let mut c = Command::new("/usr/bin/nice");
+                    c.arg("-n").arg("2").arg(executable).args(args);
+                    c
+                };
+                #[cfg(windows)]
+                let mut command = {
+                    let mut c = Command::new(executable);
+                    c.args(args);
+                    c
+                };
+                command.current_dir(&self.runtime.root_dir);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
+                let mut child = command
                     .env("PYTHONNOUSERSITE", "1")
                     .env("PYTHONPATH", &inject_dir)
                     .env("PYTHONUNBUFFERED", "1")
@@ -2582,12 +2638,18 @@ impl ToolManager {
             .unpack(&staging_dir)
             .with_context(|| format!("extracting into {}", staging_dir.display()))?;
 
-        // The tarball's single root is `python/`.
+        // The tarball's single root is `python/`. On Windows the interpreter is
+        // `python.exe` at the root; on Unix it is `bin/python3`.
         let extracted_root = staging_dir.join("python");
-        if !extracted_root.join("bin").join("python3").exists() {
+        let expected_python = if cfg!(target_os = "windows") {
+            extracted_root.join("python.exe")
+        } else {
+            extracted_root.join("bin").join("python3")
+        };
+        if !expected_python.exists() {
             bail!(
                 "standalone python extraction completed but {} was not found",
-                extracted_root.join("bin/python3").display()
+                expected_python.display()
             );
         }
         if self.runtime.python_dir.exists() {
@@ -4298,11 +4360,13 @@ impl ToolManager {
 
     pub fn install_rtk(&self) -> Result<()> {
         let artifact = rtk_distribution_artifact()?;
+        let extension = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
         let archive_path = self.runtime.downloads_dir.join(format!(
-            "rtk-v{}-{}-{}.tar.gz",
+            "rtk-v{}-{}-{}.{}",
             RTK_VERSION,
             std::env::consts::OS,
-            std::env::consts::ARCH
+            std::env::consts::ARCH,
+            extension
         ));
         download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
 
@@ -4314,15 +4378,29 @@ impl ToolManager {
         std::fs::create_dir_all(&extract_dir)
             .with_context(|| format!("creating {}", extract_dir.display()))?;
 
-        let file = std::fs::File::open(&archive_path)
-            .with_context(|| format!("opening {}", archive_path.display()))?;
-        let decoder = GzDecoder::new(file);
-        let mut archive = Archive::new(decoder);
-        archive
-            .unpack(&extract_dir)
-            .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+        #[cfg(target_os = "windows")]
+        {
+            let file = std::fs::File::open(&archive_path)
+                .with_context(|| format!("opening {}", archive_path.display()))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .with_context(|| format!("reading zip {}", archive_path.display()))?;
+            archive
+                .extract(&extract_dir)
+                .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let file = std::fs::File::open(&archive_path)
+                .with_context(|| format!("opening {}", archive_path.display()))?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = Archive::new(decoder);
+            archive
+                .unpack(&extract_dir)
+                .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+        }
 
-        let extracted_binary = extract_dir.join("rtk");
+        let binary_name = if cfg!(target_os = "windows") { "rtk.exe" } else { "rtk" };
+        let extracted_binary = extract_dir.join(binary_name);
         if !extracted_binary.exists() {
             bail!(
                 "rtk extraction completed but {} was not found",
@@ -4452,14 +4530,24 @@ impl ToolManager {
     }
 
     pub fn markitdown_entrypoint(&self) -> PathBuf {
-        self.runtime.venv_dir.join("bin").join("markitdown")
+        let name = if cfg!(target_os = "windows") {
+            "markitdown.exe"
+        } else {
+            "markitdown"
+        };
+        self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
     /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
     /// permission both reference this absolute path, so it works whether or not
     /// the bin dir is on PATH (RTK, which exports it, is now opt-in).
     pub fn markitdown_shim_path(&self) -> PathBuf {
-        self.runtime.bin_dir.join("markitdown")
+        let name = if cfg!(target_os = "windows") {
+            "markitdown.cmd"
+        } else {
+            "markitdown"
+        };
+        self.runtime.bin_dir.join(name)
     }
 
     fn markitdown_conversion_counter_path(&self) -> PathBuf {
@@ -4507,6 +4595,28 @@ impl ToolManager {
             std::fs::set_permissions(&shim, perms).with_context(|| {
                 format!("marking markitdown shim executable {}", shim.display())
             })?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                "@echo off\r\n\
+                 setlocal\r\n\
+                 rem Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\r\n\
+                 if \"%~1\"==\"\" goto :run\r\n\
+                 if \"%~1\"==\"--help\" goto :run\r\n\
+                 set \"C={counter}\"\r\n\
+                 set /p n=<\"%C%\" 2>nul\r\n\
+                 if not defined n set n=0\r\n\
+                 set /a n+=1 >nul 2>nul\r\n\
+                 >\"%C%.tmp\" echo %n%\r\n\
+                 move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
+                 :run\r\n\
+                 \"{real}\" %*\r\n",
+                counter = self.markitdown_conversion_counter_path().display(),
+                real = self.markitdown_entrypoint().display(),
+            );
+            crate::client_adapters::atomic_write(&shim, script.as_bytes())
+                .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
         }
         Ok(())
     }
@@ -4592,7 +4702,8 @@ impl ToolManager {
     }
 
     pub fn serena_entrypoint(&self) -> PathBuf {
-        self.serena_venv_dir().join("bin").join("serena")
+        let name = if cfg!(target_os = "windows") { "serena.exe" } else { "serena" };
+        self.serena_venv_dir().join(bin_subdir()).join(name)
     }
 
     pub fn serena_installed(&self) -> bool {
@@ -4613,7 +4724,10 @@ impl ToolManager {
             Duration::from_secs(120),
         )
         .context("creating serena venv")?;
-        let serena_python = self.serena_venv_dir().join("bin").join("python3");
+        let serena_python = self
+            .serena_venv_dir()
+            .join(bin_subdir())
+            .join(python_exe_name());
         run_pip_install_with_retries_streaming(
             &serena_python,
             &[
@@ -4826,6 +4940,7 @@ impl ToolManager {
         };
         std::fs::rename(&extracted_binary, &staged)
             .with_context(|| format!("staging {}", staged.display()))?;
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut permissions = std::fs::metadata(&staged)
@@ -6280,6 +6395,7 @@ pub(crate) struct InPlaceUpgradeContext {
 
 /// Best-effort free-bytes query for the volume backing `path`. Returns None
 /// on error — callers should treat that as "don't block on disk space".
+#[cfg(unix)]
 fn available_disk_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -6291,6 +6407,35 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(windows)]
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    let mut free_bytes_available: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            existing.as_ptr(),
+            &mut free_bytes_available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(free_bytes_available)
 }
 
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
@@ -6323,23 +6468,31 @@ fn python_distribution_artifact() -> Result<DownloadArtifact> {
             ),
             sha256: Some(PYTHON_SHA256_LINUX_AARCH64),
         }),
+        ("windows", "x86_64") => Ok(DownloadArtifact {
+            url: format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{}/cpython-3.12.12+20251014-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+                PYTHON_STANDALONE_RELEASE
+            ),
+            sha256: Some(PYTHON_SHA256_WINDOWS_X86_64),
+        }),
         (os, arch) => bail!("unsupported Headroom managed Python target: {os}/{arch}"),
     }
 }
 
 fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
-    let (target, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("aarch64-apple-darwin", RTK_SHA256_MACOS_AARCH64),
-        ("macos", "x86_64") => ("x86_64-apple-darwin", RTK_SHA256_MACOS_X86_64),
-        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", RTK_SHA256_LINUX_AARCH64),
-        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", RTK_SHA256_LINUX_X86_64),
+    let (target, sha256, extension) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("aarch64-apple-darwin", RTK_SHA256_MACOS_AARCH64, "tar.gz"),
+        ("macos", "x86_64") => ("x86_64-apple-darwin", RTK_SHA256_MACOS_X86_64, "tar.gz"),
+        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", RTK_SHA256_LINUX_AARCH64, "tar.gz"),
+        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", RTK_SHA256_LINUX_X86_64, "tar.gz"),
+        ("windows", "x86_64") => ("x86_64-pc-windows-msvc", RTK_SHA256_WINDOWS_X86_64, "zip"),
         (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
     };
 
     Ok(DownloadArtifact {
         url: format!(
-            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.tar.gz",
-            RTK_VERSION, target
+            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.{}",
+            RTK_VERSION, target, extension
         ),
         sha256: Some(sha256),
     })
@@ -6813,6 +6966,10 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
         // headroom-ai[all] stack pulls optional native packages like hnswlib
         // that fail on many fresh Linux systems.
         "linux" => HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        // Windows uses the full stack: every optional native package ships a
+        // win_amd64 wheel. The pin set is its own file so a Windows-only
+        // resolution change never perturbs the macOS lock.
+        "windows" => HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
         _ => HEADROOM_REQUIREMENTS_LOCK,
     }
 }
@@ -6825,12 +6982,10 @@ fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 /// `workspace_dir()` default of `~/.headroom` (neither the proxy nor the
 /// seeding run sets `HEADROOM_WORKSPACE_DIR`, so both resolve here).
 fn output_savings_ledger_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".headroom")
-            .join("output_savings.json"),
-    )
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".headroom").join("output_savings.json"))
 }
 
 /// Core of [`purge_output_savings_control_arm`]: given the ledger bytes, return
@@ -7466,6 +7621,7 @@ impl std::error::Error for HeadroomStartupFailure {}
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7473,6 +7629,8 @@ mod tests {
     use chrono::Local;
 
     use super::log_tail;
+    #[cfg(windows)]
+    use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::{
         apply_serena_gitignore, bootstrap_requirements_lock_for_target,
@@ -7483,13 +7641,15 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
         path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
         verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
         PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        PLUGIN_ADDONS, RTK_VERSION,
+        PLUGIN_ADDONS, RTK_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -7842,6 +8002,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn run_command_failure_carries_structured_output() {
         let tmp = std::env::temp_dir();
         let err = run_command(
@@ -7879,6 +8040,62 @@ mod tests {
         assert!(runtime.standalone_python().starts_with(&runtime.root_dir));
         assert!(runtime.managed_pip().starts_with(&runtime.root_dir));
         assert!(runtime.bin_dir.starts_with(&runtime.root_dir));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn managed_runtime_uses_windows_layout() {
+        let runtime =
+            ManagedRuntime::bootstrap_root(&std::env::temp_dir().join("headroom-layout-test"));
+        assert!(runtime.standalone_python().ends_with("python\\python.exe"));
+        assert!(runtime.managed_python().ends_with("Scripts\\python.exe"));
+        assert!(runtime.managed_pip().ends_with("Scripts\\pip.exe"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tool_manager_entrypoints_use_windows_layout() {
+        let runtime = ManagedRuntime::bootstrap_root(
+            &std::env::temp_dir().join("headroom-entrypoints-test"),
+        );
+        let manager = ToolManager::new(runtime);
+        assert!(manager.headroom_entrypoint().ends_with("Scripts\\headroom.exe"));
+        assert!(manager.rtk_entrypoint().ends_with("bin\\rtk.exe"));
+        assert!(manager.markitdown_shim_path().ends_with("bin\\markitdown.cmd"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn python_distribution_artifact_supports_windows_x86_64() {
+        let artifact = python_distribution_artifact().expect("windows python target");
+        assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
+        assert!(artifact.url.ends_with(".tar.gz"));
+        assert!(artifact.sha256.is_some(), "python checksum should be pinned");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rtk_distribution_artifact_supports_windows_x86_64() {
+        let artifact = rtk_distribution_artifact().expect("windows rtk target");
+        assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
+        assert!(artifact.url.ends_with(".zip"));
+        assert!(artifact.sha256.is_some(), "rtk checksum should be pinned");
+    }
+
+    #[test]
+    fn bootstrap_requirements_lock_targets_windows() {
+        assert_eq!(
+            bootstrap_requirements_lock_for_target("windows"),
+            HEADROOM_WINDOWS_REQUIREMENTS_LOCK
+        );
+        assert_eq!(
+            bootstrap_requirements_lock_for_target("linux"),
+            HEADROOM_LINUX_REQUIREMENTS_LOCK
+        );
+        assert_eq!(
+            bootstrap_requirements_lock_for_target("macos"),
+            HEADROOM_REQUIREMENTS_LOCK
+        );
     }
 
     #[test]
@@ -7968,12 +8185,12 @@ mod tests {
 
     #[test]
     fn rtk_installed_requires_binary_and_receipt() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-installed");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-installed");
 
         assert!(!manager.rtk_installed(), "no binary or receipt yet");
 
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nexit 0\n",
         );
         assert!(
@@ -7991,9 +8208,9 @@ mod tests {
 
     #[test]
     fn installed_rtk_version_reads_receipt() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-version");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-version");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nexit 0\n",
         );
         manager
@@ -8034,9 +8251,9 @@ mod tests {
 
     #[test]
     fn rtk_needs_install_false_when_current() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-needs-install-current");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-needs-install-current");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nexit 0\n",
         );
         manager
@@ -8085,10 +8302,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // read_rtk_activity spawns `rtk session`; the fake is a shell script
     fn read_rtk_activity_returns_last_lines_from_session_output() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-activity");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-activity");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"session\" ]; then\n  printf 'line-1\\nline-2\\nline-3\\nline-4\\n';\n  exit 0\nfi\nexit 9\n",
         );
         manager
@@ -8102,10 +8320,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // read_rtk_activity spawns `rtk session`; the fake is a shell script
     fn read_rtk_activity_surfaces_session_failures() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-activity-fail");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-activity-fail");
         write_executable(
-            &runtime.bin_dir.join("rtk"),
+            &manager.rtk_entrypoint(),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"session\" ]; then\n  echo 'session stdout';\n  echo 'session stderr' 1>&2;\n  exit 7\nfi\nexit 9\n",
         );
         manager
@@ -8123,6 +8342,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn rtk_today_stats_returns_matching_daily_row() {
         let (root, runtime, manager) = seed_test_runtime("rtk-today");
         let today = Local::now().date_naive().to_string();
@@ -8531,6 +8751,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn reclaim_orphan_proxy_never_kills_foreign_http_server() {
         let port = {
             let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -9017,9 +9238,12 @@ after
             fs::create_dir_all(parent).expect("create parent");
         }
         fs::write(path, body).expect("write script");
-        let mut perms = fs::metadata(path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("chmod");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).expect("chmod");
+        }
     }
 
     fn seed_test_runtime(prefix: &str) -> (PathBuf, ManagedRuntime, ToolManager) {
@@ -9074,6 +9298,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn markitdown_shim_counts_file_conversions_but_not_flag_calls() {
         let (_root, _runtime, manager) = seed_test_runtime("markitdown-shim");
         write_executable(
@@ -9563,6 +9788,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn recover_from_interrupted_upgrade_handles_wheel_only_marker() {
         // In-place marker without a lock backup (wheel-only interrupted
         // upgrade). A stub python stands in for a successful pip reinstall;
@@ -9603,6 +9829,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn recover_from_interrupted_upgrade_handles_in_place_marker_with_lock_backup() {
         // In-place marker with a lock backup. Recovery should: copy the lock
         // backup back to the active lock path, remove the backup, restore the
@@ -9923,6 +10150,7 @@ after
 
     #[test]
     #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn repair_stale_requirements_updates_receipt_and_emits_progress() {
         let (root, runtime, manager) = seed_test_runtime("repair-requirements");
         let _home = HomeGuard::new(&root);
@@ -9959,6 +10187,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_succeeds_with_executable_python() {
         let (root, runtime, manager) = seed_test_runtime("smoke-ok");
         write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
@@ -9971,6 +10200,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_returns_command_failure_output_on_nonzero_exit() {
         let (root, runtime, manager) = seed_test_runtime("smoke-fail");
         write_executable(
@@ -10138,6 +10368,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_markitdown_succeeds_when_entrypoint_runs() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-ok");
         fs::write(
@@ -10172,6 +10403,7 @@ after
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_repairs_pydantic_core_skew_and_retries() {
         let (root, runtime, manager) = seed_test_runtime("smoke-pydantic-skew");
         let state_file = root.join("smoke-attempts");
@@ -10230,6 +10462,7 @@ exit 0
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_does_not_repair_unrelated_failures() {
         let (root, runtime, manager) = seed_test_runtime("smoke-unrelated-fail");
         let state_file = root.join("attempts");
@@ -10259,6 +10492,7 @@ exit 0
     }
 
     #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_times_out() {
         let (root, runtime, manager) = seed_test_runtime("smoke-timeout");
         write_executable(&runtime.managed_python(), "#!/bin/sh\nsleep 1\n");

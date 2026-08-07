@@ -305,16 +305,52 @@ mod platform {
     }
 }
 
+// ── Release / Windows: Credential Manager (keyring, windows-native) ─────────
+
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+mod platform {
+    use keyring::Entry;
+
+    pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
+        let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(format!("Windows credential read failed: {err}")),
+        }
+    }
+
+    pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
+        let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
+        entry
+            .set_password(secret)
+            .map_err(|err| format!("Windows credential write failed: {err}"))
+    }
+
+    pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
+        let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(format!("Windows credential delete failed: {err}")),
+        }
+    }
+}
+
 // ── Release / non-macOS: stub ─────────────────────────────────────────────────
 
-#[cfg(all(not(debug_assertions), not(target_os = "macos")))]
+#[cfg(all(
+    not(debug_assertions),
+    not(target_os = "macos"),
+    not(target_os = "windows")
+))]
 mod platform {
     pub fn read_secret(_service: &str, _account: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
 
     pub fn write_secret(_service: &str, _account: &str, _secret: &str) -> Result<(), String> {
-        Err("Secure key storage is currently only implemented for macOS builds.".into())
+        Err("Secure key storage is not implemented for this platform build.".into())
     }
 
     pub fn delete_secret(_service: &str, _account: &str) -> Result<(), String> {
@@ -423,5 +459,24 @@ mod tests {
         super::write_secret("test-svc", "acct-c", "second").expect("second write");
         let value = super::read_secret("test-svc", "acct-c").expect("read");
         assert_eq!(value.as_deref(), Some("second"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secret_interface_round_trips_via_debug_store() {
+        // Debug builds use the file store on every platform; this guards the
+        // public interface + debug-store path on Windows. The keyring-backed
+        // release path is smoke-tested on a real Windows host (Phase 6).
+        let service = format!("headroom-test-{}", uuid::Uuid::new_v4());
+        super::write_secret(&service, "account", "value").expect("write should succeed");
+        assert_eq!(
+            super::read_secret(&service, "account").expect("read should succeed").as_deref(),
+            Some("value")
+        );
+        super::delete_secret(&service, "account").expect("delete should succeed");
+        assert_eq!(
+            super::read_secret(&service, "account").expect("read should succeed"),
+            None
+        );
     }
 }

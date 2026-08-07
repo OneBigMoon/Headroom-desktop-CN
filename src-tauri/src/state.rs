@@ -3143,10 +3143,7 @@ impl AppState {
 
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
-            let _ = std::process::Command::new("/bin/kill")
-                .arg("-TERM")
-                .arg(format!("-{pid}"))
-                .status();
+            terminate_process_tree(pid, false);
             // Bounded wait: a backend that ignores SIGTERM (mid-request, stuck
             // shutdown) must not block this caller forever. stop_headroom runs
             // on the UI thread during restart_app, so an unbounded child.wait()
@@ -3158,10 +3155,7 @@ impl AppState {
                     Ok(Some(_)) | Err(_) => break,
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
-                            let _ = std::process::Command::new("/bin/kill")
-                                .arg("-KILL")
-                                .arg(format!("-{pid}"))
-                                .status();
+                            terminate_process_tree(pid, true);
                             let _ = child.wait();
                             break;
                         }
@@ -3178,15 +3172,13 @@ impl AppState {
         // and the python module path / entrypoint subcommand is unique enough
         // to identify our proxies regardless of port.
         let managed_python = self.tool_manager.managed_python();
+        let headroom_entrypoint = self.tool_manager.headroom_entrypoint();
         let command_patterns = [
-            format!("{} -m headroom.proxy.server", managed_python.display()),
-            format!(
-                "{} proxy --port",
-                self.tool_manager.headroom_entrypoint().display()
-            ),
+            (managed_python.as_path(), "-m headroom.proxy.server"),
+            (headroom_entrypoint.as_path(), "proxy --port"),
         ];
-        for pattern in command_patterns {
-            if let Err(err) = kill_processes_by_command_pattern(&pattern) {
+        for (exe, args_pattern) in command_patterns {
+            if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
                 log::warn!("failed to clean detached headroom proxy processes: {err}");
             }
         }
@@ -3564,8 +3556,12 @@ pub(crate) fn current_platform() -> &'static str {
 }
 
 pub(crate) fn current_platform_support_tier() -> &'static str {
-    match current_platform() {
-        "linux" => "experimental",
+    support_tier_for_platform(current_platform())
+}
+
+pub(crate) fn support_tier_for_platform(os: &str) -> &'static str {
+    match os {
+        "linux" | "windows" => "experimental",
         _ => "stable",
     }
 }
@@ -3585,10 +3581,7 @@ impl Drop for AppState {
         let mut process = self.headroom_process.lock();
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
-            let _ = std::process::Command::new("/bin/kill")
-                .arg("-TERM")
-                .arg(format!("-{pid}"))
-                .status();
+            terminate_process_tree(pid, false);
             let _ = child.wait();
         }
     }
@@ -6372,11 +6365,31 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
+/// Terminate a process tree. Windows uses taskkill /T (subtree); Unix signals
+/// the process group by negating the pid.
+fn terminate_process_tree(pid: i32, force: bool) {
+    if cfg!(target_os = "windows") {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.status();
+    } else {
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(signal)
+            .arg(format!("-{pid}"))
+            .status();
+    }
+}
+
+fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     #[cfg(unix)]
     {
+        let pattern = format!("{} {args_pattern}", exe.display());
         let status = Command::new("pkill")
-            .args(["-f", pattern])
+            .args(["-f", &pattern])
             .status()
             .with_context(|| format!("running pkill for pattern '{pattern}'"))?;
 
@@ -6391,9 +6404,50 @@ fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
         ));
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
     {
-        let _ = pattern;
+        // `Win32_Process.CommandLine` wraps the executable in double quotes
+        // (e.g. `"C:\...\python.exe" -m headroom.proxy.server`), so matching
+        // "{exe} {args_pattern}" as one substring never hits -- the quote
+        // right after the exe breaks the adjacency. Match the exe and the
+        // args as two independent `-like` clauses instead. Escape `[`/`]`
+        // (wildcard metacharacters to `-like`) and any embedded `'` (would
+        // otherwise close the single-quoted PowerShell literal early -- a
+        // Windows username containing `'` could break out of it).
+        fn escape_like(value: &str) -> String {
+            value
+                .replace('`', "``")
+                .replace('\'', "''")
+                .replace('[', "`[")
+                .replace(']', "`]")
+        }
+        let exe_pattern = escape_like(&exe.display().to_string());
+        let args_escaped = escape_like(args_pattern);
+        let script = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .with_context(|| {
+                format!("running powershell kill for exe '{}' args '{args_pattern}'", exe.display())
+            })?;
+
+        if status.success() {
+            return Ok(());
+        }
+
+        return Err(anyhow!(
+            "powershell exited with status {:?} for exe '{}' args '{}'",
+            status.code(),
+            exe.display(),
+            args_pattern
+        ));
+    }
+
+    #[cfg(all(not(unix), not(target_os = "windows")))]
+    {
+        let _ = (exe, args_pattern);
         Ok(())
     }
 }
@@ -6665,10 +6719,11 @@ mod tests {
         log_mtime_advanced, merge_daily_savings, merge_hourly_savings, most_recent_monday,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
-        rebuild_persisted_savings_from_records, tcp_port_accepts_connection,
-        tool_schema_savings_usd, total_dir_size_bytes, AppState, BootValidationOutcome,
-        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
-        OutputReduction, PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        rebuild_persisted_savings_from_records, support_tier_for_platform,
+        tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes, AppState,
+        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats,
+        HeadroomSavingsHistoryPoint, OutputReduction, PersistedSavingsState, SavingsObservation,
+        SavingsRecord, SavingsTracker,
     };
 
     #[test]
@@ -10024,5 +10079,12 @@ mod tests {
         let next = bootstrap_failed_state(&idle_progress(), "early failure".into());
         assert_eq!(next.overall_percent, 1);
         assert!(next.failed);
+    }
+
+    #[test]
+    fn support_tier_for_platform_marks_windows_experimental() {
+        assert_eq!(support_tier_for_platform("linux"), "experimental");
+        assert_eq!(support_tier_for_platform("windows"), "experimental");
+        assert_eq!(support_tier_for_platform("macos"), "stable");
     }
 }

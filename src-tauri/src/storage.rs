@@ -3,6 +3,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 pub fn app_data_dir() -> PathBuf {
+    // Explicit override, used for test hermeticity: nextest runs each test in
+    // its own process, so an in-process env lock cannot stop parallel tests
+    // from sharing (and corrupting) the real profile's Headroom dir — on
+    // macOS/Windows dirs::data_local_dir() ignores every env var TestHome
+    // sets. Production never sets this. Relative paths are ignored so a stray
+    // value can't scatter state under an arbitrary cwd.
+    if let Some(dir) = std::env::var_os("HEADROOM_DATA_DIR").filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir;
+        }
+    }
     let base = dirs::data_local_dir()
         .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
         .or_else(|| {
