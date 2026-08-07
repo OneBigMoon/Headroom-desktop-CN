@@ -8302,6 +8302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // read_rtk_activity spawns `rtk session`; the fake is a shell script
     fn read_rtk_activity_returns_last_lines_from_session_output() {
         let (root, _runtime, manager) = seed_test_runtime("rtk-activity");
         write_executable(
@@ -8319,6 +8320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // read_rtk_activity spawns `rtk session`; the fake is a shell script
     fn read_rtk_activity_surfaces_session_failures() {
         let (root, _runtime, manager) = seed_test_runtime("rtk-activity-fail");
         write_executable(
