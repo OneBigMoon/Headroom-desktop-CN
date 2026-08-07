@@ -1,0 +1,105 @@
+name: Windows Preview Build
+
+# Manual-only preview channel for the experimental Windows tier. Publishes an
+# NSIS installer plus its own updater manifest to the rolling windows-preview
+# prerelease. Deliberately decoupled from release-macos.yml: it never touches
+# the stable v* releases or their latest.json, so there is no manifest race.
+# Retire this workflow when Windows joins the stable release flow.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows x64 preview
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      # Preview builds update from the windows-preview channel, not stable.
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/windows-preview/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/windows-preview/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build NSIS installer
+        shell: bash
+        run: npx tauri build --target x86_64-pc-windows-msvc
+
+      - name: Publish to windows-preview prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          bundle_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          setup="$(ls "$bundle_dir"/*-setup.exe)"
+          sig="${setup}.sig"
+          [ -f "$sig" ] || { echo "updater signature missing: $sig" >&2; exit 1; }
+          asset_name="$(basename "$setup")"
+
+          jq -n \
+            --arg version "$version" \
+            --arg notes "Windows preview build of Headroom ${version} (${GITHUB_SHA})." \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat "$sig")" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/windows-preview/${asset_name}" \
+            '{version: $version, notes: $notes, pub_date: $pub_date,
+              platforms: {"windows-x86_64": {signature: $signature, url: $url}}}' \
+            > latest.json
+
+          notes="Rolling Windows preview (experimental tier). Current: v${version} @ ${GITHUB_SHA}.
+          Install: download the -setup.exe below. Unsigned preview build - SmartScreen will warn; choose More info -> Run anyway."
+          if gh release view windows-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            for asset in $(gh release view windows-preview --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
+              gh release delete-asset windows-preview "$asset" --yes --repo "$GITHUB_REPOSITORY"
+            done
+            gh release upload windows-preview "$setup" "$sig" latest.json --repo "$GITHUB_REPOSITORY"
+            gh release edit windows-preview --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Windows preview (rolling)" --notes "$notes"
+          else
+            gh release create windows-preview \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Windows preview (rolling)" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              "$setup" "$sig" latest.json
+          fi
+          echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/windows-preview"
