@@ -274,7 +274,9 @@ The cask source at `packaging/homebrew/headroom.rb` in this repo is a
 submission template, not a maintained artifact: `scripts/bump-version.sh` only
 touches `package.json`, `tauri.conf.json`, and `Cargo.toml`, and the `sha256`
 can't be filled in until CI has built and notarized the DMG, so it goes stale
-on the next release. To ship it, open a PR against
+on the next release. Refresh both before submitting: `brew audit --cask --new
+--strict` treats a `version` that differs from what `livecheck` resolves as a
+hard failure, not a warning. To ship it, open a PR against
 [`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
 file at `Casks/h/headroom.rb`. Once merged there, the tap becomes the
 source of truth and BrewTestBot maintains `version` and `sha256` automatically
