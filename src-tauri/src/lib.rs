@@ -3529,11 +3529,15 @@ async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn hide_launcher_animated(app: AppHandle) {
+async fn hide_launcher_animated(app: AppHandle) {
     // The launcher close animation now lives in the webview/CSS layer.
     // Keep the backend hide on the straightforward window path instead of
     // mutating window geometry from a background thread.
-    let _ = hide_launcher_window(&app);
+    // Async so the hide doesn't queue behind main-thread work during startup;
+    // window ops proxy to the main thread internally either way.
+    if let Err(err) = hide_launcher_window(&app) {
+        log::warn!("hide_launcher_animated: failed to hide launcher: {err:#}");
+    }
 }
 
 #[tauri::command]
@@ -5895,9 +5899,10 @@ fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
 
 fn hide_launcher_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("launcher") {
-        if window.is_visible()? {
-            window.hide()?;
-        }
+        // No is_visible() guard: NSWindow.isVisible false-negatives (miniaturized
+        // window, hidden app) made the guard skip real hides, leaving the launcher
+        // stuck on screen. hide() on an already-hidden window is a no-op anyway.
+        window.hide()?;
     }
     Ok(())
 }
