@@ -247,3 +247,35 @@ To bypass the guard for emergency hotfixes, include `[skip-rc-check]` in the **P
 ### Final update-flow verification
 
 After the stable workflow publishes `vX.Y.Z`, it re-points the rolling `staging` release at the stable artifacts. The staging test machine receives `X.Y.Z` as an update via the staging endpoint (since `X.Y.Z > X.Y.Z-rc.N` in semver). Once installed, its version is plain `X.Y.Z` and the app automatically switches to the stable endpoint for all future update checks.
+
+## Homebrew (cask)
+
+Homebrew users can install the latest signed release with:
+
+```bash
+brew install --cask headroom
+```
+
+The cask token is `headroom`, not `headroom-desktop`. Homebrew's new-cask audit
+rejects any token ending in `desktop` (also `mac`, `osx`, `macos`, `launcher`),
+and the rule is `--new`-only so a plain `brew audit --cask --strict` run will not
+catch a rename back. Verify with `brew audit --cask --new --strict headroom`.
+
+The cask is versioned (`version "X.Y.Z"`, not `version :latest`) and points at
+the tagged release's `Headroom_X.Y.Z_mac.dmg` asset directly, since each stable
+release already publishes a versioned URL. A `livecheck` block using
+`strategy :github_latest` lets BrewTestBot autobump the cask on every release,
+and `auto_updates true` is accurate since the app also self-updates through its
+built-in updater between cask bumps.
+
+### Maintaining the cask
+
+The cask source at `packaging/homebrew/headroom.rb` in this repo is a
+submission template, not a maintained artifact: `scripts/bump-version.sh` only
+touches `package.json`, `tauri.conf.json`, and `Cargo.toml`, and the `sha256`
+can't be filled in until CI has built and notarized the DMG, so it goes stale
+on the next release. To ship it, open a PR against
+[`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
+file at `Casks/h/headroom.rb`. Once merged there, the tap becomes the
+source of truth and BrewTestBot maintains `version` and `sha256` automatically
+via `livecheck`.

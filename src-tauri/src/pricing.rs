@@ -610,7 +610,13 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
 
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
-    let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
+    // Merged profile (live bearer + auth.json), same source the identity
+    // payload reports to headroom-web. `None` = no Codex evidence at all →
+    // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
+    // still maps conservatively to Max x20.
+    let codex_plan = crate::client_adapters::is_codex_enabled()
+        .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
+        .flatten();
     let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude, codex_plan);
     // Captured before the mismatch is moved into the Claude evaluator; the Codex
     // gate meters an under-subscribed account exactly like the Claude side.
@@ -1013,7 +1019,13 @@ pub(crate) fn verify_auth_code_with_base_url(
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let account = remote_account_to_profile(body.account);
-    let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
+    // Merged profile (live bearer + auth.json), same source the identity
+    // payload reports to headroom-web. `None` = no Codex evidence at all →
+    // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
+    // still maps conservatively to Max x20.
+    let codex_plan = crate::client_adapters::is_codex_enabled()
+        .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
+        .flatten();
     let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude, codex_plan);
 
     Ok(evaluate_pricing_status_with_mismatch(
@@ -1119,7 +1131,13 @@ pub(crate) fn activate_account_with_base_url(
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let account = remote_account_to_profile(body.account);
-    let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
+    // Merged profile (live bearer + auth.json), same source the identity
+    // payload reports to headroom-web. `None` = no Codex evidence at all →
+    // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
+    // still maps conservatively to Max x20.
+    let codex_plan = crate::client_adapters::is_codex_enabled()
+        .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
+        .flatten();
     let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude, codex_plan);
 
     Ok(evaluate_pricing_status_with_mismatch(
@@ -1626,6 +1644,10 @@ fn evaluate_pricing_status_with_mismatch(
 /// subscriber's paid tier is below the tier their confidently-detected Claude
 /// plan implies. Uses the live `claude.plan_tier` only — `Unknown`/`Free`
 /// (and any cached fallback) yield no recommended tier, so no mismatch fires.
+/// Codex differs: `codex_plan` must be `None` when there is no Codex evidence
+/// at all (callers pass the merged `cached_codex_profile` tier), while an
+/// explicit `Some(Unknown)` — real Codex evidence with an unclassifiable plan
+/// — deliberately maps to Max x20 via `headroom_tier_for_codex_plan`.
 fn detect_tier_mismatch(
     account: &HeadroomAccountProfile,
     claude: &ClaudeAccountProfile,
@@ -5094,6 +5116,26 @@ mod tests {
         let account = active_subscriber(HeadroomSubscriptionTier::Pro);
         let claude = empty_claude_profile(ClaudePlanTier::Unknown);
         assert!(detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Plus)).is_none());
+    }
+
+    #[test]
+    fn detect_tier_mismatch_codex_free_and_absent_yield_no_recommendation() {
+        // User 861's case: Max x5 subscriber, Claude Max 5x, auth.json says
+        // Codex Free. Free maps to no tier; absent evidence (None) must not
+        // fire either. Explicit Unknown (evidence, unclassifiable) still
+        // recommends Max x20 by design.
+        let account = active_subscriber(HeadroomSubscriptionTier::Max5x);
+        let claude = empty_claude_profile(ClaudePlanTier::Max5x);
+        assert!(detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Free)).is_none());
+        assert!(detect_tier_mismatch(&account, &claude, None).is_none());
+        assert_eq!(
+            detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Unknown)),
+            Some((
+                HeadroomSubscriptionTier::Max5x,
+                HeadroomSubscriptionTier::Max20x,
+                TierRecommendationSource::Codex
+            ))
+        );
     }
 
     #[test]

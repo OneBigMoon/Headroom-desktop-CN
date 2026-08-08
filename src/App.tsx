@@ -3941,7 +3941,14 @@ export default function App() {
     hidingRef.current = true;
     document.documentElement.classList.add("window-hiding");
     window.setTimeout(() => {
-      void invoke("hide_launcher_animated");
+      invoke("hide_launcher_animated").catch((error) => {
+        // Surface the failure and re-arm so a second click can retry instead
+        // of silently dead-ending (the 400ms reset may have been throttled
+        // while the window was hidden).
+        console.error("hide_launcher_animated failed", error);
+        document.documentElement.classList.remove("window-hiding");
+        hidingRef.current = false;
+      });
     }, launcherHideAnimationMs);
     setTimeout(() => {
       document.documentElement.classList.remove("window-hiding");

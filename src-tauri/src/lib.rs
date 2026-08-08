@@ -3529,11 +3529,15 @@ async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn hide_launcher_animated(app: AppHandle) {
+async fn hide_launcher_animated(app: AppHandle) {
     // The launcher close animation now lives in the webview/CSS layer.
     // Keep the backend hide on the straightforward window path instead of
     // mutating window geometry from a background thread.
-    let _ = hide_launcher_window(&app);
+    // Async so the hide doesn't queue behind main-thread work during startup;
+    // window ops proxy to the main thread internally either way.
+    if let Err(err) = hide_launcher_window(&app) {
+        log::warn!("hide_launcher_animated: failed to hide launcher: {err:#}");
+    }
 }
 
 #[tauri::command]
@@ -5453,10 +5457,28 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 log::info!(
                     "watchdog: giving up after {MAX_CONSECUTIVE_FAILURES} failures; pausing runtime and bypassing to Anthropic"
                 );
+                // Flip bypass FIRST so the Rust intercept passes new
+                // requests straight through to Anthropic instead of returning
+                // 502 in the window between Python being torn down and the
+                // user noticing. See proxy_intercept.rs:161 — without this,
+                // every request lands on the unreachable backend branch.
+                //
+                // "First" means before the diagnostic capture below, not just
+                // before stop_headroom: capture_watchdog_give_up re-probes the
+                // backend and sleeps ~4s to sample a CPU rate, so capturing
+                // first held every request on the dead-backend branch for that
+                // whole window purely to decide a Sentry level. Storing the
+                // flag tears nothing down, so the capture still observes the
+                // same pre-teardown state.
+                state
+                    .proxy_bypass
+                    .store(true, std::sync::atomic::Ordering::Release);
                 // Capture once per down episode, BEFORE stop_headroom tears
                 // down the tracked child and the proxy log handle, so the
                 // exit status and log tail reflect the failure we're about
-                // to recover from.
+                // to recover from. `bypass_active` is the snapshot read at the
+                // top of this tick, so the flip above does not change what is
+                // reported.
                 capture_watchdog_give_up(
                     &*state,
                     consecutive_failures,
@@ -5465,14 +5487,6 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     readyz_body,
                     last_wall_jump.map(|(at, gap)| (at.elapsed().as_secs(), gap)),
                 );
-                // Flip bypass FIRST so the Rust intercept passes new
-                // requests straight through to Anthropic instead of returning
-                // 502 in the window between Python being torn down and the
-                // user noticing. See proxy_intercept.rs:161 — without this,
-                // every request lands on the unreachable backend branch.
-                state
-                    .proxy_bypass
-                    .store(true, std::sync::atomic::Ordering::Release);
                 state.set_runtime_paused(true);
                 // Mark this as an AUTO pause (distinct from a user pause) so the
                 // self-heal loop above will keep retrying and the UI shows the
@@ -5885,9 +5899,10 @@ fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
 
 fn hide_launcher_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("launcher") {
-        if window.is_visible()? {
-            window.hide()?;
-        }
+        // No is_visible() guard: NSWindow.isVisible false-negatives (miniaturized
+        // window, hidden app) made the guard skip real hides, leaving the launcher
+        // stuck on screen. hide() on an already-hidden window is a no-op anyway.
+        window.hide()?;
     }
     Ok(())
 }
@@ -7456,6 +7471,32 @@ Some unrelated content.
         assert_eq!(auto_resume_backoff(2), Duration::from_secs(120));
         assert_eq!(auto_resume_backoff(3), Duration::from_secs(300));
         assert_eq!(auto_resume_backoff(50), Duration::from_secs(300));
+    }
+
+    /// Ordering guard for the give-up path. `capture_watchdog_give_up`
+    /// re-probes the backend and sleeps ~4s to sample a CPU rate, so running it
+    /// before the bypass flip holds every in-flight request on the unreachable
+    /// backend branch for that whole window — purely to decide a Sentry level.
+    /// Setting the flag tears nothing down, so it must come first.
+    #[test]
+    fn watchdog_give_up_flips_bypass_before_capturing_diagnostics() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn spawn_proxy_watchdog")
+            .expect("watchdog implementation exists");
+        let body = &source[start..];
+
+        let bypass_flip = body
+            .find(".store(true, std::sync::atomic::Ordering::Release)")
+            .expect("give-up path flips proxy_bypass");
+        let capture = body
+            .find("capture_watchdog_give_up(")
+            .expect("give-up path captures diagnostics");
+
+        assert!(
+            bypass_flip < capture,
+            "proxy_bypass must be set before capture_watchdog_give_up, which sleeps ~4s"
+        );
     }
 
     #[test]
