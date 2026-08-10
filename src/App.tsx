@@ -62,6 +62,13 @@ import {
   maybeFireUrgentRuntimeNotification,
 } from "./lib/urgentNotifications";
 import {
+  maybeFireSetupStallAlert,
+  SETUP_STALL_CHECK_INTERVAL_MS,
+  SETUP_STALL_EARLIEST_MS,
+  type SetupStallAlert,
+} from "./lib/setupHealthAlert";
+import { SetupStallModal } from "./components/SetupStallModal";
+import {
   describeInvokeError,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
@@ -1358,6 +1365,10 @@ export default function App() {
   // blocks). Gated flow applies only to fresh installs: an installed runtime
   // means the user is grandfathered and sees zero difference.
   const [launchFlags, setLaunchFlags] = useState<LaunchFlags | null>(null);
+  // Set when the app has been up past the stall window with zero savings on
+  // record. Held in state (not rendered immediately) so the modal is waiting
+  // whenever the user next opens the tray, rather than stealing focus.
+  const [setupStall, setSetupStall] = useState<SetupStallAlert | null>(null);
   const [connectors, setConnectors] = useState<ClientConnectorStatus[]>([]);
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
@@ -1519,6 +1530,19 @@ export default function App() {
   const bootstrapFailureSignatureRef = useRef("");
   const mainWindowLastBlurAtRef = useRef<number | null>(null);
   const mainWindowLastSeenDayRef = useRef(formatDayKey(new Date()));
+  // Session uptime anchor for the setup-stall check. The tray webview is
+  // created at app launch and stays alive while the window is hidden, so first
+  // render is a good stand-in for "when Headroom started running".
+  const appStartedAtMsRef = useRef(Date.now());
+  // Mirrors the account gate for the setup-stall closure: a signed-out or
+  // unpaid user has zero savings by design, and both states already fire their
+  // own daily notification. Undefined until pricing status first loads.
+  const optimizationBlockedRef = useRef<boolean | undefined>(undefined);
+  // Mirrors connector status for the same closure. Undefined until the startup
+  // fetch lands, which keeps the no-traffic branch quiet rather than guessing.
+  // Staleness in the "became verified" direction is harmless: that only happens
+  // once traffic flows, and the no-traffic branch requires zero requests.
+  const connectorsRef = useRef<ClientConnectorStatus[] | undefined>(undefined);
   const appUpdateKnownVersionRef = useRef<string | null>(null);
   const appUpdateReadyToRestartRef = useRef(false);
   const appUpdateBusyRef = useRef(false);
@@ -1569,6 +1593,10 @@ export default function App() {
     dashboard.launchExperience === "first_run" &&
     dashboard.lifetimeEstimatedTokensSaved <= 0 &&
     dashboard.lifetimeEstimatedSavingsUsd <= 0;
+  // Independent of launchExperience: any savings on record at all, which is
+  // what retires the setup-stall watchdog below.
+  const savingsEverRecorded =
+    dashboard.lifetimeEstimatedTokensSaved > 0 || dashboard.lifetimeEstimatedSavingsUsd > 0;
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;
@@ -2216,6 +2244,55 @@ export default function App() {
       });
     return () => unlisten?.();
   }, [isLastScreen, awaitingFirstSavings]);
+
+  const optimizationBlocked = pricingStatus
+    ? pricingStatus.needsAuthentication || !pricingStatus.optimizationAllowed
+    : undefined;
+  useEffect(() => {
+    optimizationBlockedRef.current = optimizationBlocked;
+  }, [optimizationBlocked]);
+
+  // Setup-stall watchdog: Headroom running for a long stretch with nothing
+  // saved almost always means the hookup is incomplete, not that the user was
+  // idle the whole time. Runs regardless of tray visibility (the other
+  // dashboard pollers are focus-gated, so without this a broken install stays
+  // silent while the window is closed), and stops for good once any savings
+  // land. `maybeFireSetupStallAlert` owns the once-per-local-day throttle.
+  useEffect(() => {
+    if (windowLabel !== "main" || savingsEverRecorded) {
+      return;
+    }
+
+    let active = true;
+    const check = async () => {
+      const uptimeMs = Date.now() - appStartedAtMsRef.current;
+      if (uptimeMs < SETUP_STALL_EARLIEST_MS) {
+        return;
+      }
+      const latest = await loadDashboard().catch(() => null);
+      if (!active || !latest) {
+        return;
+      }
+      applyDashboardIfChanged(latest);
+      const alert = await maybeFireSetupStallAlert(latest, uptimeMs, {
+        optimizationBlocked: optimizationBlockedRef.current,
+        connectors: connectorsRef.current,
+      });
+      if (active && alert) {
+        setSetupStall(alert);
+      }
+    };
+
+    void check();
+    const interval = window.setInterval(() => {
+      void check();
+    }, SETUP_STALL_CHECK_INTERVAL_MS);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [windowLabel, savingsEverRecorded]);
 
   useEffect(() => {
     if (windowLabel !== "main" || !trayWindowFocused) {
@@ -3243,6 +3320,10 @@ export default function App() {
     try {
       setConnectorsError(null);
       const items = await fetchConnectors();
+      // Set unconditionally, unlike the state below: an empty result is a real
+      // answer ("nothing connected") that the diff-and-set helper swallows,
+      // and the setup-stall watchdog has to tell it apart from "not loaded".
+      connectorsRef.current = items;
       applyConnectorsIfChanged(items);
     } catch (error) {
       setConnectorsError(
@@ -6947,6 +7028,17 @@ export default function App() {
               </button>
             </section>
           </div>
+
+          {setupStall && (
+            <SetupStallModal
+              kind={setupStall.kind}
+              onClose={() => setSetupStall(null)}
+              onOpenSettings={() => {
+                setSetupStall(null);
+                setActiveView("settings");
+              }}
+            />
+          )}
 
           {showSavingsInfo && (
             <div

@@ -24,6 +24,7 @@ export function notificationActionView(action: string | null): TrayView | null {
       return "upgradeAuth";
     case "runtime":
     case "connectors":
+    case "setup":
       return "settings";
     case "optimize":
       return "optimization";

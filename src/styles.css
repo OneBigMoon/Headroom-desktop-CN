@@ -3092,6 +3092,17 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.4;
 }
 
+/* Troubleshooting steps inside the "no savings yet" setup alert modal. */
+.setup-stall__steps {
+  margin: 2px 0 4px;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
 /* Savings drill-down rows inside the "How savings are calculated" modal. */
 .savings-breakdown {
   display: grid;

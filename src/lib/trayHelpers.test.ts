@@ -22,9 +22,10 @@ describe("notificationActionView", () => {
     expect(notificationActionView("billing")).toBe("upgradeAuth");
   });
 
-  it("routes runtime/connectors actions to settings", () => {
+  it("routes runtime/connectors/setup actions to settings", () => {
     expect(notificationActionView("runtime")).toBe("settings");
     expect(notificationActionView("connectors")).toBe("settings");
+    expect(notificationActionView("setup")).toBe("settings");
   });
 
   it("routes optimize/activity actions to their respective views", () => {

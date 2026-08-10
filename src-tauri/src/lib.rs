@@ -405,14 +405,45 @@ fn maybe_fire_onboarding_recovery_nudge(
     if !state.try_mark_onboarding_recovery_notified() {
         return;
     }
-    let _ = show_notification_impl(
+    // Resolved only after the one-shot gate is consumed, so the setup-state
+    // read happens once per install rather than on every poll.
+    //
+    // Trustworthy at this point specifically: clear_client_setups() empties
+    // configured_clients on every quit and restore_client_setups() repopulates
+    // it during startup, so a "nothing enabled" reading is a lie during early
+    // boot. Ten minutes of uptime puts this well past that window. On error,
+    // assume something is connected and keep the restart-your-terminal copy,
+    // which is the more common cause.
+    let any_connector_enabled = client_adapters::list_client_connectors(&state.cached_clients())
+        .map(|connectors| connectors.iter().any(|connector| connector.enabled))
+        .unwrap_or(true);
+    let (title, body) = onboarding_recovery_copy(any_connector_enabled);
+
+    let _ = show_notification_impl(app, title, body, None);
+    analytics::track_event(
         app,
-        "Headroom isn't seeing any traffic",
-        "Setup finished, but no Claude Code or Codex requests have come through yet. \
-         Restart your terminal or editor so they pick up the new settings.",
-        None,
+        "onboarding_recovery_nudge_shown",
+        Some(json!({ "any_connector_enabled": any_connector_enabled })),
     );
-    analytics::track_event(app, "onboarding_recovery_nudge_shown", None);
+}
+
+/// Copy for the recovery nudge, split by why nothing has come through. The
+/// old single string always blamed a stale terminal environment, which reads
+/// as nonsense to someone who never got a connector turned on: there is no
+/// routing to pick up, so restarting anything changes nothing.
+fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'static str) {
+    if any_connector_enabled {
+        return (
+            "Headroom isn't seeing any traffic",
+            "Setup finished, but no Claude Code or Codex requests have come through yet. \
+             Restart your terminal or editor so they pick up the new settings.",
+        );
+    }
+    (
+        "Headroom isn't connected to anything yet",
+        "No coding tool is connected, so there's nothing for Headroom to trim. \
+         Open Headroom and turn on the connector for Claude Code or Codex.",
+    )
 }
 
 /// The payoff moment: lifetime savings crossed zero during THIS app session.
@@ -6094,7 +6125,7 @@ mod tests {
         fetch_transformations_feed_from, format_token_count, install_pending_update,
         is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
         is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, parse_live_learnings,
+        noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
         parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
@@ -6579,6 +6610,23 @@ mod tests {
             config.endpoints[0].as_str(),
             "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"
         );
+    }
+
+    #[test]
+    fn onboarding_recovery_copy_blames_a_stale_environment_only_when_something_is_connected() {
+        let (title, body) = onboarding_recovery_copy(true);
+        assert_eq!(title, "Headroom isn't seeing any traffic");
+        assert!(
+            body.contains("Restart your terminal or editor"),
+            "got: {body}"
+        );
+
+        // Telling a user with no connector to restart their terminal sends them
+        // after a problem they don't have: there is no routing to pick up.
+        let (title, body) = onboarding_recovery_copy(false);
+        assert_eq!(title, "Headroom isn't connected to anything yet");
+        assert!(!body.contains("Restart"), "got: {body}");
+        assert!(body.contains("turn on the connector"), "got: {body}");
     }
 
     #[test]
