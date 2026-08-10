@@ -54,7 +54,7 @@ const STEPS: Record<SetupStallKind, string[]> = {
 // actionable isn't buried at the end of a paragraph.
 const CLAUDE_DESKTOP_NOTE = {
   title: "Running Claude Code in the Claude desktop app?",
-  why: "That one can't be optimized. Anthropic's desktop app doesn't use the Claude Code CLI's configuration, so its requests never pass through Headroom. That is a design decision on Anthropic's side, not something restarting will fix.",
+  why: "That unfortunately doesn't work due to a design decision by Anthropic. The desktop app doesn't allow setting a proxy URL, so we can't pass requests through Headroom.",
   action:
     "Run Claude Code from a terminal, or use the VS Code extension, and Headroom picks it up automatically.",
 };
