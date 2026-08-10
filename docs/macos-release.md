@@ -316,3 +316,8 @@ hard failure, not a warning. To ship it, open a PR against
 file at `Casks/h/headroom.rb`. Once merged there, the tap becomes the
 source of truth and BrewTestBot maintains `version` and `sha256` automatically
 via `livecheck`.
+
+Do not add `verified:` to the `url` stanza. It is a no-op kept only for casks
+that already had it, and `brew audit --new` rejects it outright — which is easy
+to miss because the audit only fires on a brew new enough to carry the
+deprecation, so a local run on an older brew passes while CI fails.
