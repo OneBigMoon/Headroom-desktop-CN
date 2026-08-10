@@ -470,7 +470,9 @@ mod tests {
         let service = format!("headroom-test-{}", uuid::Uuid::new_v4());
         super::write_secret(&service, "account", "value").expect("write should succeed");
         assert_eq!(
-            super::read_secret(&service, "account").expect("read should succeed").as_deref(),
+            super::read_secret(&service, "account")
+                .expect("read should succeed")
+                .as_deref(),
             Some("value")
         );
         super::delete_secret(&service, "account").expect("delete should succeed");
