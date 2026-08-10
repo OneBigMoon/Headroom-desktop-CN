@@ -1045,17 +1045,36 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
-    // Kompress model snapshot pulled into the shared HuggingFace hub cache by
-    // prefetch_kompress_model. Remove only our model's dirs (data + download
-    // locks), never the cache itself — other apps share it.
+    // Model snapshots the bundled runtime pulls into the shared HuggingFace hub
+    // cache. This used to remove only KOMPRESS_HF_MODEL_DIR, which orphaned every
+    // other model we fetch (~788MB measured: ModernBERT-base, two all-MiniLM-L6-v2
+    // variants, siglip-image-encoder-onnx, technique-router-onnx).
+    //
+    // Sweep by prefix instead of naming each one, so a new model added upstream
+    // does not silently start leaking. `chopratejas` is the author of the Python
+    // package we bundle, so `models--chopratejas--*` is unambiguously ours.
+    //
+    // Generic third-party models we also pull (answerdotai--ModernBERT-base,
+    // sentence-transformers--all-MiniLM-L6-v2, Qdrant--all-MiniLM-L6-v2-onnx) are
+    // deliberately left in place: another tool on this machine may share them, and
+    // re-pulling one is cheap next to breaking someone else's cache. Never the
+    // cache root either, for the same reason.
+    const HF_OWNED_MODEL_PREFIX: &str = "models--chopratejas--";
     let hf_hub = home_dir().join(".cache").join("huggingface").join("hub");
-    for dir in [
-        hf_hub.join(crate::tool_manager::KOMPRESS_HF_MODEL_DIR),
-        hf_hub
-            .join(".locks")
-            .join(crate::tool_manager::KOMPRESS_HF_MODEL_DIR),
-    ] {
-        if dir.exists() {
+    // `.locks` holds a same-named sibling dir per model.
+    for parent in [hf_hub.clone(), hf_hub.join(".locks")] {
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(HF_OWNED_MODEL_PREFIX)
+            {
+                continue;
+            }
+            let dir = entry.path();
             match std::fs::remove_dir_all(&dir) {
                 Ok(_) => removed.push(dir.display().to_string()),
                 Err(err) => log::warn!("cleanup: removing {} failed: {err}", dir.display()),
@@ -7383,6 +7402,63 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !dot_headroom.exists(),
             "full cleanup should remove ~/.headroom"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_cleanup_sweeps_our_hf_models_but_spares_shared_ones() {
+        // Regression: this used to remove only models--chopratejas--kompress-v2-base
+        // and orphaned every other model the runtime pulls (~788MB measured on a
+        // real install). Sweep by `models--chopratejas--*` so a newly added upstream
+        // model cannot silently start leaking.
+        let home = TestHome::new();
+        let hub = home.path().join(".cache").join("huggingface").join("hub");
+
+        // Ours: author prefix of the bundled Python package.
+        let ours = [
+            "models--chopratejas--kompress-v2-base",
+            "models--chopratejas--technique-router-onnx",
+            "models--chopratejas--siglip-image-encoder-onnx",
+        ];
+        // Generic models we also pull, but which another tool may share. Removing
+        // these would break that tool's cache, so they must survive.
+        let shared = [
+            "models--answerdotai--ModernBERT-base",
+            "models--sentence-transformers--all-MiniLM-L6-v2",
+            "models--Qdrant--all-MiniLM-L6-v2-onnx",
+        ];
+
+        for name in ours.iter().chain(shared.iter()) {
+            for parent in [hub.join(name), hub.join(".locks").join(name)] {
+                fs::create_dir_all(&parent).unwrap();
+                fs::write(parent.join("blob"), b"weights").unwrap();
+            }
+        }
+
+        super::perform_full_cleanup();
+
+        for name in ours {
+            assert!(
+                !hub.join(name).exists(),
+                "{name} is ours and should be removed"
+            );
+            assert!(
+                !hub.join(".locks").join(name).exists(),
+                "{name} lock dir should be removed"
+            );
+        }
+        for name in shared {
+            assert!(
+                hub.join(name).join("blob").exists(),
+                "{name} is shared with other tools and must survive uninstall"
+            );
+            assert!(
+                hub.join(".locks").join(name).exists(),
+                "{name} lock dir is shared and must survive"
+            );
+        }
+        // The cache root itself is never ours to delete.
+        assert!(hub.exists(), "hub cache root preserved");
     }
 
     #[test]
