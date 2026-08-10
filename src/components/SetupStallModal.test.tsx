@@ -3,17 +3,17 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { SetupStallModal } from "./SetupStallModal";
-import { setupStallMinutes } from "../lib/setupHealthAlert";
+import { setupStallNoTrafficMinutes } from "../lib/setupHealthAlert";
 
 describe("SetupStallModal", () => {
   it("tells a no-traffic user to restart their agent", () => {
     render(<SetupStallModal kind="no_traffic" onClose={vi.fn()} onOpenSettings={vi.fn()} />);
 
     expect(
-      screen.getByText(new RegExp(`${setupStallMinutes()} minutes`))
+      screen.getByText(new RegExp(`${setupStallNoTrafficMinutes()} minutes`))
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Restart your terminal, editor, or coding agent/i)
+      screen.getByText(/Quit your terminal, editor, or coding agent completely/i)
     ).toBeInTheDocument();
   });
 

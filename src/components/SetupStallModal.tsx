@@ -1,4 +1,4 @@
-import { setupStallMinutes, type SetupStallKind } from "../lib/setupHealthAlert";
+import { setupStallNoTrafficMinutes, type SetupStallKind } from "../lib/setupHealthAlert";
 
 export interface SetupStallModalProps {
   kind: SetupStallKind;
@@ -9,17 +9,20 @@ export interface SetupStallModalProps {
   onOpenSettings: () => void;
 }
 
+// The no_traffic branch only fires when a connector is configured but has never
+// seen traffic come back, so the copy can state that as fact rather than asking
+// the user to go check whether anything is connected.
 const LEAD: Record<SetupStallKind, string> = {
   no_traffic:
-    "Headroom has been running for {minutes} minutes and has not seen a single request from Claude Code or Codex. That usually means traffic is not reaching it yet.",
+    "Your coding agent is connected to Headroom, but {minutes} minutes on, not one request has come back through it. That almost always means the agent is still running with the settings it had before Headroom was installed.",
   no_savings:
     "Requests are reaching Headroom, but none of them have been optimized. That usually means optimization is paused or blocked rather than misrouted.",
 };
 
 const STEPS: Record<SetupStallKind, string[]> = {
   no_traffic: [
-    "Restart your terminal, editor, or coding agent so it picks up Headroom's settings.",
-    "Check that the connector for your agent is enabled under Settings.",
+    "Quit your terminal, editor, or coding agent completely, then reopen it. A new tab or window often reuses the old environment.",
+    "Run your agent from a freshly opened terminal so it picks up Headroom's settings.",
     "Confirm Headroom itself is running. The menu bar icon is solid when it is.",
   ],
   no_savings: [
@@ -33,7 +36,7 @@ const STEPS: Record<SetupStallKind, string[]> = {
 /// alongside a native notification (see `maybeFireSetupStallAlert`); this is the
 /// surface the user lands on when they open the tray.
 export function SetupStallModal({ kind, onClose, onOpenSettings }: SetupStallModalProps) {
-  const lead = LEAD[kind].replace("{minutes}", String(setupStallMinutes()));
+  const lead = LEAD[kind].replace("{minutes}", String(setupStallNoTrafficMinutes()));
 
   return (
     <div

@@ -63,8 +63,8 @@ import {
 } from "./lib/urgentNotifications";
 import {
   maybeFireSetupStallAlert,
-  SETUP_STALL_AFTER_MS,
   SETUP_STALL_CHECK_INTERVAL_MS,
+  SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
@@ -1538,6 +1538,11 @@ export default function App() {
   // unpaid user has zero savings by design, and both states already fire their
   // own daily notification. Undefined until pricing status first loads.
   const optimizationBlockedRef = useRef<boolean | undefined>(undefined);
+  // Mirrors connector status for the same closure. Undefined until the startup
+  // fetch lands, which keeps the no-traffic branch quiet rather than guessing.
+  // Staleness in the "became verified" direction is harmless: that only happens
+  // once traffic flows, and the no-traffic branch requires zero requests.
+  const connectorsRef = useRef<ClientConnectorStatus[] | undefined>(undefined);
   const appUpdateKnownVersionRef = useRef<string | null>(null);
   const appUpdateReadyToRestartRef = useRef(false);
   const appUpdateBusyRef = useRef(false);
@@ -2261,7 +2266,7 @@ export default function App() {
     let active = true;
     const check = async () => {
       const uptimeMs = Date.now() - appStartedAtMsRef.current;
-      if (uptimeMs < SETUP_STALL_AFTER_MS) {
+      if (uptimeMs < SETUP_STALL_EARLIEST_MS) {
         return;
       }
       const latest = await loadDashboard().catch(() => null);
@@ -2271,6 +2276,7 @@ export default function App() {
       applyDashboardIfChanged(latest);
       const alert = await maybeFireSetupStallAlert(latest, uptimeMs, {
         optimizationBlocked: optimizationBlockedRef.current,
+        connectors: connectorsRef.current,
       });
       if (active && alert) {
         setSetupStall(alert);
@@ -3314,6 +3320,10 @@ export default function App() {
     try {
       setConnectorsError(null);
       const items = await fetchConnectors();
+      // Set unconditionally, unlike the state below: an empty result is a real
+      // answer ("nothing connected") that the diff-and-set helper swallows,
+      // and the setup-stall watchdog has to tell it apart from "not loaded".
+      connectorsRef.current = items;
       applyConnectorsIfChanged(items);
     } catch (error) {
       setConnectorsError(

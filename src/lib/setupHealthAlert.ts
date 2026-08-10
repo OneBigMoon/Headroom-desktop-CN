@@ -3,20 +3,34 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { needsTermsAcceptance } from "./launcherHelpers";
 import { formatDayKey } from "./dashboardHelpers";
-import type { DashboardState } from "./types";
+import type { ClientConnectorStatus, DashboardState } from "./types";
 
-// How long the app must run with nothing to show before we tell the user the
-// setup is probably broken. Long enough that a user who launched Headroom and
-// then went to a meeting isn't accused of a bad install on a normal quiet
-// stretch, short enough that a genuinely broken hookup surfaces the same day
-// it was installed.
-export const SETUP_STALL_AFTER_MS = 30 * 60 * 1000;
+// Nothing at all has come through. This is the weaker of the two signals:
+// uptime is not the same as time spent coding (Headroom can autostart at
+// login), so a clock on its own cannot tell "the hookup is broken" from "the
+// user has not opened a terminal yet". The connector predicate below carries
+// most of the confidence here; the timer is just a floor.
+export const SETUP_STALL_NO_TRAFFIC_AFTER_MS = 30 * 60 * 1000;
+
+// Requests are arriving and none of them are being optimized. The user is
+// demonstrably at their keyboard routing traffic through Headroom, so this
+// fires sooner and leans on request volume rather than the clock: ten requests
+// with nothing trimmed does not happen by accident, and every minute of
+// waiting is a minute of them getting no value while believing it works.
+export const SETUP_STALL_NO_SAVINGS_AFTER_MS = 10 * 60 * 1000;
+export const SETUP_STALL_NO_SAVINGS_MIN_REQUESTS = 10;
+
+// Earliest point either branch can fire. The watchdog skips its dashboard read
+// entirely before this.
+export const SETUP_STALL_EARLIEST_MS = Math.min(
+  SETUP_STALL_NO_TRAFFIC_AFTER_MS,
+  SETUP_STALL_NO_SAVINGS_AFTER_MS
+);
 
 // Cadence of the background check. The dashboard read is local (in-memory Rust
 // state), so this is cheap; 5 min just keeps it off the hot path while the tray
-// is hidden. It also means the alert lands anywhere in the 30-35 minute range,
-// which is well inside the tolerance of a "you have been running a while"
-// signal.
+// is hidden. It also means an alert lands anywhere within 5 minutes of its
+// threshold, which is well inside the tolerance of these signals.
 export const SETUP_STALL_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 // Local day, not UTC, for the same reason the other urgent notifications use a
@@ -36,15 +50,15 @@ export interface SetupStallAlert {
   body: string;
 }
 
-export function setupStallMinutes(): number {
-  return Math.round(SETUP_STALL_AFTER_MS / 60_000);
+export function setupStallNoTrafficMinutes(): number {
+  return Math.round(SETUP_STALL_NO_TRAFFIC_AFTER_MS / 60_000);
 }
 
 const STALL_TITLE = "Headroom hasn't saved anything yet";
 
 function stallBody(kind: SetupStallKind): string {
   if (kind === "no_traffic") {
-    return `Headroom has been running for ${setupStallMinutes()} minutes without seeing a single Claude Code or Codex request. Your setup likely needs another step. Open Headroom to check.`;
+    return `Your coding agent is connected, but ${setupStallNoTrafficMinutes()} minutes on not one request has come back through Headroom. It is probably still running with its pre-Headroom settings. Open Headroom to check.`;
   }
   return "Requests are reaching Headroom but none are being optimized. Something is likely misconfigured. Open Headroom to check.";
 }
@@ -55,6 +69,21 @@ export interface SetupStallContext {
   /// and those states already have their own daily notifications. Undefined
   /// means pricing status hasn't loaded yet, which is treated as allowed.
   optimizationBlocked?: boolean;
+  /// Current connector status. Undefined means it hasn't loaded yet.
+  connectors?: ClientConnectorStatus[];
+}
+
+/// A connector we configured that has never seen traffic come back through
+/// Headroom - the same state the Home banner surfaces as "restart it first".
+/// This, not the clock, is what makes a no-traffic alert trustworthy.
+///
+/// Undefined connectors means status hasn't loaded; stay quiet rather than
+/// guess. Empty means nothing is connected, which is not a malfunction and is
+/// already covered by the banner's "No coding tools connected" state.
+function hasUnverifiedConnector(connectors: ClientConnectorStatus[] | undefined): boolean {
+  return (connectors ?? []).some(
+    (connector) => connector.installed && connector.enabled && !connector.verified
+  );
 }
 
 /// Pure decision: is this session's silence worth alerting about? Returns null
@@ -65,7 +94,7 @@ export function evaluateSetupStall(
   uptimeMs: number,
   context: SetupStallContext = {}
 ): SetupStallAlert | null {
-  if (uptimeMs < SETUP_STALL_AFTER_MS) {
+  if (uptimeMs < SETUP_STALL_EARLIEST_MS) {
     return null;
   }
   // A half-finished install has its own progress UI and its own failure
@@ -86,8 +115,26 @@ export function evaluateSetupStall(
   if (savingsRecorded) {
     return null;
   }
-  const kind: SetupStallKind = dashboard.lifetimeRequests > 0 ? "no_savings" : "no_traffic";
-  return { kind, title: STALL_TITLE, body: stallBody(kind) };
+
+  if (dashboard.lifetimeRequests === 0) {
+    if (uptimeMs < SETUP_STALL_NO_TRAFFIC_AFTER_MS) {
+      return null;
+    }
+    if (!hasUnverifiedConnector(context.connectors)) {
+      return null;
+    }
+    return { kind: "no_traffic", title: STALL_TITLE, body: stallBody("no_traffic") };
+  }
+
+  // Some traffic, but not yet enough to rule out a normal quiet start. Wait
+  // for the volume rather than accusing the setup on one or two requests.
+  if (
+    dashboard.lifetimeRequests < SETUP_STALL_NO_SAVINGS_MIN_REQUESTS ||
+    uptimeMs < SETUP_STALL_NO_SAVINGS_AFTER_MS
+  ) {
+    return null;
+  }
+  return { kind: "no_savings", title: STALL_TITLE, body: stallBody("no_savings") };
 }
 
 /// Fire the alert at most once per local day, and never once savings exist.
