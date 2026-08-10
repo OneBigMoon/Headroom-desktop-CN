@@ -1060,7 +1060,10 @@ pub fn perform_full_cleanup() -> Vec<String> {
     // re-pulling one is cheap next to breaking someone else's cache. Never the
     // cache root either, for the same reason.
     const HF_OWNED_MODEL_PREFIX: &str = "models--chopratejas--";
-    let hf_hub = home_dir().join(".cache").join("huggingface").join("hub");
+    // Resolve the cache the way huggingface_hub does rather than assuming the
+    // default, so a relocated cache is still cleaned up.
+    let hf_hub = crate::tool_manager::hf_hub_cache_dir()
+        .unwrap_or_else(|| home_dir().join(".cache").join("huggingface").join("hub"));
     // `.locks` holds a same-named sibling dir per model.
     for parent in [hf_hub.clone(), hf_hub.join(".locks")] {
         let Ok(entries) = std::fs::read_dir(&parent) else {
@@ -7025,6 +7028,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             // Clear any real ZDOTDIR so zsh_dir() resolves against the temp
             // $HOME and the shell-block tests stay hermetic on dev machines.
             std::env::remove_var("ZDOTDIR");
+            // Clear every var huggingface_hub honours, so hf_hub_cache_dir()
+            // resolves to the temp $HOME. Without this, a dev with HF_HOME or
+            // HF_HUB_CACHE set would have the cleanup tests delete models out
+            // of their REAL HuggingFace cache.
+            for var in [
+                "HF_HUB_CACHE",
+                "HUGGINGFACE_HUB_CACHE",
+                "HF_HOME",
+                "XDG_CACHE_HOME",
+            ] {
+                std::env::remove_var(var);
+            }
             // Mirror what the app does at startup so write_setup_state has a
             // config dir to land in.
             crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())

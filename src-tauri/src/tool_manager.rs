@@ -796,9 +796,42 @@ pub struct HeadroomLearnProjectSummary {
     pub pattern_count: Option<usize>,
 }
 
-/// HuggingFace hub cache directory name for the Kompress model. Shared with
-/// uninstall cleanup (client_adapters) so both sides track the same model.
+/// HuggingFace hub cache directory name for the Kompress model. Uninstall
+/// cleanup sweeps the whole `models--chopratejas--` prefix instead of this one
+/// name, so the two can drift apart without leaking.
 pub(crate) const KOMPRESS_HF_MODEL_DIR: &str = "models--chopratejas--kompress-v2-base";
+
+/// HuggingFace hub cache directory, resolved the way `huggingface_hub` itself
+/// resolves it. Precedence mirrors its `constants.py`: `HF_HUB_CACHE`, then the
+/// legacy `HUGGINGFACE_HUB_CACHE`, then `$HF_HOME/hub`, then
+/// `${XDG_CACHE_HOME:-~/.cache}/huggingface/hub`.
+///
+/// Reading it from our own env is correct by construction: the bundled runtime
+/// is spawned as our child and inherits this env, so wherever we resolve to is
+/// where it actually writes. Hardcoding the default bit us twice — the prefetch
+/// guard re-downloaded an already-cached model, and uninstall left it behind.
+///
+/// Two deliberate deviations from python: no `$VAR` expansion inside the values
+/// (`os.path.expandvars`), and an empty value is treated as unset where
+/// `os.getenv` would return `""` and resolve to a CWD-relative path. Both cases
+/// are already broken upstream; falling back to the default beats guessing.
+/// ponytail: add expansion if anyone reports a `$`-containing value.
+pub(crate) fn hf_hub_cache_dir() -> Option<PathBuf> {
+    fn var(key: &str) -> Option<PathBuf> {
+        std::env::var_os(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+
+    var("HF_HUB_CACHE")
+        .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
+        .or_else(|| var("HF_HOME").map(|home| home.join("hub")))
+        .or_else(|| {
+            let cache =
+                var("XDG_CACHE_HOME").or_else(|| dirs::home_dir().map(|h| h.join(".cache")))?;
+            Some(cache.join("huggingface").join("hub"))
+        })
+}
 
 /// Result of a best-effort kompress model prefetch.
 pub enum KompressPrefetchOutcome {
@@ -1157,7 +1190,11 @@ impl ToolManager {
     }
 
     pub fn rtk_entrypoint(&self) -> PathBuf {
-        let name = if cfg!(target_os = "windows") { "rtk.exe" } else { "rtk" };
+        let name = if cfg!(target_os = "windows") {
+            "rtk.exe"
+        } else {
+            "rtk"
+        };
         self.runtime.bin_dir.join(name)
     }
 
@@ -2013,25 +2050,21 @@ impl ToolManager {
     }
 
     /// True if the Kompress model snapshot is already present in the
-    /// HuggingFace hub cache (`$HOME/.cache/huggingface/hub/
-    /// <KOMPRESS_HF_MODEL_DIR>/snapshots/<rev>`). Used as the
-    /// prefetch idempotency guard so we never re-download an existing model.
+    /// HuggingFace hub cache (`<hf_hub_cache_dir>/<KOMPRESS_HF_MODEL_DIR>/
+    /// snapshots/<rev>`). Used as the prefetch idempotency guard so we never
+    /// re-download an existing model.
     pub fn kompress_model_cached(&self) -> bool {
-        let Some(home) = dirs::home_dir() else {
+        let Some(hub) = hf_hub_cache_dir() else {
             return false;
         };
-        let snapshots = home
-            .join(".cache")
-            .join("huggingface")
-            .join("hub")
-            .join(KOMPRESS_HF_MODEL_DIR)
-            .join("snapshots");
+        let snapshots = hub.join(KOMPRESS_HF_MODEL_DIR).join("snapshots");
         std::fs::read_dir(&snapshots)
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false)
     }
 
-    /// Download the Kompress model (~260MB) into the HF cache by running the
+    /// Download the Kompress model (~850MB measured, not the ~260MB this doc
+    /// used to claim) into the HF cache by running the
     /// bundled venv python's loader with network enabled. Blocks until the
     /// download finishes — call this on a background thread. Output is captured
     /// to `logs/kompress-prefetch.log`.
@@ -4395,7 +4428,11 @@ impl ToolManager {
 
     pub fn install_rtk(&self) -> Result<()> {
         let artifact = rtk_distribution_artifact()?;
-        let extension = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
+        let extension = if cfg!(target_os = "windows") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
         let archive_path = self.runtime.downloads_dir.join(format!(
             "rtk-v{}-{}-{}.{}",
             RTK_VERSION,
@@ -4434,7 +4471,11 @@ impl ToolManager {
                 .with_context(|| format!("extracting into {}", extract_dir.display()))?;
         }
 
-        let binary_name = if cfg!(target_os = "windows") { "rtk.exe" } else { "rtk" };
+        let binary_name = if cfg!(target_os = "windows") {
+            "rtk.exe"
+        } else {
+            "rtk"
+        };
         let extracted_binary = extract_dir.join(binary_name);
         if !extracted_binary.exists() {
             bail!(
@@ -4737,7 +4778,11 @@ impl ToolManager {
     }
 
     pub fn serena_entrypoint(&self) -> PathBuf {
-        let name = if cfg!(target_os = "windows") { "serena.exe" } else { "serena" };
+        let name = if cfg!(target_os = "windows") {
+            "serena.exe"
+        } else {
+            "serena"
+        };
         self.serena_venv_dir().join(bin_subdir()).join(name)
     }
 
@@ -6518,8 +6563,16 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
     let (target, sha256, extension) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => ("aarch64-apple-darwin", RTK_SHA256_MACOS_AARCH64, "tar.gz"),
         ("macos", "x86_64") => ("x86_64-apple-darwin", RTK_SHA256_MACOS_X86_64, "tar.gz"),
-        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", RTK_SHA256_LINUX_AARCH64, "tar.gz"),
-        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", RTK_SHA256_LINUX_X86_64, "tar.gz"),
+        ("linux", "aarch64") => (
+            "aarch64-unknown-linux-gnu",
+            RTK_SHA256_LINUX_AARCH64,
+            "tar.gz",
+        ),
+        ("linux", "x86_64") => (
+            "x86_64-unknown-linux-musl",
+            RTK_SHA256_LINUX_X86_64,
+            "tar.gz",
+        ),
         ("windows", "x86_64") => ("x86_64-pc-windows-msvc", RTK_SHA256_WINDOWS_X86_64, "zip"),
         (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
     };
@@ -7678,15 +7731,14 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
         path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path,
+        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
         verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
         PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        PLUGIN_ADDONS, RTK_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, PLUGIN_ADDONS, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -8103,13 +8155,16 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn tool_manager_entrypoints_use_windows_layout() {
-        let runtime = ManagedRuntime::bootstrap_root(
-            &std::env::temp_dir().join("headroom-entrypoints-test"),
-        );
+        let runtime =
+            ManagedRuntime::bootstrap_root(&std::env::temp_dir().join("headroom-entrypoints-test"));
         let manager = ToolManager::new(runtime);
-        assert!(manager.headroom_entrypoint().ends_with("Scripts\\headroom.exe"));
+        assert!(manager
+            .headroom_entrypoint()
+            .ends_with("Scripts\\headroom.exe"));
         assert!(manager.rtk_entrypoint().ends_with("bin\\rtk.exe"));
-        assert!(manager.markitdown_shim_path().ends_with("bin\\markitdown.cmd"));
+        assert!(manager
+            .markitdown_shim_path()
+            .ends_with("bin\\markitdown.cmd"));
     }
 
     #[cfg(target_os = "windows")]
@@ -8118,7 +8173,10 @@ mod tests {
         let artifact = python_distribution_artifact().expect("windows python target");
         assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
         assert!(artifact.url.ends_with(".tar.gz"));
-        assert!(artifact.sha256.is_some(), "python checksum should be pinned");
+        assert!(
+            artifact.sha256.is_some(),
+            "python checksum should be pinned"
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -8241,10 +8299,7 @@ mod tests {
 
         assert!(!manager.rtk_installed(), "no binary or receipt yet");
 
-        write_executable(
-            &manager.rtk_entrypoint(),
-            "#!/usr/bin/env bash\nexit 0\n",
-        );
+        write_executable(&manager.rtk_entrypoint(), "#!/usr/bin/env bash\nexit 0\n");
         assert!(
             !manager.rtk_installed(),
             "binary alone should not count as installed"
@@ -8261,10 +8316,7 @@ mod tests {
     #[test]
     fn installed_rtk_version_reads_receipt() {
         let (root, _runtime, manager) = seed_test_runtime("rtk-version");
-        write_executable(
-            &manager.rtk_entrypoint(),
-            "#!/usr/bin/env bash\nexit 0\n",
-        );
+        write_executable(&manager.rtk_entrypoint(), "#!/usr/bin/env bash\nexit 0\n");
         manager
             .write_tool_receipt("rtk", serde_json::json!({ "version": "0.37.2-test" }))
             .expect("rtk receipt");
@@ -8304,10 +8356,7 @@ mod tests {
     #[test]
     fn rtk_needs_install_false_when_current() {
         let (root, _runtime, manager) = seed_test_runtime("rtk-needs-install-current");
-        write_executable(
-            &manager.rtk_entrypoint(),
-            "#!/usr/bin/env bash\nexit 0\n",
-        );
+        write_executable(&manager.rtk_entrypoint(), "#!/usr/bin/env bash\nexit 0\n");
         manager
             .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
             .expect("rtk receipt");
@@ -10198,6 +10247,88 @@ after
                 None => std::env::remove_var("CODEX_HOME"),
             }
         }
+    }
+
+    /// Snapshots and clears every var `hf_hub_cache_dir` reads, so the
+    /// precedence test is hermetic on a dev machine that has any of them set.
+    struct HfEnvGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    const HF_CACHE_VARS: [&str; 4] = [
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "HF_HOME",
+        "XDG_CACHE_HOME",
+    ];
+
+    impl HfEnvGuard {
+        fn new() -> Self {
+            let prev = HF_CACHE_VARS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            for key in HF_CACHE_VARS {
+                std::env::remove_var(key);
+            }
+            HfEnvGuard { prev }
+        }
+    }
+
+    impl Drop for HfEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.prev.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hf_hub_cache_dir_follows_huggingface_precedence() {
+        let root = std::env::temp_dir().join("headroom-hf-precedence");
+        let _home = HomeGuard::new(&root);
+        let _hf = HfEnvGuard::new();
+
+        // Default: ${XDG_CACHE_HOME:-$HOME/.cache}/huggingface/hub
+        assert_eq!(
+            super::hf_hub_cache_dir(),
+            Some(root.join(".cache").join("huggingface").join("hub"))
+        );
+
+        // An empty value is treated as unset rather than resolving to a
+        // relative path.
+        std::env::set_var("HF_HUB_CACHE", "");
+        assert_eq!(
+            super::hf_hub_cache_dir(),
+            Some(root.join(".cache").join("huggingface").join("hub"))
+        );
+        std::env::remove_var("HF_HUB_CACHE");
+
+        std::env::set_var("XDG_CACHE_HOME", "/x/xdg");
+        assert_eq!(
+            super::hf_hub_cache_dir(),
+            Some(PathBuf::from("/x/xdg/huggingface/hub"))
+        );
+
+        // $HF_HOME/hub beats XDG_CACHE_HOME.
+        std::env::set_var("HF_HOME", "/x/hfhome");
+        assert_eq!(
+            super::hf_hub_cache_dir(),
+            Some(PathBuf::from("/x/hfhome/hub"))
+        );
+
+        // The legacy var beats HF_HOME and is itself the full hub path, no
+        // `hub` suffix appended.
+        std::env::set_var("HUGGINGFACE_HUB_CACHE", "/x/legacy");
+        assert_eq!(super::hf_hub_cache_dir(), Some(PathBuf::from("/x/legacy")));
+
+        // HF_HUB_CACHE wins outright.
+        std::env::set_var("HF_HUB_CACHE", "/x/win");
+        assert_eq!(super::hf_hub_cache_dir(), Some(PathBuf::from("/x/win")));
     }
 
     #[test]

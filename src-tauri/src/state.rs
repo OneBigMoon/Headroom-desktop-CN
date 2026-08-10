@@ -149,18 +149,10 @@ fn probe_proxy_livez(client: &reqwest::blocking::Client) -> bool {
 }
 
 /// HuggingFace hub cache path — where transformers/huggingface_hub write
-/// downloaded model weights. HF respects ``$HF_HOME`` but we set neither
-/// in the bundled runtime, so the default ``$HOME/.cache/huggingface/hub``
-/// is what we observe. Returns None if we can't resolve a home dir or the
-/// path doesn't exist yet (first-run pre-download).
+/// downloaded model weights. Returns None if we can't resolve the path or it
+/// doesn't exist yet (first-run pre-download).
 fn hf_hub_cache_dir() -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    let path = home.join(".cache").join("huggingface").join("hub");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    crate::tool_manager::hf_hub_cache_dir().filter(|path| path.exists())
 }
 
 /// Total byte size of every regular file under ``path``. Used as a
@@ -6430,7 +6422,10 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
             .with_context(|| {
-                format!("running powershell kill for exe '{}' args '{args_pattern}'", exe.display())
+                format!(
+                    "running powershell kill for exe '{}' args '{args_pattern}'",
+                    exe.display()
+                )
             })?;
 
         if status.success() {
@@ -8780,7 +8775,10 @@ mod tests {
         let names: Vec<&str> = rates.iter().map(|r| r.model.as_str()).collect();
         // Best rate first; gpt-5.5 is under the 100-request floor and the
         // passthrough probe is excluded however many requests it racked up.
-        assert_eq!(names, ["claude-sonnet-5", "claude-fable-5", "claude-opus-5"]);
+        assert_eq!(
+            names,
+            ["claude-sonnet-5", "claude-fable-5", "claude-opus-5"]
+        );
         assert_eq!(rates[0].requests, 5663);
         assert!((rates[0].savings_percent - 37.86).abs() < 1e-9);
     }
