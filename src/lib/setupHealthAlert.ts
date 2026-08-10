@@ -176,7 +176,12 @@ export async function maybeFireSetupStallAlert(
     writeDayKey(today);
   }
 
-  if (!(await isWindowVisible())) {
+  // In production the notification is redundant when the user is already
+  // looking at the tray, so it is skipped there. A forced run always sends it:
+  // the point of the override is to see both surfaces, and the forced alert
+  // fires about a second after launch, which is exactly when a tester is most
+  // likely to have the tray open and would otherwise see the modal only.
+  if (context.forceKind || !(await isWindowVisible())) {
     try {
       await invoke("show_notification", {
         title: alert.title,

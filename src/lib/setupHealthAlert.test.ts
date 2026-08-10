@@ -208,6 +208,24 @@ describe("evaluateSetupStall", () => {
       ).toBe("no_savings");
     });
 
+    // The override exists to exercise both surfaces. A tester almost always has
+    // the tray open when the forced alert fires, and the production skip would
+    // then hide the notification and make it look like there isn't one.
+    it("still sends the notification when the tray window is open", async () => {
+      isVisibleMock.mockResolvedValue(true);
+
+      const alert = await maybeFireSetupStallAlert(stalledDashboard(), 0, {
+        forceKind: "no_savings",
+      });
+
+      expect(alert).not.toBeNull();
+      expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+        title: alert?.title,
+        body: alert?.body,
+        action: "setup",
+      });
+    });
+
     // Eyeballing the modal must not silence the real alert for the rest of the
     // day, so a forced fire neither reads nor writes the throttle key.
     it("never consumes the once-per-day slot", async () => {
