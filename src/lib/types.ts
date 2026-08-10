@@ -199,6 +199,13 @@ export interface ClientSetupVerification {
   failures: string[];
 }
 
+/// Test overrides read from HEADROOM_FAKE_* env vars by the Rust side. Every
+/// field is null on a stable build and on any RC launched without the var, so
+/// production behaviour is the all-null case.
+export interface DebugOverrides {
+  setupStall: "no_traffic" | "no_savings" | null;
+}
+
 export interface ClientConnectorStatus {
   clientId: string;
   name: string;

@@ -171,6 +171,7 @@ import type {
   ClientSetupResult,
   DailySavingsPoint,
   DashboardState,
+  DebugOverrides,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
   HeadroomSubscriptionTier,
@@ -296,7 +297,17 @@ const connectorSetupDetails: Record<string, string> = {
     "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project."
 };
 
-const connectorSupportWarnings: Record<string, string> = {};
+// Claude Code run inside the Claude desktop app is the one Claude Code surface
+// Headroom cannot reach. Headroom routes Claude Code by pointing it at a local
+// proxy through your shell profile and ~/.claude/settings.json; the desktop
+// app's built-in Claude Code uses neither, so its requests never pass through
+// Headroom and there is no configuration that changes that.
+const CLAUDE_DESKTOP_LIMITATION =
+  "Claude Code inside the Claude desktop app cannot be optimized. Headroom routes Claude Code by pointing it at a local proxy via your shell profile and ~/.claude/settings.json, and the desktop app's built-in Claude Code uses neither, so its requests never reach Headroom. Run Claude Code from a terminal, or use the VS Code or JetBrains extension, and Headroom picks it up automatically.";
+
+const connectorSupportWarnings: Record<string, string> = {
+  claude_code: CLAUDE_DESKTOP_LIMITATION
+};
 
 // Two-letter badges for the home-banner connector cluster: with three or
 // more connectors, full names push the banner headline onto a second line.
@@ -308,8 +319,11 @@ const connectorMonograms: Record<string, string> = {
 };
 
 const connectorUnavailableReasons: Record<string, string> = {
+  // A user whose only Claude Code is the one built into the Claude desktop app
+  // lands here, because the CLI genuinely isn't installed. Say so, or they
+  // reasonably conclude Headroom is broken rather than inapplicable.
   claude_code:
-    "Claude Code was not detected. Install Claude Code and restart Headroom.",
+    "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized - it does not use the CLI's configuration, so Headroom never sees its requests.",
   codex:
     "Codex was not detected. Install the Codex CLI and restart Headroom.",
   grok_build:
@@ -1369,6 +1383,7 @@ export default function App() {
   // record. Held in state (not rendered immediately) so the modal is waiting
   // whenever the user next opens the tray, rather than stealing focus.
   const [setupStall, setSetupStall] = useState<SetupStallAlert | null>(null);
+  const [debugOverrides, setDebugOverrides] = useState<DebugOverrides | null>(null);
   const [connectors, setConnectors] = useState<ClientConnectorStatus[]>([]);
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
@@ -1543,6 +1558,9 @@ export default function App() {
   // Staleness in the "became verified" direction is harmless: that only happens
   // once traffic flows, and the no-traffic branch requires zero requests.
   const connectorsRef = useRef<ClientConnectorStatus[] | undefined>(undefined);
+  // A forced setup-stall alert skips the day throttle, so this keeps it to one
+  // showing per app run instead of resurrecting itself on every poll.
+  const forcedSetupStallFiredRef = useRef(false);
   const appUpdateKnownVersionRef = useRef<string | null>(null);
   const appUpdateReadyToRestartRef = useRef(false);
   const appUpdateBusyRef = useRef(false);
@@ -1597,6 +1615,7 @@ export default function App() {
   // what retires the setup-stall watchdog below.
   const savingsEverRecorded =
     dashboard.lifetimeEstimatedTokensSaved > 0 || dashboard.lifetimeEstimatedSavingsUsd > 0;
+  const forcedSetupStall = debugOverrides?.setupStall ?? null;
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;
@@ -2252,6 +2271,26 @@ export default function App() {
     optimizationBlockedRef.current = optimizationBlocked;
   }, [optimizationBlocked]);
 
+  // Test overrides (HEADROOM_FAKE_* env vars, RC builds only). Null on every
+  // shipped stable build and on any RC launched without the vars, so this
+  // resolves to "no overrides" in production.
+  useEffect(() => {
+    if (windowLabel !== "main") {
+      return;
+    }
+    let active = true;
+    void invoke<DebugOverrides>("get_debug_overrides")
+      .then((overrides) => {
+        if (active) setDebugOverrides(overrides);
+      })
+      .catch(() => {
+        // Older backend or command unavailable: behave as if unset.
+      });
+    return () => {
+      active = false;
+    };
+  }, [windowLabel]);
+
   // Setup-stall watchdog: Headroom running for a long stretch with nothing
   // saved almost always means the hookup is incomplete, not that the user was
   // idle the whole time. Runs regardless of tray visibility (the other
@@ -2259,14 +2298,24 @@ export default function App() {
   // silent while the window is closed), and stops for good once any savings
   // land. `maybeFireSetupStallAlert` owns the once-per-local-day throttle.
   useEffect(() => {
-    if (windowLabel !== "main" || savingsEverRecorded) {
+    if (windowLabel !== "main") {
+      return;
+    }
+    // Forced runs are for eyeballing the modal, so they ignore the "already
+    // earning savings" retirement that would otherwise never let it show.
+    if (!forcedSetupStall && savingsEverRecorded) {
       return;
     }
 
     let active = true;
     const check = async () => {
       const uptimeMs = Date.now() - appStartedAtMsRef.current;
-      if (uptimeMs < SETUP_STALL_EARLIEST_MS) {
+      if (!forcedSetupStall && uptimeMs < SETUP_STALL_EARLIEST_MS) {
+        return;
+      }
+      // Once per app run when forced: the alert bypasses the day throttle, so
+      // without this it would reappear on every tick after being dismissed.
+      if (forcedSetupStall && forcedSetupStallFiredRef.current) {
         return;
       }
       const latest = await loadDashboard().catch(() => null);
@@ -2277,8 +2326,12 @@ export default function App() {
       const alert = await maybeFireSetupStallAlert(latest, uptimeMs, {
         optimizationBlocked: optimizationBlockedRef.current,
         connectors: connectorsRef.current,
+        forceKind: forcedSetupStall,
       });
       if (active && alert) {
+        if (forcedSetupStall) {
+          forcedSetupStallFiredRef.current = true;
+        }
         setSetupStall(alert);
       }
     };
@@ -2292,7 +2345,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, savingsEverRecorded]);
+  }, [windowLabel, savingsEverRecorded, forcedSetupStall]);
 
   useEffect(() => {
     if (windowLabel !== "main" || !trayWindowFocused) {

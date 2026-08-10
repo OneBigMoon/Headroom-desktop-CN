@@ -32,6 +32,14 @@ const STEPS: Record<SetupStallKind, string[]> = {
   ],
 };
 
+// Shown only on the no-traffic branch, where the steps above would otherwise
+// send a Claude-desktop user chasing a stale terminal environment they don't
+// have. No detection behind it: having the desktop app installed doesn't mean
+// that's where they run Claude Code, so this is phrased as a question rather
+// than an accusation.
+const CLAUDE_DESKTOP_NOTE =
+  "Running Claude Code inside the Claude desktop app? That one can't be optimized. It doesn't use the Claude Code CLI's configuration, so its requests never pass through Headroom, and no amount of restarting will change that. Use the CLI in a terminal or the VS Code extension instead.";
+
 /// Shown when the app has been up for a while with zero savings recorded. Fires
 /// alongside a native notification (see `maybeFireSetupStallAlert`); this is the
 /// surface the user lands on when they open the tray.
@@ -54,6 +62,9 @@ export function SetupStallModal({ kind, onClose, onOpenSettings }: SetupStallMod
             <li key={step}>{step}</li>
           ))}
         </ul>
+        {kind === "no_traffic" ? (
+          <p className="setup-stall__note">{CLAUDE_DESKTOP_NOTE}</p>
+        ) : null}
         <div className="modal-actions">
           <button className="secondary-button" onClick={onClose} type="button">
             Dismiss

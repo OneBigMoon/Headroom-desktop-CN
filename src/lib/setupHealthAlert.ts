@@ -71,6 +71,11 @@ export interface SetupStallContext {
   optimizationBlocked?: boolean;
   /// Current connector status. Undefined means it hasn't loaded yet.
   connectors?: ClientConnectorStatus[];
+  /// Test override (HEADROOM_FAKE_SETUP_STALL on an RC build, see
+  /// get_debug_overrides in Rust): fire this branch immediately, ignoring
+  /// uptime, savings, connector state and the account gate. The caller is
+  /// responsible for not letting a forced alert repeat on every poll.
+  forceKind?: SetupStallKind | null;
 }
 
 /// A connector we configured that has never seen traffic come back through
@@ -94,6 +99,13 @@ export function evaluateSetupStall(
   uptimeMs: number,
   context: SetupStallContext = {}
 ): SetupStallAlert | null {
+  if (context.forceKind) {
+    return {
+      kind: context.forceKind,
+      title: STALL_TITLE,
+      body: stallBody(context.forceKind),
+    };
+  }
   if (uptimeMs < SETUP_STALL_EARLIEST_MS) {
     return null;
   }
@@ -154,11 +166,15 @@ export async function maybeFireSetupStallAlert(
     return null;
   }
 
-  const today = formatDayKey(new Date());
-  if (readDayKey() === today) {
-    return null;
+  // A forced alert bypasses the day slot entirely rather than consuming it:
+  // testing the modal must not silence the real alert for the rest of the day.
+  if (!context.forceKind) {
+    const today = formatDayKey(new Date());
+    if (readDayKey() === today) {
+      return null;
+    }
+    writeDayKey(today);
   }
-  writeDayKey(today);
 
   if (!(await isWindowVisible())) {
     try {
