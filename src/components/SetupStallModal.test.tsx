@@ -23,10 +23,10 @@ describe("SetupStallModal", () => {
     render(<SetupStallModal kind="no_traffic" onClose={vi.fn()} onOpenSettings={vi.fn()} onContact={vi.fn()} />);
 
     expect(screen.getByText(/Claude desktop app/i)).toBeInTheDocument();
-    expect(screen.getByText(/can't be optimized/i)).toBeInTheDocument();
+    expect(screen.getByText(/doesn't allow setting a proxy URL/i)).toBeInTheDocument();
     // Naming whose limitation this is is the point: without it the note reads
     // as Headroom being broken.
-    expect(screen.getByText(/design decision on Anthropic's side/i)).toBeInTheDocument();
+    expect(screen.getByText(/design decision by Anthropic/i)).toBeInTheDocument();
     // Structured rather than one paragraph: a scannable title and a separate
     // actionable line, so the way out isn't buried at the end of the prose.
     expect(
