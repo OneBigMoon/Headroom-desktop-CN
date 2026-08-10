@@ -66,9 +66,11 @@ import {
   SETUP_STALL_CHECK_INTERVAL_MS,
   SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
+  type SetupStallKind,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
 import {
+  buildSetupStallMailto,
   describeInvokeError,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
@@ -7093,6 +7095,16 @@ export default function App() {
               onOpenSettings={() => {
                 setSetupStall(null);
                 setActiveView("settings");
+              }}
+              onContact={() => {
+                void invoke("open_external_link", {
+                  url: buildSetupStallMailto(setupStall.kind, {
+                    appVersion: appSemver,
+                    lifetimeRequests: dashboard.lifetimeRequests,
+                    runtime: runtimeStatus,
+                    connectors
+                  })
+                });
               }}
             />
           )}

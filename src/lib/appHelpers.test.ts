@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildSetupStallMailto,
   describeInvokeError,
   forgoneSavingsLabel,
   getNextLowerUpgradePlanId,
@@ -13,6 +14,7 @@ import {
   recentDailySavingsUsd,
   upgradePlanIntentLabel,
 } from "./appHelpers";
+import type { ClientConnectorStatus, RuntimeStatus } from "./types";
 import type { DailySavingsPoint, IntroOffer } from "./types";
 
 const daily = (usd: number): DailySavingsPoint => ({
@@ -443,5 +445,61 @@ describe("app helpers", () => {
       expect(active?.purchaseInfo?.cancelAtPeriodEnd).toBe(false);
       expect(active?.purchaseInfo?.endsOn).toBeUndefined();
     });
+  });
+});
+
+describe("buildSetupStallMailto", () => {
+  const context = {
+    appVersion: "0.7.7-rc.6",
+    lifetimeRequests: 12,
+    runtime: {
+      installed: true,
+      running: true,
+      paused: false,
+      proxyReachable: false,
+    } as unknown as RuntimeStatus,
+    connectors: [
+      {
+        clientId: "claude_code",
+        name: "Claude Code",
+        installed: true,
+        enabled: true,
+        verified: false,
+      },
+    ] as ClientConnectorStatus[],
+  };
+
+  function decodedBody(url: string): string {
+    return decodeURIComponent(url.split("&body=")[1] ?? "");
+  }
+
+  it("addresses support and names the branch in the subject", () => {
+    const url = buildSetupStallMailto("no_savings", context);
+
+    expect(url.startsWith("mailto:support@extraheadroom.com?subject=")).toBe(true);
+    expect(decodeURIComponent(url.split("?subject=")[1].split("&body=")[0])).toBe(
+      "Headroom is not saving anything (no_savings)"
+    );
+  });
+
+  // The point of the escape hatch is that a reply doesn't open with "what
+  // version are you on, is it running, what's connected?".
+  it("carries the state that decided which branch fired", () => {
+    const body = decodedBody(buildSetupStallMailto("no_traffic", context));
+
+    expect(body).toContain("Alert: no_traffic");
+    expect(body).toContain("App version: 0.7.7-rc.6");
+    expect(body).toContain("Lifetime requests seen: 12");
+    expect(body).toContain("proxyReachable=false");
+    expect(body).toContain("Claude Code: installed=true enabled=true verified=false");
+  });
+
+  it("survives a missing runtime and an empty connector list", () => {
+    const body = decodedBody(
+      buildSetupStallMailto("no_traffic", { ...context, runtime: null, connectors: [] })
+    );
+
+    expect(body).toContain("installed=unknown");
+    expect(body).toContain("(none reported)");
   });
 });

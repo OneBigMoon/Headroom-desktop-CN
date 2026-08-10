@@ -3093,18 +3093,64 @@ details[open] .optimize-minimal__details summary::after {
 }
 
 /* Secondary caveat under the steps: relevant to a subset of users, so it sits
-   visually below the actionable list rather than competing with it. */
-/* Scoped to .modal-card so it outranks the `.modal-card p` dark-mode override,
-   which would otherwise decide this element's color by specificity. */
+   visually below the actionable list rather than competing with it. Icon rail
+   plus title / why / what-to-do, so it scans instead of reading as a wall.
+   Scoped to .modal-card so these rules outrank the `.modal-card p` dark-mode
+   override, which would otherwise decide the text color by specificity. */
 .modal-card .setup-stall__note {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 9px;
+  align-items: start;
   margin: 0;
-  padding: 8px 10px;
+  padding: 9px 11px;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
   background: var(--surface-sunken);
+}
+
+.modal-card .setup-stall__note-icon {
   color: var(--text-muted);
+  /* Optical alignment with the title's cap height. */
+  margin-top: 1px;
+}
+
+.modal-card .setup-stall__note-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.modal-card .setup-stall__note-title {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.modal-card .setup-stall__note p {
+  margin: 0;
   font-size: var(--text-xs);
   line-height: 1.45;
+  color: var(--text-muted);
+}
+
+/* The one actionable line: lifted out of the muted body so it reads as the
+   takeaway rather than more explanation. */
+.modal-card .setup-stall__note p.setup-stall__note-action {
+  color: var(--text-secondary);
+}
+
+/* Escape hatch under the note, above the buttons. Quiet by design: it is the
+   fallback once the steps have failed, not a competing call to action. */
+.modal-card p.setup-stall__contact {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.modal-card p.setup-stall__contact .link-button {
+  font-size: inherit;
 }
 
 /* Troubleshooting steps inside the "no savings yet" setup alert modal. */

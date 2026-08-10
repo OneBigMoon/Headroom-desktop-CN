@@ -1,5 +1,7 @@
 import type {
   BillingPeriod,
+  ClientConnectorStatus,
+  RuntimeStatus,
   DailySavingsPoint,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
@@ -7,6 +9,8 @@ import type {
   TierRecommendationSource,
 } from "./types";
 import { currencyExact } from "./dashboardHelpers";
+// Type-only, so this stays free of setupHealthAlert's Tauri imports at runtime.
+import type { SetupStallKind } from "./setupHealthAlert";
 
 export type PricingAudience = "individual" | "teamEnterprise";
 export type { BillingPeriod };
@@ -500,4 +504,44 @@ export function getUpgradePlans(
     ],
     featuredPlanId: "enterprise"
   };
+}
+
+/// Support mail for the setup-stall alert. Carries the state that decided which
+/// branch fired, so a reply doesn't have to start by asking for all of it.
+export function buildSetupStallMailto(
+  kind: SetupStallKind,
+  context: {
+    appVersion: string;
+    lifetimeRequests: number;
+    runtime: RuntimeStatus | null;
+    connectors: ClientConnectorStatus[];
+  }
+): string {
+  const subject = `Headroom is not saving anything (${kind})`;
+  const connectorLines = context.connectors.length
+    ? context.connectors.map(
+        (connector) =>
+          `  ${connector.name}: installed=${connector.installed} enabled=${connector.enabled} verified=${connector.verified}`
+      )
+    : ["  (none reported)"];
+  const diagnosticLines = [
+    `Alert: ${kind}`,
+    `App version: ${context.appVersion}`,
+    `Lifetime requests seen: ${context.lifetimeRequests}`,
+    `Runtime: installed=${context.runtime?.installed ?? "unknown"} running=${
+      context.runtime?.running ?? "unknown"
+    } paused=${context.runtime?.paused ?? "unknown"} proxyReachable=${
+      context.runtime?.proxyReachable ?? "unknown"
+    }`,
+    "Connectors:",
+    ...connectorLines,
+  ];
+  const body =
+    "Which coding agent are you using, and how do you launch it?\n\n\n" +
+    "---\n" +
+    "Diagnostic info (please keep):\n" +
+    diagnosticLines.join("\n");
+  return `mailto:support@extraheadroom.com?subject=${encodeURIComponent(
+    subject
+  )}&body=${encodeURIComponent(body)}`;
 }
