@@ -24,6 +24,9 @@ describe("SetupStallModal", () => {
 
     expect(screen.getByText(/Claude desktop app/i)).toBeInTheDocument();
     expect(screen.getByText(/can't be optimized/i)).toBeInTheDocument();
+    // Naming whose limitation this is is the point: without it the note reads
+    // as Headroom being broken.
+    expect(screen.getByText(/design decision on Anthropic's side/i)).toBeInTheDocument();
   });
 
   it("leaves that warning off the no-savings branch, where traffic already flows", () => {
