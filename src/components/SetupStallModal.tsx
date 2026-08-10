@@ -35,10 +35,12 @@ const STEPS: Record<SetupStallKind, string[]> = {
 // Shown only on the no-traffic branch, where the steps above would otherwise
 // send a Claude-desktop user chasing a stale terminal environment they don't
 // have. No detection behind it: having the desktop app installed doesn't mean
-// that's where they run Claude Code, so this is phrased as a question rather
-// than an accusation.
+// that's where they run Claude Code, so this opens as a question rather than
+// an accusation. It then names Anthropic as the source of the limitation,
+// because "this cannot work" without whose constraint it is reads as Headroom
+// being broken.
 const CLAUDE_DESKTOP_NOTE =
-  "Running Claude Code inside the Claude desktop app? That one can't be optimized. It doesn't use the Claude Code CLI's configuration, so its requests never pass through Headroom, and no amount of restarting will change that. Use the CLI in a terminal or the VS Code extension instead.";
+  "Running Claude Code inside the Claude desktop app? That one can't be optimized. Anthropic's desktop app doesn't use the Claude Code CLI's configuration, so its requests never pass through Headroom. That is a design decision on Anthropic's side, so no amount of restarting will change it. Use the CLI in a terminal or the VS Code extension instead.";
 
 /// Shown when the app has been up for a while with zero savings recorded. Fires
 /// alongside a native notification (see `maybeFireSetupStallAlert`); this is the

@@ -299,11 +299,15 @@ const connectorSetupDetails: Record<string, string> = {
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
 // Headroom cannot reach. Headroom routes Claude Code by pointing it at a local
-// proxy through your shell profile and ~/.claude/settings.json; the desktop
-// app's built-in Claude Code uses neither, so its requests never pass through
-// Headroom and there is no configuration that changes that.
+// proxy through your shell profile and ~/.claude/settings.json; Anthropic's
+// desktop app uses neither, so its requests never pass through Headroom.
+//
+// The copy names Anthropic as the source of the limitation, because a user who
+// is not told whose constraint it is reasonably concludes Headroom is broken.
+// It stops at attributing the decision and does not speculate about why they
+// made it, which we do not know.
 const CLAUDE_DESKTOP_LIMITATION =
-  "Claude Code inside the Claude desktop app cannot be optimized. Headroom routes Claude Code by pointing it at a local proxy via your shell profile and ~/.claude/settings.json, and the desktop app's built-in Claude Code uses neither, so its requests never reach Headroom. Run Claude Code from a terminal, or use the VS Code or JetBrains extension, and Headroom picks it up automatically.";
+  "Claude Code inside the Claude desktop app cannot be optimized. Headroom routes Claude Code by pointing it at a local proxy via your shell profile and ~/.claude/settings.json, and Anthropic's desktop app uses neither, so its requests never reach Headroom. That is a design decision on Anthropic's side and nothing Headroom can work around. Run Claude Code from a terminal, or use the VS Code or JetBrains extension, and Headroom picks it up automatically.";
 
 const connectorSupportWarnings: Record<string, string> = {
   claude_code: CLAUDE_DESKTOP_LIMITATION
@@ -323,7 +327,7 @@ const connectorUnavailableReasons: Record<string, string> = {
   // lands here, because the CLI genuinely isn't installed. Say so, or they
   // reasonably conclude Headroom is broken rather than inapplicable.
   claude_code:
-    "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized - it does not use the CLI's configuration, so Headroom never sees its requests.",
+    "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
   codex:
     "Codex was not detected. Install the Codex CLI and restart Headroom.",
   grok_build:
