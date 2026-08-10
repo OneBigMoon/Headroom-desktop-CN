@@ -68,6 +68,9 @@ const DEFAULT_UPDATER_ENDPOINT: &str =
 const BETA_CHANNEL_ENV: &str = "HEADROOM_BETA_CHANNEL";
 const BETA_CHANNEL_SENTINEL: &str = "beta_channel";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
+/// Headless revert of Headroom's edits to other tools, for package managers that
+/// can run a command before deleting the bundle. See `handle_uninstall_flag`.
+const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
@@ -3677,6 +3680,37 @@ fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
 
+/// Handle `--uninstall` and exit; return normally otherwise.
+///
+/// Exists for package managers that delete the app bundle themselves and so
+/// cannot rely on the app being alive to clean up after itself. A Homebrew cask
+/// calls this from its `uninstall script:` stanza, which runs *before* the
+/// bundle is removed.
+///
+/// Scope is deliberately narrower than the in-app "uninstall and quit": it
+/// reverts our edits to *other* tools (agent configs, shell rc blocks, hooks,
+/// MCP registrations, keychain, backup files) and leaves Headroom's own data
+/// directories alone, because a cask's `uninstall` must not destroy user data —
+/// that is what `zap` is for.
+///
+/// Quitting a *running* instance already reverts the routing layer via
+/// `clear_client_setups`, so this mainly covers the case where the app was
+/// force-killed or never launched, plus the pieces quitting does not touch.
+fn handle_uninstall_flag() {
+    if !std::env::args().any(|arg| arg == UNINSTALL_LAUNCH_ARG) {
+        return;
+    }
+
+    let removed = client_adapters::revert_external_mutations();
+    for path in &removed {
+        println!("removed {path}");
+    }
+    println!("Headroom: reverted {} item(s).", removed.len());
+    // Headroom's own data (app data dir, ~/.headroom, caches, logs, the Kompress
+    // model) is intentionally left in place; `brew zap` removes it.
+    std::process::exit(0);
+}
+
 fn exit_headroom(app: &AppHandle, source: QuitSource) {
     SHUTTING_DOWN.store(true, Ordering::Release);
     let runtime_paused = {
@@ -3726,6 +3760,10 @@ pub fn run() {
     // Initialize the panic-safe file logger after Sentry so warn!/error!
     // records flow into Sentry too. Failure here cannot abort startup.
     let _ = logging::init();
+
+    // Must come before any Tauri/state setup: this path never shows a window and
+    // never starts the proxy, it just undoes our edits to other tools and exits.
+    handle_uninstall_flag();
 
     // Raise the open-file soft limit to the hard limit. macOS launches GUI apps
     // with RLIMIT_NOFILE soft = 256, which the intercept proxy exhausts under
