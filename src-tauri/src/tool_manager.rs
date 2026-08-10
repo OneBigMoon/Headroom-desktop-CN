@@ -827,8 +827,11 @@ pub(crate) fn hf_hub_cache_dir() -> Option<PathBuf> {
         .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
         .or_else(|| var("HF_HOME").map(|home| home.join("hub")))
         .or_else(|| {
-            let cache =
-                var("XDG_CACHE_HOME").or_else(|| dirs::home_dir().map(|h| h.join(".cache")))?;
+            // `HOME` before `dirs::home_dir()`: on Windows the dirs crate reads the
+            // profile known folder and ignores `$HOME`, so a redirected home (tests,
+            // Git Bash) would resolve the sweep against the REAL profile instead.
+            let cache = var("XDG_CACHE_HOME")
+                .or_else(|| var("HOME").or_else(dirs::home_dir).map(|h| h.join(".cache")))?;
             Some(cache.join("huggingface").join("hub"))
         })
 }
