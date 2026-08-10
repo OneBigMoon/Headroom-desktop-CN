@@ -186,6 +186,44 @@ describe("evaluateSetupStall", () => {
     });
   });
 
+  describe("forceKind test override", () => {
+    it("fires immediately regardless of uptime, savings, gate or connectors", () => {
+      const healthy = stalledDashboard({
+        lifetimeEstimatedTokensSaved: 5_000_000,
+        lifetimeEstimatedSavingsUsd: 42,
+        lifetimeRequests: 900,
+      });
+      const alert = evaluateSetupStall(healthy, 0, {
+        forceKind: "no_traffic",
+        optimizationBlocked: true,
+        connectors: [],
+      });
+
+      expect(alert?.kind).toBe("no_traffic");
+    });
+
+    it("honours the requested branch", () => {
+      expect(
+        evaluateSetupStall(stalledDashboard(), 0, { forceKind: "no_savings" })?.kind
+      ).toBe("no_savings");
+    });
+
+    // Eyeballing the modal must not silence the real alert for the rest of the
+    // day, so a forced fire neither reads nor writes the throttle key.
+    it("never consumes the once-per-day slot", async () => {
+      expect(
+        await maybeFireSetupStallAlert(stalledDashboard(), 0, { forceKind: "no_traffic" })
+      ).not.toBeNull();
+      expect(
+        await maybeFireSetupStallAlert(stalledDashboard(), 0, { forceKind: "no_traffic" })
+      ).not.toBeNull();
+      expect(localStorage.setItem).not.toHaveBeenCalled();
+
+      // The genuine alert still has its slot available afterwards.
+      expect(await maybeFireSetupStallAlert(busyDashboard(), PAST_WINDOW)).not.toBeNull();
+    });
+  });
+
   describe("no_savings branch", () => {
     it("fires on request volume rather than waiting out the no-traffic clock", () => {
       const alert = evaluateSetupStall(busyDashboard(), SETUP_STALL_NO_SAVINGS_AFTER_MS);

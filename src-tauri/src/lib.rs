@@ -394,6 +394,23 @@ fn maybe_fire_onboarding_recovery_nudge(
     state: &AppState,
     dashboard: &DashboardState,
 ) {
+    // Test affordance: HEADROOM_FAKE_ONBOARDING_NUDGE=connected|disconnected
+    // fires the nudge on the next dashboard poll with the chosen copy, skipping
+    // the uptime, zero-traffic and return-launch gates. Fires once per process,
+    // because Home polls the dashboard every 5 seconds and would otherwise turn
+    // this into a notification storm, and deliberately does NOT consume the
+    // persisted one-shot flag, so testing the copy never burns a real user's
+    // only chance to see it.
+    if let Some(mode) = fake_override("HEADROOM_FAKE_ONBOARDING_NUDGE") {
+        static FORCED_NUDGE_FIRED: AtomicBool = AtomicBool::new(false);
+        if FORCED_NUDGE_FIRED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (title, body) = onboarding_recovery_copy(mode != "disconnected");
+        let _ = show_notification_impl(app, title, body, None);
+        return;
+    }
+
     static FIRST_POLLED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let first_polled_at = *FIRST_POLLED_AT.get_or_init(std::time::Instant::now);
     if first_polled_at.elapsed() < std::time::Duration::from_secs(10 * 60) {
@@ -501,6 +518,33 @@ fn format_token_count(tokens: u64) -> String {
             out.push(ch);
         }
         out.chars().rev().collect()
+    }
+}
+
+/// Trimmed, lowercased value of a `HEADROOM_FAKE_*` test override, or None when
+/// it is unset/empty or this build does not honor overrides.
+///
+/// Same enablement rule as the older fake-gate affordances: inert in stable, so
+/// only RC versions (X.Y.Z-rc.N) can be talked into faking anything, and even
+/// there only when a tester sets the var explicitly.
+fn fake_override(name: &str) -> Option<String> {
+    if !env!("CARGO_PKG_VERSION").contains("-rc") {
+        return None;
+    }
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_lowercase()),
+        _ => None,
+    }
+}
+
+/// Test overrides the frontend needs to see. Read fresh from the environment on
+/// every call rather than cached, so the value always reflects how the app was
+/// launched.
+#[tauri::command]
+fn get_debug_overrides() -> DebugOverrides {
+    DebugOverrides {
+        setup_stall: fake_override("HEADROOM_FAKE_SETUP_STALL")
+            .filter(|mode| mode == "no_traffic" || mode == "no_savings"),
     }
 }
 
@@ -2524,6 +2568,18 @@ pub struct LaunchFlags {
     pub paywall_first: bool,
 }
 
+/// Frontend-visible test overrides. Every field is None on a stable build and
+/// on any RC launched without the matching env var, so the shipped default is
+/// "no overrides" and the UI paths below stay exactly as they are in production.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugOverrides {
+    /// "no_traffic" or "no_savings" when HEADROOM_FAKE_SETUP_STALL forces the
+    /// setup-stall alert to fire immediately, ignoring uptime, savings,
+    /// connector state, the account gate and the once-per-day throttle.
+    pub setup_stall: Option<String>,
+}
+
 /// Cached launch flags. On a cold cache, performs one bounded config fetch so
 /// a fresh first launch does not miss its server bucket.
 #[tauri::command]
@@ -4100,6 +4156,7 @@ pub fn run() {
             start_headroom,
             force_restart_headroom,
             track_analytics_event,
+            get_debug_overrides,
             show_dashboard_window,
             open_headroom_dashboard,
             open_external_link,
@@ -6121,7 +6178,7 @@ mod tests {
         classify_backend_readyz, classify_bootstrap_failure, classify_upgrade_error,
         client_setup_error_kind, compute_tray_window_position, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects, extract_llm_failure_warnings,
+        empty_live_learnings_for_projects, extract_llm_failure_warnings, fake_override,
         fetch_transformations_feed_from, format_token_count, install_pending_update,
         is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
         is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
@@ -6610,6 +6667,33 @@ mod tests {
             config.endpoints[0].as_str(),
             "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"
         );
+    }
+
+    // The override is opt-in AND build-gated: a stable build must ignore the
+    // env var entirely so a shipped release can never be talked into faking a
+    // setup failure for a healthy user.
+    #[test]
+    fn fake_overrides_are_inert_unless_this_is_an_rc_build() {
+        let is_rc = env!("CARGO_PKG_VERSION").contains("-rc");
+        std::env::set_var("HEADROOM_FAKE_OVERRIDE_PROBE", "no_traffic");
+        let resolved = fake_override("HEADROOM_FAKE_OVERRIDE_PROBE");
+        std::env::remove_var("HEADROOM_FAKE_OVERRIDE_PROBE");
+
+        if is_rc {
+            assert_eq!(resolved.as_deref(), Some("no_traffic"));
+        } else {
+            assert_eq!(resolved, None, "stable builds must ignore HEADROOM_FAKE_*");
+        }
+    }
+
+    #[test]
+    fn fake_override_treats_blank_and_unset_alike() {
+        std::env::set_var("HEADROOM_FAKE_OVERRIDE_BLANK", "   ");
+        let blank = fake_override("HEADROOM_FAKE_OVERRIDE_BLANK");
+        std::env::remove_var("HEADROOM_FAKE_OVERRIDE_BLANK");
+
+        assert_eq!(blank, None);
+        assert_eq!(fake_override("HEADROOM_FAKE_OVERRIDE_NEVER_SET"), None);
     }
 
     #[test]

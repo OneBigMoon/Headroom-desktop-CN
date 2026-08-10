@@ -3092,6 +3092,21 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.4;
 }
 
+/* Secondary caveat under the steps: relevant to a subset of users, so it sits
+   visually below the actionable list rather than competing with it. */
+/* Scoped to .modal-card so it outranks the `.modal-card p` dark-mode override,
+   which would otherwise decide this element's color by specificity. */
+.modal-card .setup-stall__note {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+}
+
 /* Troubleshooting steps inside the "no savings yet" setup alert modal. */
 .setup-stall__steps {
   margin: 2px 0 4px;

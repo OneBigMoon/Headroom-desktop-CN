@@ -17,6 +17,21 @@ describe("SetupStallModal", () => {
     ).toBeInTheDocument();
   });
 
+  // The restart-your-terminal steps are actively wrong for someone whose only
+  // Claude Code is the one inside the Claude desktop app.
+  it("warns the no-traffic user about Claude Code in the Claude desktop app", () => {
+    render(<SetupStallModal kind="no_traffic" onClose={vi.fn()} onOpenSettings={vi.fn()} />);
+
+    expect(screen.getByText(/Claude desktop app/i)).toBeInTheDocument();
+    expect(screen.getByText(/can't be optimized/i)).toBeInTheDocument();
+  });
+
+  it("leaves that warning off the no-savings branch, where traffic already flows", () => {
+    render(<SetupStallModal kind="no_savings" onClose={vi.fn()} onOpenSettings={vi.fn()} />);
+
+    expect(screen.queryByText(/Claude desktop app/i)).not.toBeInTheDocument();
+  });
+
   it("points a no-savings user at the optimization controls instead", () => {
     render(<SetupStallModal kind="no_savings" onClose={vi.fn()} onOpenSettings={vi.fn()} />);
 
