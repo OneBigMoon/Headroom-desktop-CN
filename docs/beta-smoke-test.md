@@ -70,7 +70,7 @@ Timing matters either way: a `Read` result becomes part of Claude's *next* outgo
 **Claude Code subscription/OAuth traffic** (UA `claude-code/`, classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before}'
    ```
 2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
@@ -101,11 +101,11 @@ The desktop's internal proxy port (default `6768`) can be claimed by other macOS
 First, confirm the live port and verify the proxy answers there:
 ```bash
 lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
-curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
+curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
 ```
 Expect: at least one `127.0.0.1:67XX` line in the 6768-6790 range, and the curl returns `200`.
 
-Then, force a fallback. Quit Headroom, hold 6768 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. Two timing traps here. First: the quit must wait for the process to actually die — teardown takes 2s+ (`stop_headroom`'s bounded SIGTERM wait plus Codex thread retagging), and `open -a` against a still-dying instance just activates it, so nothing relaunches and the check strands with no app running (a fixed `sleep 2` loses this race; the executable is `headroom-desktop`, not `Headroom`, so poll with `pgrep -x headroom-desktop`). Second: the proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep:
+Then, force a fallback. Quit Headroom, hold 6768 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. Three timing traps here. First: the quit must wait for the process to actually die — teardown takes 2s+ (`stop_headroom`'s bounded SIGTERM wait plus Codex thread retagging), and `open -a` against a still-dying instance just activates it, so nothing relaunches and the check strands with no app running (a fixed `sleep 2` loses this race; the executable is `headroom-desktop`, not `Headroom`, so poll with `pgrep -x headroom-desktop`). Second: the proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep. Third: every curl in the poll loop needs `--max-time` — against a half-booted intercept a timeout-less curl can hang for minutes, and with the backgrounded blocker still holding the shell's stdout open, one hung curl strands the whole script past any outer timeout even after the fallback has already succeeded (observed on the 0.7.6-rc.1 pass):
 ```bash
 osascript -e 'quit app "Headroom"' 2>/dev/null
 for _ in $(seq 1 30); do pgrep -xq headroom-desktop || break; sleep 0.5; done
@@ -114,7 +114,7 @@ BLOCK_PID=$!
 sleep 1
 open -a Headroom
 for _ in $(seq 1 90); do
-  code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:6767/livez" 2>/dev/null)
+  code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:6767/livez" 2>/dev/null)
   [ "$code" = "200" ] && break
   sleep 1
 done
@@ -193,6 +193,8 @@ Every `rtk` invocation in this doc (checks 3, 7, C2, and above) has the same PAT
 ```bash
 "$HOME/Library/Application Support/Headroom/headroom/bin/rtk" proxy curl -s http://127.0.0.1:6767/stats | jq .summary
 ```
+
+When RTK is disabled (check 3's gate), the managed binary path above does not exist either — but no rewrite hook is active, so a plain `curl -s http://127.0.0.1:6767/stats | jq ...` is unfiltered and correct. Drop the `rtk proxy` wrapper entirely in that case.
 
 ## When something fails
 

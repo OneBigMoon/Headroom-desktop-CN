@@ -268,13 +268,50 @@ release already publishes a versioned URL. A `livecheck` block using
 and `auto_updates true` is accurate since the app also self-updates through its
 built-in updater between cask bumps.
 
+### The `--uninstall` flag and its release gate
+
+The app accepts a `--uninstall` flag (`handle_uninstall_flag` in `lib.rs`) that
+runs `client_adapters::revert_external_mutations()` headlessly and exits without
+showing a window. It undoes Headroom's edits to *other* tools — agent settings,
+shell rc blocks, hook scripts, MCP registrations, keychain entries, backup files,
+the LaunchAgent plist — and deliberately leaves Headroom's own directories alone,
+because a cask's `uninstall` must not delete user data (that is `zap`'s job).
+
+The cask should eventually call it:
+
+```ruby
+  uninstall script:    {
+                         executable: "#{appdir}/Headroom.app/Contents/MacOS/headroom-desktop",
+                         args:       ["--uninstall"],
+                       },
+            launchctl: "com.extraheadroom.headroom",
+            quit:      "com.extraheadroom.headroom"
+```
+
+This is safe ordering-wise: Homebrew's `ORDERED_DIRECTIVES` runs `script` after
+`quit`, and the `Uninstall` artifact sorts before `App`, so the binary still
+exists at `appdir` when the script fires.
+
+**Do not add that stanza until the cask's `version` points at a release that
+actually contains the flag.** An older binary ignores the unknown argument and
+launches the GUI instead, which would hang `brew uninstall` on a window nobody
+asked for. The flag landed after 0.7.6, so it is gated on the first release
+after that. Add the stanza in the same cask PR that bumps to that version.
+
+Until then, `quit: "com.extraheadroom.headroom"` already reverts the routing
+layer on its own, because the app's quit handler calls `clear_client_setups()` —
+verified on a clean VM: a plain `brew uninstall --cask` leaves no dead
+`ANTHROPIC_BASE_URL` and no dangling shell block or guard hook.
+
 ### Maintaining the cask
 
 The cask source at `packaging/homebrew/headroom.rb` in this repo is a
 submission template, not a maintained artifact: `scripts/bump-version.sh` only
 touches `package.json`, `tauri.conf.json`, and `Cargo.toml`, and the `sha256`
 can't be filled in until CI has built and notarized the DMG, so it goes stale
-on the next release. To ship it, open a PR against
+on the next release. Refresh both before submitting: `brew audit --cask --new
+--strict` treats a `version` that differs from what `livecheck` resolves as a
+hard failure, not a warning. To ship it, open a PR against
 [`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
 file at `Casks/h/headroom.rb`. Once merged there, the tap becomes the
 source of truth and BrewTestBot maintains `version` and `sha256` automatically

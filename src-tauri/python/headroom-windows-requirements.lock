@@ -1,9 +1,16 @@
-# Windows x86_64 (cp312) resolution of headroom-ai[all,vector]==0.32.0, 2026-08-03.
+# Windows x86_64 (cp312) resolution of headroom-ai[all]==0.32.0, 2026-08-03.
 # Platform-neutral pins (plain name==version lines) carried forward from the
-# macOS full-stack lock; every native dependency ships a win_amd64 cp312 wheel
-# (hnswlib==0.8.0, torch==2.12.1, onnxruntime, opencv-python, etc.), so the full
-# stack installs on Windows. A Windows-only resolution change belongs in this
-# file and never perturbs the macOS lock.
+# macOS full-stack lock; every native dependency here ships a win_amd64 cp312
+# wheel (torch==2.12.1, onnxruntime, opencv-python, etc.), so the full stack
+# installs on Windows. A Windows-only resolution change belongs in this file
+# and never perturbs the macOS lock.
+#
+# hnswlib is deliberately ABSENT (unlike the macOS lock's [all,vector]):
+# PyPI has no hnswlib wheel at all (sdist only), vendor-wheels-v1 carries no
+# win_amd64 build, and a source build needs MSVC — it bricked every Windows
+# bootstrap without build tools (Sentry RUST-65/66). The memory vector
+# backend AUTO-prefers sqlite-vec (win_amd64 wheel, pinned below); hnswlib is
+# an unreachable fallback. Re-add only alongside a vendored win_amd64 wheel.
 #
 # Generated on macOS 2026-08-03 as a platform-neutral full-stack resolution;
 # to be re-validated on a real Windows x86_64 host before the experimental tier
@@ -51,7 +58,6 @@ googleapis-common-protos==1.75.0
 h11==0.16.0
 h2==4.3.0
 hf-xet==1.5.1
-hnswlib==0.8.0
 hpack==4.2.0
 htmldate==1.10.0
 httpcore==1.0.9

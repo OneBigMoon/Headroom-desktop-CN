@@ -914,7 +914,16 @@ fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
     last
 }
 
-pub fn perform_full_cleanup() -> Vec<String> {
+/// Undo every edit Headroom made to *other* tools' state: agent settings, shell
+/// rc blocks, hook scripts, MCP registrations, login-keychain credentials, the
+/// backup files we left behind, and the LaunchAgent plist.
+///
+/// Deliberately leaves Headroom's own directories alone. Splitting it out this
+/// way is what lets the Homebrew cask call `--uninstall` from its `uninstall`
+/// stanza without destroying user data that belongs to `zap` — see
+/// docs/macos-release.md. Idempotent: safe to run when the app is not running,
+/// and safe to run twice.
+pub fn revert_external_mutations() -> Vec<String> {
     let mut removed: Vec<String> = Vec::new();
 
     // Reverse settings.json mutations and shell blocks for every known client.
@@ -983,6 +992,37 @@ pub fn perform_full_cleanup() -> Vec<String> {
     // failing MCP server against the deleted entrypoint.
     removed.extend(remove_headroom_mcp_entries());
 
+    // Credentials live in the login keychain, which no Homebrew cask stanza can
+    // reach, so this has to happen here rather than being left to `zap`.
+    remove_known_keychain_entries();
+
+    // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
+    // siblings created by `backup_if_exists` for every file we ever mutated.
+    // Without this, stale backups remain in ~/.claude, ~/.claude/hooks,
+    // ~/.codex, ~/Library/Application Support/Code/User, and the user's
+    // shell rc directory after uninstall.
+    for target in managed_backup_targets() {
+        removed.extend(sweep_managed_backups(&target));
+    }
+
+    // The LaunchAgent plist is an install side effect outside Headroom's own
+    // directories, so it belongs here and not with the user-data removal.
+    #[cfg(target_os = "macos")]
+    removed.extend(remove_macos_launch_agents());
+
+    removed
+}
+
+/// Full uninstall: everything `revert_external_mutations` undoes, plus every
+/// directory Headroom owns (app data, `~/.headroom`, caches, logs, preferences,
+/// the Kompress model snapshot). Used by the in-app "uninstall and quit".
+///
+/// The `--uninstall` CLI flag deliberately calls the narrower function instead:
+/// a Homebrew cask's `uninstall` must not delete user data, which is what `zap`
+/// is for.
+pub fn perform_full_cleanup() -> Vec<String> {
+    let mut removed = revert_external_mutations();
+
     // Also wipe the per-client setup-state file so a reinstall starts clean.
     let setup_state = setup_state_path();
     if setup_state.exists() {
@@ -1025,7 +1065,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
 
     #[cfg(target_os = "macos")]
     {
-        removed.extend(remove_macos_launch_agents());
+        // remove_macos_launch_agents() runs in revert_external_mutations().
         removed.extend(remove_macos_preferences());
         removed.extend(remove_macos_caches());
         removed.extend(remove_macos_logs());
@@ -1062,27 +1102,26 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
-    remove_known_keychain_entries();
+    removed
+}
 
-    // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
-    // siblings created by `backup_if_exists` for every file we ever mutated.
-    // Without this, stale backups remain in ~/.claude, ~/.claude/hooks,
-    // ~/.codex, ~/Library/Application Support/Code/User, and the user's
-    // shell rc directory after uninstall.
-    let mut backup_targets: Vec<PathBuf> = claude_settings_candidates();
-    backup_targets.push(home_dir().join(".claude.json"));
-    backup_targets.push(headroom_rtk_hook_path());
-    backup_targets.push(headroom_markitdown_hook_path());
-    backup_targets.push(claude_guard_hook_path());
-    backup_targets.push(codex_config_toml_path());
-    backup_targets.push(codex_hooks_json_path());
-    backup_targets.push(codex_guard_hook_path());
-    backup_targets.push(grok_config_toml_path());
+/// Every file Headroom has ever mutated, and therefore every file that may have
+/// a `.headroom-backup-*` / `.nommer-backup-*` sibling to sweep.
+fn managed_backup_targets() -> Vec<PathBuf> {
+    let mut targets: Vec<PathBuf> = claude_settings_candidates();
+    targets.push(home_dir().join(".claude.json"));
+    targets.push(headroom_rtk_hook_path());
+    targets.push(headroom_markitdown_hook_path());
+    targets.push(claude_guard_hook_path());
+    targets.push(codex_config_toml_path());
+    targets.push(codex_hooks_json_path());
+    targets.push(codex_guard_hook_path());
+    targets.push(grok_config_toml_path());
     // Both possible opencode config names: backups are created next to
     // whichever file was active at apply/disable time.
-    backup_targets.push(opencode_config_dir().join("opencode.json"));
-    backup_targets.push(opencode_config_dir().join("opencode.jsonc"));
-    backup_targets.push(
+    targets.push(opencode_config_dir().join("opencode.json"));
+    targets.push(opencode_config_dir().join("opencode.jsonc"));
+    targets.push(
         home_dir()
             .join("Library")
             .join("Application Support")
@@ -1090,12 +1129,8 @@ pub fn perform_full_cleanup() -> Vec<String> {
             .join("User")
             .join("settings.json"),
     );
-    backup_targets.extend(all_shell_paths());
-    for target in backup_targets {
-        removed.extend(sweep_managed_backups(&target));
-    }
-
-    removed
+    targets.extend(all_shell_paths());
+    targets
 }
 
 /// Remove sibling backup files that `backup_if_exists` (or its predecessor
@@ -7277,6 +7312,76 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             ss.contains("headroom-claude-guard.py"),
             "guard still registered on SessionStart, got:\n{settings:#}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revert_external_mutations_spares_user_data_but_full_cleanup_removes_it() {
+        // The Homebrew cask calls `--uninstall` (-> revert_external_mutations)
+        // from its `uninstall` stanza, which runs on every `brew uninstall`.
+        // Homebrew reserves user-data deletion for the opt-in `zap`, so the
+        // narrow function must undo our edits to OTHER tools while leaving
+        // Headroom's own directories intact. perform_full_cleanup (the in-app
+        // "uninstall and quit") must still remove both.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {}}"#,
+        )
+        .unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        // User data: Headroom's own directories.
+        let app_dir = super::app_data_dir();
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(app_dir.join("memory.db"), b"user data").unwrap();
+        let dot_headroom = home.path().join(".headroom");
+        fs::create_dir_all(&dot_headroom).unwrap();
+        fs::write(dot_headroom.join("keep.json"), b"user data").unwrap();
+
+        // An external mutation and a stray backup file, both of which the
+        // narrow function is responsible for.
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let stray_backup = home.path().join(".zshrc.headroom-backup-20260101000000");
+        fs::write(&stray_backup, "# old\n").unwrap();
+        assert_eq!(
+            read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:6767"),
+            "precondition: base url wired"
+        );
+
+        super::revert_external_mutations();
+
+        assert!(
+            read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].is_null(),
+            "revert should strip the routing env"
+        );
+        assert!(
+            !stray_backup.exists(),
+            "revert should sweep stray backup files"
+        );
+        assert!(
+            app_dir.join("memory.db").exists(),
+            "revert must NOT delete Headroom's app data — that belongs to `brew zap`"
+        );
+        assert!(
+            dot_headroom.join("keep.json").exists(),
+            "revert must NOT delete ~/.headroom — that belongs to `brew zap`"
+        );
+
+        super::perform_full_cleanup();
+
+        assert!(
+            !app_dir.exists(),
+            "full cleanup should remove Headroom's app data"
+        );
+        assert!(
+            !dot_headroom.exists(),
+            "full cleanup should remove ~/.headroom"
         );
     }
 

@@ -221,6 +221,21 @@ const SITECUSTOMIZE_PY: &str = r#""""Headroom Desktop injection (managed -- do n
 Registers SIGUSR1 to dump all Python thread stacks to stderr (the proxy
 log). The desktop watchdog sends SIGUSR1 before force-killing a wedged
 backend so the log shows what the event loop was stuck on.
+
+Also re-protects user-turn text from lossy compression: headroom-ai 0.34.0
+flipped the default "coding" persona to compress_user_messages=True (cache-
+mode delta compression), which exposes user-role TEXT blocks -- including
+Claude Code's <system-reminder> blocks carrying CLAUDE.md contents -- to
+Kompress. The router's tag protection is defeated there because mixed
+content is split into sections BEFORE protect_tags runs, so the reminder's
+open/close tags land in different sections and the pair never matches
+(unmatched tags protect nothing). Net effect: users' CLAUDE.md instructions
+arrive word-dropped/mangled. There is no env override -- the profile kwargs
+force the flag on and HEADROOM_COMPRESS_USER_MESSAGES can only force-enable
+-- so flip the persona field itself. tool_result blocks compress regardless
+of this flag (the role gate only guards text blocks), so the coding token
+mass is unaffected. Remove once a wheel protects tag pairs before the
+mixed-content split.
 """
 import faulthandler
 import signal
@@ -230,6 +245,23 @@ import signal
 # the watchdog controls the actual kill.
 try:
     faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
+
+# Protect user-turn text (CLAUDE.md system-reminders) from lossy Kompress:
+# flip the coding persona back to compress_user_messages=False. Guarded so
+# fallback runtimes without the persona (< 0.30.0) and half-installed venvs
+# no-op cleanly.
+try:
+    from dataclasses import replace as _hd_replace
+
+    import headroom.agent_savings as _hd_savings
+
+    _hd_coding = _hd_savings._PROFILES.get("coding")
+    if _hd_coding is not None and _hd_coding.compress_user_messages:
+        _hd_savings._PROFILES["coding"] = _hd_replace(
+            _hd_coding, compress_user_messages=False
+        )
 except Exception:
     pass
 "#;
@@ -1565,15 +1597,18 @@ impl ToolManager {
                     // returns policy_default_payg() when enforcement is off) -- a
                     // net loss on cache-billed subscription sessions.
                     .env("HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT", "enabled")
-                    // User-message text compression is intentionally left OFF
-                    // (proxy default: user turns are protected). It's a single
-                    // process-global switch with no per-provider scoping, so the
-                    // choice is on-for-both-clients or off-for-both. We keep it off
-                    // to protect the coding working set carried in user turns (code,
-                    // errors, paths the model must see verbatim) and because the
-                    // token mass is tool_results, which compress regardless — this
-                    // also matches the "coding" savings persona, which sets
-                    // compress_user_messages=False. Trade-off: gives up the modest
+                    // User-message text compression is intentionally OFF: user
+                    // turns carry the coding working set (code, errors, paths)
+                    // and Claude Code's <system-reminder> blocks (CLAUDE.md),
+                    // which the model must see verbatim; the token mass is
+                    // tool_results, which compress regardless. As of headroom-ai
+                    // 0.34.0 the "coding" persona flipped to
+                    // compress_user_messages=True and the profile kwargs force
+                    // it on per request (HEADROOM_COMPRESS_USER_MESSAGES can
+                    // only force-ENABLE, never disable), so the OFF posture is
+                    // enforced by SITECUSTOMIZE_PY flipping the persona field
+                    // back — see that constant for the mangled-CLAUDE.md bug
+                    // this prevents. Trade-off: gives up the modest
                     // Codex/OpenAI user-text savings (0.5 read-discount, 0.0
                     // write-penalty) that HEADROOM_COMPRESS_USER_MESSAGES=1 enabled.
                     // Output-token shaping (new in headroom-ai 0.27.0). The proxy
@@ -1613,10 +1648,10 @@ impl ToolManager {
                     // smart_crusher_with_compaction) with a low min_tokens so
                     // compression stays visible, and target_ratio unset so savings
                     // emerge from lossless + relevance rather than a forced keep.
-                    // The persona also sets compress_user_messages=False (avoids
-                    // prompt mutation / prefix-cache busting); this now applies
-                    // cleanly since we no longer force HEADROOM_COMPRESS_USER_MESSAGES
-                    // on, so user turns stay protected as the persona intends.
+                    // The persona set compress_user_messages=False through
+                    // 0.33.x; 0.34.0 flipped it to True, so user-turn
+                    // protection is now restored by the SITECUSTOMIZE_PY
+                    // persona patch (see that constant).
                     // Version-gated: "coding" only exists in _PROFILES from 0.30.0.
                     // When 0.30.0 boot-validation times out the app falls back to
                     // 0.28.0, whose profile set is {agent-90, balanced} only —
@@ -6966,9 +7001,11 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
         // headroom-ai[all] stack pulls optional native packages like hnswlib
         // that fail on many fresh Linux systems.
         "linux" => HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        // Windows uses the full stack: every optional native package ships a
-        // win_amd64 wheel. The pin set is its own file so a Windows-only
-        // resolution change never perturbs the macOS lock.
+        // Windows uses the full stack minus hnswlib (sdist-only on PyPI, no
+        // vendored win_amd64 wheel; a source build needs MSVC and bricked
+        // bootstrap — RUST-65/66). sqlite-vec covers the vector backend. The
+        // pin set is its own file so a Windows-only resolution change never
+        // perturbs the macOS lock.
         "windows" => HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
         _ => HEADROOM_REQUIREMENTS_LOCK,
     }
@@ -7804,6 +7841,17 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_reprotects_user_turn_text_from_lossy_compression() {
+        // headroom-ai 0.34.0's coding persona compresses user-role text
+        // blocks, which mangles CLAUDE.md system-reminders (no env can
+        // disable it). The injection must flip the persona field back.
+        assert!(super::SITECUSTOMIZE_PY.contains("compress_user_messages=False"));
+        assert!(super::SITECUSTOMIZE_PY.contains(r#"_PROFILES.get("coding")"#));
+        // Must stay guarded: fallback runtimes (< 0.30.0) lack the persona.
+        assert!(super::SITECUSTOMIZE_PY.contains("except Exception:"));
+    }
+
+    #[test]
     fn pre_upstream_concurrency_stays_within_bounds() {
         let value = pre_upstream_concurrency();
         assert!((8..=32).contains(&value), "got {value}");
@@ -8096,6 +8144,10 @@ mod tests {
             bootstrap_requirements_lock_for_target("macos"),
             HEADROOM_REQUIREMENTS_LOCK
         );
+        // hnswlib is sdist-only on PyPI with no vendored win_amd64 wheel; a
+        // pin here bricks bootstrap on any Windows box without MSVC (RUST-65).
+        assert!(!HEADROOM_WINDOWS_REQUIREMENTS_LOCK.contains("hnswlib=="));
+        assert!(HEADROOM_WINDOWS_REQUIREMENTS_LOCK.contains("sqlite-vec=="));
     }
 
     #[test]
