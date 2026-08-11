@@ -101,6 +101,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
+  billableInputSavingsRate,
   cacheHitPair,
   compactNumber,
   connectorDashboardStatus,
@@ -119,7 +120,6 @@ import {
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
-  savingsRate,
   sortClientConnectors,
   startOfDay,
   startOfMonth,
@@ -836,9 +836,19 @@ function DailySavingsChart({
   }, []);
   const firstSavingsMonth = earliestSavingsMonth(data);
   const firstHourlyDay = earliestHourlyDay(hourlyData);
-  const monthlyData = buildMonthlySavingsChartData(buildMonthlySavingsWindow(data, visibleMonth));
-  const hourlyChartData = buildHourlySavingsChartData(buildHourlySavingsWindow(hourlyData, visibleDay));
+  const monthlyWindow = buildMonthlySavingsWindow(data, visibleMonth);
+  const hourlyWindow = buildHourlySavingsWindow(hourlyData, visibleDay);
+  const monthlyData = buildMonthlySavingsChartData(monthlyWindow);
+  const hourlyChartData = buildHourlySavingsChartData(hourlyWindow);
   const chartData = view === "month" ? monthlyData : hourlyChartData;
+  // Canonical rate under the headline: input compression as a share of the
+  // BILLABLE input for the visible window, in the active unit. Output shaping
+  // stays out of every percentage (it keeps its own measured reduction chip);
+  // cache reads stay out of the denominator (~0.1x, deliberately untouched).
+  const billableRate = billableInputSavingsRate(
+    view === "month" ? monthlyWindow : hourlyWindow,
+    chartMode
+  );
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -856,11 +866,6 @@ function DailySavingsChart({
         : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
       : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
-  const chartSpent = chartData.reduce(
-    (s, d) => s + (chartMode === "usd" ? d.actualCostUsd : d.totalTokensSent),
-    0
-  );
-  const chartSavingsRate = savingsRate(chartSaved, chartSpent);
 
   useEffect(() => {
     const now = new Date();
@@ -948,22 +953,22 @@ function DailySavingsChart({
           <div className="savings-chart__overlay" aria-hidden="true">
             <span className="savings-chart__overlay-total">
               {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
-              {chartSavingsRate !== null && (
-                // Denominator is savings + input spend. Output spend is not in
-                // the backend's rollups at all, so the rate is explicitly a
-                // share of input cost rather than of the whole bill.
-                <span
-                  className="savings-chart__overlay-rate"
-                  title={`${chartSavingsRate}% of what this ${view === "day" ? "day" : "month"}'s input would have cost without Headroom`}
-                >
-                  {" "}
-                  ({chartSavingsRate}%)
-                </span>
-              )}
             </span>
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
+            {billableRate !== null && (
+              <span
+                className="savings-chart__overlay-rate"
+                title={`Input compression removed ${Math.round(billableRate)}% of this ${
+                  view === "day" ? "day" : "month"
+                }'s billable input${
+                  chartMode === "usd" ? " cost" : " tokens"
+                }. Cache reads (~10% of the input price, deliberately left intact) are excluded; output shaping is measured separately.`}
+              >
+                {Math.round(billableRate)}% of billable input removed
+              </span>
+            )}
           </div>
           <ResponsiveContainer height="100%" width="100%">
             <BarChart
@@ -6974,10 +6979,11 @@ export default function App() {
                   <div className="runtime-status__meta">
                     <span className="runtime-status__section-title">
                       Headroom CLI ({headroomVersion})
-                      {headroomLifetimeSavingsPct !== null ? (
+                      {(compressionOfRestPct ?? headroomLifetimeSavingsPct) !== null ? (
                         <span className="runtime-status__section-context">
                           {" "}
-                          ({percent1(headroomLifetimeSavingsPct)}% all-time savings)
+                          ({percent1((compressionOfRestPct ?? headroomLifetimeSavingsPct)!)}% of
+                          billable input removed all-time)
                         </span>
                       ) : null}
                     </span>

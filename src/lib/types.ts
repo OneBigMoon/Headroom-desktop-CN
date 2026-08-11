@@ -73,6 +73,9 @@ export interface DailySavingsPoint {
   // raw history checkpoints. Null/absent for local-tracker buckets and days
   // that aged out of history retention.
   cacheReadTokens?: number | null;
+  // The provider read discount earned in the bucket, same coverage as
+  // cacheReadTokens. Actual read cost = this / 9 (reads bill at ~0.1x).
+  cacheSavingsUsd?: number | null;
 }
 
 // Counterfactual output-token reduction from the proxy's output shaper.
@@ -130,6 +133,7 @@ export interface HourlySavingsPoint {
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
   cacheReadTokens?: number | null;
+  cacheSavingsUsd?: number | null;
   byProvider: ProviderSavingsPoint[];
 }
 

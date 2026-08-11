@@ -107,6 +107,46 @@ export function cacheHitPair(
   return { hitPct, compressedPct };
 }
 
+/** Canonical input-compression rate for a window of buckets: the share of the
+ * BILLABLE input Headroom removed, in the requested unit. Cache reads are
+ * excluded from the denominator (they bill at ~0.1x and Headroom deliberately
+ * never touches the cached prefix); output shaping is never part of this rate.
+ *
+ * `usd` mode prices both sides with the provider's own figures: read cost is
+ * recovered from the read discount (`cacheSavingsUsd / 9`) and subtracted
+ * from the bucket's actual input cost. Only buckets with cache coverage
+ * count, so numerator and denominator always describe the same slice; null
+ * when the window has no coverage. */
+export function billableInputSavingsRate(
+  points: Array<{
+    cacheReadTokens?: number | null;
+    cacheSavingsUsd?: number | null;
+    totalTokensSent: number;
+    estimatedTokensSaved: number;
+    actualCostUsd: number;
+    estimatedSavingsUsd: number;
+  }>,
+  mode: "usd" | "tokens"
+) {
+  let saved = 0;
+  let billable = 0;
+  for (const point of points) {
+    if (point.cacheReadTokens == null) continue;
+    if (mode === "tokens") {
+      saved += Math.max(0, point.estimatedTokensSaved);
+      billable += Math.max(0, point.totalTokensSent - point.cacheReadTokens);
+    } else {
+      if (point.cacheSavingsUsd == null) continue;
+      const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
+      saved += Math.max(0, point.estimatedSavingsUsd);
+      billable += Math.max(0, point.actualCostUsd - readCostUsd);
+    }
+  }
+  const baseline = saved + billable;
+  if (baseline <= 0) return null;
+  return Math.min(100, (saved / baseline) * 100);
+}
+
 export function formatDayLabel(dayKey: string) {
   const parsed = new Date(`${dayKey}T00:00:00`);
   if (Number.isNaN(parsed.getTime())) {

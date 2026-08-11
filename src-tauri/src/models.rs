@@ -197,6 +197,10 @@ pub struct DailySavingsPoint {
     /// backend's history retention.
     #[serde(default)]
     pub cache_read_tokens: Option<u64>,
+    /// The provider read discount earned in the bucket, same derivation and
+    /// coverage as `cache_read_tokens`. Actual read cost = this / 9.
+    #[serde(default)]
+    pub cache_savings_usd: Option<f64>,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly
@@ -229,6 +233,8 @@ pub struct HourlySavingsPoint {
     /// See `DailySavingsPoint::cache_read_tokens`.
     #[serde(default)]
     pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_savings_usd: Option<f64>,
     #[serde(default)]
     pub by_provider: Vec<ProviderSavingsPoint>,
 }

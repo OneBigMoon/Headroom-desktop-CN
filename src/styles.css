@@ -2370,8 +2370,11 @@ select {
   line-height: 1.2;
 }
 
+/* Canonical input-compression rate, on its own line under the saved total.
+   Tokens only, so dark mode needs no override. */
 .savings-chart__overlay-rate {
-  font-size: 0.85em;
+  display: block;
+  font-size: var(--text-xs);
   font-weight: 600;
   color: var(--text-muted);
 }
