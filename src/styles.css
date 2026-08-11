@@ -2382,17 +2382,6 @@ select {
   pointer-events: auto;
 }
 
-.savings-chart__rate-chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 8px;
-  border-radius: 999px;
-  border: 1px solid var(--border-subtle);
-  background: var(--surface-sunken);
-  color: var(--text-secondary);
-  font-size: var(--text-xs);
-  font-weight: 600;
-}
 
 .savings-chart__overlay-label {
   font-size: 0.7rem;

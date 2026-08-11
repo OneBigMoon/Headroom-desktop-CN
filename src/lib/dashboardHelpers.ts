@@ -144,7 +144,7 @@ export function billableInputSavingsRate(
   }
   const baseline = saved + billable;
   if (baseline <= 0) return null;
-  return Math.min(100, (saved / baseline) * 100);
+  return { pct: Math.min(100, (saved / baseline) * 100), saved, billable };
 }
 
 /** Output-shaper reduction over a window of buckets, from the locally-sampled
@@ -164,7 +164,7 @@ export function outputReductionForWindow(
     baseline += Math.max(0, point.outputBaselineTokens);
   }
   if (baseline <= 0) return null;
-  return Math.min(100, (saved / baseline) * 100);
+  return { pct: Math.min(100, (saved / baseline) * 100), savedTokens: saved, baselineTokens: baseline };
 }
 
 export function formatDayLabel(dayKey: string) {

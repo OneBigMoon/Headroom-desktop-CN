@@ -734,6 +734,85 @@ type SavingsChartMode = "usd" | "tokens";
 // output savings are counterfactual. Caller renders this only when `reduction`
 // is present (the backend returns null until a verbosity baseline is seeded).
 // The parent card is itself clickable, so the trigger stops event propagation.
+function WindowRateChip({
+  label,
+  dot,
+  title,
+  badge,
+  value,
+  rows,
+  note
+}: {
+  label: string;
+  dot?: boolean;
+  title: string;
+  badge: string;
+  value: string;
+  rows: Array<{ dt: string; dd: string }>;
+  note: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: Event) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: Event) => {
+      if ((e as KeyboardEvent).key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="output-chip" ref={ref}>
+      <button
+        type="button"
+        className={`output-chip__button${open ? " is-open" : ""}`}
+        aria-expanded={open}
+        aria-label={`${title} details`}
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        onKeyDown={(e) => e.stopPropagation()}
+      >
+        {dot ? <span className="output-chip__dot" aria-hidden="true" /> : null}
+        {label}
+      </button>
+      {open ? (
+        <div
+          className="output-chip__popover"
+          role="dialog"
+          aria-label={`${title} details`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="output-chip__pop-head">
+            <span className="output-chip__pop-title">{title}</span>
+            <span className="output-chip__pop-badge">{badge}</span>
+          </div>
+          <div className="output-chip__pop-value">{value}</div>
+          <dl className="output-chip__pop-stats">
+            {rows.map((row) => (
+              <div key={row.dt}>
+                <dt>{row.dt}</dt>
+                <dd>{row.dd}</dd>
+              </div>
+            ))}
+          </dl>
+          <p className="output-chip__pop-note">{note}</p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function OutputReductionChip({ reduction }: { reduction: OutputReduction }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -856,7 +935,7 @@ function DailySavingsChart({
   // back to the all-time estimator chip only when the window includes now —
   // a historical window with no samples shows no output figure rather than
   // an all-time number masquerading as that period's.
-  const windowOutputPct = outputReductionForWindow(
+  const windowOutput = outputReductionForWindow(
     view === "month" ? monthlyWindow : hourlyWindow
   );
   const windowIncludesToday =
@@ -972,30 +1051,54 @@ function DailySavingsChart({
               {view === "day" ? "saved today" : "saved this month"}
             </span>
             {billableRate !== null ||
-            windowOutputPct !== null ||
+            windowOutput !== null ||
             (windowIncludesToday && outputReduction) ? (
               <span className="savings-chart__overlay-chips">
                 {billableRate !== null && (
-                  <span
-                    className="savings-chart__rate-chip"
-                    title={`Input compression removed ${Math.round(billableRate)}% of this ${
+                  <WindowRateChip
+                    label={`Input −${Math.round(billableRate.pct)}%`}
+                    title="Input compression"
+                    badge="measured"
+                    value={`${Math.round(billableRate.pct)}%`}
+                    rows={[
+                      {
+                        dt: "Removed",
+                        dd:
+                          chartMode === "usd"
+                            ? currency(billableRate.saved)
+                            : compactNumber(billableRate.saved)
+                      },
+                      {
+                        dt: "Billable input",
+                        dd:
+                          chartMode === "usd"
+                            ? currency(billableRate.saved + billableRate.billable)
+                            : compactNumber(billableRate.saved + billableRate.billable)
+                      }
+                    ]}
+                    note={`Share of this ${
                       view === "day" ? "day" : "month"
-                    }'s billable input${
-                      chartMode === "usd" ? " cost" : " tokens"
-                    }. Cache reads (~10% of the input price, which Headroom deliberately leaves intact) are excluded from the baseline.`}
-                  >
-                    Input −{Math.round(billableRate)}%
-                  </span>
+                    }'s billable input removed by compression. Cache reads (~10% of the input price, which Headroom deliberately leaves intact) are excluded from the baseline.`}
+                  />
                 )}
-                {windowOutputPct !== null ? (
-                  <span
-                    className="savings-chart__rate-chip"
-                    title={`Output shaping avoided ${Math.round(windowOutputPct)}% of the output tokens the model would otherwise have emitted this ${
+                {windowOutput !== null ? (
+                  <WindowRateChip
+                    dot
+                    label={`Output −${Math.round(windowOutput.pct)}%`}
+                    title="Output token reduction"
+                    badge="estimated"
+                    value={`${Math.round(windowOutput.pct)}%`}
+                    rows={[
+                      { dt: "Avoided", dd: compactNumber(windowOutput.savedTokens) },
+                      { dt: "Baseline", dd: compactNumber(windowOutput.baselineTokens) },
+                      ...(outputReduction
+                        ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
+                        : [])
+                    ]}
+                    note={`Output tokens the model didn't emit this ${
                       view === "day" ? "day" : "month"
-                    }, sampled from the shaper's own baseline estimator while the app was running. Counterfactual estimate, not a measured diff.`}
-                  >
-                    Output −{Math.round(windowOutputPct)}%
-                  </span>
+                    }, vs the shaper's learned baseline — sampled while the app was running, so short or partial coverage can sit far from the all-time rate. Counterfactual estimate, not a measured diff.`}
+                  />
                 ) : windowIncludesToday && outputReduction ? (
                   <OutputReductionChip reduction={outputReduction} />
                 ) : null}

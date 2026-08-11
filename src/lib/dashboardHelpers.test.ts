@@ -376,24 +376,24 @@ describe("billableInputSavingsRate", () => {
 
   it("tokens mode: saved vs non-cached input", () => {
     // 25 / (25 + (1000 - 900))
-    expect(billableInputSavingsRate([bucket], "tokens")).toBeCloseTo(20);
+    expect(billableInputSavingsRate([bucket], "tokens")!.pct).toBeCloseTo(20);
   });
 
   it("usd mode: prices reads via the discount and excludes them", () => {
     // 0.5 / (0.5 + (3 - 9/9))
-    expect(billableInputSavingsRate([bucket], "usd")).toBeCloseTo(20);
+    expect(billableInputSavingsRate([bucket], "usd")!.pct).toBeCloseTo(20);
   });
 
   it("skips buckets without coverage in both modes", () => {
     const uncovered = { ...bucket, cacheReadTokens: null, cacheSavingsUsd: null };
     expect(billableInputSavingsRate([uncovered], "tokens")).toBeNull();
     expect(billableInputSavingsRate([uncovered], "usd")).toBeNull();
-    expect(billableInputSavingsRate([bucket, uncovered], "tokens")).toBeCloseTo(20);
+    expect(billableInputSavingsRate([bucket, uncovered], "tokens")!.pct).toBeCloseTo(20);
   });
 
   it("usd mode requires the dollar counter, tokens mode does not", () => {
     const tokensOnly = { ...bucket, cacheSavingsUsd: null };
-    expect(billableInputSavingsRate([tokensOnly], "tokens")).toBeCloseTo(20);
+    expect(billableInputSavingsRate([tokensOnly], "tokens")!.pct).toBeCloseTo(20);
     expect(billableInputSavingsRate([tokensOnly], "usd")).toBeNull();
   });
 });
@@ -405,7 +405,7 @@ describe("outputReductionForWindow", () => {
       { outputSampledTokensSaved: null, outputBaselineTokens: null },
       { outputSampledTokensSaved: 100, outputBaselineTokens: 1000 }
     ]);
-    expect(pct).toBeCloseTo(20);
+    expect(pct!.pct).toBeCloseTo(20);
   });
 
   it("returns null without coverage or baseline", () => {
