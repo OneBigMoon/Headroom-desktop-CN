@@ -201,6 +201,15 @@ pub struct DailySavingsPoint {
     /// coverage as `cache_read_tokens`. Actual read cost = this / 9.
     #[serde(default)]
     pub cache_savings_usd: Option<f64>,
+    /// Locally-sampled output-shaper deltas for the bucket (poll-over-poll
+    /// diffs of the estimator's durable cumulative counters, attributed to the
+    /// sampling moment). None for buckets without samples: periods before this
+    /// build, or while the app wasn't running. Window reduction = saved /
+    /// baseline over the covered buckets.
+    #[serde(default)]
+    pub output_sampled_tokens_saved: Option<u64>,
+    #[serde(default)]
+    pub output_baseline_tokens: Option<u64>,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly
@@ -235,6 +244,11 @@ pub struct HourlySavingsPoint {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_savings_usd: Option<f64>,
+    /// See `DailySavingsPoint::output_sampled_tokens_saved`.
+    #[serde(default)]
+    pub output_sampled_tokens_saved: Option<u64>,
+    #[serde(default)]
+    pub output_baseline_tokens: Option<u64>,
     #[serde(default)]
     pub by_provider: Vec<ProviderSavingsPoint>,
 }

@@ -76,6 +76,11 @@ export interface DailySavingsPoint {
   // The provider read discount earned in the bucket, same coverage as
   // cacheReadTokens. Actual read cost = this / 9 (reads bill at ~0.1x).
   cacheSavingsUsd?: number | null;
+  // Locally-sampled output-shaper deltas (saved / baseline) for the bucket.
+  // Null/absent for periods before this build or while the app wasn't
+  // running. Window reduction = saved / baseline over covered buckets.
+  outputSampledTokensSaved?: number | null;
+  outputBaselineTokens?: number | null;
 }
 
 // Counterfactual output-token reduction from the proxy's output shaper.
@@ -134,6 +139,8 @@ export interface HourlySavingsPoint {
   outputTokensSaved?: number;
   cacheReadTokens?: number | null;
   cacheSavingsUsd?: number | null;
+  outputSampledTokensSaved?: number | null;
+  outputBaselineTokens?: number | null;
   byProvider: ProviderSavingsPoint[];
 }
 

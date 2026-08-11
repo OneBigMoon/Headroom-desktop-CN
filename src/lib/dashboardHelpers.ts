@@ -147,6 +147,26 @@ export function billableInputSavingsRate(
   return Math.min(100, (saved / baseline) * 100);
 }
 
+/** Output-shaper reduction over a window of buckets, from the locally-sampled
+ * saved/baseline deltas. Only buckets with samples count; null when the window
+ * has no coverage or the sampled baseline is zero. */
+export function outputReductionForWindow(
+  points: Array<{
+    outputSampledTokensSaved?: number | null;
+    outputBaselineTokens?: number | null;
+  }>
+) {
+  let saved = 0;
+  let baseline = 0;
+  for (const point of points) {
+    if (point.outputSampledTokensSaved == null || point.outputBaselineTokens == null) continue;
+    saved += Math.max(0, point.outputSampledTokensSaved);
+    baseline += Math.max(0, point.outputBaselineTokens);
+  }
+  if (baseline <= 0) return null;
+  return Math.min(100, (saved / baseline) * 100);
+}
+
 export function formatDayLabel(dayKey: string) {
   const parsed = new Date(`${dayKey}T00:00:00`);
   if (Number.isNaN(parsed.getTime())) {

@@ -103,6 +103,7 @@ import {
   buildMonthlySavingsWindow,
   billableInputSavingsRate,
   cacheHitPair,
+  outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
   currency,
@@ -851,6 +852,17 @@ function DailySavingsChart({
     view === "month" ? monthlyWindow : hourlyWindow,
     chartMode
   );
+  // Window-scoped output reduction from the locally-sampled series. Falls
+  // back to the all-time estimator chip only when the window includes now —
+  // a historical window with no samples shows no output figure rather than
+  // an all-time number masquerading as that period's.
+  const windowOutputPct = outputReductionForWindow(
+    view === "month" ? monthlyWindow : hourlyWindow
+  );
+  const windowIncludesToday =
+    view === "month"
+      ? visibleMonth.getTime() === currentMonth.getTime()
+      : visibleDay.getTime() === today.getTime();
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -959,7 +971,9 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {billableRate !== null || outputReduction ? (
+            {billableRate !== null ||
+            windowOutputPct !== null ||
+            (windowIncludesToday && outputReduction) ? (
               <span className="savings-chart__overlay-chips">
                 {billableRate !== null && (
                   <span
@@ -973,7 +987,18 @@ function DailySavingsChart({
                     Input −{Math.round(billableRate)}%
                   </span>
                 )}
-                {outputReduction ? <OutputReductionChip reduction={outputReduction} /> : null}
+                {windowOutputPct !== null ? (
+                  <span
+                    className="savings-chart__rate-chip"
+                    title={`Output shaping avoided ${Math.round(windowOutputPct)}% of the output tokens the model would otherwise have emitted this ${
+                      view === "day" ? "day" : "month"
+                    }, sampled from the shaper's own baseline estimator while the app was running. Counterfactual estimate, not a measured diff.`}
+                  >
+                    Output −{Math.round(windowOutputPct)}%
+                  </span>
+                ) : windowIncludesToday && outputReduction ? (
+                  <OutputReductionChip reduction={outputReduction} />
+                ) : null}
               </span>
             ) : null}
           </div>

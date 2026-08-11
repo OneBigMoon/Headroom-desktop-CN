@@ -7,6 +7,7 @@ import {
   buildMonthlySavingsWindow,
   billableInputSavingsRate,
   cacheHitPair,
+  outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
   currency,
@@ -394,5 +395,23 @@ describe("billableInputSavingsRate", () => {
     const tokensOnly = { ...bucket, cacheSavingsUsd: null };
     expect(billableInputSavingsRate([tokensOnly], "tokens")).toBeCloseTo(20);
     expect(billableInputSavingsRate([tokensOnly], "usd")).toBeNull();
+  });
+});
+
+describe("outputReductionForWindow", () => {
+  it("computes reduction over sampled buckets only", () => {
+    const pct = outputReductionForWindow([
+      { outputSampledTokensSaved: 300, outputBaselineTokens: 1000 },
+      { outputSampledTokensSaved: null, outputBaselineTokens: null },
+      { outputSampledTokensSaved: 100, outputBaselineTokens: 1000 }
+    ]);
+    expect(pct).toBeCloseTo(20);
+  });
+
+  it("returns null without coverage or baseline", () => {
+    expect(outputReductionForWindow([{}])).toBeNull();
+    expect(
+      outputReductionForWindow([{ outputSampledTokensSaved: 0, outputBaselineTokens: 0 }])
+    ).toBeNull();
   });
 });

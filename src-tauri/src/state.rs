@@ -2356,6 +2356,26 @@ impl AppState {
             hourly_savings = merge_hourly_savings(hourly_savings, native_hourly, &cutoff_hour);
         }
 
+        // Overlay the locally-sampled output series onto the merged points.
+        // Neither merge source carries it: backend rollups have no baseline
+        // dimension and tracker buckets predate the sampler. Daily joins on
+        // UTC date keys, hourly on local hour keys — matching each list.
+        {
+            let tracker = self.savings_tracker.lock();
+            for point in daily_savings.iter_mut() {
+                if let Some(sample) = tracker.output_daily_samples.get(&point.date) {
+                    point.output_sampled_tokens_saved = Some(sample.saved_tokens);
+                    point.output_baseline_tokens = Some(sample.baseline_tokens);
+                }
+            }
+            for point in hourly_savings.iter_mut() {
+                if let Some(sample) = tracker.output_hourly_samples.get(&point.hour) {
+                    point.output_sampled_tokens_saved = Some(sample.saved_tokens);
+                    point.output_baseline_tokens = Some(sample.baseline_tokens);
+                }
+            }
+        }
+
         let (launch_experience, accepted_terms_version) = {
             let profile = self.launch_profile.lock();
             (
@@ -3993,6 +4013,17 @@ struct DailySavingsBucket {
     output_tokens_saved: u64,
 }
 
+/// One bucket of the locally-sampled output-shaper series: poll-over-poll
+/// deltas of the estimator's durable cumulative `tokens_saved` and
+/// `baseline_tokens`. The backend's rollups carry no per-bucket baseline, so
+/// this local series is the only source of a window-scoped output reduction.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+struct OutputSampleBucket {
+    saved_tokens: u64,
+    baseline_tokens: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct PersistedSavingsState {
@@ -4026,6 +4057,11 @@ struct PersistedSavingsState {
     session_hourly_buckets: BTreeMap<String, DailySavingsBucket>,
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
+    /// Locally-sampled output-shaper deltas. Daily keys are UTC dates (they
+    /// join onto the backend's UTC-bucketed daily rollups); hourly keys are
+    /// local (`local_hour_key`, joining the local-keyed hourly points).
+    output_daily_samples: BTreeMap<String, OutputSampleBucket>,
+    output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
 }
 
 struct SavingsTracker {
@@ -4056,6 +4092,14 @@ struct SavingsTracker {
     session_hourly_buckets: BTreeMap<String, DailySavingsBucket>,
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
+    /// See `PersistedSavingsState::output_daily_samples`.
+    output_daily_samples: BTreeMap<String, OutputSampleBucket>,
+    output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// Last raw (tokens_saved, baseline_tokens) reading of the shaper's
+    /// durable estimator. Not persisted, same rationale as
+    /// `tool_schema_process_total`: the first post-launch reading seeds a
+    /// baseline, never a delta, and a reading below the watermark reseeds.
+    output_sample_watermark: Option<(u64, u64)>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -4156,6 +4200,13 @@ impl SavingsTracker {
             hourly_savings: persisted_state
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
+            output_daily_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| state.output_daily_samples.clone()),
+            output_hourly_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| state.output_hourly_samples.clone()),
+            output_sample_watermark: None,
             last_written_at: None,
         };
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
@@ -4222,6 +4273,9 @@ impl SavingsTracker {
                 // The local tracker has no cache dimension.
                 cache_read_tokens: None,
                 cache_savings_usd: None,
+                // Filled by the sampler overlay in build_dashboard.
+                output_sampled_tokens_saved: None,
+                output_baseline_tokens: None,
             })
             .collect()
     }
@@ -4239,6 +4293,8 @@ impl SavingsTracker {
                 output_tokens_saved: bucket.output_tokens_saved,
                 cache_read_tokens: None,
                 cache_savings_usd: None,
+                output_sampled_tokens_saved: None,
+                output_baseline_tokens: None,
                 // The local pre-cutoff tracker has no provider dimension.
                 by_provider: Vec::new(),
             })
@@ -4358,6 +4414,7 @@ impl SavingsTracker {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
         }
+        self.sample_output_reduction(stats);
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -4773,6 +4830,45 @@ impl SavingsTracker {
         Ok(())
     }
 
+    /// Bucket the poll-over-poll delta of the output shaper's durable
+    /// cumulative counters into the local day/hour sample maps. Between polls
+    /// several requests may land; the whole gap is attributed to the sampling
+    /// moment (same tradeoff as `session_new_input_history`). A reading below
+    /// the watermark means the estimator state was rebuilt — reseed without
+    /// emitting a delta, so a reset can only lose a sample, never inflate one.
+    fn sample_output_reduction(&mut self, stats: &HeadroomDashboardStats) {
+        let Some(reduction) = stats.output_reduction.as_ref() else {
+            return;
+        };
+        let current = (reduction.tokens_saved, reduction.baseline_tokens);
+        let previous = self.output_sample_watermark.replace(current);
+        let Some((prev_saved, prev_baseline)) = previous else {
+            return;
+        };
+        if current.0 < prev_saved || current.1 < prev_baseline {
+            return;
+        }
+        let delta_saved = current.0 - prev_saved;
+        let delta_baseline = current.1 - prev_baseline;
+        if delta_saved == 0 && delta_baseline == 0 {
+            return;
+        }
+        let now_utc = Utc::now();
+        let now_local = now_utc.with_timezone(&Local);
+        // Daily keys are UTC to join the backend's UTC-bucketed daily rollups;
+        // hourly keys are local to join the local-keyed hourly points.
+        let day_key = now_utc.format("%Y-%m-%d").to_string();
+        let hour_key = local_hour_key(now_local);
+        for (map, key) in [
+            (&mut self.output_daily_samples, day_key),
+            (&mut self.output_hourly_samples, hour_key),
+        ] {
+            let entry = map.entry(key).or_default();
+            entry.saved_tokens += delta_saved;
+            entry.baseline_tokens += delta_baseline;
+        }
+    }
+
     fn persisted_state(&self) -> PersistedSavingsState {
         PersistedSavingsState {
             schema_version: 3,
@@ -4790,6 +4886,8 @@ impl SavingsTracker {
             session_hourly_buckets: self.session_hourly_buckets.clone(),
             daily_savings: self.daily_savings.clone(),
             hourly_savings: self.hourly_savings.clone(),
+            output_daily_samples: self.output_daily_samples.clone(),
+            output_hourly_samples: self.output_hourly_samples.clone(),
         }
     }
 
@@ -4820,6 +4918,8 @@ impl SavingsTracker {
         self.hourly_savings
             .retain(|key, _| key.as_str() >= cutoff.as_str());
         self.session_hourly_buckets
+            .retain(|key, _| key.as_str() >= cutoff.as_str());
+        self.output_hourly_samples
             .retain(|key, _| key.as_str() >= cutoff.as_str());
     }
 
@@ -5062,6 +5162,10 @@ struct OutputReduction {
     /// backend restarts and covers every request since the baseline was seeded,
     /// including the period before the rollups carried the layer at all.
     tokens_saved: u64,
+    /// The estimator's durable cumulative baseline (what the model would have
+    /// emitted unshaped). Sampled poll-over-poll by the tracker to build the
+    /// per-bucket output series; never surfaced to the frontend directly.
+    baseline_tokens: u64,
 }
 
 /// One provider's slice of a rollup bucket's delta, parsed from the upstream
@@ -5129,6 +5233,9 @@ impl HeadroomSavingsHistoryResponse {
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
                 cache_savings_usd: point.cache_savings_usd_delta,
+                // Filled by the sampler overlay in build_dashboard.
+                output_sampled_tokens_saved: None,
+                output_baseline_tokens: None,
             })
             .collect()
     }
@@ -5146,6 +5253,8 @@ impl HeadroomSavingsHistoryResponse {
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
                 cache_savings_usd: point.cache_savings_usd_delta,
+                output_sampled_tokens_saved: None,
+                output_baseline_tokens: None,
                 by_provider: point
                     .by_provider
                     .iter()
@@ -5273,6 +5382,10 @@ fn parse_output_reduction(root: &Value) -> Option<OutputReduction> {
         requests: node.get("requests").and_then(Value::as_u64).unwrap_or(0),
         tokens_saved: node
             .get("tokens_saved")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        baseline_tokens: node
+            .get("baseline_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
     })
@@ -6878,6 +6991,7 @@ mod tests {
             ci_high_percent: 39.8,
             requests: 48_638,
             tokens_saved,
+            baseline_tokens: 0,
         };
 
         // The estimator covers history the rollups never carried: price all of
@@ -7619,6 +7733,58 @@ mod tests {
         let _ = std::fs::remove_file(&records_path);
     }
 
+    #[test]
+    fn sample_output_reduction_buckets_deltas_and_reseeds_on_reset() {
+        let mut tracker = make_tracker();
+        let stats = |saved, baseline| HeadroomDashboardStats {
+            session_requests: None,
+            session_estimated_savings_usd: None,
+            session_estimated_tokens_saved: None,
+            session_savings_pct: None,
+            session_actual_cost_usd: None,
+            session_total_tokens_sent: None,
+            savings_history: Vec::new(),
+            output_reduction: Some(OutputReduction {
+                method: "estimated".into(),
+                reduction_percent: 39.0,
+                ci_low_percent: 36.0,
+                ci_high_percent: 42.0,
+                requests: 1,
+                tokens_saved: saved,
+                baseline_tokens: baseline,
+            }),
+            tool_schema_tokens_saved: None,
+        };
+        // First reading seeds the watermark, never a delta.
+        tracker.sample_output_reduction(&stats(1_000, 3_000));
+        assert!(tracker.output_daily_samples.is_empty());
+        tracker.sample_output_reduction(&stats(1_400, 4_000));
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = tracker
+            .output_daily_samples
+            .get(&day_key)
+            .copied()
+            .expect("day bucket");
+        assert_eq!(day.saved_tokens, 400);
+        assert_eq!(day.baseline_tokens, 1_000);
+        // A reading below the watermark (estimator rebuilt) reseeds silently.
+        tracker.sample_output_reduction(&stats(100, 200));
+        tracker.sample_output_reduction(&stats(150, 300));
+        let day = tracker
+            .output_daily_samples
+            .get(&day_key)
+            .copied()
+            .expect("day bucket");
+        assert_eq!(day.saved_tokens, 450);
+        assert_eq!(day.baseline_tokens, 1_100);
+        let hourly_total: u64 = tracker
+            .output_hourly_samples
+            .values()
+            .map(|bucket| bucket.saved_tokens)
+            .sum();
+        assert_eq!(hourly_total, 450);
+    }
+
     fn make_tracker() -> SavingsTracker {
         let id = uuid::Uuid::new_v4();
         let records_path = std::env::temp_dir().join(format!("headroom-savings-test-{}.jsonl", id));
@@ -7641,6 +7807,9 @@ mod tests {
             session_hourly_buckets: std::collections::BTreeMap::new(),
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),
+            output_daily_samples: std::collections::BTreeMap::new(),
+            output_hourly_samples: std::collections::BTreeMap::new(),
+            output_sample_watermark: None,
             last_written_at: None,
         }
     }
@@ -9793,6 +9962,8 @@ mod tests {
             session_hourly_buckets: std::collections::BTreeMap::new(),
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),
+            output_daily_samples: std::collections::BTreeMap::new(),
+            output_hourly_samples: std::collections::BTreeMap::new(),
         };
         std::fs::write(
             config_file(&base_dir, "savings-state.json"),
@@ -9818,6 +9989,8 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
         }
     }
 
@@ -9833,6 +10006,8 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
         }
     }
 
@@ -9997,6 +10172,8 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
         }];
         let result = merge_daily_savings(tracker, history, "2026-04-20");
         assert_eq!(result.len(), 1);

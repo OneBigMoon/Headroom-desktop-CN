@@ -582,6 +582,8 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
         })
         .collect();
     // Keep the headline card in sync with the buckets it derives from.
@@ -6242,6 +6244,8 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
         }
     }
 
