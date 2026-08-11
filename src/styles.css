@@ -48,6 +48,9 @@
   --accent-strong:      #5fa688;
   --accent-tint:        rgba(79, 158, 145, 0.12);
   --accent-tint-strong: rgba(79, 158, 145, 0.28);
+  /* Output-savings bar segment (chart gradients are theme-invariant), so the
+     chip legend dots can key to the exact segment hue. */
+  --chart-output-savings: #63b3a4;
   --warning:            #cb8027;
   --warning-tint:       rgba(203, 128, 39, 0.12);
   --danger:             #c14b24;
@@ -89,6 +92,8 @@
     --accent-strong:      #5fa688;
     --accent-tint:        rgba(79, 158, 145, 0.2);
     --accent-tint-strong: rgba(79, 158, 145, 0.3);
+    /* Same as light: the chart's segment gradients don't change in dark. */
+    --chart-output-savings: #63b3a4;
     --warning:            #e4a84a;
     --warning-tint:       rgba(220, 143, 26, 0.2);
     --danger:             #e76d3d;
@@ -2183,15 +2188,23 @@ select {
   width: 6px;
   height: 6px;
   border-radius: 50%;
+  /* Legend key: matches the output-savings segment in the history bars. */
+  background: var(--chart-output-savings);
+}
+
+.output-chip__dot--input {
+  /* Legend key: matches the compression-savings segment in the history bars. */
   background: var(--accent);
 }
 
 .output-chip__popover {
   position: absolute;
-  top: calc(100% + 6px);
-  /* Anchored right: this lives in the right column of the 2-col stat grid, so
-     growing leftward keeps the 240px panel from overflowing the window edge. */
-  right: 0;
+  /* Beside the chip, vertically centered: the chips sit over the history
+     chart, and a downward popover extended the panel's scroll area and got
+     clipped. Sideways stays inside the panel. */
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
   z-index: 20;
   width: 240px;
   padding: 12px;

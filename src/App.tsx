@@ -744,7 +744,7 @@ function WindowRateChip({
   note
 }: {
   label: string;
-  dot?: boolean;
+  dot?: "input" | "output";
   title: string;
   badge: string;
   value: string;
@@ -783,7 +783,12 @@ function WindowRateChip({
         }}
         onKeyDown={(e) => e.stopPropagation()}
       >
-        {dot ? <span className="output-chip__dot" aria-hidden="true" /> : null}
+        {dot ? (
+          <span
+            className={`output-chip__dot${dot === "input" ? " output-chip__dot--input" : ""}`}
+            aria-hidden="true"
+          />
+        ) : null}
         {label}
       </button>
       {open ? (
@@ -1056,6 +1061,7 @@ function DailySavingsChart({
               <span className="savings-chart__overlay-chips">
                 {billableRate !== null && (
                   <WindowRateChip
+                    dot="input"
                     label={`Input −${Math.round(billableRate.pct)}%`}
                     title="Input compression"
                     badge="measured"
@@ -1076,14 +1082,12 @@ function DailySavingsChart({
                             : compactNumber(billableRate.saved + billableRate.billable)
                       }
                     ]}
-                    note={`Share of this ${
-                      view === "day" ? "day" : "month"
-                    }'s billable input removed by compression. Cache reads (~10% of the input price, which Headroom deliberately leaves intact) are excluded from the baseline.`}
+                    note="Cache reads (billed at ~10%) are excluded from the baseline; Headroom leaves the cached prefix intact."
                   />
                 )}
                 {windowOutput !== null ? (
                   <WindowRateChip
-                    dot
+                    dot="output"
                     label={`Output −${Math.round(windowOutput.pct)}%`}
                     title="Output token reduction"
                     badge="estimated"
@@ -1095,9 +1099,7 @@ function DailySavingsChart({
                         ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
                         : [])
                     ]}
-                    note={`Output tokens the model didn't emit this ${
-                      view === "day" ? "day" : "month"
-                    }, vs the shaper's learned baseline — sampled while the app was running, so short or partial coverage can sit far from the all-time rate. Counterfactual estimate, not a measured diff.`}
+                    note="Estimate vs the shaper's learned baseline, sampled only while the app runs — short coverage can sit far from the all-time rate."
                   />
                 ) : windowIncludesToday && outputReduction ? (
                   <OutputReductionChip reduction={outputReduction} />
