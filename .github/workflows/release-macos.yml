@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   release:
-    name: macOS Apple Silicon
+    name: macOS Universal
     runs-on: macos-latest
     timeout-minutes: 45
 
@@ -57,7 +57,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -290,7 +290,7 @@ jobs:
           prerelease: false
           assetNamePattern: '[name]_[version]_mac[ext]'
           includeUpdaterJson: true
-          args: --target aarch64-apple-darwin
+          args: --target universal-apple-darwin
 
       - name: Mirror stable artifacts to rolling staging release
         if: steps.release_guard.outputs.should_release == 'true'
