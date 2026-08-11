@@ -4110,6 +4110,27 @@ export default function App() {
           lifetimeTotalTokensBeforeOptimization) *
         100
       : null;
+  // Paired context for the savings headline. The headline rate dilutes as the
+  // client's prompt caching improves, because cache reads sit in its
+  // denominator while compression deliberately never touches the cached
+  // prefix -- so a healthier cache reads as a Headroom regression. Show the
+  // two forces side by side instead: how much of lifetime input the client's
+  // cache served (cheap, never claimed by Headroom), and how much of the
+  // REMAINING (compressible) input Headroom removed.
+  const cacheHitPct = (() => {
+    const b = dashboard.savingsBreakdown;
+    if (!b || b.totalInputTokens <= 0 || b.cacheReadTokens <= 0) return null;
+    return Math.min(100, (b.cacheReadTokens / b.totalInputTokens) * 100);
+  })();
+  const compressionOfRestPct = (() => {
+    const b = dashboard.savingsBreakdown;
+    if (!b || b.totalInputTokens <= 0) return null;
+    const nonCachedInput = Math.max(0, b.totalInputTokens - b.cacheReadTokens);
+    const saved = dashboard.lifetimeEstimatedTokensSaved;
+    const baseline = saved + nonCachedInput;
+    if (baseline <= 0) return null;
+    return Math.min(100, (saved / baseline) * 100);
+  })();
   const rtkAvgSavingsPct =
     runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalCommands ?? 0) > 0
       ? runtimeStatus.rtk.avgSavingsPct ?? 0
@@ -5814,6 +5835,15 @@ export default function App() {
                   </button>
                 </span>
                 <strong className="stat-value--green">{currency(dashboard.lifetimeEstimatedSavingsUsd)}</strong>
+                {cacheHitPct !== null && compressionOfRestPct !== null ? (
+                  <span
+                    className="stat-card__context-line"
+                    title="Cache hits are your AI client's own prompt caching, billed at ~10% of the input price. Headroom compresses only the content outside that cached prefix, so its rate is shown against what remains."
+                  >
+                    Cache hits {Math.round(cacheHitPct)}% · Headroom compressed{" "}
+                    {Math.round(compressionOfRestPct)}% of the rest
+                  </span>
+                ) : null}
               </article>
               <article
                 className={`soft-card stat-card stat-card--clickable${chartMode === "tokens" ? " is-active" : ""}`}
@@ -7120,6 +7150,16 @@ export default function App() {
                 <h3>How savings are calculated</h3>
                 <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex, and shapes the replies that come back.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
+                {cacheHitPct !== null && compressionOfRestPct !== null ? (
+                  <p>
+                    Across all time, <strong>{Math.round(cacheHitPct)}%</strong> of your input was
+                    served from your AI client&apos;s prompt cache at ~10% of the input price.
+                    Headroom deliberately leaves that cached prefix untouched, so its compression is
+                    measured against the rest: of the remaining input,{" "}
+                    <strong>{Math.round(compressionOfRestPct)}%</strong> was removed. A healthier
+                    cache makes the blended savings rate look smaller while your actual bill shrinks.
+                  </p>
+                ) : null}
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
                     <div className="savings-breakdown__row">
