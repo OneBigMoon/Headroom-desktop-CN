@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "headroom-desktop"
-version = "0.7.8-rc.3"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
