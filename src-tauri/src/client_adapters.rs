@@ -224,15 +224,23 @@ pub fn is_permission_denied(err: &anyhow::Error) -> bool {
     })
 }
 
-/// True when the error chain contains a filesystem "no space left on device"
-/// (ENOSPC, os error 28) -- a full disk, an environment issue not an app bug,
-/// same class as `is_permission_denied`. ErrorKind::StorageFull isn't stable, so
-/// match the raw errno (28 on macOS and Linux).
+/// Raw OS codes for a full disk. ErrorKind::StorageFull isn't stable, so match
+/// the platform's codes: ENOSPC (28) on macOS/Linux; ERROR_HANDLE_DISK_FULL (39)
+/// and ERROR_DISK_FULL (112) on Windows.
+#[cfg(unix)]
+const NO_SPACE_OS_ERRORS: &[i32] = &[28];
+#[cfg(windows)]
+const NO_SPACE_OS_ERRORS: &[i32] = &[39, 112];
+
+/// True when the error chain contains a filesystem "no space left on device" --
+/// a full disk, an environment issue not an app bug, same class as
+/// `is_permission_denied`.
 pub fn is_no_space(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.raw_os_error() == Some(28))
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.raw_os_error()
+                .is_some_and(|code| NO_SPACE_OS_ERRORS.contains(&code))
+        })
     })
 }
 
@@ -5709,7 +5717,7 @@ mod tests {
         retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
-        ClientSetupState, ShellFamily,
+        ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -5803,10 +5811,12 @@ mod tests {
     }
 
     #[test]
-    fn is_no_space_matches_only_enospc() {
-        let full = anyhow::Error::new(std::io::Error::from_raw_os_error(28))
-            .context("creating backup /Users/x/.claude/settings.json.headroom-backup");
-        assert!(is_no_space(&full));
+    fn is_no_space_matches_only_disk_full_codes() {
+        for &code in NO_SPACE_OS_ERRORS {
+            let full = anyhow::Error::new(std::io::Error::from_raw_os_error(code))
+                .context("creating backup /Users/x/.claude/settings.json.headroom-backup");
+            assert!(is_no_space(&full));
+        }
 
         let denied = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
             .context("writing /Users/x/.zshrc");
