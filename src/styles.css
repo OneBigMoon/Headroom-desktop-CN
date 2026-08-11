@@ -2370,13 +2370,28 @@ select {
   line-height: 1.2;
 }
 
-/* Canonical input-compression rate, on its own line under the saved total.
+/* Rate chips under the saved total: the canonical input-compression rate for
+   the visible window next to the output-reduction chip. The overlay itself is
+   pointer-events: none, so re-enable here for the output chip's popover.
    Tokens only, so dark mode needs no override. */
-.savings-chart__overlay-rate {
-  display: block;
+.savings-chart__overlay-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  pointer-events: auto;
+}
+
+.savings-chart__rate-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
   font-size: var(--text-xs);
   font-weight: 600;
-  color: var(--text-muted);
 }
 
 .savings-chart__overlay-label {

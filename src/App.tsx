@@ -810,13 +810,15 @@ function DailySavingsChart({
   hourlyData,
   resetSignal,
   chartMode,
-  setChartMode
+  setChartMode,
+  outputReduction
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
   resetSignal: number;
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
+  outputReduction: OutputReduction | null;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -957,18 +959,23 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {billableRate !== null && (
-              <span
-                className="savings-chart__overlay-rate"
-                title={`Input compression removed ${Math.round(billableRate)}% of this ${
-                  view === "day" ? "day" : "month"
-                }'s billable input${
-                  chartMode === "usd" ? " cost" : " tokens"
-                }. Cache reads (~10% of the input price, deliberately left intact) are excluded; output shaping is measured separately.`}
-              >
-                {Math.round(billableRate)}% of billable input removed
+            {billableRate !== null || outputReduction ? (
+              <span className="savings-chart__overlay-chips">
+                {billableRate !== null && (
+                  <span
+                    className="savings-chart__rate-chip"
+                    title={`Input compression removed ${Math.round(billableRate)}% of this ${
+                      view === "day" ? "day" : "month"
+                    }'s billable input${
+                      chartMode === "usd" ? " cost" : " tokens"
+                    }. Cache reads (~10% of the input price, which Headroom deliberately leaves intact) are excluded from the baseline.`}
+                  >
+                    Input −{Math.round(billableRate)}%
+                  </span>
+                )}
+                {outputReduction ? <OutputReductionChip reduction={outputReduction} /> : null}
               </span>
-            )}
+            ) : null}
           </div>
           <ResponsiveContainer height="100%" width="100%">
             <BarChart
@@ -5876,9 +5883,6 @@ export default function App() {
                   <strong className="stat-value--blue">
                     {compactNumber(dashboard.lifetimeEstimatedTokensSaved)}
                   </strong>
-                  {dashboard.outputReduction ? (
-                    <OutputReductionChip reduction={dashboard.outputReduction} />
-                  ) : null}
                 </div>
               </article>
             </section>
@@ -5890,6 +5894,7 @@ export default function App() {
                 resetSignal={chartResetSignal}
                 chartMode={chartMode}
                 setChartMode={setChartMode}
+                outputReduction={dashboard.outputReduction}
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
