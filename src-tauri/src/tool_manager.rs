@@ -294,6 +294,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
         _hd_client_pos = _hd_cv.ContextVar("headroom_client_bp_pos", default=None)
 
         def _hd_marker_positions(messages):
+            # Block-level (msg_idx, block_idx, marker): clients mark multiple
+            # blocks within one long message, and the ~20-block lookback
+            # applies within a message just as across messages.
             positions = []
             if isinstance(messages, list):
                 for i, msg in enumerate(messages):
@@ -302,14 +305,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     content = msg.get("content")
                     if not isinstance(content, list):
                         continue
-                    marker = None
-                    for b in content:
+                    for bi, b in enumerate(content):
                         if isinstance(b, dict) and isinstance(
                             b.get("cache_control"), dict
                         ):
-                            marker = b["cache_control"]
-                    if marker is not None:
-                        positions.append((i, dict(marker)))
+                            positions.append((i, bi, dict(b["cache_control"])))
             return positions
 
         def _hd_count_breakpoints(body):
@@ -427,18 +427,24 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             else:
                                 out.append(msg)
                         placed = False
-                        for idx, marker in positions:
+                        for idx, bi, marker in positions:
                             msg = out[idx]
                             content = (
                                 msg.get("content") if isinstance(msg, dict) else None
                             )
                             if not isinstance(content, list) or not content:
                                 continue
-                            if not isinstance(content[-1], dict):
-                                continue
                             content = list(content)
-                            content[-1] = {
-                                **content[-1],
+                            # Same block if still in range, else the message's
+                            # last block (a slightly-off placement lands on a
+                            # stable block; markers are not part of the key).
+                            target = bi if 0 <= bi < len(content) else len(content) - 1
+                            if not isinstance(content[target], dict):
+                                target = len(content) - 1
+                            if not isinstance(content[target], dict):
+                                continue
+                            content[target] = {
+                                **content[target],
                                 "cache_control": dict(marker),
                             }
                             out[idx] = {**msg, "content": content}
