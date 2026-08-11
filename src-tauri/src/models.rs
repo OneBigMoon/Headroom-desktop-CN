@@ -190,6 +190,13 @@ pub struct DailySavingsPoint {
     pub output_savings_usd: f64,
     #[serde(default)]
     pub output_tokens_saved: u64,
+    /// Provider prompt-cache reads inside the bucket, derived from consecutive
+    /// cumulative checkpoints in the backend's raw `history` array (the rollup
+    /// series itself has no cache dimension). UTC-bucketed like the rollups.
+    /// None for local-tracker buckets and for days that have aged out of the
+    /// backend's history retention.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly
@@ -219,6 +226,9 @@ pub struct HourlySavingsPoint {
     pub output_savings_usd: f64,
     #[serde(default)]
     pub output_tokens_saved: u64,
+    /// See `DailySavingsPoint::cache_read_tokens`.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub by_provider: Vec<ProviderSavingsPoint>,
 }

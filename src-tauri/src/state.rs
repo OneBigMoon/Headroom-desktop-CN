@@ -4219,6 +4219,8 @@ impl SavingsTracker {
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
+                // The local tracker has no cache dimension.
+                cache_read_tokens: None,
             })
             .collect()
     }
@@ -4234,6 +4236,7 @@ impl SavingsTracker {
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
+                cache_read_tokens: None,
                 // The local pre-cutoff tracker has no provider dimension.
                 by_provider: Vec::new(),
             })
@@ -5082,6 +5085,10 @@ struct HeadroomSavingsRollupPoint {
     // then read as zero and simply contribute nothing to the bucket.
     output_savings_usd_delta: f64,
     output_tokens_saved_delta: u64,
+    // Cache reads inside the bucket, derived from the payload's raw `history`
+    // checkpoints (the rollup series has no cache dimension). None when no
+    // checkpoint fell inside the bucket.
+    cache_read_tokens_delta: Option<u64>,
     by_provider: Vec<ProviderRollupDelta>,
 }
 
@@ -5115,6 +5122,7 @@ impl HeadroomSavingsHistoryResponse {
                 total_tokens_sent: point.total_input_tokens_delta,
                 output_savings_usd: point.output_savings_usd_delta,
                 output_tokens_saved: point.output_tokens_saved_delta,
+                cache_read_tokens: point.cache_read_tokens_delta,
             })
             .collect()
     }
@@ -5130,6 +5138,7 @@ impl HeadroomSavingsHistoryResponse {
                 total_tokens_sent: point.total_input_tokens_delta,
                 output_savings_usd: point.output_savings_usd_delta,
                 output_tokens_saved: point.output_tokens_saved_delta,
+                cache_read_tokens: point.cache_read_tokens_delta,
                 by_provider: point
                     .by_provider
                     .iter()
@@ -5483,6 +5492,22 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
         .and_then(parse_savings_rollup_series)
         .unwrap_or_default();
 
+    // The rollup series carries no cache dimension, but the payload's raw
+    // `history` checkpoints do (cumulative, sampled per request) — diff them
+    // into per-bucket cache-read deltas and attach to the rollup points.
+    // Keys are UTC (same identity as the rollup buckets; see daily_savings).
+    let (daily_cache_reads, hourly_cache_reads) = derive_cache_read_deltas(&root);
+    for point in &mut daily {
+        point.cache_read_tokens_delta = daily_cache_reads
+            .get(&point.timestamp.format("%Y-%m-%d").to_string())
+            .copied();
+    }
+    for point in &mut hourly {
+        point.cache_read_tokens_delta = hourly_cache_reads
+            .get(&point.timestamp.format("%Y-%m-%dT%H").to_string())
+            .copied();
+    }
+
     // When the upstream stored history has been trimmed (point-count cap
     // reached), the backend's rollup diffs the oldest surviving checkpoint from
     // a zero baseline, dumping its entire cumulative into the first bucket's
@@ -5611,6 +5636,52 @@ fn parse_savings_history(value: &Value) -> Option<Vec<HeadroomSavingsHistoryPoin
     Some(points)
 }
 
+/// Per-UTC-day and per-UTC-hour cache-read token deltas, diffed from the raw
+/// `history` checkpoints (each carries the GLOBAL cumulative
+/// `cache_read_tokens` at the moment of one request). Each consecutive diff is
+/// attributed to the later checkpoint's bucket. The first checkpoint has no
+/// predecessor and is skipped — which also avoids dumping the whole cumulative
+/// into the window's leading edge on trimmed histories, mirroring
+/// `drop_oldest_rollup_bucket`. Diffs clamp at zero so a counter reset can
+/// only lose a sample, never produce a negative or inflated bucket.
+fn derive_cache_read_deltas(
+    root: &Value,
+) -> (
+    std::collections::HashMap<String, u64>,
+    std::collections::HashMap<String, u64>,
+) {
+    let mut daily: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut hourly: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let Some(Value::Array(items)) = value_at_path(root, &["history"]) else {
+        return (daily, hourly);
+    };
+    let mut checkpoints: Vec<(chrono::DateTime<Utc>, u64)> = items
+        .iter()
+        .filter_map(|item| {
+            let map = item.as_object()?;
+            let timestamp = map
+                .get("timestamp")
+                .and_then(|value| value.as_str())
+                .and_then(parse_history_timestamp)?;
+            let cache_read = map.get("cache_read_tokens").and_then(parse_u64_value)?;
+            Some((timestamp, cache_read))
+        })
+        .collect();
+    checkpoints.sort_by_key(|(timestamp, _)| *timestamp);
+    for pair in checkpoints.windows(2) {
+        let (_, previous) = pair[0];
+        let (timestamp, current) = pair[1];
+        let delta = current.saturating_sub(previous);
+        *daily
+            .entry(timestamp.format("%Y-%m-%d").to_string())
+            .or_insert(0) += delta;
+        *hourly
+            .entry(timestamp.format("%Y-%m-%dT%H").to_string())
+            .or_insert(0) += delta;
+    }
+    (daily, hourly)
+}
+
 fn parse_savings_rollup_series(value: &Value) -> Option<Vec<HeadroomSavingsRollupPoint>> {
     let Value::Array(items) = value else {
         return None;
@@ -5662,6 +5733,9 @@ fn parse_savings_rollup_point(value: &Value) -> Option<HeadroomSavingsRollupPoin
 
     Some(HeadroomSavingsRollupPoint {
         timestamp,
+        // Attached afterwards from the raw history checkpoints; the rollup
+        // object itself has no cache field.
+        cache_read_tokens_delta: None,
         tokens_saved: map
             .get("tokens_saved")
             .and_then(parse_u64_value)
@@ -8758,6 +8832,50 @@ mod tests {
         assert!((hourly_points[0].estimated_savings_usd - 0.15).abs() < 1e-9);
         // No by_provider in this fixture -> empty breakdown.
         assert!(hourly_points[0].by_provider.is_empty());
+        // No raw history in this fixture -> no cache dimension.
+        assert_eq!(daily_points[0].cache_read_tokens, None);
+        assert_eq!(hourly_points[0].cache_read_tokens, None);
+    }
+
+    #[test]
+    fn parse_headroom_stats_history_derives_cache_reads_from_checkpoints() {
+        // The rollup series has no cache dimension; consecutive cumulative
+        // history checkpoints are diffed into per-bucket deltas. First
+        // checkpoint's delta is unattributable and skipped; a counter reset
+        // (cumulative going backwards) clamps to zero rather than inflating.
+        let parsed = parse_headroom_stats_history_from_json(
+            r#"{
+                "history": [
+                    {"timestamp": "2026-03-27T09:10:00Z", "cache_read_tokens": 1000},
+                    {"timestamp": "2026-03-27T09:20:00Z", "cache_read_tokens": 1400},
+                    {"timestamp": "2026-03-27T10:05:00Z", "cache_read_tokens": 2400},
+                    {"timestamp": "2026-03-28T08:00:00Z", "cache_read_tokens": 2000}
+                ],
+                "series": {
+                    "hourly": [
+                        {"timestamp": "2026-03-27T09:00:00Z", "tokens_saved": 1, "compression_savings_usd_delta": 0.1},
+                        {"timestamp": "2026-03-27T10:00:00Z", "tokens_saved": 1, "compression_savings_usd_delta": 0.1},
+                        {"timestamp": "2026-03-28T08:00:00Z", "tokens_saved": 1, "compression_savings_usd_delta": 0.1}
+                    ],
+                    "daily": [
+                        {"timestamp": "2026-03-27T00:00:00Z", "tokens_saved": 2, "compression_savings_usd_delta": 0.2},
+                        {"timestamp": "2026-03-28T00:00:00Z", "tokens_saved": 1, "compression_savings_usd_delta": 0.1}
+                    ]
+                }
+            }"#,
+        )
+        .expect("parsed history");
+
+        let daily_points = parsed.daily_savings();
+        // 09:10 checkpoint skipped (no predecessor); 400 + 1000 land on the 27th.
+        assert_eq!(daily_points[0].cache_read_tokens, Some(1400));
+        // Reset on the 28th (2400 -> 2000) clamps to a zero-delta bucket.
+        assert_eq!(daily_points[1].cache_read_tokens, Some(0));
+
+        let hourly_points = parsed.hourly_savings();
+        assert_eq!(hourly_points[0].cache_read_tokens, Some(400));
+        assert_eq!(hourly_points[1].cache_read_tokens, Some(1000));
+        assert_eq!(hourly_points[2].cache_read_tokens, Some(0));
     }
 
     #[test]
@@ -9663,6 +9781,7 @@ mod tests {
             total_tokens_sent: 0,
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
+            cache_read_tokens: None,
         }
     }
 
@@ -9676,6 +9795,7 @@ mod tests {
             by_provider: Vec::new(),
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
+            cache_read_tokens: None,
         }
     }
 
@@ -9838,6 +9958,7 @@ mod tests {
             total_tokens_sent: 123_456,
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
+            cache_read_tokens: None,
         }];
         let result = merge_daily_savings(tracker, history, "2026-04-20");
         assert_eq!(result.len(), 1);

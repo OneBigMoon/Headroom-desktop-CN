@@ -2150,12 +2150,11 @@ select {
   flex-wrap: wrap;
 }
 
-/* Companion line under the savings headline: cache-hit share next to the
-   compression rate, so a healthier cache doesn't read as a regression.
-   Tokens only, so dark mode needs no override. */
-.stat-card__context-line {
-  display: block;
-  margin-top: 2px;
+/* Companion line under the history graph: cache-hit share next to the
+   compression rate for the visible day/month, so a healthier cache doesn't
+   read as a regression. Tokens only, so dark mode needs no override. */
+.savings-chart__cache-line {
+  margin: 6px 2px 0;
   font-size: var(--text-xs);
   color: var(--text-muted);
 }

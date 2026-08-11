@@ -73,6 +73,40 @@ export function savingsRate(saved: number, spent: number) {
   return Math.round((Math.max(0, saved) / baseline) * 100);
 }
 
+/** Cache-hit / compression pair over a window of savings buckets.
+ *
+ * Only buckets that carry cache data count (backend rollup coverage; local
+ * tracker buckets and days aged out of history retention have none), so both
+ * rates describe the same covered slice of the window. Null when no bucket in
+ * the window has coverage. `hitPct` is the share of forwarded input served
+ * from the provider's prompt cache; `compressedPct` is the share of the
+ * REMAINING (compressible) input Headroom removed. */
+export function cacheHitPair(
+  points: Array<{
+    cacheReadTokens?: number | null;
+    totalTokensSent: number;
+    estimatedTokensSaved: number;
+  }>
+) {
+  let read = 0;
+  let total = 0;
+  let saved = 0;
+  for (const point of points) {
+    if (point.cacheReadTokens == null) continue;
+    read += Math.max(0, point.cacheReadTokens);
+    total += Math.max(0, point.totalTokensSent);
+    saved += Math.max(0, point.estimatedTokensSaved);
+  }
+  if (total <= 0) return null;
+  const hitPct = Math.min(100, (read / total) * 100);
+  const rest = Math.max(0, total - read);
+  const baseline = saved + rest;
+  // A fully-cached window leaves nothing to compress: report 0% of an empty
+  // remainder rather than hiding the (excellent) hit rate.
+  const compressedPct = baseline > 0 ? Math.min(100, (saved / baseline) * 100) : 0;
+  return { hitPct, compressedPct };
+}
+
 export function formatDayLabel(dayKey: string) {
   const parsed = new Date(`${dayKey}T00:00:00`);
   if (Number.isNaN(parsed.getTime())) {

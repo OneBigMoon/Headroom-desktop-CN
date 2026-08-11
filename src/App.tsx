@@ -101,6 +101,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
+  cacheHitPair,
   compactNumber,
   connectorDashboardStatus,
   currency,
@@ -835,9 +836,15 @@ function DailySavingsChart({
   }, []);
   const firstSavingsMonth = earliestSavingsMonth(data);
   const firstHourlyDay = earliestHourlyDay(hourlyData);
-  const monthlyData = buildMonthlySavingsChartData(buildMonthlySavingsWindow(data, visibleMonth));
-  const hourlyChartData = buildHourlySavingsChartData(buildHourlySavingsWindow(hourlyData, visibleDay));
+  const monthlyWindow = buildMonthlySavingsWindow(data, visibleMonth);
+  const hourlyWindow = buildHourlySavingsWindow(hourlyData, visibleDay);
+  const monthlyData = buildMonthlySavingsChartData(monthlyWindow);
+  const hourlyChartData = buildHourlySavingsChartData(hourlyWindow);
   const chartData = view === "month" ? monthlyData : hourlyChartData;
+  // Cache-hit / compression pair for the visible window, from the buckets
+  // that carry cache coverage (backend history checkpoints; local-tracker
+  // buckets and aged-out days have none and are excluded from both rates).
+  const cachePair = cacheHitPair(view === "month" ? monthlyWindow : hourlyWindow);
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -1105,6 +1112,15 @@ function DailySavingsChart({
             </BarChart>
           </ResponsiveContainer>
         </div>
+        {cachePair ? (
+          <p
+            className="savings-chart__cache-line"
+            title="Cache hits are your AI client's own prompt caching, billed at ~10% of the input price. Headroom compresses only the content outside that cached prefix, so its rate is shown against what remains. Covers the part of this period with cache data."
+          >
+            Cache hits {Math.round(cachePair.hitPct)}% · Headroom compressed{" "}
+            {Math.round(cachePair.compressedPct)}% of the rest
+          </p>
+        ) : null}
       </section>
     </div>
   );
@@ -5835,15 +5851,6 @@ export default function App() {
                   </button>
                 </span>
                 <strong className="stat-value--green">{currency(dashboard.lifetimeEstimatedSavingsUsd)}</strong>
-                {cacheHitPct !== null && compressionOfRestPct !== null ? (
-                  <span
-                    className="stat-card__context-line"
-                    title="Cache hits are your AI client's own prompt caching, billed at ~10% of the input price. Headroom compresses only the content outside that cached prefix, so its rate is shown against what remains."
-                  >
-                    Cache hits {Math.round(cacheHitPct)}% · Headroom compressed{" "}
-                    {Math.round(compressionOfRestPct)}% of the rest
-                  </span>
-                ) : null}
               </article>
               <article
                 className={`soft-card stat-card stat-card--clickable${chartMode === "tokens" ? " is-active" : ""}`}

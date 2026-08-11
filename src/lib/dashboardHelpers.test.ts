@@ -5,6 +5,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
+  cacheHitPair,
   compactNumber,
   connectorDashboardStatus,
   currency,
@@ -329,4 +330,34 @@ describe("mergeProviderSavingsForDisplay", () => {
     expect(mergeProviderSavingsForDisplay([])).toEqual([]);
   });
 
+});
+
+describe("cacheHitPair", () => {
+  it("computes both rates over covered buckets only", () => {
+    const pair = cacheHitPair([
+      { cacheReadTokens: 900, totalTokensSent: 1000, estimatedTokensSaved: 50 },
+      // No cache coverage: excluded from BOTH rates, not just the hit rate.
+      { totalTokensSent: 5000, estimatedTokensSaved: 999 },
+      { cacheReadTokens: 100, totalTokensSent: 1000, estimatedTokensSaved: 150 }
+    ]);
+    expect(pair).not.toBeNull();
+    // read 1000 / total 2000
+    expect(pair!.hitPct).toBeCloseTo(50);
+    // saved 200 / (saved 200 + rest 1000)
+    expect(pair!.compressedPct).toBeCloseTo((200 / 1200) * 100);
+  });
+
+  it("returns null when no bucket carries cache data", () => {
+    expect(
+      cacheHitPair([{ totalTokensSent: 1000, estimatedTokensSaved: 100 }])
+    ).toBeNull();
+    expect(cacheHitPair([])).toBeNull();
+  });
+
+  it("clamps reads above total to a 100% hit rate", () => {
+    const pair = cacheHitPair([
+      { cacheReadTokens: 2000, totalTokensSent: 1000, estimatedTokensSaved: 0 }
+    ]);
+    expect(pair!.hitPct).toBe(100);
+  });
 });

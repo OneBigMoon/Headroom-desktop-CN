@@ -69,6 +69,10 @@ export interface DailySavingsPoint {
   // layer existed, or that came from the local tracker.
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
+  // Provider prompt-cache reads inside the bucket, derived from the backend's
+  // raw history checkpoints. Null/absent for local-tracker buckets and days
+  // that aged out of history retention.
+  cacheReadTokens?: number | null;
 }
 
 // Counterfactual output-token reduction from the proxy's output shaper.
@@ -125,6 +129,7 @@ export interface HourlySavingsPoint {
   totalTokensSent: number;
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
+  cacheReadTokens?: number | null;
   byProvider: ProviderSavingsPoint[];
 }
 
