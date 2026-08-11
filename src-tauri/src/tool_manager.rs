@@ -30,15 +30,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// platform now covers every CPython >= 3.10 — the pin below
 /// (`cp310-abi3-macosx_11_0_arm64`) installs cleanly on our bundled cp312 and
 /// stays valid if `PYTHON_STANDALONE_RELEASE` later moves to 3.13+. Only the
-/// per-platform axis still matters: if Linux is ever added to the release matrix
-/// (release-macos.yml builds macOS arm64 only today), re-pick the matching
-/// `*-manylinux_*` abi3 wheel from
-/// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
-/// wheel-picker (mirroring `python_distribution_artifact`).
+/// per-platform axis still matters, which `headroom_wheel_artifact` handles —
+/// when bumping this pin, re-pick every platform's wheel URL/sha256 from
+/// https://pypi.org/pypi/headroom-ai/<version>/json.
 pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.34.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/82/f8/d9416f0fd07cf1da050853fd84ab0b85261c94f0bb40e6ed0a3d214a74ca/headroom_ai-0.34.0-cp310-abi3-macosx_11_0_arm64.whl";
-const HEADROOM_PINNED_SHA256: &str =
-    "381391ab816daf0894a40fd6523f54abf55c30a57273879c2f6e6b501ab997c3";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -830,8 +825,11 @@ pub(crate) fn hf_hub_cache_dir() -> Option<PathBuf> {
             // `HOME` before `dirs::home_dir()`: on Windows the dirs crate reads the
             // profile known folder and ignores `$HOME`, so a redirected home (tests,
             // Git Bash) would resolve the sweep against the REAL profile instead.
-            let cache = var("XDG_CACHE_HOME")
-                .or_else(|| var("HOME").or_else(dirs::home_dir).map(|h| h.join(".cache")))?;
+            let cache = var("XDG_CACHE_HOME").or_else(|| {
+                var("HOME")
+                    .or_else(dirs::home_dir)
+                    .map(|h| h.join(".cache"))
+            })?;
             Some(cache.join("huggingface").join("hub"))
         })
 }
@@ -2384,11 +2382,7 @@ impl ToolManager {
         if installed == HEADROOM_PINNED_VERSION {
             return None;
         }
-        Some(HeadroomRelease {
-            version: HEADROOM_PINNED_VERSION.into(),
-            wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
-            sha256: HEADROOM_PINNED_SHA256.into(),
-        })
+        Some(pinned_headroom_release().ok()?)
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -2618,21 +2612,29 @@ impl ToolManager {
             download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
         }
         if !self.runtime.managed_python().exists() {
+            let release = pinned_headroom_release()?;
             download_to_path(
-                HEADROOM_PINNED_WHEEL_URL,
-                &self.wheel_download_path(HEADROOM_PINNED_VERSION),
-                Some(HEADROOM_PINNED_SHA256),
+                &release.wheel_url,
+                &self.wheel_download_path(&release.wheel_url),
+                Some(&release.sha256),
             )?;
         }
         Ok(())
     }
 
     /// Shared by the prefetch and the install/upgrade paths so a prefetched
-    /// wheel always lands exactly where the installer looks for it.
-    fn wheel_download_path(&self, version: &str) -> PathBuf {
-        self.runtime
-            .downloads_dir
-            .join(format!("headroom_ai-{version}-py3-none-any.whl"))
+    /// wheel always lands exactly where the installer looks for it. Keeps
+    /// PyPI's own filename (platform tags and all) so pip's "not a supported
+    /// wheel on this platform" check still backstops a mis-picked wheel — a
+    /// `py3-none-any` rename made pip install a macOS wheel on Windows.
+    fn wheel_download_path(&self, wheel_url: &str) -> PathBuf {
+        self.runtime.downloads_dir.join(
+            wheel_url
+                .rsplit('/')
+                .next()
+                .filter(|name| name.ends_with(".whl"))
+                .unwrap_or("headroom_ai.whl"),
+        )
     }
 
     fn install_python_distribution<F>(&self, mut emit_step: F) -> Result<()>
@@ -2800,15 +2802,7 @@ impl ToolManager {
         // Bootstrap path runs at first launch where there is no boot
         // validation yet — no caller will read the captured pip output, so
         // skip the buffer to avoid allocating it.
-        self.install_headroom_release(
-            &HeadroomRelease {
-                version: HEADROOM_PINNED_VERSION.into(),
-                wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
-                sha256: HEADROOM_PINNED_SHA256.into(),
-            },
-            |_| {},
-            None,
-        )
+        self.install_headroom_release(&pinned_headroom_release()?, |_| {}, None)
     }
 
     fn install_headroom_release<F>(
@@ -2822,7 +2816,7 @@ impl ToolManager {
     {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
-        let wheel_path = self.wheel_download_path(&release.version);
+        let wheel_path = self.wheel_download_path(&release.wheel_url);
 
         progress(BootstrapStepUpdate {
             step: "Downloading update",
@@ -6521,6 +6515,43 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
     Some(free_bytes_available)
 }
 
+/// Pinned headroom-ai wheel for the running platform. The wheel carries a
+/// native `_core` extension, so a macOS wheel installed on Windows/Linux
+/// yields `ModuleNotFoundError: No module named 'headroom._core'` at proxy
+/// start (RUST-6E: every 0.7.7 Windows install). Keep this in step with
+/// `python_distribution_artifact`'s platform matrix.
+fn pinned_headroom_release() -> Result<HeadroomRelease> {
+    let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => (
+            "https://files.pythonhosted.org/packages/82/f8/d9416f0fd07cf1da050853fd84ab0b85261c94f0bb40e6ed0a3d214a74ca/headroom_ai-0.34.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "381391ab816daf0894a40fd6523f54abf55c30a57273879c2f6e6b501ab997c3",
+        ),
+        ("macos", "x86_64") => (
+            "https://files.pythonhosted.org/packages/80/c2/18127c595f1098cc65ef8aa40dbb6ae2c33656928fc1f6469022d9a2f8db/headroom_ai-0.34.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "ab190aee94cbd9757413ac06cb15972a38baeff2d1283112b71de4ba685fe381",
+        ),
+        ("linux", "aarch64") => (
+            "https://files.pythonhosted.org/packages/9e/f7/fc978da714ba3b1693bfa779c251312a6ca8e3fcd093b81913662e96b673/headroom_ai-0.34.0-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "8d1763844dcd6d1736dddb6acbc754fd736652580a673b44f6beb1167648cbdc",
+        ),
+        ("linux", "x86_64") => (
+            "https://files.pythonhosted.org/packages/93/09/2b5a3470207cb4c8d75bf737d0bc8e59c5ab80b3c28f5d46b2aaa97913df/headroom_ai-0.34.0-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "061d974b4f4e95b8fc9611fc4d059331e43fd2bd4737243bbed5fcb3af82775f",
+        ),
+        ("windows", "x86_64") => (
+            "https://files.pythonhosted.org/packages/9a/59/19b97ea93e684d2676a9d7772f5615f27ef333c90cfd6851901f78f22677/headroom_ai-0.34.0-cp310-abi3-win_amd64.whl",
+            "2adbb309bfe34a6685c832a59eea32db0f4a837c01439f9b99051039ca81bf22",
+        ),
+        (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
+    };
+
+    Ok(HeadroomRelease {
+        version: HEADROOM_PINNED_VERSION.into(),
+        wheel_url: url.into(),
+        sha256: sha256.into(),
+    })
+}
+
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok(DownloadArtifact {
@@ -7733,15 +7764,16 @@ mod tests {
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
-        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, PLUGIN_ADDONS, RTK_VERSION,
+        path_with_binary_dir, pinned_headroom_release, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
+        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        PLUGIN_ADDONS, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -8168,6 +8200,53 @@ mod tests {
         assert!(manager
             .markitdown_shim_path()
             .ends_with("bin\\markitdown.cmd"));
+    }
+
+    /// The wheel carries a native `_core` extension, so the platform tag in
+    /// its filename must match the platform we're installing on. Runs on every
+    /// target: a macOS wheel shipped to Windows is what broke RUST-6E.
+    #[test]
+    fn pinned_headroom_wheel_matches_running_platform() {
+        let release = pinned_headroom_release().expect("pinned wheel for this platform");
+        let expected_tag = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => "macosx_11_0_arm64",
+            ("macos", "x86_64") => "macosx_10_12_x86_64",
+            ("linux", "aarch64") => "manylinux_2_28_aarch64",
+            ("linux", "x86_64") => "manylinux_2_28_x86_64",
+            ("windows", "x86_64") => "win_amd64",
+            (os, arch) => panic!("test needs a tag for {os}/{arch}"),
+        };
+        assert!(
+            release.wheel_url.ends_with(&format!("{expected_tag}.whl")),
+            "wheel {} is not built for {}/{}",
+            release.wheel_url,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        assert!(
+            release
+                .wheel_url
+                .contains(&format!("headroom_ai-{HEADROOM_PINNED_VERSION}-")),
+            "wheel url {} does not carry the pinned version",
+            release.wheel_url
+        );
+        assert_eq!(release.sha256.len(), 64, "sha256 must be pinned");
+    }
+
+    /// Downloads keep PyPI's filename so pip's own platform check stays a
+    /// backstop; a `py3-none-any` rename is what let a macOS wheel install on
+    /// Windows.
+    #[test]
+    fn wheel_download_path_keeps_platform_tagged_filename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+        let release = pinned_headroom_release().expect("pinned wheel for this platform");
+        let path = manager.wheel_download_path(&release.wheel_url);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            release.wheel_url.rsplit('/').next()
+        );
+        assert!(!path.to_string_lossy().contains("py3-none-any"));
     }
 
     #[cfg(target_os = "windows")]

@@ -6415,8 +6415,13 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
         }
         let exe_pattern = escape_like(&exe.display().to_string());
         let args_escaped = escape_like(args_pattern);
+        // Exclude our own PID: this powershell process's `CommandLine` embeds
+        // both `-like` patterns as literals, so without the guard it matches
+        // its own filter and force-kills itself mid-pipeline -- exit -1, and
+        // the real targets after it in the enumeration are never killed
+        // (RUST-6F/6G/6H: 44 events on the first 0.7.7 Windows install).
         let script = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
         );
         let status = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
