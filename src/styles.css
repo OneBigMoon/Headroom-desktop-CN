@@ -2150,14 +2150,6 @@ select {
   flex-wrap: wrap;
 }
 
-/* Companion line under the history graph: cache-hit share next to the
-   compression rate for the visible day/month, so a healthier cache doesn't
-   read as a regression. Tokens only, so dark mode needs no override. */
-.savings-chart__cache-line {
-  margin: 6px 2px 0;
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-}
 
 /* Output-shaper reduction: a compact pill next to the big token value that
    opens a details popover on click. All colors come from semantic tokens, so

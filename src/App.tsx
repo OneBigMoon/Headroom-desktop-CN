@@ -836,15 +836,9 @@ function DailySavingsChart({
   }, []);
   const firstSavingsMonth = earliestSavingsMonth(data);
   const firstHourlyDay = earliestHourlyDay(hourlyData);
-  const monthlyWindow = buildMonthlySavingsWindow(data, visibleMonth);
-  const hourlyWindow = buildHourlySavingsWindow(hourlyData, visibleDay);
-  const monthlyData = buildMonthlySavingsChartData(monthlyWindow);
-  const hourlyChartData = buildHourlySavingsChartData(hourlyWindow);
+  const monthlyData = buildMonthlySavingsChartData(buildMonthlySavingsWindow(data, visibleMonth));
+  const hourlyChartData = buildHourlySavingsChartData(buildHourlySavingsWindow(hourlyData, visibleDay));
   const chartData = view === "month" ? monthlyData : hourlyChartData;
-  // Cache-hit / compression pair for the visible window, from the buckets
-  // that carry cache coverage (backend history checkpoints; local-tracker
-  // buckets and aged-out days have none and are excluded from both rates).
-  const cachePair = cacheHitPair(view === "month" ? monthlyWindow : hourlyWindow);
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -1112,15 +1106,6 @@ function DailySavingsChart({
             </BarChart>
           </ResponsiveContainer>
         </div>
-        {cachePair ? (
-          <p
-            className="savings-chart__cache-line"
-            title="Cache hits are your AI client's own prompt caching, billed at ~10% of the input price. Headroom compresses only the content outside that cached prefix, so its rate is shown against what remains. Covers the part of this period with cache data."
-          >
-            Cache hits {Math.round(cachePair.hitPct)}% · Headroom compressed{" "}
-            {Math.round(cachePair.compressedPct)}% of the rest
-          </p>
-        ) : null}
       </section>
     </div>
   );
@@ -1539,6 +1524,7 @@ export default function App() {
   // chart anyway after this delay rather than spinning forever.
   const [historyLoadTimedOut, setHistoryLoadTimedOut] = useState(false);
   const [showSavingsInfo, setShowSavingsInfo] = useState(false);
+  const [showCacheInfo, setShowCacheInfo] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [rtkBusy, setRtkBusy] = useState(false);
@@ -4147,6 +4133,16 @@ export default function App() {
     if (baseline <= 0) return null;
     return Math.min(100, (saved / baseline) * 100);
   })();
+  // Same pair for the shorter windows, from the buckets that carry cache
+  // coverage (backend history checkpoints; local-tracker buckets and days
+  // aged out of retention are excluded from both rates). The all-time row
+  // above uses the true lifetime breakdown instead, which predates coverage.
+  const cachePairToday = cacheHitPair(
+    buildHourlySavingsWindow(dashboard.hourlySavings, new Date())
+  );
+  const cachePairMonth = cacheHitPair(
+    buildMonthlySavingsWindow(dashboard.dailySavings, new Date())
+  );
   const rtkAvgSavingsPct =
     runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalCommands ?? 0) > 0
       ? runtimeStatus.rtk.avgSavingsPct ?? 0
@@ -5862,6 +5858,14 @@ export default function App() {
                 <span className="stat-card__label">
                   <Cpu aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
                   Total input tokens saved
+                  <button
+                    className="stat-card__info-button"
+                    onClick={(e) => { e.stopPropagation(); setShowCacheInfo(true); }}
+                    type="button"
+                    aria-label="Cache hits and compression by period"
+                  >
+                    <Info size={13} weight="bold" />
+                  </button>
                 </span>
                 <div className="stat-value-row">
                   <strong className="stat-value--blue">
@@ -7157,16 +7161,6 @@ export default function App() {
                 <h3>How savings are calculated</h3>
                 <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex, and shapes the replies that come back.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
-                {cacheHitPct !== null && compressionOfRestPct !== null ? (
-                  <p>
-                    Across all time, <strong>{Math.round(cacheHitPct)}%</strong> of your input was
-                    served from your AI client&apos;s prompt cache at ~10% of the input price.
-                    Headroom deliberately leaves that cached prefix untouched, so its compression is
-                    measured against the rest: of the remaining input,{" "}
-                    <strong>{Math.round(compressionOfRestPct)}%</strong> was removed. A healthier
-                    cache makes the blended savings rate look smaller while your actual bill shrinks.
-                  </p>
-                ) : null}
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
                     <div className="savings-breakdown__row">
@@ -7268,6 +7262,64 @@ export default function App() {
                   <button
                     className="button button--primary"
                     onClick={() => setShowSavingsInfo(false)}
+                    type="button"
+                  >
+                    Got it
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showCacheInfo && (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => setShowCacheInfo(false)}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>Cache hits &amp; compression</h3>
+                <p>
+                  Most of your input is re-sent conversation history that your AI client serves
+                  from the provider&apos;s prompt cache at ~10% of the input price. Headroom
+                  deliberately leaves that cached prefix untouched (compressing it would break the
+                  discount), so its compression works on the rest. A healthier cache makes blended
+                  savings rates look smaller while your actual bill shrinks.
+                </p>
+                <div className="savings-breakdown">
+                  {[
+                    { label: "Today", pair: cachePairToday },
+                    { label: "This month", pair: cachePairMonth },
+                    {
+                      label: "All time",
+                      pair:
+                        cacheHitPct !== null && compressionOfRestPct !== null
+                          ? { hitPct: cacheHitPct, compressedPct: compressionOfRestPct }
+                          : null
+                    }
+                  ].map(({ label, pair }) => (
+                    <div className="savings-breakdown__row" key={label}>
+                      <span>{label}</span>
+                      <strong>
+                        {pair
+                          ? `${Math.round(pair.hitPct)}% cache hits · ${Math.round(
+                              pair.compressedPct
+                            )}% of the rest compressed`
+                          : "No cache data"}
+                      </strong>
+                    </div>
+                  ))}
+                </div>
+                <p className="savings-breakdown__note">
+                  Today and this month cover the part of the period with cache data (the backend
+                  keeps a limited history of cache checkpoints). Output shaping is a separate
+                  layer and is not part of these rates.
+                </p>
+                <div className="modal-actions">
+                  <button
+                    className="button button--primary"
+                    onClick={() => setShowCacheInfo(false)}
                     type="button"
                   >
                     Got it
