@@ -231,6 +231,19 @@ force the flag on and HEADROOM_COMPRESS_USER_MESSAGES can only force-enable
 of this flag (the role gate only guards text blocks), so the coding token
 mass is unaffected. Remove once a wheel protects tag pairs before the
 mixed-content split.
+
+Also ports three cache fixes owed upstream (remove each once a wheel ships
+it), gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend
+process pays the proxy import cost:
+1. event=cache_breakpoints: per-request client cache_control breakpoints
+   in vs forwarded out, WARNING when one is dropped or the last marker
+   moves away from the tail (the "large uncached input_tokens next to a
+   healthy cache_read" billing signature).
+2. HEADROOM_LOG_PAYLOAD_PREVIEW=0 strips verbatim payload previews from
+   headroom_retrieve log events so proxy.log is shareable in bug reports.
+3. CCR proactive expansion never injects into a text block carrying
+   cache_control: the client re-sends the original bytes next turn, so
+   mutating the breakpointed block busts the prefix cache at that message.
 """
 import faulthandler
 import signal
@@ -259,6 +272,194 @@ try:
         )
 except Exception:
     pass
+
+import os as _hd_os
+
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
+    # Cache-breakpoint in/out diagnostics. Inbound counts are snapshotted
+    # when the request body is parsed; outbound counts are taken at the
+    # single serialization funnel every forwarded body passes through
+    # (select_outbound_body; prepare_outbound_body_bytes wraps it). The
+    # contextvar ties the two together within one request task, including
+    # CCR continuations, which then compare against the original client
+    # request -- exactly what a dropped-marker hunt wants.
+    try:
+        import contextvars as _hd_cv
+        import logging as _hd_logging
+
+        _hd_bp_log = _hd_logging.getLogger("headroom.proxy")
+        _hd_inbound_bp = _hd_cv.ContextVar("headroom_inbound_bp", default=None)
+
+        def _hd_count_breakpoints(body):
+            system = body.get("system")
+            tools = body.get("tools")
+            messages = body.get("messages")
+            sys_n = 0
+            if isinstance(system, list):
+                sys_n = sum(
+                    1 for b in system if isinstance(b, dict) and "cache_control" in b
+                )
+            tool_n = 0
+            if isinstance(tools, list):
+                tool_n = sum(
+                    1 for t in tools if isinstance(t, dict) and "cache_control" in t
+                )
+            msg_n = 0
+            last = -1
+            count = 0
+            if isinstance(messages, list):
+                count = len(messages)
+                for i, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        continue
+                    found = 1 if "cache_control" in msg else 0
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if "cache_control" in block:
+                                found += 1
+                            inner = block.get("content")
+                            if isinstance(inner, list):
+                                found += sum(
+                                    1
+                                    for s in inner
+                                    if isinstance(s, dict) and "cache_control" in s
+                                )
+                    if found:
+                        msg_n += found
+                        last = i
+            tail = count - 1 - last if last >= 0 else -1
+            return {
+                "system": sys_n,
+                "tools": tool_n,
+                "messages": msg_n,
+                "total": sys_n + tool_n + msg_n,
+                "message_count": count,
+                "last_marker_tail": tail,
+            }
+
+        import headroom.proxy.helpers as _hd_helpers
+
+        _hd_orig_read = _hd_helpers.read_request_json_with_bytes
+
+        async def _hd_read_with_bp_snapshot(request):
+            body, raw = await _hd_orig_read(request)
+            try:
+                if isinstance(body, dict):
+                    _hd_inbound_bp.set(_hd_count_breakpoints(body))
+            except Exception:
+                pass
+            return body, raw
+
+        _hd_helpers.read_request_json_with_bytes = _hd_read_with_bp_snapshot
+
+        import headroom.proxy.body_forwarding as _hd_fwd
+
+        _hd_orig_select = _hd_fwd.select_outbound_body
+
+        def _hd_select_with_bp_log(**kwargs):
+            try:
+                inbound = _hd_inbound_bp.get()
+                body = kwargs.get("body")
+                if inbound is not None and isinstance(body, dict):
+                    outbound = _hd_count_breakpoints(body)
+                    if inbound["total"] or outbound["total"]:
+                        dropped = outbound["total"] < inbound["total"]
+                        tail_grew = inbound["last_marker_tail"] >= 0 and (
+                            outbound["last_marker_tail"] < 0
+                            or outbound["last_marker_tail"]
+                            > inbound["last_marker_tail"]
+                        )
+                        emit = (
+                            _hd_bp_log.warning
+                            if (dropped or tail_grew)
+                            else _hd_bp_log.info
+                        )
+                        emit(
+                            "event=cache_breakpoints in_total=%d out_total=%d "
+                            "in_system=%d out_system=%d in_tools=%d out_tools=%d "
+                            "in_messages=%d out_messages=%d in_msg_count=%d "
+                            "out_msg_count=%d in_last_tail=%d out_last_tail=%d "
+                            "dropped=%s tail_grew=%s",
+                            inbound["total"],
+                            outbound["total"],
+                            inbound["system"],
+                            outbound["system"],
+                            inbound["tools"],
+                            outbound["tools"],
+                            inbound["messages"],
+                            outbound["messages"],
+                            inbound["message_count"],
+                            outbound["message_count"],
+                            inbound["last_marker_tail"],
+                            outbound["last_marker_tail"],
+                            "true" if dropped else "false",
+                            "true" if tail_grew else "false",
+                        )
+            except Exception:
+                pass
+            return _hd_orig_select(**kwargs)
+
+        _hd_fwd.select_outbound_body = _hd_select_with_bp_log
+    except Exception:
+        pass
+
+    # Shareable proxy.log: HEADROOM_LOG_PAYLOAD_PREVIEW=0 drops the verbatim
+    # payload_preview from headroom_retrieve events, keeping byte counts.
+    try:
+        import headroom.cache.compression_store as _hd_store
+
+        _hd_orig_payload_log = _hd_store._payload_for_retrieval_log
+
+        def _hd_payload_log(payload):
+            raw = _hd_os.environ.get("HEADROOM_LOG_PAYLOAD_PREVIEW")
+            if raw is not None and raw.strip().lower() in ("0", "false", "no", "off"):
+                return {
+                    "payload_chars": len(payload),
+                    "payload_preview_chars": 0,
+                    "payload_truncated": len(payload) > 0,
+                    "payload_preview": "",
+                }
+            return _hd_orig_payload_log(payload)
+
+        _hd_store._payload_for_retrieval_log = _hd_payload_log
+    except Exception:
+        pass
+
+    # Never inject proactive-expansion text into the block carrying the
+    # client's cache breakpoint. Skipping the injection for that turn is
+    # safe (it is best-effort context enrichment); mutating the block is
+    # not (prefix bust at that message on every later turn).
+    try:
+        import headroom.proxy.handlers.anthropic as _hd_anth
+
+        _hd_orig_append = (
+            _hd_anth.AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn
+        )
+
+        def _hd_guarded_append(messages, context_text, *, frozen_message_count):
+            try:
+                if messages and isinstance(messages[-1], dict):
+                    content = messages[-1].get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                if "cache_control" in block:
+                                    return messages
+                                break
+            except Exception:
+                pass
+            return _hd_orig_append(
+                messages, context_text, frozen_message_count=frozen_message_count
+            )
+
+        _hd_anth.AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn = staticmethod(
+            _hd_guarded_append
+        )
+    except Exception:
+        pass
 "#;
 
 /// Pre-upstream concurrency passed to the backend: 2x logical cores,
@@ -7936,6 +8137,18 @@ mod tests {
         assert!(super::SITECUSTOMIZE_PY.contains(r#"_PROFILES.get("coding")"#));
         // Must stay guarded: fallback runtimes (< 0.30.0) lack the persona.
         assert!(super::SITECUSTOMIZE_PY.contains("except Exception:"));
+    }
+
+    #[test]
+    fn sitecustomize_cache_patches_are_gated_on_backend_env() {
+        // The breakpoint-diagnostics / payload-preview / expansion-guard
+        // patches import the full proxy stack; they must only run in the
+        // backend process, never in markitdown or other venv Pythons.
+        assert!(super::SITECUSTOMIZE_PY
+            .contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+        assert!(super::SITECUSTOMIZE_PY.contains("event=cache_breakpoints"));
+        assert!(super::SITECUSTOMIZE_PY.contains("HEADROOM_LOG_PAYLOAD_PREVIEW"));
+        assert!(super::SITECUSTOMIZE_PY.contains("_append_context_to_latest_non_frozen_user_turn"));
     }
 
     #[test]
