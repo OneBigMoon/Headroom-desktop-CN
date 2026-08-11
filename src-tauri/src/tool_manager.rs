@@ -289,6 +289,28 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
         _hd_bp_log = _hd_logging.getLogger("headroom.proxy")
         _hd_inbound_bp = _hd_cv.ContextVar("headroom_inbound_bp", default=None)
+        # (message_count, [(msg_index, marker_dict), ...]) of the CLIENT's own
+        # message-level markers -- consumed by the normalize wrapper below.
+        _hd_client_pos = _hd_cv.ContextVar("headroom_client_bp_pos", default=None)
+
+        def _hd_marker_positions(messages):
+            positions = []
+            if isinstance(messages, list):
+                for i, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    marker = None
+                    for b in content:
+                        if isinstance(b, dict) and isinstance(
+                            b.get("cache_control"), dict
+                        ):
+                            marker = b["cache_control"]
+                    if marker is not None:
+                        positions.append((i, dict(marker)))
+            return positions
 
         def _hd_count_breakpoints(body):
             system = body.get("system")
@@ -349,11 +371,86 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             try:
                 if isinstance(body, dict):
                     _hd_inbound_bp.set(_hd_count_breakpoints(body))
+                    msgs = body.get("messages")
+                    if isinstance(msgs, list):
+                        _hd_client_pos.set((len(msgs), _hd_marker_positions(msgs)))
             except Exception:
                 pass
             return body, raw
 
         _hd_helpers.read_request_json_with_bytes = _hd_read_with_bp_snapshot
+
+        # Mirror the CLIENT's cache_control positions instead of the wheel's
+        # single-marker consolidation. Anthropic resolves each breakpoint with
+        # a ~20-content-block lookback; the client keeps a marker on the
+        # previous turn's newest message as the read anchor that lets a big
+        # turn's write chain to the prior cache entry. Collapsing to one
+        # newest-block marker breaks that chain on tool-heavy turns (silent
+        # full re-write; measured 2-3x miss rate in the 2026-08-11 field
+        # report). Upstream-shaped fix; remove once a wheel ships it.
+        import headroom.cache.prefix_tracker as _hd_pt
+
+        _hd_orig_normalize = _hd_pt.normalize_message_cache_control
+
+        def _hd_normalize_mirror(messages, *args, **kwargs):
+            try:
+                stash = _hd_client_pos.get()
+                if stash is not None:
+                    count, positions = stash
+                    if positions and count == len(messages):
+                        out = []
+                        changed = False
+                        for msg in messages:
+                            content = (
+                                msg.get("content") if isinstance(msg, dict) else None
+                            )
+                            if isinstance(content, list) and any(
+                                isinstance(b, dict) and "cache_control" in b
+                                for b in content
+                            ):
+                                out.append(
+                                    {
+                                        **msg,
+                                        "content": [
+                                            {
+                                                k: v
+                                                for k, v in b.items()
+                                                if k != "cache_control"
+                                            }
+                                            if isinstance(b, dict)
+                                            else b
+                                            for b in content
+                                        ],
+                                    }
+                                )
+                                changed = True
+                            else:
+                                out.append(msg)
+                        placed = False
+                        for idx, marker in positions:
+                            msg = out[idx]
+                            content = (
+                                msg.get("content") if isinstance(msg, dict) else None
+                            )
+                            if not isinstance(content, list) or not content:
+                                continue
+                            if not isinstance(content[-1], dict):
+                                continue
+                            content = list(content)
+                            content[-1] = {
+                                **content[-1],
+                                "cache_control": dict(marker),
+                            }
+                            out[idx] = {**msg, "content": content}
+                            placed = True
+                        if placed or changed:
+                            return out
+                        return messages
+            except Exception:
+                pass
+            return _hd_orig_normalize(messages, *args, **kwargs)
+
+        _hd_pt.normalize_message_cache_control = _hd_normalize_mirror
 
         import headroom.proxy.body_forwarding as _hd_fwd
 
@@ -8149,6 +8246,10 @@ mod tests {
         assert!(super::SITECUSTOMIZE_PY.contains("event=cache_breakpoints"));
         assert!(super::SITECUSTOMIZE_PY.contains("HEADROOM_LOG_PAYLOAD_PREVIEW"));
         assert!(super::SITECUSTOMIZE_PY.contains("_append_context_to_latest_non_frozen_user_turn"));
+        // Marker-mirroring fix: the wheel's single-marker consolidation breaks
+        // Anthropic's ~20-block breakpoint lookback on tool-heavy turns.
+        assert!(super::SITECUSTOMIZE_PY.contains("normalize_message_cache_control"));
+        assert!(super::SITECUSTOMIZE_PY.contains("_hd_normalize_mirror"));
     }
 
     #[test]
