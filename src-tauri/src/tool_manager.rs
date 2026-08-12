@@ -232,9 +232,9 @@ of this flag (the role gate only guards text blocks), so the coding token
 mass is unaffected. Remove once a wheel protects tag pairs before the
 mixed-content split.
 
-Also ports three cache fixes owed upstream (remove each once a wheel ships
-it), gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend
-process pays the proxy import cost:
+Also ports four fixes owed upstream (remove each once a wheel ships it),
+gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
+pays the proxy import cost:
 1. event=cache_breakpoints: per-request client cache_control breakpoints
    in vs forwarded out, WARNING when one is dropped or the last marker
    moves away from the tail (the "large uncached input_tokens next to a
@@ -244,6 +244,17 @@ process pays the proxy import cost:
 3. CCR proactive expansion never injects into a text block carrying
    cache_control: the client re-sends the original bytes next turn, so
    mutating the breakpointed block busts the prefix cache at that message.
+4. Context-limit guard (upstream PR #2942): compression under-reports
+   usage to the client, so Claude Code's proactive auto-compaction never
+   fires; once even the compressed request exceeds the model's real
+   window, every turn 400s with "prompt is too long" and the client
+   force-compacts on each error -- a compact-every-other-prompt loop
+   (churn report 2026-08-12). The guard nudges the reported message_start
+   input_tokens once the forwarded total nears the real window, learns
+   the real window from prompt-too-long 400 bodies, and makes
+   get_context_limit honor the context-1m beta so 1M sessions stop being
+   max-crushed by compression pressure. Kill switch:
+   HEADROOM_CONTEXT_GUARD=0.
 """
 import faulthandler
 import signal
@@ -561,6 +572,230 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
         _hd_anth.AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn = staticmethod(
             _hd_guarded_append
         )
+    except Exception:
+        pass
+
+    # Context-limit guard (upstream PR #2942; remove once a wheel ships it).
+    # See point 4 of the module docstring for the failure mode this breaks.
+    try:
+        if _hd_os.environ.get("HEADROOM_CONTEXT_GUARD", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            import contextvars as _hd_cg_cvars
+            import json as _hd_cg_json
+            import logging as _hd_cg_logging
+            import re as _hd_cg_re
+
+            import headroom.providers.anthropic as _hd_cg_prov
+            import headroom.proxy.handlers.anthropic as _hd_cg_anth
+            import headroom.proxy.handlers.streaming as _hd_cg_stream
+
+            _hd_cg_log = _hd_cg_logging.getLogger("headroom.proxy")
+            # Beta header of the in-flight request; set by the entry wrapper
+            # so the get_context_limit patch can see it.
+            _hd_cg_beta = _hd_cg_cvars.ContextVar("headroom_cg_beta", default=None)
+            # (model, has_1m_beta) -> real window learned from a 400 body.
+            _hd_cg_learned = {}
+            _HD_CG_RE = _hd_cg_re.compile(
+                r"prompt is too long:\s*(\d+)\s*tokens?\s*>\s*(\d+)\s*maximum",
+                _hd_cg_re.IGNORECASE,
+            )
+            # Nudge arms at 90% of the real window; reports 95% of the window
+            # the client believes in (Claude Code compacts around 92%).
+            _HD_CG_TRIGGER = 0.90
+            _HD_CG_REPORT = 0.95
+
+            def _hd_cg_has_1m(beta):
+                if not beta:
+                    return False
+                return any(
+                    t.strip().lower().startswith("context-1m") for t in beta.split(",")
+                )
+
+            def _hd_cg_believed(base, beta):
+                return max(base, 1_000_000) if _hd_cg_has_1m(beta) else base
+
+            def _hd_cg_effective(model, base, beta):
+                believed = _hd_cg_believed(base, beta)
+                learned = _hd_cg_learned.get((model, _hd_cg_has_1m(beta)))
+                return min(believed, learned) if learned is not None else believed
+
+            def _hd_cg_learn(model, beta, text):
+                if isinstance(text, (bytes, bytearray)):
+                    text = bytes(text).decode("utf-8", errors="replace")
+                m = _HD_CG_RE.search(text or "")
+                if m:
+                    _hd_cg_learned[(model, _hd_cg_has_1m(beta))] = int(m.group(2))
+                    _hd_cg_log.warning(
+                        "event=context_guard_learned_limit model=%s context_1m=%s limit=%s",
+                        model,
+                        _hd_cg_has_1m(beta),
+                        m.group(2),
+                    )
+
+            _hd_cg_orig_handle = _hd_cg_anth.AnthropicHandlerMixin.handle_anthropic_messages
+
+            async def _hd_cg_handle(self, request, *args, **kwargs):
+                token = None
+                try:
+                    token = _hd_cg_beta.set(request.headers.get("anthropic-beta"))
+                except Exception:
+                    token = None
+                try:
+                    return await _hd_cg_orig_handle(self, request, *args, **kwargs)
+                finally:
+                    if token is not None:
+                        _hd_cg_beta.reset(token)
+
+            _hd_cg_anth.AnthropicHandlerMixin.handle_anthropic_messages = _hd_cg_handle
+
+            # Compression pressure sees the window the request is really
+            # subject to (context-1m raised, learned-capped) instead of a
+            # flat 200k that pins context_pressure at 1.0 for 1M sessions.
+            _hd_cg_orig_limit = _hd_cg_prov.AnthropicProvider.get_context_limit
+
+            def _hd_cg_limit(self, model):
+                base = _hd_cg_orig_limit(self, model)
+                try:
+                    return _hd_cg_effective(model, base, _hd_cg_beta.get())
+                except Exception:
+                    return base
+
+            _hd_cg_prov.AnthropicProvider.get_context_limit = _hd_cg_limit
+
+            class _HdCgGuard:
+                # Mirrors upstream MessageStartGuard (PR #2942): rewrite the
+                # first message_start's input_tokens when the forwarded total
+                # nears the real window so the client compacts gracefully
+                # before the prompt-too-long wall. One decision, then inert.
+                def __init__(self, believed, effective):
+                    self.believed = believed
+                    self.effective = effective
+                    self.buf = bytearray()
+                    self.done = believed <= 0 or effective <= 0
+
+                def flush(self):
+                    self.done = True
+                    out = bytes(self.buf)
+                    self.buf = bytearray()
+                    return out
+
+                def feed(self, chunk):
+                    if self.done:
+                        return chunk
+                    self.buf.extend(chunk)
+                    if len(self.buf) > 262144:
+                        return self.flush()
+                    out = bytearray()
+                    while not self.done:
+                        cut = self.buf.find(b"\n\n")
+                        if cut == -1:
+                            break
+                        event = bytes(self.buf[: cut + 2])
+                        del self.buf[: cut + 2]
+                        out += self._event(event)
+                    if self.done:
+                        out += self.flush()
+                    return bytes(out)
+
+                def _event(self, event):
+                    if b"event: ping" in event or event.strip() == b"":
+                        return event
+                    self.done = True
+                    if b"message_start" not in event:
+                        return event
+                    try:
+                        return self._rewrite(event)
+                    except Exception:
+                        return event
+
+                def _rewrite(self, event):
+                    lines = event.split(b"\n")
+                    for i, line in enumerate(lines):
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = _hd_cg_json.loads(line[5:].strip())
+                        if payload.get("type") != "message_start":
+                            return event
+                        usage = payload.get("message", {}).get("usage")
+                        if not isinstance(usage, dict):
+                            return event
+                        cr = int(usage.get("cache_read_input_tokens") or 0)
+                        cw = int(usage.get("cache_creation_input_tokens") or 0)
+                        total = int(usage.get("input_tokens") or 0) + cr + cw
+                        if total < _HD_CG_TRIGGER * self.effective:
+                            return event
+                        target = int(self.believed * _HD_CG_REPORT)
+                        if total >= target:
+                            return event
+                        usage["input_tokens"] = target - cr - cw
+                        _hd_cg_log.warning(
+                            "event=context_guard_nudge forwarded_total=%s "
+                            "effective_limit=%s reported_total=%s believed_limit=%s",
+                            total,
+                            self.effective,
+                            target,
+                            self.believed,
+                        )
+                        lines[i] = b"data: " + _hd_cg_json.dumps(
+                            payload, separators=(",", ":")
+                        ).encode()
+                        return b"\n".join(lines)
+                    return event
+
+            _hd_cg_orig_stream = _hd_cg_stream.StreamingMixin._stream_response
+
+            async def _hd_cg_stream_response(
+                self, url, headers, body, provider, model, request_id, *args, **kwargs
+            ):
+                resp = await _hd_cg_orig_stream(
+                    self, url, headers, body, provider, model, request_id, *args, **kwargs
+                )
+                if provider != "anthropic":
+                    return resp
+                try:
+                    beta = (
+                        headers.get("anthropic-beta") if isinstance(headers, dict) else None
+                    )
+                    if getattr(resp, "status_code", 200) == 400:
+                        _hd_cg_learn(model, beta, getattr(resp, "body", b"") or b"")
+                        return resp
+                    inner = getattr(resp, "body_iterator", None)
+                    if inner is None:
+                        return resp
+                    base = _hd_cg_orig_limit(self.anthropic_provider, model)
+                    guard = _HdCgGuard(
+                        _hd_cg_believed(base, beta),
+                        _hd_cg_effective(model, base, beta),
+                    )
+
+                    async def _hd_cg_guarded():
+                        async for chunk in inner:
+                            if guard.done:
+                                yield chunk
+                                continue
+                            if not isinstance(chunk, (bytes, bytearray)):
+                                tail = guard.flush()
+                                if tail:
+                                    yield tail
+                                yield chunk
+                                continue
+                            out = guard.feed(bytes(chunk))
+                            if out:
+                                yield out
+                        tail = guard.flush()
+                        if tail:
+                            yield tail
+
+                    resp.body_iterator = _hd_cg_guarded()
+                except Exception:
+                    pass
+                return resp
+
+            _hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response
     except Exception:
         pass
 "#;
@@ -8256,6 +8491,26 @@ mod tests {
         // Anthropic's ~20-block breakpoint lookback on tool-heavy turns.
         assert!(super::SITECUSTOMIZE_PY.contains("normalize_message_cache_control"));
         assert!(super::SITECUSTOMIZE_PY.contains("_hd_normalize_mirror"));
+    }
+
+    #[test]
+    fn sitecustomize_ports_context_limit_guard() {
+        // Upstream PR #2942: without the guard, long sessions degrade into a
+        // compact-every-other-prompt loop once the compressed request hits
+        // the model's real window (churn report 2026-08-12). Verified against
+        // installed 0.34.0 by scratchpad/verify_sitecustomize.py on 2026-08-12.
+        let py = super::SITECUSTOMIZE_PY;
+        // All three seams are patched...
+        assert!(py.contains("_hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response"));
+        assert!(py.contains("_hd_cg_prov.AnthropicProvider.get_context_limit = _hd_cg_limit"));
+        assert!(py.contains("_hd_cg_anth.AnthropicHandlerMixin.handle_anthropic_messages = _hd_cg_handle"));
+        // ...the real window is learned from prompt-too-long 400 bodies,
+        // keyed by 1m-beta presence so a clamped account never poisons one
+        // with real 1M access...
+        assert!(py.contains("prompt is too long"));
+        assert!(py.contains("_hd_cg_learned.get((model, _hd_cg_has_1m(beta)))"));
+        // ...and the kill switch is honored.
+        assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
     }
 
     #[test]
