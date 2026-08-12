@@ -211,6 +211,13 @@ There are two channels with separate GitHub Actions workflows:
 |---------|--------|----------|----------------|----------|
 | Stable | `main` | `release-macos.yml` | `X.Y.Z` | `releases/latest/download/latest.json` |
 | Staging | `staging` | `release-macos-staging.yml` | `X.Y.Z-rc.N` | `releases/download/staging-rolling/latest.json` |
+| Windows preview | ad-hoc branch | `windows-preview.yml` (manual) | `X.Y.Z-win.N` | `releases/download/windows-preview/latest.json` |
+
+Stable is cross-platform: the `windows` job in `release-macos.yml` runs after the
+macOS job, uploads the NSIS installer to the same `vX.Y.Z` release, and merges
+`windows-x86_64` into its `latest.json`. Staging stays macOS-only. Each stable
+release also rewrites the windows-preview channel manifest so lingering preview
+installs migrate to stable.
 
 ### Branching model
 

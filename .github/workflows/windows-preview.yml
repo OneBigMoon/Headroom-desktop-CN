@@ -1,10 +1,12 @@
 name: Windows Preview Build
 
-# Manual-only preview channel for the experimental Windows tier. Publishes an
-# NSIS installer plus its own updater manifest to the rolling windows-preview
-# prerelease. Deliberately decoupled from release-macos.yml: it never touches
-# the stable v* releases or their latest.json, so there is no manifest race.
-# Retire this workflow when Windows joins the stable release flow.
+# Manual-only channel for ad-hoc Windows builds (-win.N) ahead of a stable
+# cut. Stable Windows ships from release-macos.yml alongside macOS; every
+# stable release also rewrites windows-preview/latest.json to pull remaining
+# preview installs onto stable, so anything published here is superseded by
+# the next stable release. Publishes an NSIS installer plus its own updater
+# manifest to the rolling windows-preview prerelease; never touches the
+# stable v* releases or their latest.json, so there is no manifest race.
 on:
   workflow_dispatch:
 

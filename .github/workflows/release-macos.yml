@@ -1,4 +1,10 @@
-name: Release macOS App
+name: Release App
+
+# Stable release for every platform. The macOS job releases first (it owns the
+# GitHub release and the updater manifest via tauri-action); the Windows job
+# runs strictly after it, uploads the NSIS installer to the same release, and
+# merges windows-x86_64 into latest.json. A Windows build failure therefore
+# never blocks or breaks the already-published macOS release.
 
 on:
   push:
@@ -21,6 +27,9 @@ jobs:
     name: macOS Universal
     runs-on: macos-latest
     timeout-minutes: 45
+    outputs:
+      should_release: ${{ steps.release_guard.outputs.should_release }}
+      package_version: ${{ steps.release_guard.outputs.package_version }}
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
@@ -292,6 +301,8 @@ jobs:
           includeUpdaterJson: true
           args: --target universal-apple-darwin
 
+      # Runs before the windows job, so staging-rolling stays macOS-only:
+      # there is no Windows staging channel, only stable.
       - name: Mirror stable artifacts to rolling staging release
         if: steps.release_guard.outputs.should_release == 'true'
         env:
@@ -334,4 +345,94 @@ jobs:
               --prerelease \
               --target "$GITHUB_SHA" \
               "$workdir"/*
+          fi
+
+  windows:
+    name: Windows x64
+    needs: release
+    if: needs.release.outputs.should_release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build NSIS installer
+        shell: bash
+        # NSIS only: bundle.targets is "all", which also builds an MSI this
+        # workflow never publishes. No Authenticode cert yet, so SmartScreen
+        # warns on install; the release notes should keep saying so.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Publish Windows installer to the stable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STABLE_TAG: v${{ needs.release.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          setup="$(ls "$bundle_dir"/*-setup.exe)"
+          sig="${setup}.sig"
+          [ -f "$sig" ] || { echo "updater signature missing: $sig" >&2; exit 1; }
+          asset_name="$(basename "$setup")"
+
+          # Installer before manifest, so the updater never points at an
+          # asset that isn't there yet (same rule as the staging mirror).
+          gh release upload "$STABLE_TAG" "$setup" "$sig" --clobber --repo "$GITHUB_REPOSITORY"
+
+          # Merge windows-x86_64 into the manifest tauri-action published in
+          # the macOS job. This job runs strictly after it (needs:), so there
+          # is no write race on latest.json.
+          workdir="$(mktemp -d)"
+          gh release download "$STABLE_TAG" --pattern latest.json --dir "$workdir" --repo "$GITHUB_REPOSITORY"
+          jq \
+            --arg signature "$(cat "$sig")" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${STABLE_TAG}/${asset_name}" \
+            '.platforms["windows-x86_64"] = {signature: $signature, url: $url}' \
+            "$workdir/latest.json" > "$workdir/latest.merged.json"
+          mv "$workdir/latest.merged.json" "$workdir/latest.json"
+          gh release upload "$STABLE_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+
+          # Refresh the windows-preview channel manifest so existing preview
+          # installs (which poll windows-preview/latest.json and sort
+          # X.Y.Z above X.Y.Z-win.N) are offered this stable build; once
+          # installed they update from the stable endpoint.
+          if gh release view windows-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload windows-preview "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit windows-preview --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Windows preview (rolling)" \
+              --notes "Windows now ships with the stable releases (current: ${STABLE_TAG}). This channel only redirects remaining preview installs to stable - install from the latest stable release instead."
           fi
