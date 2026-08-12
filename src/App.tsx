@@ -1121,7 +1121,8 @@ function DailySavingsChart({
               barCategoryGap="5%"
               barGap={1}
               data={chartData}
-              margin={{ top: 64, right: 2, left: 2, bottom: 0 }}
+              // Clears the overlay: total + label + the chip row added in 0.7.9.
+              margin={{ top: 96, right: 2, left: 2, bottom: 0 }}
             >
               <defs>
                 <linearGradient id="actualUsdGradient" x1="0" x2="0" y1="0" y2="1">
