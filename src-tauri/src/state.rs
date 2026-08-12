@@ -2392,14 +2392,25 @@ impl AppState {
             .iter()
             .map(|point| point.estimated_savings_usd)
             .sum();
+        let (lifetime_tool_schema_tokens_saved, cached_output_estimator_tokens) = {
+            let tracker = self.savings_tracker.lock();
+            (
+                tracker.lifetime_tool_schema_tokens_saved,
+                tracker.last_output_estimator_tokens_saved,
+            )
+        };
+        // Until the backend is reachable (cold start), price the output layer
+        // off the last persisted estimator reading instead of the bucket sum,
+        // so the headline doesn't dip by hundreds of dollars for the first
+        // minutes and then jump back up.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            stats.as_ref().and_then(|s| s.output_reduction.as_ref()),
+            stats
+                .as_ref()
+                .and_then(|s| s.output_reduction.as_ref())
+                .map(|r| r.tokens_saved)
+                .or(cached_output_estimator_tokens),
         );
-        let lifetime_tool_schema_tokens_saved = self
-            .savings_tracker
-            .lock()
-            .lifetime_tool_schema_tokens_saved;
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
         let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
@@ -4062,6 +4073,11 @@ struct PersistedSavingsState {
     /// local (`local_hour_key`, joining the local-keyed hourly points).
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// Last reading of the output shaper's durable estimator total. Cached so
+    /// the lifetime headline can price this layer while the backend is still
+    /// starting: without it, cold start falls back to the (understating)
+    /// bucket sum and the total visibly dips for the first minutes.
+    last_output_estimator_tokens_saved: Option<u64>,
 }
 
 struct SavingsTracker {
@@ -4100,6 +4116,8 @@ struct SavingsTracker {
     /// `tool_schema_process_total`: the first post-launch reading seeds a
     /// baseline, never a delta, and a reading below the watermark reseeds.
     output_sample_watermark: Option<(u64, u64)>,
+    /// See `PersistedSavingsState::last_output_estimator_tokens_saved`.
+    last_output_estimator_tokens_saved: Option<u64>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -4207,6 +4225,9 @@ impl SavingsTracker {
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.output_hourly_samples.clone()),
             output_sample_watermark: None,
+            last_output_estimator_tokens_saved: persisted_state
+                .as_ref()
+                .and_then(|state| state.last_output_estimator_tokens_saved),
             last_written_at: None,
         };
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
@@ -4840,6 +4861,10 @@ impl SavingsTracker {
         let Some(reduction) = stats.output_reduction.as_ref() else {
             return;
         };
+        // Cache the raw reading as-is (not a high-water mark): the cold-start
+        // fallback must mirror what the live path would show, including the
+        // "re-seeded estimator below the bucket sum" case its caller guards.
+        self.last_output_estimator_tokens_saved = Some(reduction.tokens_saved);
         let current = (reduction.tokens_saved, reduction.baseline_tokens);
         let previous = self.output_sample_watermark.replace(current);
         let Some((prev_saved, prev_baseline)) = previous else {
@@ -4888,6 +4913,7 @@ impl SavingsTracker {
             hourly_savings: self.hourly_savings.clone(),
             output_daily_samples: self.output_daily_samples.clone(),
             output_hourly_samples: self.output_hourly_samples.clone(),
+            last_output_estimator_tokens_saved: self.last_output_estimator_tokens_saved,
         }
     }
 
@@ -6748,23 +6774,24 @@ fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u6
 /// Falls back to the bucket sum whenever the estimator is absent, is smaller
 /// (a re-seeded baseline), or the buckets carry no rate to price with. The two
 /// sources measure the same layer, so this replaces the bucket sum, never adds
-/// to it.
+/// to it. `estimator_tokens_saved` is the live `/stats` reading when the
+/// backend is up, or the tracker's persisted last reading during cold start.
 fn lifetime_output_savings_usd(
     daily_savings: &[DailySavingsPoint],
-    reduction: Option<&OutputReduction>,
+    estimator_tokens_saved: Option<u64>,
 ) -> f64 {
     let bucket_usd: f64 = daily_savings.iter().map(|p| p.output_savings_usd).sum();
     let bucket_tokens: u64 = daily_savings.iter().map(|p| p.output_tokens_saved).sum();
 
-    let Some(reduction) = reduction else {
+    let Some(tokens_saved) = estimator_tokens_saved else {
         return bucket_usd;
     };
-    if bucket_tokens == 0 || bucket_usd <= 0.0 || reduction.tokens_saved <= bucket_tokens {
+    if bucket_tokens == 0 || bucket_usd <= 0.0 || tokens_saved <= bucket_tokens {
         return bucket_usd;
     }
 
     let usd_per_token = bucket_usd / bucket_tokens as f64;
-    usd_per_token * reduction.tokens_saved as f64
+    usd_per_token * tokens_saved as f64
 }
 
 /// For days before `cutoff_date` (exclusive), the tracker is preferred.
@@ -6984,23 +7011,13 @@ mod tests {
         buckets[1].output_tokens_saved = 60_000;
         buckets[1].output_savings_usd = 1.5;
 
-        let reduction = |tokens_saved| OutputReduction {
-            method: "estimated".into(),
-            reduction_percent: 37.1,
-            ci_low_percent: 34.3,
-            ci_high_percent: 39.8,
-            requests: 48_638,
-            tokens_saved,
-            baseline_tokens: 0,
-        };
-
         // The estimator covers history the rollups never carried: price all of
         // it at the buckets' own rate.
-        let usd = lifetime_output_savings_usd(&buckets, Some(&reduction(1_000_000)));
+        let usd = lifetime_output_savings_usd(&buckets, Some(1_000_000));
         assert!((usd - 25.0).abs() < 1e-9, "{usd}");
 
         // Re-seeded / lagging estimator: never go below what we can see.
-        let usd = lifetime_output_savings_usd(&buckets, Some(&reduction(10_000)));
+        let usd = lifetime_output_savings_usd(&buckets, Some(10_000));
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No estimate at all (old backend, unseeded baseline).
@@ -7009,10 +7026,7 @@ mod tests {
 
         // No priced buckets yet: nothing to extrapolate a rate from.
         let empty = vec![daily("2026-08-04", 0, 0.0)];
-        assert_eq!(
-            lifetime_output_savings_usd(&empty, Some(&reduction(1_000_000))),
-            0.0
-        );
+        assert_eq!(lifetime_output_savings_usd(&empty, Some(1_000_000)), 0.0);
     }
 
     #[test]
@@ -7767,9 +7781,14 @@ mod tests {
             .expect("day bucket");
         assert_eq!(day.saved_tokens, 400);
         assert_eq!(day.baseline_tokens, 1_000);
+        // Every reading refreshes the cached estimator total, including a
+        // below-watermark one — the cold-start fallback must show what the
+        // live path would.
+        assert_eq!(tracker.last_output_estimator_tokens_saved, Some(1_400));
         // A reading below the watermark (estimator rebuilt) reseeds silently.
         tracker.sample_output_reduction(&stats(100, 200));
         tracker.sample_output_reduction(&stats(150, 300));
+        assert_eq!(tracker.last_output_estimator_tokens_saved, Some(150));
         let day = tracker
             .output_daily_samples
             .get(&day_key)
@@ -7783,6 +7802,21 @@ mod tests {
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
+    }
+
+    #[test]
+    fn cached_output_estimator_total_survives_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("config")).expect("config dir");
+        let mut tracker = SavingsTracker::load_or_create(dir.path()).expect("tracker");
+        assert_eq!(tracker.last_output_estimator_tokens_saved, None);
+        tracker.last_output_estimator_tokens_saved = Some(22_000_000);
+        tracker.persist_state().expect("persist");
+        let reloaded = SavingsTracker::load_or_create(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.last_output_estimator_tokens_saved,
+            Some(22_000_000)
+        );
     }
 
     fn make_tracker() -> SavingsTracker {
@@ -7810,6 +7844,7 @@ mod tests {
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
             output_sample_watermark: None,
+            last_output_estimator_tokens_saved: None,
             last_written_at: None,
         }
     }
@@ -9964,6 +9999,7 @@ mod tests {
             hourly_savings: std::collections::BTreeMap::new(),
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
+            last_output_estimator_tokens_saved: None,
         };
         std::fs::write(
             config_file(&base_dir, "savings-state.json"),
