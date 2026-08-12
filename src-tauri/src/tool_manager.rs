@@ -667,14 +667,21 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             _hd_cg_prov.AnthropicProvider.get_context_limit = _hd_cg_limit
 
             class _HdCgGuard:
-                # Mirrors upstream MessageStartGuard (PR #2942): rewrite the
+                # Mirrors upstream StreamUsageGuard (PR #2942): rewrite the
                 # first message_start's input_tokens when the forwarded total
-                # nears the real window so the client compacts gracefully
-                # before the prompt-too-long wall. One decision, then inert.
+                # nears the real window, AND the final cumulative-usage
+                # message_delta -- verified live 2026-08-12 that Claude Code
+                # merges the latter over the former, so nudging only the
+                # first event loses the merge. Below the trigger the guard
+                # goes inert on the first event (steady-state untouched).
                 def __init__(self, believed, effective):
                     self.believed = believed
                     self.effective = effective
                     self.buf = bytearray()
+                    self.seen_start = False
+                    self.target = None
+                    self.start_cr = 0
+                    self.start_cw = 0
                     self.done = believed <= 0 or effective <= 0
 
                 def flush(self):
@@ -704,15 +711,28 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 def _event(self, event):
                     if b"event: ping" in event or event.strip() == b"":
                         return event
-                    self.done = True
-                    if b"message_start" not in event:
+                    if not self.seen_start:
+                        self.seen_start = True
+                        if b"message_start" not in event:
+                            self.done = True
+                            return event
+                        try:
+                            rewritten = self._rewrite_start(event)
+                        except Exception:
+                            self.done = True
+                            return event
+                        if self.target is None:
+                            self.done = True
+                        return rewritten
+                    if b"message_delta" not in event:
                         return event
+                    self.done = True
                     try:
-                        return self._rewrite(event)
+                        return self._rewrite_delta(event)
                     except Exception:
                         return event
 
-                def _rewrite(self, event):
+                def _rewrite_start(self, event):
                     lines = event.split(b"\n")
                     for i, line in enumerate(lines):
                         if not line.startswith(b"data:"):
@@ -731,6 +751,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         target = int(self.believed * _HD_CG_REPORT)
                         if total >= target:
                             return event
+                        self.target = target
+                        self.start_cr = cr
+                        self.start_cw = cw
                         usage["input_tokens"] = target - cr - cw
                         _hd_cg_log.warning(
                             "event=context_guard_nudge forwarded_total=%s "
@@ -740,6 +763,33 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             target,
                             self.believed,
                         )
+                        lines[i] = b"data: " + _hd_cg_json.dumps(
+                            payload, separators=(",", ":")
+                        ).encode()
+                        return b"\n".join(lines)
+                    return event
+
+                def _rewrite_delta(self, event):
+                    lines = event.split(b"\n")
+                    for i, line in enumerate(lines):
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = _hd_cg_json.loads(line[5:].strip())
+                        if payload.get("type") != "message_delta":
+                            return event
+                        usage = payload.get("usage")
+                        # A delta without cumulative input usage cannot
+                        # override the already-nudged message_start.
+                        if not isinstance(usage, dict) or "input_tokens" not in usage:
+                            return event
+                        cr = int(usage.get("cache_read_input_tokens", self.start_cr) or 0)
+                        cw = int(
+                            usage.get("cache_creation_input_tokens", self.start_cw) or 0
+                        )
+                        new_input = self.target - cr - cw
+                        if int(usage.get("input_tokens") or 0) >= new_input:
+                            return event
+                        usage["input_tokens"] = new_input
                         lines[i] = b"data: " + _hd_cg_json.dumps(
                             payload, separators=(",", ":")
                         ).encode()
@@ -8509,6 +8559,12 @@ mod tests {
         // with real 1M access...
         assert!(py.contains("prompt is too long"));
         assert!(py.contains("_hd_cg_learned.get((model, _hd_cg_has_1m(beta)))"));
+        // ...the nudge covers BOTH usage-bearing events -- Claude Code merges
+        // the final cumulative-usage message_delta over message_start
+        // (verified live 2026-08-12), so rewriting only the first loses the
+        // merge...
+        assert!(py.contains("_rewrite_start"));
+        assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
     }
