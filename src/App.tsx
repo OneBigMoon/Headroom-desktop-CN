@@ -741,7 +741,8 @@ function WindowRateChip({
   badge,
   value,
   rows,
-  note
+  note,
+  popSide = "right"
 }: {
   label: string;
   dot?: "input" | "output";
@@ -750,6 +751,7 @@ function WindowRateChip({
   value: string;
   rows: Array<{ dt: string; dd: string }>;
   note: string;
+  popSide?: "right" | "left";
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -793,7 +795,7 @@ function WindowRateChip({
       </button>
       {open ? (
         <div
-          className="output-chip__popover"
+          className={`output-chip__popover${popSide === "left" ? " output-chip__popover--flip" : ""}`}
           role="dialog"
           aria-label={`${title} details`}
           onClick={(e) => e.stopPropagation()}
@@ -818,7 +820,13 @@ function WindowRateChip({
   );
 }
 
-function OutputReductionChip({ reduction }: { reduction: OutputReduction }) {
+function OutputReductionChip({
+  reduction,
+  flip = false
+}: {
+  reduction: OutputReduction;
+  flip?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const isMeasured = reduction.method === "measured";
@@ -857,7 +865,7 @@ function OutputReductionChip({ reduction }: { reduction: OutputReduction }) {
       </button>
       {open ? (
         <div
-          className="output-chip__popover"
+          className={`output-chip__popover${flip ? " output-chip__popover--flip" : ""}`}
           role="dialog"
           aria-label="Output reduction details"
           onClick={(e) => e.stopPropagation()}
@@ -1088,6 +1096,7 @@ function DailySavingsChart({
                 {windowOutput !== null ? (
                   <WindowRateChip
                     dot="output"
+                    popSide="left"
                     label={`Output −${Math.round(windowOutput.pct)}%`}
                     title="Output token reduction"
                     badge="estimated"
@@ -1102,7 +1111,7 @@ function DailySavingsChart({
                     note="Estimate vs the shaper's learned baseline, sampled only while the app runs — short coverage can sit far from the all-time rate."
                   />
                 ) : windowIncludesToday && outputReduction ? (
-                  <OutputReductionChip reduction={outputReduction} />
+                  <OutputReductionChip flip reduction={outputReduction} />
                 ) : null}
               </span>
             ) : null}

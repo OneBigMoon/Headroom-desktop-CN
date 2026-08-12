@@ -2214,6 +2214,13 @@ select {
   box-shadow: 0 8px 24px rgba(36, 31, 29, 0.16);
 }
 
+/* Rightmost chip: extend leftward instead, so the panel never overflows the
+   window edge. */
+.output-chip__popover--flip {
+  left: auto;
+  right: calc(100% + 8px);
+}
+
 .output-chip__pop-head {
   display: flex;
   align-items: center;
