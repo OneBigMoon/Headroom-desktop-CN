@@ -238,9 +238,9 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports one fix owed upstream (remove once a wheel ships it), gated on
-HEADROOM_SDK=headroom-desktop-proxy so only the backend process pays the
-proxy import cost:
+Also ports two fixes owed upstream (remove each once a wheel ships it),
+gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
+pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
 usage to the client, so Claude Code's proactive auto-compaction never
 fires; once even the compressed request exceeds the model's real
@@ -252,6 +252,11 @@ the real window from prompt-too-long 400 bodies, and makes
 get_context_limit honor the context-1m beta so 1M sessions stop being
 max-crushed by compression pressure. Kill switch:
 HEADROOM_CONTEXT_GUARD=0.
+Response-cache poisoning guard: SemanticCache.set stores any body gated
+only on status_code == 200, so an empty/unparseable/error body is
+replayed for the whole TTL (1h) and only a proxy restart clears it. The
+guard refuses to store anything that is not a JSON object or that
+carries an error payload. Kill switch: HEADROOM_RESPONSE_CACHE_GUARD=0.
 """
 import faulthandler
 import signal
@@ -555,6 +560,59 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 return resp
 
             _hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response
+    except Exception:
+        pass
+
+    # Response-cache poisoning guard (owed upstream). SemanticCache.set is
+    # gated only on `status_code == 200`, so an empty body, an unparseable
+    # one, or an error payload that some path returned as 200 is stored and
+    # replayed verbatim for the full TTL (default 1h) to every matching
+    # non-streaming request. Observed 2026-08-13: three /v1/messages replays
+    # served in 6-10ms from one poisoned entry, and the only recovery was
+    # restarting the proxy. Provider-generic (Anthropic and OpenAI both use a
+    # top-level "error"), so it protects every handler, not just the CCR path
+    # that surfaced it. Kill switch: HEADROOM_RESPONSE_CACHE_GUARD=0.
+    try:
+        if _hd_os.environ.get("HEADROOM_RESPONSE_CACHE_GUARD", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            import json as _hd_sc_json
+            import logging as _hd_sc_logging
+
+            import headroom.proxy.semantic_cache as _hd_sc
+
+            _hd_sc_log = _hd_sc_logging.getLogger("headroom.proxy")
+            _hd_sc_orig_set = _hd_sc.SemanticCache.set
+
+            def _hd_sc_cacheable(body):
+                if not body:
+                    return False
+                try:
+                    parsed = _hd_sc_json.loads(body)
+                except Exception:
+                    return False
+                if not isinstance(parsed, dict):
+                    return False
+                # An error body stored under a 200 is the worst case: every
+                # replay re-serves it and the client never retries.
+                return not (parsed.get("type") == "error" or "error" in parsed)
+
+            async def _hd_sc_set(self, messages, model, response_body, *args, **kwargs):
+                if not _hd_sc_cacheable(response_body):
+                    _hd_sc_log.warning(
+                        "event=response_cache_store_refused model=%s bytes=%d",
+                        model,
+                        len(response_body or b""),
+                    )
+                    return None
+                return await _hd_sc_orig_set(
+                    self, messages, model, response_body, *args, **kwargs
+                )
+
+            _hd_sc.SemanticCache.set = _hd_sc_set
     except Exception:
         pass
 "#;
@@ -6471,6 +6529,24 @@ fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
     }
 }
 
+/// The unified `--no-ccr` flag replaced the split `--no-ccr-marker` /
+/// `--no-ccr-inject-tool` pair in headroom-ai 0.31.0 (upstream ecc93991);
+/// 0.30.0 and earlier exit 2 with "No such option", which would fail boot
+/// validation on the 0.28.0 fallback runtime exactly as --no-http2 did on
+/// 0.26.0 (Sentry RUST-4A). Verified against the tagged CLI: v0.30.0 carries
+/// the split pair, v0.31.0+ the unified flag. Unknown/unparseable version means
+/// the receipt is from a current install, so assume the pinned runtime.
+fn runtime_supports_no_ccr(installed_version: Option<&str>) -> bool {
+    let Some(version) = installed_version else {
+        return true;
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 31),
+        _ => true,
+    }
+}
+
 /// The "coding" savings persona only exists in `agent_savings._PROFILES` from
 /// headroom-ai 0.30.0. On the 0.28.0 fallback runtime (chosen when 0.30.0 boot
 /// validation times out) the set is {agent-90, balanced}, so `coding` makes the
@@ -6510,6 +6586,24 @@ fn headroom_entrypoint_startup_args(
         args.push("--no-http2".to_string());
     }
     args.push("--log-messages".to_string());
+    // CCR off: with headroom_retrieve injected into the tools array, every
+    // stream:true turn is rewritten to a buffered stream:false upstream call
+    // and re-synthesized as SSE (`buffered_stream_ccr`, upstream #1451/#2479).
+    // That wrapper commits `http.response.start` with status 200 +
+    // text/event-stream after a 1s keepalive, before the upstream outcome is
+    // known; when the buffered call then returns anything that is not a
+    // StreamingResponse (unparseable body, or a real 429/500/529) it can only
+    // emit a bare `event: error` with no message_start, so the client sees
+    // "API returned an empty or malformed response (HTTP 200)" and, because the
+    // status is 200, never retries. Upstream's own help text names --no-ccr as
+    // the right setting for streaming clients. Turning it off also restores
+    // real streaming and puts those turns back through
+    // StreamingMixin._stream_response, which is where SITECUSTOMIZE_PY's
+    // context-limit guard (#2942) attaches — the buffered path bypassed it
+    // entirely. Present since 0.33.0, so this is not a 0.35.0 regression.
+    if runtime_supports_no_ccr(installed_version) {
+        args.push("--no-ccr".to_string());
+    }
     if learn_enabled {
         args.extend(headroom_learn_startup_args());
     }
@@ -8267,6 +8361,27 @@ mod tests {
         assert!(!super::SITECUSTOMIZE_PY.contains("normalize_message_cache_control"));
     }
 
+    /// SemanticCache.set stores any body gated only on `status_code == 200`,
+    /// so one empty/unparseable/error response is replayed for the full TTL
+    /// (1h) and only a proxy restart clears it — the amplifier that turned a
+    /// single bad upstream response into a wedged session on 2026-08-13.
+    #[test]
+    fn sitecustomize_guards_response_cache_against_poisoning() {
+        let py = super::SITECUSTOMIZE_PY;
+        // Must patch the class the proxy actually instantiates
+        // (headroom.proxy.semantic_cache.SemanticCache, not cache.semantic).
+        assert!(py.contains("import headroom.proxy.semantic_cache as _hd_sc"));
+        assert!(py.contains("_hd_sc.SemanticCache.set = _hd_sc_set"));
+        // The wrapper must stay async: callers `await self.cache.set(...)`.
+        assert!(py.contains("async def _hd_sc_set("));
+        assert!(py.contains("await _hd_sc_orig_set("));
+        // Error payloads under a 200 are the worst case to cache.
+        assert!(py.contains(r#"parsed.get("type") == "error""#));
+        assert!(py.contains("HEADROOM_RESPONSE_CACHE_GUARD"));
+        // Backend process only: it imports the proxy stack.
+        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+    }
+
     #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
@@ -9444,6 +9559,41 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         // The python -m argparse variant has defined --no-http2 since 0.10.0
         // and must keep it unconditionally.
         assert!(headroom_python_startup_args().contains(&"--no-http2".to_string()));
+
+        backend_port::reset_for_tests();
+    }
+
+    /// CCR tool injection forces every stream:true turn through the buffered
+    /// non-stream path, whose keepalive wrapper commits HTTP 200 before the
+    /// upstream outcome is known and then cannot report a real error — the
+    /// client sees an empty/malformed 200 and cannot retry. The unified
+    /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
+    /// click would exit 2 and boot validation would fail like RUST-4A.
+    #[test]
+    fn entrypoint_args_gate_no_ccr_on_runtime_version() {
+        backend_port::reset_for_tests();
+
+        // 0.30.0 and earlier expose the split --no-ccr-marker /
+        // --no-ccr-inject-tool pair, not the unified flag.
+        assert!(!headroom_entrypoint_startup_args(Some("0.28.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        assert!(!headroom_entrypoint_startup_args(Some("0.30.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("0.31.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("0.35.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        // Unknown or malformed receipt version: assume pinned runtime.
+        assert!(headroom_entrypoint_startup_args(None, true).contains(&"--no-ccr".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("garbage"), true)
+            .contains(&"--no-ccr".to_string()));
+        // The `python -m headroom.proxy.server` argparse defines no CCR
+        // option at all; passing it there would exit 2 on every fallback boot.
+        assert!(!headroom_python_startup_args().contains(&"--no-ccr".to_string()));
+        // Version-gated flags stay out of the staleness signature: a runtime
+        // that cannot take the flag would otherwise never match and the
+        // desktop would stop/restart the proxy on every check.
+        assert!(!super::expected_proxy_arg_signature(true).contains(&"--no-ccr"));
 
         backend_port::reset_for_tests();
     }

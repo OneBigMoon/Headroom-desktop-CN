@@ -42,20 +42,20 @@ describe("app helpers", () => {
   });
 
   it("shows the payback anchor only at a genuine value-add (>= 2x)", () => {
-    // Pro annual is $5/mo. $50/mo savings -> 10x.
-    expect(paybackLabel(50, "pro", "annual")).toContain("10x");
+    // Pro annual is $3.50/mo. $35/mo savings -> 10x.
+    expect(paybackLabel(35, "pro", "annual")).toContain("10x");
     // Exactly 2x -> shown.
-    expect(paybackLabel(10, "pro", "annual")).toContain("2x");
+    expect(paybackLabel(7, "pro", "annual")).toContain("2x");
     // Floors, never overstates: 2.8x -> "2x", not "3x".
-    expect(paybackLabel(14, "pro", "annual")).toContain("2x");
-    expect(paybackLabel(14, "pro", "annual")).not.toContain("3x");
+    expect(paybackLabel(9.8, "pro", "annual")).toContain("2x");
+    expect(paybackLabel(9.8, "pro", "annual")).not.toContain("3x");
     // Under 2x (covers price but weak) -> null, so it never deters.
-    expect(paybackLabel(9, "pro", "annual")).toBeNull();
-    expect(paybackLabel(6, "pro", "annual")).toBeNull();
+    expect(paybackLabel(6.3, "pro", "annual")).toBeNull();
+    expect(paybackLabel(4.2, "pro", "annual")).toBeNull();
     // Below price -> null.
-    expect(paybackLabel(3, "pro", "annual")).toBeNull();
+    expect(paybackLabel(2, "pro", "annual")).toBeNull();
     // No em dashes in user-facing copy.
-    expect(paybackLabel(50, "pro", "annual")).not.toContain("—");
+    expect(paybackLabel(35, "pro", "annual")).not.toContain("—");
   });
 
   it("projects forgone savings until reset, suppressing trivial sums", () => {
@@ -140,14 +140,34 @@ describe("app helpers", () => {
 
     expect(result.featuredPlanId).toBe("max5x");
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["max5x", "$15"],
+      ["pro", "$3.50"],
+      ["max20x", "$30"],
+    ]);
+  });
+
+  it("shows discounted annual prices when launch discount is active", () => {
+    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true);
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["max5x", "$7.50"],
+      ["pro", "$1.75"],
+      ["max20x", "$15"],
+    ]);
+  });
+
+  it("shows full monthly prices when launch discount is inactive", () => {
+    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, false, "monthly");
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["max5x", "$20"],
       ["pro", "$5"],
       ["max20x", "$40"],
     ]);
   });
 
-  it("shows discounted annual prices when launch discount is active", () => {
-    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true);
+  it("shows discounted monthly prices when launch discount is active", () => {
+    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true, "monthly");
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["max5x", "$10"],
@@ -156,54 +176,34 @@ describe("app helpers", () => {
     ]);
   });
 
-  it("shows full monthly prices when launch discount is inactive", () => {
-    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, false, "monthly");
-
-    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["max5x", "$30"],
-      ["pro", "$7.50"],
-      ["max20x", "$60"],
-    ]);
-  });
-
-  it("shows discounted monthly prices when launch discount is active", () => {
-    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true, "monthly");
-
-    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["max5x", "$15"],
-      ["pro", "$3.75"],
-      ["max20x", "$30"],
-    ]);
-  });
-
   it("shows discounted prices on upgrade-target cards for an active subscriber with the launch discount", () => {
     const result = getUpgradePlans("individual", "max20x", undefined, "pro", true, true);
 
     const byId = (id: string) => result.plans.find((plan) => plan.id === id);
     // Active plan card keeps its full list price (purchaseInfo conveys the real amount).
-    expect(byId("pro")?.price).toBe("$5");
+    expect(byId("pro")?.price).toBe("$3.50");
     expect(byId("pro")?.originalPrice).toBeUndefined();
     // Upgrade targets show the discounted price with the full price struck through.
-    expect([byId("max5x")?.price, byId("max5x")?.originalPrice]).toEqual(["$10", "$20"]);
-    expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$20", "$40"]);
+    expect([byId("max5x")?.price, byId("max5x")?.originalPrice]).toEqual(["$7.50", "$15"]);
+    expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$15", "$30"]);
   });
 
   it("drives discounted annual prices from the active cohort percent", () => {
-    // 25% off the early cohort: $5 -> $3.75, $20 -> $15, $40 -> $30.
+    // 25% off the early cohort: $3.50 -> $2.63, $15 -> $11.25, $30 -> $22.50.
     const result = getUpgradePlans(
       "individual", "free", undefined, undefined, undefined, true, "annual",
       undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, 25
     );
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["max5x", "$15"],
-      ["pro", "$3.75"],
-      ["max20x", "$30"],
+      ["max5x", "$11.25"],
+      ["pro", "$2.63"],
+      ["max20x", "$22.50"],
     ]);
   });
 
   describe("intro offer", () => {
-    const intro: IntroOffer = { active: true, percentOff: 50, durationMonths: 6 };
+    const intro: IntroOffer = { active: true, percentOff: 50, durationMonths: 3 };
 
     it("returns the straight percent while the offer runs", () => {
       expect(introPercentOff(intro)).toBe(50);
@@ -212,7 +212,7 @@ describe("app helpers", () => {
     });
 
     it("labels the sale badge with the offer duration", () => {
-      expect(introSaleBadgeLabel(intro)).toBe("50% off first 6 months");
+      expect(introSaleBadgeLabel(intro)).toBe("50% off first 3 months");
       expect(introSaleBadgeLabel(null)).toBeNull();
     });
 
@@ -224,9 +224,9 @@ describe("app helpers", () => {
       );
 
       expect(result.plans.map((plan) => [plan.id, plan.price, plan.originalPrice])).toEqual([
-        ["max5x", "$15", "$30"],
-        ["pro", "$3.75", "$7.50"],
-        ["max20x", "$30", "$60"],
+        ["max5x", "$10", "$20"],
+        ["pro", "$2.50", "$5"],
+        ["max20x", "$20", "$40"],
       ]);
     });
 
@@ -238,9 +238,9 @@ describe("app helpers", () => {
       );
 
       expect(result.plans.map((plan) => [plan.id, plan.price, plan.originalPrice])).toEqual([
-        ["max5x", "$10", "$20"],
-        ["pro", "$2.50", "$5"],
-        ["max20x", "$20", "$40"],
+        ["max5x", "$7.50", "$15"],
+        ["pro", "$1.75", "$3.50"],
+        ["max20x", "$15", "$30"],
       ]);
     });
 
@@ -253,19 +253,19 @@ describe("app helpers", () => {
 
       const max5x = result.plans.find((p) => p.id === "max5x");
       expect(max5x?.billingLines).toEqual(["USD / month", "billed annually"]);
-      expect(max5x?.reversionLine).toBe("then $20/mo after 6 months");
+      expect(max5x?.reversionLine).toBe("then $15/mo after 3 months");
     });
 
     it("lets an account forever discount win over the intro offer", () => {
-      // Subscriber pays $2.50/mo (50% off pro annual, forever). Intro also on.
+      // Subscriber pays $1.75/mo (50% off pro annual, forever). Intro also on.
       const result = getUpgradePlans(
         "individual", undefined, undefined, "pro", true, false, "annual",
-        3000, "annual", "2026-12-01", "2025-12-01", "forever", null, false, undefined, 0,
+        2100, "annual", "2026-12-01", "2025-12-01", "forever", null, false, undefined, 0,
         intro
       );
       const max5x = result.plans.find((p) => p.id === "max5x");
-      // The account's own 50% beats the intro offer's 50%: $20 -> $10 either way.
-      expect(max5x?.price).toBe("$10");
+      // The account's own 50% beats the intro offer's 50%: $15 -> $7.50 either way.
+      expect(max5x?.price).toBe("$7.50");
     });
   });
 
@@ -278,26 +278,26 @@ describe("app helpers", () => {
 
   describe("getPlanRenewalPriceLabel", () => {
     it("returns the standard per-month price when no current paid amount is given", () => {
-      // Max x5 annual is $20 / month (billed annually).
-      expect(getPlanRenewalPriceLabel("max5x", "annual")).toBe("$20 / month");
-      expect(getPlanRenewalPriceLabel("max5x", "monthly")).toBe("$30 / month");
+      // Max x5 annual is $15 / month (billed annually).
+      expect(getPlanRenewalPriceLabel("max5x", "annual")).toBe("$15 / month");
+      expect(getPlanRenewalPriceLabel("max5x", "monthly")).toBe("$20 / month");
     });
 
     it("carries the user's current discount ratio forward to the target plan", () => {
-      // 100% off Pro annual (paid $0 vs $60/year list) -> 100% off Max x20.
+      // 100% off Pro annual (paid $0 vs $42/year list) -> 100% off Max x20.
       expect(
         getPlanRenewalPriceLabel("max20x", "annual", { fromTier: "pro", currentPaidCents: 0 })
       ).toBe("$0 / month");
-      // 50% off Pro annual (paid $30/year = 3000 cents per cycle vs $60 list)
-      // -> 50% off Max x5 annual: $20 / month list -> $10 / month.
+      // 50% off Pro annual (paid $21/year = 2100 cents per cycle vs $42 list)
+      // -> 50% off Max x5 annual: $15 / month list -> $7.50 / month.
       expect(
-        getPlanRenewalPriceLabel("max5x", "annual", { fromTier: "pro", currentPaidCents: 3000 })
+        getPlanRenewalPriceLabel("max5x", "annual", { fromTier: "pro", currentPaidCents: 2100 })
+      ).toBe("$7.50 / month");
+      // 50% off monthly cycle (paid $2.50 vs $5 list per month) -> 50% off Max x5
+      // monthly: $20 / month list -> $10 / month.
+      expect(
+        getPlanRenewalPriceLabel("max5x", "monthly", { fromTier: "pro", currentPaidCents: 250 })
       ).toBe("$10 / month");
-      // 50% off monthly cycle (paid $3.75 vs $7.50 list per month) -> 50% off Max x5
-      // monthly: $30 / month list -> $15 / month.
-      expect(
-        getPlanRenewalPriceLabel("max5x", "monthly", { fromTier: "pro", currentPaidCents: 375 })
-      ).toBe("$15 / month");
     });
   });
 
@@ -322,15 +322,15 @@ describe("app helpers", () => {
     });
 
     it("omits purchase info when renewal date is missing", () => {
-      // 6000 cents = $5/mo * 12 months
-      const result = getUpgradePlans(...baseArgs, 6000, "annual", null);
+      // 4200 cents = $3.50/mo * 12 months
+      const result = getUpgradePlans(...baseArgs, 4200, "annual", null);
       expect(activePlan(result)?.purchaseInfo).toBeUndefined();
     });
 
     it("shows full renewal price when no discount is present", () => {
-      const result = getUpgradePlans(...baseArgs, 6000, "annual", "2026-12-01");
+      const result = getUpgradePlans(...baseArgs, 4200, "annual", "2026-12-01");
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$5",
+        paidPerMonthLabel: "$3.50",
         discountPct: 0,
       });
     });
@@ -339,30 +339,30 @@ describe("app helpers", () => {
       // 100% discount this period (0 cents), but "once" so renewal is full price
       const result = getUpgradePlans(...baseArgs, 0, "annual", "2026-04-16", "2025-04-16", "once");
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$5",
+        paidPerMonthLabel: "$3.50",
         discountPct: 0,
       });
     });
 
     it("shows discounted renewal price for a forever discount", () => {
-      // 3000 cents = $2.50/mo * 12 months (50% off)
-      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "forever");
+      // 2100 cents = $1.75/mo * 12 months (50% off)
+      const result = getUpgradePlans(...baseArgs, 2100, "annual", "2026-12-01", "2025-12-01", "forever");
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$2.50",
+        paidPerMonthLabel: "$1.75",
         discountPct: 50,
       });
     });
 
     it("applies the account forever discount to upgrade-target cards without launch promo", () => {
-      // 3000 cents = $2.50/mo (50% off pro). Launch discount inactive.
-      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "forever");
+      // 2100 cents = $1.75/mo (50% off pro). Launch discount inactive.
+      const result = getUpgradePlans(...baseArgs, 2100, "annual", "2026-12-01", "2025-12-01", "forever");
       const max5x = result.plans.find((p) => p.id === "max5x");
       expect(max5x?.originalPrice).toBeDefined();
       expect(max5x?.price).not.toBe(max5x?.originalPrice);
     });
 
     it("does not discount upgrade-target cards for a once-off discount", () => {
-      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "once");
+      const result = getUpgradePlans(...baseArgs, 2100, "annual", "2026-12-01", "2025-12-01", "once");
       const max5x = result.plans.find((p) => p.id === "max5x");
       expect(max5x?.originalPrice).toBeUndefined();
     });
@@ -370,9 +370,9 @@ describe("app helpers", () => {
     it("shows discounted renewal price when repeating discount window has not expired", () => {
       // Started 2025-04-16, 12-month discount window → expires 2026-04-16
       // Renewal at 2026-01-01 is within window → discount applies
-      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-01-01", "2025-04-16", "repeating", 12);
+      const result = getUpgradePlans(...baseArgs, 2100, "annual", "2026-01-01", "2025-04-16", "repeating", 12);
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$2.50",
+        paidPerMonthLabel: "$1.75",
         discountPct: 50,
       });
     });
@@ -380,18 +380,18 @@ describe("app helpers", () => {
     it("shows full renewal price when repeating discount window has expired", () => {
       // Started 2024-01-01, 12-month window → expired 2025-01-01
       // Renewal at 2026-04-01 is outside window → full price
-      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-04-01", "2024-01-01", "repeating", 12);
+      const result = getUpgradePlans(...baseArgs, 2100, "annual", "2026-04-01", "2024-01-01", "repeating", 12);
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$5",
+        paidPerMonthLabel: "$3.50",
         discountPct: 0,
       });
     });
 
     it("shows full renewal price for repeating discount with missing window data", () => {
       // "repeating" but duration_in_months is null → treat as no discount at renewal
-      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "repeating", null);
+      const result = getUpgradePlans(...baseArgs, 2100, "annual", "2026-12-01", "2025-12-01", "repeating", null);
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$5",
+        paidPerMonthLabel: "$3.50",
         discountPct: 0,
       });
     });

@@ -2834,6 +2834,22 @@ async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<Strin
 }
 
 #[tauri::command]
+async fn get_headroom_save_offer(app: AppHandle) -> Result<Option<pricing::SaveOffer>, String> {
+    let offer = pricing::get_save_offer()?;
+    if offer.is_some() {
+        analytics::track_event(&app, "save_offer_shown", None);
+    }
+    Ok(offer)
+}
+
+#[tauri::command]
+async fn redeem_headroom_save_offer(app: AppHandle) -> Result<(), String> {
+    pricing::redeem_save_offer()?;
+    analytics::track_event(&app, "save_offer_redeemed", None);
+    Ok(())
+}
+
+#[tauri::command]
 fn get_headroom_learn_status(
     state: State<'_, AppState>,
     project_path: Option<String>,
@@ -4139,6 +4155,8 @@ pub fn run() {
             change_headroom_subscription_plan,
             reactivate_headroom_subscription,
             get_headroom_billing_portal_url,
+            get_headroom_save_offer,
+            redeem_headroom_save_offer,
             get_activity_feed,
             list_live_learnings,
             list_live_learnings_for_projects,

@@ -72,6 +72,7 @@ import { SetupStallModal } from "./components/SetupStallModal";
 import {
   buildSetupStallMailto,
   describeInvokeError,
+  formatCents,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
@@ -186,6 +187,7 @@ import type {
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
+  SaveOffer,
 } from "./lib/types";
 
 interface NavItem {
@@ -1696,6 +1698,10 @@ export default function App() {
   const [planChangeError, setPlanChangeError] = useState<string | null>(null);
   const [reactivateBusy, setReactivateBusy] = useState(false);
   const [reactivateError, setReactivateError] = useState<string | null>(null);
+  const [saveOffer, setSaveOffer] = useState<SaveOffer | null>(null);
+  const [saveOfferBusy, setSaveOfferBusy] = useState(false);
+  const [saveOfferError, setSaveOfferError] = useState<string | null>(null);
+  const [saveOfferRedeemed, setSaveOfferRedeemed] = useState(false);
   const [contactEmail, setContactEmail] = useState("");
   const [contactMessage, setContactMessage] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
@@ -4044,12 +4050,17 @@ export default function App() {
       setUpgradeActionError(null);
 
       try {
-        // Deep-link to the user's subscription page so they land one click
-        // away from "Change plan" instead of at the portal root.
-        const url = await invoke<string>("get_headroom_billing_portal_url", {
-          target: "subscription"
-        });
-        await openExternalLink(url);
+        // Cancellation happens in Polar's hosted portal, so this is the only
+        // place we can put a save offer in front of it. A failure here must not
+        // block anyone from reaching billing, so the fetch swallows its error.
+        const offer = await invoke<SaveOffer | null>("get_headroom_save_offer").catch(() => null);
+        if (offer) {
+          setSaveOfferError(null);
+          setSaveOfferRedeemed(false);
+          setSaveOffer(offer);
+          return;
+        }
+        await openBillingPortal();
       } catch (error) {
         setUpgradeActionError(
           error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
@@ -4108,6 +4119,51 @@ export default function App() {
     if (planChangeBusy) return;
     setPendingPlanChange(null);
     setPlanChangeError(null);
+  }
+
+  async function openBillingPortal() {
+    // Deep-link to the user's subscription page so they land one click away
+    // from "Change plan" instead of at the portal root.
+    const url = await invoke<string>("get_headroom_billing_portal_url", {
+      target: "subscription"
+    });
+    await openExternalLink(url);
+  }
+
+  async function handleRedeemSaveOffer() {
+    if (saveOfferBusy) return;
+    setSaveOfferBusy(true);
+    setSaveOfferError(null);
+    try {
+      await invoke("redeem_headroom_save_offer");
+      setSaveOfferRedeemed(true);
+      await refreshPricingStatus();
+    } catch (error) {
+      setSaveOfferError(
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not apply the offer."
+      );
+    } finally {
+      setSaveOfferBusy(false);
+    }
+  }
+
+  async function handleDeclineSaveOffer() {
+    if (saveOfferBusy) return;
+    setSaveOffer(null);
+    setUpgradeActionBusy("free");
+    try {
+      await openBillingPortal();
+    } catch (error) {
+      setUpgradeActionError(
+        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+      );
+    } finally {
+      setUpgradeActionBusy(null);
+    }
   }
 
   async function handleReactivateSubscription() {
@@ -7626,6 +7682,81 @@ export default function App() {
               </div>
             );
           })() : null}
+
+          {saveOffer ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => {
+                if (!saveOfferBusy) setSaveOffer(null);
+              }}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                {saveOfferRedeemed ? (
+                  <>
+                    <h3>You're all set</h3>
+                    <p>
+                      Your plan stays active at{" "}
+                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
+                      for the next {saveOffer.durationMonths} months. The new price
+                      takes effect at your next renewal.
+                    </p>
+                    <div className="modal-actions">
+                      <button
+                        className="primary-button"
+                        onClick={() => setSaveOffer(null)}
+                        type="button"
+                      >
+                        Done
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <h3>Before you go: {saveOffer.percentOff}% off for {saveOffer.durationMonths} months</h3>
+                    <p>
+                      Stay on your plan and pay{" "}
+                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
+                      instead of{" "}
+                      <strong>{formatCents(saveOffer.currentMonthlyCents)} / month</strong>{" "}
+                      for the next {saveOffer.durationMonths} months
+                      {saveOffer.billingPeriod === "annual" ? ", billed annually" : ""}.
+                      That is {saveOffer.percentOff}% off on top of the rate you are
+                      already on.
+                    </p>
+                    <p>
+                      The new price starts at your next renewal. Nothing else about
+                      your plan changes, and you can still cancel any time.
+                    </p>
+                    {saveOfferError ? (
+                      <p className="install-progress__error">{saveOfferError}</p>
+                    ) : null}
+                    <div className="modal-actions">
+                      <button
+                        className="secondary-button"
+                        disabled={saveOfferBusy}
+                        onClick={() => void handleDeclineSaveOffer()}
+                        type="button"
+                      >
+                        Continue to cancel
+                      </button>
+                      <button
+                        className="primary-button"
+                        disabled={saveOfferBusy}
+                        onClick={() => void handleRedeemSaveOffer()}
+                        type="button"
+                      >
+                        {saveOfferBusy
+                          ? "Applying..."
+                          : `Keep it at ${formatCents(saveOffer.offerMonthlyCents)} / mo`}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          ) : null}
 
           {showAppUpdateDialog && appUpdateAvailable ? (
             <div className="modal-backdrop" role="dialog" aria-modal="true">

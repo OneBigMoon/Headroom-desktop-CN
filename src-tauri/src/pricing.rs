@@ -573,6 +573,23 @@ struct BillingPortalResponse {
     url: String,
 }
 
+/// Cancellation save offer terms, as computed server-side. Cents are per month
+/// even on annual plans, matching how the plan cards quote prices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveOffer {
+    pub percent_off: u32,
+    pub duration_months: u32,
+    pub billing_period: String,
+    pub current_monthly_cents: i64,
+    pub offer_monthly_cents: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SaveOfferResponse {
+    offer: Option<SaveOffer>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiErrorResponse {
@@ -1444,6 +1461,78 @@ pub(crate) fn get_billing_portal_url_with_base_url(
         .json::<BillingPortalResponse>()
         .map(|body| body.url)
         .map_err(|err| format!("Could not parse billing portal response: {err}"))
+}
+
+/// The save offer to show before handing someone off to the cancel flow, or
+/// `None` when there is nothing to offer. Fetching also marks the offer as
+/// seen, which is what suppresses the cancellation winback email.
+pub fn get_save_offer() -> Result<Option<SaveOffer>, String> {
+    get_save_offer_with_base_url(&api_base_url())
+}
+
+pub(crate) fn get_save_offer_with_base_url(base_url: &str) -> Result<Option<SaveOffer>, String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before managing your plan.".to_string())?;
+    let response = http_client()?
+        .get(join_url(base_url, "desktop/save_offer"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|err| format!("Could not check for an offer: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(
+            api_error.unwrap_or_else(|| format!("Could not check for an offer (status {status})."))
+        );
+    }
+
+    response
+        .json::<SaveOfferResponse>()
+        .map(|body| body.offer)
+        .map_err(|err| format!("Could not parse offer response: {err}"))
+}
+
+pub fn redeem_save_offer() -> Result<(), String> {
+    redeem_save_offer_with_base_url(&api_base_url())
+}
+
+pub(crate) fn redeem_save_offer_with_base_url(base_url: &str) -> Result<(), String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before managing your plan.".to_string())?;
+    let response = http_client()?
+        .post(join_url(base_url, "desktop/save_offer"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|err| format!("Could not apply the offer: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(
+            api_error.unwrap_or_else(|| format!("Could not apply the offer (status {status})."))
+        );
+    }
+
+    Ok(())
 }
 
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
@@ -5055,6 +5144,84 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(err, "Customer not found");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_save_offer_parses_terms() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({
+                "offer": {
+                    "percentOff": 33,
+                    "durationMonths": 12,
+                    "billingPeriod": "monthly",
+                    "currentMonthlyCents": 3000,
+                    "offerMonthlyCents": 2010
+                }
+            }),
+            "HTTP/1.1 200 OK",
+        );
+
+        let offer = super::get_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect("offer fetch succeeds")
+            .expect("an offer is present");
+        server.join().unwrap();
+
+        assert_eq!(offer.percent_off, 33);
+        assert_eq!(offer.duration_months, 12);
+        assert_eq!(offer.current_monthly_cents, 3000);
+        assert_eq!(offer.offer_monthly_cents, 2010);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_save_offer_returns_none_when_ineligible() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({ "offer": null }), "HTTP/1.1 200 OK");
+
+        let offer = super::get_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect("offer fetch succeeds");
+        server.join().unwrap();
+
+        assert!(offer.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn redeem_save_offer_surfaces_api_error_message() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "This offer is no longer available." }),
+            "HTTP/1.1 422 Unprocessable Entity",
+        );
+
+        let err = super::redeem_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect_err("4xx surfaces as error");
+        server.join().unwrap();
+
+        assert_eq!(err, "This offer is no longer available.");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn redeem_save_offer_clears_session_on_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
+
+        let err = super::redeem_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect_err("401");
+        server.join().unwrap();
+        assert!(err.contains("session expired"));
+
+        let stored = crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .unwrap();
+        assert!(stored.is_none());
     }
 
     #[test]

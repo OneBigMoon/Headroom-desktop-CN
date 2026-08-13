@@ -19,9 +19,9 @@ const PLAN_PRICES: Record<
   "pro" | "max5x" | "max20x",
   Record<BillingPeriod, { full: string; fullCents: number }>
 > = {
-  pro:   { annual: { full: "$5",  fullCents: 500  }, monthly: { full: "$7.50", fullCents: 750  } },
-  max5x: { annual: { full: "$20", fullCents: 2000 }, monthly: { full: "$30",   fullCents: 3000 } },
-  max20x:{ annual: { full: "$40", fullCents: 4000 }, monthly: { full: "$60",   fullCents: 6000 } },
+  pro:   { annual: { full: "$3.50", fullCents: 350  }, monthly: { full: "$5",  fullCents: 500  } },
+  max5x: { annual: { full: "$15",   fullCents: 1500 }, monthly: { full: "$20", fullCents: 2000 } },
+  max20x:{ annual: { full: "$30",   fullCents: 3000 }, monthly: { full: "$40", fullCents: 4000 } },
 };
 
 // Discounted price for a tier, mirroring the web `sale_price_cents` rounding
@@ -57,7 +57,7 @@ function projectPerMonthCents(
   return Math.round(toFullPerMonth * (currentPaidPerMonth / fromFullPerMonth));
 }
 
-function formatCents(cents: number): string {
+export function formatCents(cents: number): string {
   const dollars = cents / 100;
   return cents % 100 === 0 ? `$${dollars}` : `$${dollars.toFixed(2)}`;
 }

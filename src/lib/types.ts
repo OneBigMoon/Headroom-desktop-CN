@@ -619,6 +619,17 @@ export interface IntroOffer {
   durationMonths: number;
 }
 
+/// Cancellation save offer computed by headroom-web: an extra percentOff on
+/// top of whatever the subscriber already pays, for durationMonths. Cents are
+/// per month even on annual plans, matching how the plan cards quote prices.
+export interface SaveOffer {
+  percentOff: number;
+  durationMonths: number;
+  billingPeriod: BillingPeriod;
+  currentMonthlyCents: number;
+  offerMonthlyCents: number;
+}
+
 export type TierRecommendationSource = "claude" | "codex" | "both";
 
 export interface TierMismatch {
