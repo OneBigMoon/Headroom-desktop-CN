@@ -136,6 +136,22 @@ describe("app helpers", () => {
     ]);
   });
 
+  it("marks the active plan only on the billing period it was bought on", () => {
+    const forPeriod = (billingPeriod: "monthly" | "annual") =>
+      getUpgradePlans(
+        "individual", "pro", undefined, "pro", true, false, billingPeriod,
+        2000, "monthly", "2026-09-01T00:00:00Z"
+      ).plans.find((plan) => plan.id === "pro")!;
+
+    const onMonthly = forPeriod("monthly");
+    expect(onMonthly.ctaLabel).toBe("Stay on Pro plan");
+    expect(onMonthly.purchaseInfo).toBeDefined();
+
+    const onAnnual = forPeriod("annual");
+    expect(onAnnual.ctaLabel).toBe("Switch to annual billing");
+    expect(onAnnual.purchaseInfo).toBeUndefined();
+  });
+
   describe("server-driven prices", () => {
     afterEach(() => setServerPlanPrices(null));
 

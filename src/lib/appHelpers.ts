@@ -63,6 +63,19 @@ function discountedPriceLabel(fullCents: number, percentOff: number): string {
 }
 const TIER_RANK: Record<HeadroomSubscriptionTier, number> = { pro: 1, max5x: 2, max20x: 3 };
 
+/// Whether the billing-period tab being viewed is the one the subscriber
+/// actually bought. An unknown/absent server value means "can't tell" - treat
+/// it as a match so the active-plan chrome never vanishes on older servers.
+export function matchesSubscriptionPeriod(
+  billingPeriod: BillingPeriod,
+  subscriptionBillingPeriod?: string | null
+): boolean {
+  if (subscriptionBillingPeriod !== "annual" && subscriptionBillingPeriod !== "monthly") {
+    return true;
+  }
+  return subscriptionBillingPeriod === billingPeriod;
+}
+
 export function isTierDowngrade(
   fromTier: HeadroomSubscriptionTier,
   toTier: HeadroomSubscriptionTier
@@ -293,6 +306,9 @@ export function getUpgradePlans(
       hasActiveHeadroomSubscription && headroomSubscriptionTier
         ? headroomSubscriptionTier
         : null;
+    // The subscription lives on one billing period. On the other tab the same
+    // tier is a switch offer, not the plan you are on.
+    const periodMatches = matchesSubscriptionPeriod(billingPeriod, subscriptionBillingPeriod);
 
     // Compute purchase info for the active plan card when data is available.
     const activePurchaseInfo = ((): UpgradePlanPurchaseInfo | undefined => {
@@ -396,7 +412,9 @@ export function getUpgradePlans(
         tagline,
         price,
         ...(showDiscount ? { originalPrice: prices.full } : {}),
-        ...(id === activeHeadroomPlanId && activePurchaseInfo ? { purchaseInfo: activePurchaseInfo } : {}),
+        ...(id === activeHeadroomPlanId && periodMatches && activePurchaseInfo
+          ? { purchaseInfo: activePurchaseInfo }
+          : {}),
         billingLines: ["USD / month", billingLabel],
         // Full-width line under the price so "$10/mo billed annually" can't
         // be misread as the full-year rate; the badge names the duration.
@@ -447,12 +465,19 @@ export function getUpgradePlans(
       }
 
       if (plan.id === activeHeadroomPlanId) {
-        return {
-          ...plan,
-          ctaLabel: `Stay on ${plan.name} plan`,
-          ctaVariant: "secondary",
-          ctaTone: "default"
-        };
+        return periodMatches
+          ? {
+              ...plan,
+              ctaLabel: `Stay on ${plan.name} plan`,
+              ctaVariant: "secondary",
+              ctaTone: "default"
+            }
+          : {
+              ...plan,
+              ctaLabel: `Switch to ${billingPeriod === "annual" ? "annual" : "monthly"} billing`,
+              ctaVariant: "primary",
+              ctaTone: "default"
+            };
       }
 
       if (planRank < activeRank) {

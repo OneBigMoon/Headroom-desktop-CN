@@ -79,6 +79,7 @@ import {
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
+  matchesSubscriptionPeriod,
   forgoneSavingsLabel,
   paybackLabel,
   recentDailySavingsUsd,
@@ -4009,7 +4010,17 @@ export default function App() {
         case "pro":
         case "max5x":
         case "max20x": {
-          if (activeHeadroomPlanId === planId) return { kind: "internal" as const };
+          // Same tier on the other billing period is a real change (Polar swaps
+          // the product), not the plan you are already on.
+          if (
+            activeHeadroomPlanId === planId &&
+            matchesSubscriptionPeriod(
+              billingPeriod,
+              pricingStatus?.account?.subscriptionBillingPeriod
+            )
+          ) {
+            return { kind: "internal" as const };
+          }
           // Polar prorates the product swap with the existing discount applied,
           // so every plan change on an active subscription uses the PATCH path.
           if (activeHeadroomPlanId) {
@@ -5726,6 +5737,12 @@ export default function App() {
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
       ? pricingStatus.account.subscriptionTier ?? null
       : null;
+  // Plan cards keep their slot on both tabs, but the "Active" chrome only
+  // belongs to the period the subscriber actually pays for.
+  const viewingSubscribedPeriod = matchesSubscriptionPeriod(
+    billingPeriod,
+    pricingStatus?.account?.subscriptionBillingPeriod
+  );
   const downgradePlanId = getNextLowerUpgradePlanId(activeHeadroomPlanId);
   const visibleUpgradePlans = (() => {
     if (showAllUpgradePlans || upgradePlansState.plans.length <= 2) {
@@ -6873,7 +6890,7 @@ export default function App() {
                   ? `primary-button upgrade-plan-card__button${downgradeButtonClassName}`
                   : `secondary-button upgrade-plan-card__button${downgradeButtonClassName}`;
 
-              const isActivePlan = plan.id === activeHeadroomPlanId;
+              const isActivePlan = plan.id === activeHeadroomPlanId && viewingSubscribedPeriod;
               return (
                 <article
                   className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}
@@ -7685,11 +7702,20 @@ export default function App() {
               pendingPlanChange.fromTier,
               pendingPlanChange.toTier
             );
-            const action = isDowngrade ? "downgrade" : "upgrade";
-            const actionTitle = isDowngrade ? "Downgrade" : "Upgrade";
+            // Same tier, different billing period: a switch, not an upgrade.
+            const isPeriodSwitch = pendingPlanChange.fromTier === pendingPlanChange.toTier;
+            const action = isPeriodSwitch ? "switch" : isDowngrade ? "downgrade" : "upgrade";
+            // The current plan is priced on the period it was bought on, not
+            // the one being switched to.
+            const currentBillingPeriod =
+              pricingStatus?.account?.subscriptionBillingPeriod === "annual"
+                ? "annual"
+                : pricingStatus?.account?.subscriptionBillingPeriod === "monthly"
+                ? "monthly"
+                : pendingPlanChange.billingPeriod;
             const currentPriceLabel = getPlanRenewalPriceLabel(
               pendingPlanChange.fromTier,
-              pendingPlanChange.billingPeriod,
+              currentBillingPeriod,
               {
                 fromTier: pendingPlanChange.fromTier,
                 currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
@@ -7723,11 +7749,13 @@ export default function App() {
                     {pendingPlanChange.billingPeriod === "annual" ? "annually" : "monthly"}.
                   </p>
                   <p>
-                    {isDowngrade
+                    {isDowngrade || (isPeriodSwitch && pendingPlanChange.billingPeriod === "monthly")
                       ? "You'll receive a prorated credit toward your next billing cycle for the unused time on your current plan."
                       : "You'll be charged a prorated amount today for the remaining time in your current billing period, with your existing discount applied."}
                   </p>
-                  {pricingStatus?.account?.subscriptionRenewsAt ? (
+                  {/* A period switch moves the renewal date, so the stored one
+                      would be stale here. */}
+                  {!isPeriodSwitch && pricingStatus?.account?.subscriptionRenewsAt ? (
                     <p>
                       Your subscription will then renew on{" "}
                       <strong>
@@ -7761,7 +7789,9 @@ export default function App() {
                       type="button"
                     >
                       {planChangeBusy
-                        ? isDowngrade
+                        ? isPeriodSwitch
+                          ? "Switching…"
+                          : isDowngrade
                           ? "Downgrading…"
                           : "Upgrading…"
                         : `Confirm ${action}`}
@@ -7871,8 +7901,8 @@ export default function App() {
                       <strong>{formatCents(saveOffer.currentMonthlyCents)} / month</strong>{" "}
                       for the next {saveOffer.durationMonths} months
                       {saveOffer.billingPeriod === "annual" ? ", billed annually" : ""}.
-                      That is {saveOffer.percentOff}% off on top of the rate you are
-                      already on.
+                      That is {saveOffer.percentOff}% off the price your plan renews
+                      at.
                     </p>
                     <p>
                       The new price starts at your next renewal. Nothing else about
