@@ -179,7 +179,9 @@ const INDIVIDUAL_PLAN_ORDER: IndividualUpgradePlanId[] = ["free", "pro", "max5x"
 
 export interface UpgradePlanPurchaseInfo {
   renewsOn: string;
-  paidPerMonthLabel: string;
+  /// What the next invoice actually charges, in the cycle it is billed in:
+  /// "$360/yr" on annual, "$30/mo" on monthly.
+  renewalPriceLabel: string;
   discountPct: number;
   /// "33% off for 12 months" / "40% off forever". Absent when nothing is off.
   renewalNote?: string;
@@ -364,7 +366,14 @@ export function getUpgradePlans(
         ? Math.round((1 - renewalCentsPerMonth / fullCents) * 100)
         : 0;
       const perMonthLabel = (cents: number) => `$${(cents / 100).toFixed(2).replace(/\.00$/, "")}`;
-      const paidPerMonthLabel = perMonthLabel(renewalCentsPerMonth);
+      // The card's sticker price is per month, but an annual subscription is
+      // charged once a year - quote the renewal in the amount that will hit
+      // the card, so it matches the billing portal.
+      const cycleLabel = (centsPerMonth: number) =>
+        purchasePeriod === "annual"
+          ? `${perMonthLabel(centsPerMonth * 12)}/yr`
+          : `${perMonthLabel(centsPerMonth)}/mo`;
+      const renewalPriceLabel = cycleLabel(renewalCentsPerMonth);
       // How long the discount behind that price runs. The save offer needs no
       // special case: applying it attaches a repeating 12-month discount, which
       // comes back through the same two fields as any other.
@@ -378,7 +387,7 @@ export function getUpgradePlans(
       const renewalNote = discountPct > 0
         ? `${discountPct}% off${durationLabel ? ` ${durationLabel}` : ""}`
         : Math.round(paidCentsPerMonth) !== Math.round(renewalCentsPerMonth)
-        ? `${perMonthLabel(paidCentsPerMonth)}/mo until then`
+        ? `${cycleLabel(paidCentsPerMonth)} until then`
         : undefined;
       const renewsOn = subscriptionRenewsAt
         ? new Date(subscriptionRenewsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
@@ -389,7 +398,7 @@ export function getUpgradePlans(
         : undefined;
       return {
         renewsOn,
-        paidPerMonthLabel,
+        renewalPriceLabel,
         discountPct,
         renewalNote,
         cancelAtPeriodEnd: subscriptionCancelAtPeriodEnd,

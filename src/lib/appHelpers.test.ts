@@ -406,7 +406,18 @@ describe("app helpers", () => {
     it("shows full renewal price when no discount is present", () => {
       const result = getUpgradePlans(...baseArgs, 3600, "annual", "2026-12-01");
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$3",
+        renewalPriceLabel: "$36/yr",
+        discountPct: 0,
+      });
+    });
+
+    it("quotes a monthly subscription per month", () => {
+      const result = getUpgradePlans(
+        "individual", undefined, undefined, "pro", true, false, "monthly",
+        300, "monthly", "2026-12-01"
+      );
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        renewalPriceLabel: "$4/mo",
         discountPct: 0,
       });
     });
@@ -415,7 +426,7 @@ describe("app helpers", () => {
       // 100% discount this period (0 cents), but "once" so renewal is full price
       const result = getUpgradePlans(...baseArgs, 0, "annual", "2026-04-16", "2025-04-16", "once");
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$3",
+        renewalPriceLabel: "$36/yr",
         discountPct: 0,
       });
     });
@@ -424,7 +435,7 @@ describe("app helpers", () => {
       // 1800 cents = $1.50/mo * 12 months (50% off)
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "forever");
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$1.50",
+        renewalPriceLabel: "$18/yr",
         discountPct: 50,
       });
     });
@@ -448,7 +459,7 @@ describe("app helpers", () => {
       // Renewal at 2026-01-01 is within window → discount applies
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-01-01", "2025-04-16", "repeating", 12);
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$1.50",
+        renewalPriceLabel: "$18/yr",
         discountPct: 50,
       });
     });
@@ -458,7 +469,7 @@ describe("app helpers", () => {
       // Renewal at 2026-04-01 is outside window → full price
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-04-01", "2024-01-01", "repeating", 12);
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$3",
+        renewalPriceLabel: "$36/yr",
         discountPct: 0,
       });
     });
@@ -472,7 +483,7 @@ describe("app helpers", () => {
         false, null, 0, null, 1200, "2027-12-01"
       );
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$1",
+        renewalPriceLabel: "$12/yr",
         discountPct: 67,
       });
     });
@@ -483,7 +494,7 @@ describe("app helpers", () => {
         null, false, null, 0, null, 1200, "2020-01-01"
       );
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$1.50",
+        renewalPriceLabel: "$18/yr",
         discountPct: 50,
       });
     });
@@ -515,9 +526,9 @@ describe("app helpers", () => {
         ...baseArgs, 3120, "annual", "2027-03-31T20:31:45Z", "2026-03-31T20:31:45Z", "repeating", 12
       );
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$3",
+        renewalPriceLabel: "$36/yr",
         discountPct: 0,
-        renewalNote: "$2.60/mo until then",
+        renewalNote: "$31.20/yr until then",
       });
     });
 
@@ -525,7 +536,7 @@ describe("app helpers", () => {
       // "repeating" but duration_in_months is null → treat as no discount at renewal
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "repeating", null);
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
-        paidPerMonthLabel: "$3",
+        renewalPriceLabel: "$36/yr",
         discountPct: 0,
       });
     });
