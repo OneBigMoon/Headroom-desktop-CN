@@ -4886,11 +4886,19 @@ fn execute_headroom_learn_run(
     }
 }
 
+/// The tray's pause/resume item, kept here so the tray updater loop can flip its
+/// label. `TrayIcon` has no menu getter.
+static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
+    std::sync::OnceLock::new();
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
+    // Text flips to "Resume Headroom" while paused, from the tray updater loop.
+    let pause = tauri::menu::MenuItem::with_id(app, "pause", "Pause Headroom", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &separator, &quit])?;
+    let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
+    let _ = TRAY_PAUSE_ITEM.set(pause.clone());
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
@@ -4934,6 +4942,23 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 } else {
                     let _ = show_launcher_window(app);
                 }
+            }
+            "pause" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let paused = {
+                        let state: tauri::State<'_, AppState> = app.state();
+                        state.runtime_is_paused()
+                    };
+                    let result = if paused {
+                        start_headroom(app).await
+                    } else {
+                        pause_headroom(app).await
+                    };
+                    if let Err(err) = result {
+                        log::warn!("tray pause toggle failed: {err}");
+                    }
+                });
             }
             "quit" => {
                 exit_headroom(app, QuitSource::TrayMenu);
@@ -5009,6 +5034,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
         let mut last_tooltip: Option<String> = None;
+        let mut last_pause_label: Option<&str> = None;
         let mut unhealthy_streak: u8 = 0;
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -5088,6 +5114,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     }
                     TrayRuntimeVisual::Off => "Headroom — off",
                 };
+
+                let pause_label = if visual == TrayRuntimeVisual::Paused {
+                    "Resume Headroom"
+                } else {
+                    "Pause Headroom"
+                };
+                if last_pause_label != Some(pause_label) {
+                    if let Some(item) = TRAY_PAUSE_ITEM.get() {
+                        let _ = item.set_text(pause_label);
+                        last_pause_label = Some(pause_label);
+                    }
+                }
 
                 let mut icon_changed = false;
                 match visual {
