@@ -662,9 +662,13 @@ function SavingsChartTooltip({
                     chartMode === "usd" ? "saved-usd" : "saved-tokens"
                   }`}
                 />
+                {/* "Input saved", not "Saved": the output-shaping group below
+                    is bucket-level (upstream's by_provider rollup has no output
+                    dimension), so an unqualified "Saved" here would read as the
+                    connector's whole contribution. */}
                 {chartMode === "usd"
-                  ? `Saved ${currencyExact(provider.estimatedSavingsUsd)}`
-                  : `Saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
+                  ? `Input saved ${currencyExact(provider.estimatedSavingsUsd)}`
+                  : `Input saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
               </span>
               <span className="savings-chart__tooltip-item">
                 <i
@@ -691,7 +695,7 @@ function SavingsChartTooltip({
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
               />
-              Saved {currencyExact(point.estimatedSavingsUsd)}
+              Input saved {currencyExact(point.estimatedSavingsUsd)}
             </span>
             <span className="savings-chart__tooltip-item">
               <i
@@ -709,7 +713,7 @@ function SavingsChartTooltip({
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
               />
-              Saved {compactNumber(point.estimatedTokensSaved)} tokens
+              Input saved {compactNumber(point.estimatedTokensSaved)} tokens
             </span>
             <span className="savings-chart__tooltip-item">
               <i
@@ -1146,8 +1150,10 @@ function DailySavingsChart({
               barCategoryGap="5%"
               barGap={1}
               data={chartData}
-              // Clears the overlay: total + label + the chip row added in 0.7.9.
-              margin={{ top: 96, right: 2, left: 2, bottom: 0 }}
+              // Clears the overlay: total + label + the chip row added in 0.7.9
+              // measure ~72px from the canvas top, so this is that plus a few
+              // px of breathing room -- not slack to be reclaimed twice.
+              margin={{ top: 82, right: 2, left: 2, bottom: 0 }}
             >
               <defs>
                 <linearGradient id="actualUsdGradient" x1="0" x2="0" y1="0" y2="1">
@@ -1188,8 +1194,11 @@ function DailySavingsChart({
                 tick={{ fill: "#7a7169", fontSize: 10 }}
                 tickLine={false}
               />
-              <YAxis hide yAxisId="usd" />
-              <YAxis hide yAxisId="tokens" />
+              {/* Both axes are hidden, so recharts' default "nice" rounding
+                  buys nothing but empty space above the tallest bar: pin the
+                  domain to the data so the peak bucket fills the plot. */}
+              <YAxis domain={[0, "dataMax"]} hide yAxisId="usd" />
+              <YAxis domain={[0, "dataMax"]} hide yAxisId="tokens" />
               <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
               {chartMode === "usd" && (
                 <>
