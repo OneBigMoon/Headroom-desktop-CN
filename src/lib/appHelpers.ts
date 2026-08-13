@@ -182,7 +182,7 @@ export interface UpgradePlanPurchaseInfo {
   paidPerMonthLabel: string;
   discountPct: number;
   /// "33% off for 12 months" / "40% off forever". Absent when nothing is off.
-  discountLabel?: string;
+  renewalNote?: string;
   cancelAtPeriodEnd?: boolean;
   endsOn?: string;
 }
@@ -363,7 +363,8 @@ export function getUpgradePlans(
       const discountPct = fullCents > 0 && renewalCentsPerMonth < fullCents
         ? Math.round((1 - renewalCentsPerMonth / fullCents) * 100)
         : 0;
-      const paidPerMonthLabel = `$${(renewalCentsPerMonth / 100).toFixed(2).replace(/\.00$/, "")}`;
+      const perMonthLabel = (cents: number) => `$${(cents / 100).toFixed(2).replace(/\.00$/, "")}`;
+      const paidPerMonthLabel = perMonthLabel(renewalCentsPerMonth);
       // How long the discount behind that price runs. The save offer needs no
       // special case: applying it attaches a repeating 12-month discount, which
       // comes back through the same two fields as any other.
@@ -371,8 +372,13 @@ export function getUpgradePlans(
       const durationLabel = subscriptionDiscountDuration === "forever"
         ? "forever"
         : months > 0 ? `for ${months} month${months === 1 ? "" : "s"}` : null;
-      const discountLabel = discountPct > 0
+      // When today's rate is not the renewal rate, say so. Otherwise the card
+      // states only the future price and reads as contradicting the billing
+      // portal, which shows the amount currently being charged.
+      const renewalNote = discountPct > 0
         ? `${discountPct}% off${durationLabel ? ` ${durationLabel}` : ""}`
+        : Math.round(paidCentsPerMonth) !== Math.round(renewalCentsPerMonth)
+        ? `${perMonthLabel(paidCentsPerMonth)}/mo until then`
         : undefined;
       const renewsOn = subscriptionRenewsAt
         ? new Date(subscriptionRenewsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
@@ -385,7 +391,7 @@ export function getUpgradePlans(
         renewsOn,
         paidPerMonthLabel,
         discountPct,
-        discountLabel,
+        renewalNote,
         cancelAtPeriodEnd: subscriptionCancelAtPeriodEnd,
         endsOn
       };

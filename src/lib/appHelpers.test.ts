@@ -477,10 +477,10 @@ describe("app helpers", () => {
 
     it("spells out how long the discount runs", () => {
       const forever = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "forever");
-      expect(activePlan(forever)?.purchaseInfo?.discountLabel).toBe("50% off forever");
+      expect(activePlan(forever)?.purchaseInfo?.renewalNote).toBe("50% off forever");
 
       const repeating = getUpgradePlans(...baseArgs, 1800, "annual", "2026-01-01", "2025-04-16", "repeating", 12);
-      expect(activePlan(repeating)?.purchaseInfo?.discountLabel).toBe("50% off for 12 months");
+      expect(activePlan(repeating)?.purchaseInfo?.renewalNote).toBe("50% off for 12 months");
 
       // A redeemed save offer arrives as the repeating 12-month discount it is,
       // dated too far back for the window check to accept on its own.
@@ -488,10 +488,24 @@ describe("app helpers", () => {
         ...baseArgs, 1800, "annual", "2026-12-01", "2024-01-01", "repeating", 12,
         false, null, 0, null, 1200, "2027-12-01"
       );
-      expect(activePlan(saveOffer)?.purchaseInfo?.discountLabel).toBe("67% off for 12 months");
+      expect(activePlan(saveOffer)?.purchaseInfo?.renewalNote).toBe("67% off for 12 months");
 
       const none = getUpgradePlans(...baseArgs, 3600, "annual", "2026-12-01");
-      expect(activePlan(none)?.purchaseInfo?.discountLabel).toBeUndefined();
+      expect(activePlan(none)?.purchaseInfo?.renewalNote).toBeUndefined();
+    });
+
+    it("names today's rate when it is not the renewal rate", () => {
+      // An annual discount repeating for 12 months covers exactly one invoice,
+      // so the renewal on the window boundary bills full. Without the note the
+      // card states only $3 while the billing portal shows the $2.60 in force.
+      const result = getUpgradePlans(
+        ...baseArgs, 3120, "annual", "2027-03-31T20:31:45Z", "2026-03-31T20:31:45Z", "repeating", 12
+      );
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$3",
+        discountPct: 0,
+        renewalNote: "$2.60/mo until then",
+      });
     });
 
     it("shows full renewal price for repeating discount with missing window data", () => {

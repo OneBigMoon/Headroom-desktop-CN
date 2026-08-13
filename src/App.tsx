@@ -6947,14 +6947,14 @@ export default function App() {
                             <>
                               Renews{" "}
                               <span className="upgrade-plan-card__renewal-price">
-                                {plan.purchaseInfo.discountLabel
+                                {plan.purchaseInfo.discountPct > 0
                                   ? plan.purchaseInfo.paidPerMonthLabel
                                   : plan.price}
                                 /mo
                               </span>{" "}
                               on {plan.purchaseInfo.renewsOn}
-                              {plan.purchaseInfo.discountLabel
-                                ? ` (${plan.purchaseInfo.discountLabel})`
+                              {plan.purchaseInfo.renewalNote
+                                ? ` (${plan.purchaseInfo.renewalNote})`
                                 : ""}
                             </>
                           ) : null}
