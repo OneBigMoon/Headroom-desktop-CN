@@ -12,6 +12,10 @@ export interface ManagedTool {
   version: string;
   checksum?: string | null;
   savingsLabel?: string | null;
+  /** Installed, but the app pins a newer version. Drives the Update action. */
+  updateAvailable?: boolean;
+  /** Version an Update would move to; null when nothing is pending. */
+  availableVersion?: string | null;
 }
 
 export interface PipelineStageMetric {

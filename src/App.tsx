@@ -1371,6 +1371,9 @@ function AddonCard({
   onInstall,
   onToggleEnabled,
   onUninstall,
+  updateAvailable,
+  onUpdate,
+  availableVersion,
   children
 }: {
   name: string;
@@ -1394,6 +1397,9 @@ function AddonCard({
   onInstall: () => void;
   onToggleEnabled: () => void;
   onUninstall: () => void;
+  updateAvailable?: boolean;
+  onUpdate?: () => void;
+  availableVersion?: string | null;
   children?: ReactNode;
 }) {
   return (
@@ -1462,6 +1468,20 @@ function AddonCard({
           </button>
         ) : (
           <>
+            {updateAvailable && onUpdate ? (
+              // install_addon is idempotent and always installs the pinned
+              // version, so it is also the upgrade path -- no second command.
+              <button
+                type="button"
+                className="addon-card__action addon-card__action--primary"
+                disabled={actionsDisabled}
+                onClick={onUpdate}
+              >
+                {availableVersion
+                  ? `Update to ${formatAddonVersion(availableVersion)}`
+                  : "Update"}
+              </button>
+            ) : null}
             <button
               type="button"
               className="addon-card__action"
@@ -3872,12 +3892,14 @@ export default function App() {
   async function runAddonAction(
     command: "install_addon" | "set_addon_enabled" | "uninstall_addon",
     id: string,
-    enabled?: boolean
+    enabled?: boolean,
+    // An update reuses install_addon, so only the wording differs.
+    updateLabels?: { busy: string; done: string }
   ) {
     const copy = addonCopy[id];
     const busyLabel =
       command === "install_addon"
-        ? copy?.installing
+        ? (updateLabels?.busy ?? copy?.installing)
         : command === "uninstall_addon"
           ? copy?.uninstalling
           : enabled
@@ -3895,7 +3917,7 @@ export default function App() {
       }
       const message =
         command === "install_addon"
-          ? copy?.installed
+          ? (updateLabels?.done ?? copy?.installed)
           : command === "uninstall_addon"
             ? copy?.uninstalled
             : enabled
@@ -6783,6 +6805,14 @@ export default function App() {
                       showClients={installed && tool.enabled}
                       savings={tool.savingsLabel ?? null}
                       actionsDisabled={addonBusyId === tool.id}
+                      updateAvailable={tool.updateAvailable ?? false}
+                      availableVersion={tool.availableVersion ?? null}
+                      onUpdate={() =>
+                        void runAddonAction("install_addon", tool.id, undefined, {
+                          busy: `Updating ${tool.name}...`,
+                          done: `${tool.name} updated.`
+                        })
+                      }
                       onInstall={() => void runAddonAction("install_addon", tool.id)}
                       onToggleEnabled={() =>
                         void runAddonAction("set_addon_enabled", tool.id, !tool.enabled)

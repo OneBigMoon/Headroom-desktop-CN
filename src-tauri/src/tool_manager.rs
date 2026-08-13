@@ -702,22 +702,22 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.42.4";
-const MARKITDOWN_PINNED_VERSION: &str = "0.1.6";
-const SERENA_PINNED_VERSION: &str = "1.6.1";
-const CONTEXT7_PINNED_VERSION: &str = "3.2.4";
+const RTK_VERSION: &str = "0.45.0";
+const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
+const SERENA_PINNED_VERSION: &str = "1.7.0";
+const CONTEXT7_PINNED_VERSION: &str = "4.0.2";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.9.0";
+const CODEBASE_MEMORY_VERSION: &str = "0.10.3";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "faa02f0404230c451a9812230394481948f80183801fa5bf67044b41c2f25ed4";
+    "0ebf02328207d4c3d862c837b5e973de5bac808df92b0941737721d467287f7f";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "6af3d02a27f589901fa763d3971089337bc8c9838bbed5d0cf543ca9f1a9e543";
+    "1107fea28285823e1436e4f38a4e00a0b472d8a43c379da7dfd200c914a4b9dd";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "68a345d9a6842f02a3cb07e187b28bc38c4f3a22967f47fadbcd0757ba93a680";
+    "967b9eababfdbd2ef1987c571d55bc7c028cd1db7f99279830634c58db311e32";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "e2832a8d207c26beaa30efa6222ed4a37cb3f526ca4bee060bfbf336ed6fc679";
+    "74997fb0934e70a22f20c2e112fb4d883867dc1f01a7bcdc94cf86d13b5cbd31";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -943,16 +943,43 @@ const PLUGIN_DISPLAY_VERSION: &str = "latest";
 fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
     PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
 }
+
+/// Whether the card offers an Update action, and what it would move to.
+///
+/// The pinned version is a *minimum*, not a target: a user already ahead of the
+/// pin (they updated the plugin themselves, or a pin has not caught up yet) is
+/// current, and must never be prompted into a downgrade. An unparseable version
+/// on either side is treated as current for the same reason — better a missed
+/// prompt than a wrong one.
+///
+/// `None` means no Update button: nothing installed, already at or past the
+/// pin, or an addon that maintains itself (headroom rides the runtime upgrade,
+/// rtk is refreshed at launch from its own pin).
+fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Option<String> {
+    let installed = installed?;
+    match id {
+        // Plugins track a moving marketplace, not a pin, so there is no local
+        // signal for "newer exists" — the Update action is the check. It always
+        // shows for an installed plugin, and the button says just "Update".
+        _ if plugin_addon(id).is_some() => Some(String::new()),
+        "markitdown" | "serena" | "context7" | "codebase-memory" => {
+            let on_disk = parse_major_minor_patch(installed)?;
+            let target = parse_major_minor_patch(pinned)?;
+            (on_disk < target).then(|| pinned.to_string())
+        }
+        _ => None,
+    }
+}
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "f223ca074a0215af002679bc1d34ca92b93e25b3e8ae16aace6e84c06e586802";
+    "064151cfc2d50b24d810b06a0af2e41b9c945e83534e4c438c3d3eae607fc3f4";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "84121316867613e61925c209607f033b2113bb0ce312c267a79d3e3e8f221e49";
+    "9ea02f889d5a2779e4fb700df4587824303c5a57cda22e903e30058079fca0ef";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "cc2b91c064eb670c097c184913c8fbcb1a943d53d7fe505375e96ba0c5b6459f";
+    "80a746dd305ef944ff50ef011ae4ce3878dd5ba88dfe35d859d05498191637c3";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "34975116da11e09e502501daf758143e0b22ed3a42a10eb67fb693a6270d9e36";
+    "c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "f0ec18963581657173bd6a51f5ba012b093823f844db749fec218581af30a568";
+    "34cea9009a8099acdaf85147b971d95f65efabfa63fb3aea7d3e2b73e6f517c3";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -1345,7 +1372,7 @@ impl ToolManager {
                 id: "context7".into(),
                 name: "Context7".into(),
                 description:
-                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Requires Node.js on PATH."
+                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Requires Node.js 20.18.1 or newer on PATH."
                         .into(),
                 runtime: "node".into(),
                 source_url: "https://github.com/upstash/context7".into(),
@@ -1391,27 +1418,69 @@ impl ToolManager {
     pub fn list_tools(&self) -> Vec<ManagedTool> {
         self.manifests
             .iter()
-            .map(|manifest| ManagedTool {
-                id: manifest.id.clone(),
-                name: manifest.name.clone(),
-                description: manifest.description.clone(),
-                runtime: manifest.runtime.clone(),
-                required: manifest.required,
-                enabled: self.tool_enabled(&manifest.id),
-                status: self.detect_status(&manifest.id),
-                source_url: manifest.source_url.clone(),
-                version: if manifest.id == "headroom" {
-                    self.installed_headroom_version()
-                        .unwrap_or_else(|| manifest.version.clone())
-                } else if let Some(plugin) = plugin_addon(&manifest.id) {
-                    installed_plugin_version(plugin).unwrap_or_else(|| manifest.version.clone())
-                } else {
-                    manifest.version.clone()
-                },
-                checksum: manifest.checksum.clone(),
-                savings_label: self.tool_savings_label(&manifest.id),
+            .map(|manifest| {
+                let installed = self.installed_addon_version(&manifest.id);
+                let enabled = self.tool_enabled(&manifest.id);
+                // Never offer Update on a disabled addon: every installer
+                // writes `enabled: true`, so the update would silently switch
+                // it back on. Enable first, then update.
+                let pending = enabled
+                    .then(|| {
+                        pending_addon_update(&manifest.id, installed.as_deref(), &manifest.version)
+                    })
+                    .flatten();
+                let update_available = pending.is_some();
+                ManagedTool {
+                    id: manifest.id.clone(),
+                    name: manifest.name.clone(),
+                    description: manifest.description.clone(),
+                    runtime: manifest.runtime.clone(),
+                    required: manifest.required,
+                    enabled,
+                    status: self.detect_status(&manifest.id),
+                    source_url: manifest.source_url.clone(),
+                    version: installed.unwrap_or_else(|| manifest.version.clone()),
+                    checksum: manifest.checksum.clone(),
+                    savings_label: self.tool_savings_label(&manifest.id),
+                    update_available,
+                    available_version: pending.filter(|version| !version.is_empty()),
+                }
             })
             .collect()
+    }
+
+    /// The version actually on disk, from whichever record the addon's own
+    /// installer writes: the headroom receipt, the host CLI's plugin registry,
+    /// or the `<id>.json` tool receipt every other installer writes. None when
+    /// the addon is not installed.
+    fn installed_addon_version(&self, tool_id: &str) -> Option<String> {
+        if tool_id == "headroom" {
+            return self.installed_headroom_version();
+        }
+        if let Some(plugin) = plugin_addon(tool_id) {
+            return installed_plugin_version(plugin);
+        }
+        if !self.addon_installed(tool_id) {
+            return None;
+        }
+        self.read_tool_receipt(tool_id)?
+            .get("version")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Whether an installed addon has the artifact its receipt claims. A
+    /// receipt without its payload (interrupted install, user-deleted venv) is
+    /// not an install, and must not produce a version or an update prompt.
+    fn addon_installed(&self, tool_id: &str) -> bool {
+        match tool_id {
+            "rtk" => self.rtk_installed(),
+            "markitdown" => self.markitdown_installed(),
+            "serena" => self.serena_installed(),
+            "context7" => self.context7_installed(),
+            "codebase-memory" => self.codebase_memory_installed(),
+            _ => false,
+        }
     }
 
     /// Chip text for the Addons tab. markitdown and serena are measured
@@ -1442,7 +1511,7 @@ impl ToolManager {
 
     /// Estimated tokens serena's tools have returned in the live session(s),
     /// summed from each running MCP process's dashboard `/get_tool_stats`
-    /// (v1.6.1 records unconditionally, CHAR_COUNT estimator; our registration
+    /// (v1.7.0 records unconditionally, CHAR_COUNT estimator; our registration
     /// only suppresses the browser popup, not the dashboard server). In-memory
     /// upstream, so the figure resets when the session ends — by design.
     /// Paired with the oldest matching MCP process's start (from `ps` etime),
@@ -1498,7 +1567,7 @@ impl ToolManager {
     /// Today's serena tool calls, counted from `~/.serena/logs/<local day>/`.
     /// Serena's usage stats are in-memory only (analytics.py), so its log
     /// files are the only persisted trace: one line containing
-    /// "; session_id: " per tool application (tools_base.py, pinned v1.6.1).
+    /// "; session_id: " per tool application (tools_base.py, pinned v1.7.0).
     /// Local day matches serena's own log-dir bucketing (datetime.now()).
     /// 60s cache: Result lines make these files large enough that scanning on
     /// every dashboard poll would be wasteful.
@@ -5281,7 +5350,12 @@ impl ToolManager {
             &self.runtime.root_dir,
             CONTEXT7_INSTALL_TIMEOUT,
         )
-        .context("context7 failed its smoke test (npx download or startup)")?;
+        // ponytail: no separate Node version probe. Context7 4.x declares
+        // node >=20.18.1 but npm only warns on an engines mismatch, so the
+        // --help run above is what actually proves this Node can run it.
+        .context(
+            "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
+        )?;
         self.register_context7_mcp()?;
         self.write_tool_receipt(
             "context7",
@@ -5548,12 +5622,23 @@ impl ToolManager {
     }
 
     /// Registers the marketplace (best-effort) and installs the plugin into a
-    /// single host. Used for both first install and re-enable.
+    /// single host. Used for first install, re-enable, and Update.
+    ///
+    /// Already present on this host means this is an Update: both hosts install
+    /// from a local marketplace checkout, so the snapshot has to be refreshed
+    /// first or the "update" reinstalls the same commit. Plain `install`/`add`
+    /// on an installed plugin is a no-op, which is why Update cannot just be
+    /// the install path replayed.
     fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
         let cli = host.cli().context("CLI not found on PATH")?;
-        // Re-adding an already-known marketplace is a benign error, so ignore it.
-        let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin));
-        self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))?;
+        if host.plugin_present(plugin) {
+            let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
+            self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))?;
+        } else {
+            // Re-adding an already-known marketplace is a benign error, ignore it.
+            let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin));
+            self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))?;
+        }
         if !host.plugin_present(plugin) {
             bail!("install completed but the plugin was not registered");
         }
@@ -5735,6 +5820,26 @@ impl PluginHost {
         vec!["plugin", "marketplace", "remove", plugin.marketplace_name]
     }
 
+    /// Pull the marketplace's newest commit into the host's local snapshot.
+    /// Claude calls it `update`, Codex calls it `upgrade`.
+    fn marketplace_update_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
+        match self {
+            PluginHost::ClaudeCode => {
+                vec!["plugin", "marketplace", "update", plugin.marketplace_name]
+            }
+            PluginHost::Codex => vec!["plugin", "marketplace", "upgrade", plugin.marketplace_name],
+        }
+    }
+
+    /// Move an installed plugin onto the refreshed snapshot. Codex has no
+    /// update verb; re-adding from the upgraded snapshot is the equivalent.
+    fn update_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
+        match self {
+            PluginHost::ClaudeCode => vec!["plugin", "update", plugin.plugin_ref],
+            PluginHost::Codex => vec!["plugin", "add", plugin.plugin_ref],
+        }
+    }
+
     fn install_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         match self {
             // No `--scope user`: it is Claude Code's default, and CLIs older
@@ -5800,7 +5905,7 @@ fn codex_plugin_present(plugin: &PluginAddon) -> bool {
 }
 
 /// One serena tool application logs exactly one line containing this marker
-/// (`tools_base.py` `_log_tool_application`, stable through pinned v1.6.1).
+/// (`tools_base.py` `_log_tool_application`, stable through pinned v1.7.0).
 const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
 
 /// Serena's dashboard API binds the first free port scanning upward from here
@@ -8175,8 +8280,8 @@ mod tests {
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, pinned_headroom_release, pre_upstream_concurrency,
-        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        path_with_binary_dir, pending_addon_update, pinned_headroom_release,
+        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
@@ -8184,9 +8289,10 @@ mod tests {
         CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
         UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
         HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        PLUGIN_ADDONS, RTK_VERSION,
+        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
+    use crate::models::ManagedTool;
     use crate::port_conflict;
     use std::net::TcpListener;
 
@@ -8395,9 +8501,13 @@ mod tests {
         // backend process, never in markitdown or other venv Pythons.
         assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
         // All three seams are patched...
-        assert!(py.contains("_hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response"));
+        assert!(
+            py.contains("_hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response")
+        );
         assert!(py.contains("_hd_cg_prov.AnthropicProvider.get_context_limit = _hd_cg_limit"));
-        assert!(py.contains("_hd_cg_anth.AnthropicHandlerMixin.handle_anthropic_messages = _hd_cg_handle"));
+        assert!(py.contains(
+            "_hd_cg_anth.AnthropicHandlerMixin.handle_anthropic_messages = _hd_cg_handle"
+        ));
         // ...the real window is learned from prompt-too-long 400 bodies,
         // keyed by 1m-beta presence so a clamped account never poisons one
         // with real 1M access...
@@ -10007,6 +10117,146 @@ after
         )
         .expect("receipt");
         assert!(manager.tool_enabled("markitdown"));
+    }
+
+    fn listed_tool(manager: &ToolManager, id: &str) -> ManagedTool {
+        manager
+            .list_tools()
+            .into_iter()
+            .find(|tool| tool.id == id)
+            .expect("tool in manifest")
+    }
+
+    #[test]
+    fn list_tools_reports_the_installed_version_and_offers_the_pinned_one() {
+        let (_root, runtime, manager) = seed_test_runtime("addon-update");
+
+        // Not installed: the card shows what an install would give you.
+        let absent = listed_tool(&manager, "markitdown");
+        assert_eq!(absent.version, MARKITDOWN_PINNED_VERSION);
+        assert!(!absent.update_available);
+        assert!(absent.available_version.is_none());
+
+        let entrypoint = manager.markitdown_entrypoint();
+        fs::create_dir_all(entrypoint.parent().expect("bin parent")).expect("bin dir");
+        fs::write(&entrypoint, b"#!/bin/sh\n").expect("entrypoint");
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            br#"{"version":"0.1.5","enabled":true}"#,
+        )
+        .expect("receipt");
+
+        // Installed and behind: report what is on disk, offer the pin.
+        let stale = listed_tool(&manager, "markitdown");
+        assert_eq!(stale.version, "0.1.5");
+        assert!(stale.update_available);
+        assert_eq!(
+            stale.available_version.as_deref(),
+            Some(MARKITDOWN_PINNED_VERSION)
+        );
+
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            format!(r#"{{"version":"{MARKITDOWN_PINNED_VERSION}","enabled":true}}"#).as_bytes(),
+        )
+        .expect("receipt");
+        let current = listed_tool(&manager, "markitdown");
+        assert_eq!(current.version, MARKITDOWN_PINNED_VERSION);
+        assert!(!current.update_available);
+
+        // The pin is a minimum: someone ahead of it is current, not overdue.
+        // Prompting here would be an offer to downgrade.
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            br#"{"version":"99.0.0","enabled":true}"#,
+        )
+        .expect("receipt");
+        let ahead = listed_tool(&manager, "markitdown");
+        assert_eq!(ahead.version, "99.0.0");
+        assert!(!ahead.update_available);
+
+        // An unreadable version is treated as current for the same reason.
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            br#"{"version":"main","enabled":true}"#,
+        )
+        .expect("receipt");
+        assert!(!listed_tool(&manager, "markitdown").update_available);
+
+        // Disabled and behind: no Update button. Every installer writes
+        // `enabled: true`, so updating here would switch the addon back on
+        // behind the user's back.
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            br#"{"version":"0.1.5","enabled":false}"#,
+        )
+        .expect("receipt");
+        let disabled = listed_tool(&manager, "markitdown");
+        assert_eq!(disabled.version, "0.1.5");
+        assert!(!disabled.update_available);
+
+        // A receipt whose payload is gone is not an install: no version claim,
+        // no update prompt.
+        fs::remove_file(&entrypoint).expect("remove entrypoint");
+        let orphaned = listed_tool(&manager, "markitdown");
+        assert_eq!(orphaned.version, MARKITDOWN_PINNED_VERSION);
+        assert!(!orphaned.update_available);
+    }
+
+    #[test]
+    fn pending_addon_update_treats_the_pin_as_a_minimum() {
+        assert_eq!(
+            pending_addon_update("serena", Some("1.6.1"), "1.7.0").as_deref(),
+            Some("1.7.0")
+        );
+        assert_eq!(pending_addon_update("serena", Some("1.7.0"), "1.7.0"), None);
+        // Ahead of the pin: current, not overdue. Never offer a downgrade.
+        assert_eq!(pending_addon_update("serena", Some("1.8.0"), "1.7.0"), None);
+        assert_eq!(pending_addon_update("serena", Some("2.0.0"), "1.7.0"), None);
+        assert_eq!(pending_addon_update("serena", None, "1.7.0"), None);
+        assert_eq!(
+            pending_addon_update("serena", Some("nightly"), "1.7.0"),
+            None
+        );
+
+        // Plugins track a marketplace, so the action is the check: offered
+        // whenever installed, with no version to advertise.
+        assert_eq!(
+            pending_addon_update("ponytail", Some("4.7.0"), PLUGIN_DISPLAY_VERSION).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            pending_addon_update("caveman", None, PLUGIN_DISPLAY_VERSION),
+            None
+        );
+
+        // Self-maintaining: rtk is refreshed at launch, headroom rides the
+        // runtime upgrade. Neither gets an Update button, stale or not.
+        assert_eq!(
+            pending_addon_update("rtk", Some("0.1.0"), RTK_VERSION),
+            None
+        );
+        assert_eq!(
+            pending_addon_update("headroom", Some("0.1.0"), HEADROOM_PINNED_VERSION),
+            None
+        );
+    }
+
+    #[test]
+    fn rtk_is_refreshed_on_launch_so_it_never_advertises_a_manual_update() {
+        let (_root, runtime, manager) = seed_test_runtime("addon-update-rtk");
+        fs::create_dir_all(&runtime.bin_dir).expect("bin dir");
+        fs::write(manager.rtk_entrypoint(), b"#!/bin/sh\n").expect("entrypoint");
+        fs::write(
+            runtime.tools_dir.join("rtk.json"),
+            br#"{"version":"0.1.0","enabled":true}"#,
+        )
+        .expect("receipt");
+
+        let rtk = listed_tool(&manager, "rtk");
+        assert_eq!(rtk.version, "0.1.0");
+        assert!(manager.rtk_needs_install());
+        assert!(!rtk.update_available);
     }
 
     #[test]

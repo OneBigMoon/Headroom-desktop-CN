@@ -21,12 +21,23 @@ pub struct ManagedTool {
     pub enabled: bool,
     pub status: ToolStatus,
     pub source_url: String,
+    /// What is on disk when installed, falling back to the pinned version when
+    /// it is not. Never report the pin for an installed addon: the card would
+    /// claim a version the user does not have the moment a release bumps a pin.
     pub version: String,
     pub checksum: Option<String>,
     /// Short savings/usage line for the addon card chip ("12 docs converted").
     /// None when the addon has no measurable or citable figure.
     #[serde(default)]
     pub savings_label: Option<String>,
+    /// Installed, but the app now pins a newer version. Drives the Update
+    /// action on the card. False for addons whose upgrade is automatic (rtk,
+    /// plugins) and for anything not installed.
+    #[serde(default)]
+    pub update_available: bool,
+    /// The version an Update would move to. None when no update is pending.
+    #[serde(default)]
+    pub available_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
