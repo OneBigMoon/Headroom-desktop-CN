@@ -33,7 +33,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.34.0";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.35.0";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -201,6 +201,12 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   uninstalls the old wheel via RECORD before unpacking the new one — no
 ///   same-version relayering. The lock-sha change triggers a dep top-up for
 ///   existing users, which is intended (they need the CVE-fixed wheels).
+/// - 0.8.x (0.34.0 → 0.35.0 bundle): floor stays at 0.20.0. requires_dist
+///   only moves the ruff dev pin (dev extra isn't installed). The lock tops
+///   up one transitive pin to match upstream's #2839 CVE clearance: h2
+///   4.3.0 → 4.4.1 (CVE-2026-71554). h2 is pure-Python, and its hpack/
+///   hyperframe requirements are already satisfied by the shipped pins, so
+///   the top-up is a wheel swap with no native or resolution churn.
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating
@@ -217,44 +223,40 @@ Registers SIGUSR1 to dump all Python thread stacks to stderr (the proxy
 log). The desktop watchdog sends SIGUSR1 before force-killing a wedged
 backend so the log shows what the event loop was stuck on.
 
-Also re-protects user-turn text from lossy compression: headroom-ai 0.34.0
-flipped the default "coding" persona to compress_user_messages=True (cache-
-mode delta compression), which exposes user-role TEXT blocks -- including
-Claude Code's <system-reminder> blocks carrying CLAUDE.md contents -- to
-Kompress. The router's tag protection is defeated there because mixed
-content is split into sections BEFORE protect_tags runs, so the reminder's
-open/close tags land in different sections and the pair never matches
-(unmatched tags protect nothing). Net effect: users' CLAUDE.md instructions
-arrive word-dropped/mangled. There is no env override -- the profile kwargs
-force the flag on and HEADROOM_COMPRESS_USER_MESSAGES can only force-enable
--- so flip the persona field itself. tool_result blocks compress regardless
-of this flag (the role gate only guards text blocks), so the coding token
-mass is unaffected. Remove once a wheel protects tag pairs before the
-mixed-content split.
+Also keeps user-turn text out of lossy compression: from headroom-ai
+0.34.0 the "coding" persona sets compress_user_messages=True, and the
+profile kwargs force it on per request (HEADROOM_COMPRESS_USER_MESSAGES
+can only force-enable, never disable), so the persona field itself is
+flipped back. Verbatim user turns are deliberate desktop posture, not a
+bug workaround: user messages carry the coding working set (code, errors,
+paths) and Claude Code's <system-reminder> blocks (CLAUDE.md), which the
+model must see verbatim. The 0.34.0 tag-split bug that made this urgent
+(open/close tags landing in different router sections, so the pair never
+matched and CLAUDE.md arrived word-dropped) was fixed upstream in 0.35.0
+(#2887), but that only protects TAGGED blocks -- plain user text would
+still compress -- so the flip stays. tool_result blocks compress
+regardless of this flag (the role gate only guards text blocks), so the
+coding token mass is unaffected.
 
-Also ports four fixes owed upstream (remove each once a wheel ships it),
+Also ports two fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
-1. event=cache_breakpoints: per-request client cache_control breakpoints
-   in vs forwarded out, WARNING when one is dropped or the last marker
-   moves away from the tail (the "large uncached input_tokens next to a
-   healthy cache_read" billing signature).
-2. HEADROOM_LOG_PAYLOAD_PREVIEW=0 strips verbatim payload previews from
-   headroom_retrieve log events so proxy.log is shareable in bug reports.
-3. CCR proactive expansion never injects into a text block carrying
-   cache_control: the client re-sends the original bytes next turn, so
-   mutating the breakpointed block busts the prefix cache at that message.
-4. Context-limit guard (upstream PR #2942): compression under-reports
-   usage to the client, so Claude Code's proactive auto-compaction never
-   fires; once even the compressed request exceeds the model's real
-   window, every turn 400s with "prompt is too long" and the client
-   force-compacts on each error -- a compact-every-other-prompt loop
-   (churn report 2026-08-12). The guard nudges the reported message_start
-   input_tokens once the forwarded total nears the real window, learns
-   the real window from prompt-too-long 400 bodies, and makes
-   get_context_limit honor the context-1m beta so 1M sessions stop being
-   max-crushed by compression pressure. Kill switch:
-   HEADROOM_CONTEXT_GUARD=0.
+Context-limit guard (upstream PR #2942): compression under-reports
+usage to the client, so Claude Code's proactive auto-compaction never
+fires; once even the compressed request exceeds the model's real
+window, every turn 400s with "prompt is too long" and the client
+force-compacts on each error -- a compact-every-other-prompt loop
+(churn report 2026-08-12). The guard nudges the reported message_start
+input_tokens once the forwarded total nears the real window, learns
+the real window from prompt-too-long 400 bodies, and makes
+get_context_limit honor the context-1m beta so 1M sessions stop being
+max-crushed by compression pressure. Kill switch:
+HEADROOM_CONTEXT_GUARD=0.
+Response-cache poisoning guard: SemanticCache.set stores any body gated
+only on status_code == 200, so an empty/unparseable/error body is
+replayed for the whole TTL (1h) and only a proxy restart clears it. The
+guard refuses to store anything that is not a JSON object or that
+carries an error payload. Kill switch: HEADROOM_RESPONSE_CACHE_GUARD=0.
 """
 import faulthandler
 import signal
@@ -287,296 +289,8 @@ except Exception:
 import os as _hd_os
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
-    # Cache-breakpoint in/out diagnostics. Inbound counts are snapshotted
-    # when the request body is parsed; outbound counts are taken at the
-    # single serialization funnel every forwarded body passes through
-    # (select_outbound_body; prepare_outbound_body_bytes wraps it). The
-    # contextvar ties the two together within one request task, including
-    # CCR continuations, which then compare against the original client
-    # request -- exactly what a dropped-marker hunt wants.
-    try:
-        import contextvars as _hd_cv
-        import logging as _hd_logging
-
-        _hd_bp_log = _hd_logging.getLogger("headroom.proxy")
-        _hd_inbound_bp = _hd_cv.ContextVar("headroom_inbound_bp", default=None)
-        # (message_count, [(msg_index, marker_dict), ...]) of the CLIENT's own
-        # message-level markers -- consumed by the normalize wrapper below.
-        _hd_client_pos = _hd_cv.ContextVar("headroom_client_bp_pos", default=None)
-
-        def _hd_marker_positions(messages):
-            # Block-level (msg_idx, block_idx, marker): clients mark multiple
-            # blocks within one long message, and the ~20-block lookback
-            # applies within a message just as across messages.
-            positions = []
-            if isinstance(messages, list):
-                for i, msg in enumerate(messages):
-                    if not isinstance(msg, dict):
-                        continue
-                    content = msg.get("content")
-                    if not isinstance(content, list):
-                        continue
-                    for bi, b in enumerate(content):
-                        if isinstance(b, dict) and isinstance(
-                            b.get("cache_control"), dict
-                        ):
-                            positions.append((i, bi, dict(b["cache_control"])))
-            return positions
-
-        def _hd_count_breakpoints(body):
-            system = body.get("system")
-            tools = body.get("tools")
-            messages = body.get("messages")
-            sys_n = 0
-            if isinstance(system, list):
-                sys_n = sum(
-                    1 for b in system if isinstance(b, dict) and "cache_control" in b
-                )
-            tool_n = 0
-            if isinstance(tools, list):
-                tool_n = sum(
-                    1 for t in tools if isinstance(t, dict) and "cache_control" in t
-                )
-            msg_n = 0
-            last = -1
-            count = 0
-            if isinstance(messages, list):
-                count = len(messages)
-                for i, msg in enumerate(messages):
-                    if not isinstance(msg, dict):
-                        continue
-                    found = 1 if "cache_control" in msg else 0
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            if "cache_control" in block:
-                                found += 1
-                            inner = block.get("content")
-                            if isinstance(inner, list):
-                                found += sum(
-                                    1
-                                    for s in inner
-                                    if isinstance(s, dict) and "cache_control" in s
-                                )
-                    if found:
-                        msg_n += found
-                        last = i
-            tail = count - 1 - last if last >= 0 else -1
-            return {
-                "system": sys_n,
-                "tools": tool_n,
-                "messages": msg_n,
-                "total": sys_n + tool_n + msg_n,
-                "message_count": count,
-                "last_marker_tail": tail,
-            }
-
-        import headroom.proxy.helpers as _hd_helpers
-
-        _hd_orig_read = _hd_helpers.read_request_json_with_bytes
-
-        async def _hd_read_with_bp_snapshot(request):
-            body, raw = await _hd_orig_read(request)
-            try:
-                if isinstance(body, dict):
-                    _hd_inbound_bp.set(_hd_count_breakpoints(body))
-                    msgs = body.get("messages")
-                    if isinstance(msgs, list):
-                        _hd_client_pos.set((len(msgs), _hd_marker_positions(msgs)))
-            except Exception:
-                pass
-            return body, raw
-
-        _hd_helpers.read_request_json_with_bytes = _hd_read_with_bp_snapshot
-
-        # Mirror the CLIENT's cache_control positions instead of the wheel's
-        # single-marker consolidation. Anthropic resolves each breakpoint with
-        # a ~20-content-block lookback; the client keeps a marker on the
-        # previous turn's newest message as the read anchor that lets a big
-        # turn's write chain to the prior cache entry. Collapsing to one
-        # newest-block marker breaks that chain on tool-heavy turns (silent
-        # full re-write; measured 2-3x miss rate in the 2026-08-11 field
-        # report). Upstream-shaped fix; remove once a wheel ships it.
-        import headroom.cache.prefix_tracker as _hd_pt
-
-        _hd_orig_normalize = _hd_pt.normalize_message_cache_control
-
-        def _hd_normalize_mirror(messages, *args, **kwargs):
-            try:
-                stash = _hd_client_pos.get()
-                if stash is not None:
-                    count, positions = stash
-                    if positions and count == len(messages):
-                        out = []
-                        changed = False
-                        for msg in messages:
-                            content = (
-                                msg.get("content") if isinstance(msg, dict) else None
-                            )
-                            if isinstance(content, list) and any(
-                                isinstance(b, dict) and "cache_control" in b
-                                for b in content
-                            ):
-                                out.append(
-                                    {
-                                        **msg,
-                                        "content": [
-                                            {
-                                                k: v
-                                                for k, v in b.items()
-                                                if k != "cache_control"
-                                            }
-                                            if isinstance(b, dict)
-                                            else b
-                                            for b in content
-                                        ],
-                                    }
-                                )
-                                changed = True
-                            else:
-                                out.append(msg)
-                        placed = False
-                        for idx, bi, marker in positions:
-                            msg = out[idx]
-                            content = (
-                                msg.get("content") if isinstance(msg, dict) else None
-                            )
-                            if not isinstance(content, list) or not content:
-                                continue
-                            content = list(content)
-                            # Same block if still in range, else the message's
-                            # last block (a slightly-off placement lands on a
-                            # stable block; markers are not part of the key).
-                            target = bi if 0 <= bi < len(content) else len(content) - 1
-                            if not isinstance(content[target], dict):
-                                target = len(content) - 1
-                            if not isinstance(content[target], dict):
-                                continue
-                            content[target] = {
-                                **content[target],
-                                "cache_control": dict(marker),
-                            }
-                            out[idx] = {**msg, "content": content}
-                            placed = True
-                        if placed or changed:
-                            return out
-                        return messages
-            except Exception:
-                pass
-            return _hd_orig_normalize(messages, *args, **kwargs)
-
-        _hd_pt.normalize_message_cache_control = _hd_normalize_mirror
-
-        import headroom.proxy.body_forwarding as _hd_fwd
-
-        _hd_orig_select = _hd_fwd.select_outbound_body
-
-        def _hd_select_with_bp_log(**kwargs):
-            try:
-                inbound = _hd_inbound_bp.get()
-                body = kwargs.get("body")
-                if inbound is not None and isinstance(body, dict):
-                    outbound = _hd_count_breakpoints(body)
-                    if inbound["total"] or outbound["total"]:
-                        dropped = outbound["total"] < inbound["total"]
-                        tail_grew = inbound["last_marker_tail"] >= 0 and (
-                            outbound["last_marker_tail"] < 0
-                            or outbound["last_marker_tail"]
-                            > inbound["last_marker_tail"]
-                        )
-                        emit = (
-                            _hd_bp_log.warning
-                            if (dropped or tail_grew)
-                            else _hd_bp_log.info
-                        )
-                        emit(
-                            "event=cache_breakpoints in_total=%d out_total=%d "
-                            "in_system=%d out_system=%d in_tools=%d out_tools=%d "
-                            "in_messages=%d out_messages=%d in_msg_count=%d "
-                            "out_msg_count=%d in_last_tail=%d out_last_tail=%d "
-                            "dropped=%s tail_grew=%s",
-                            inbound["total"],
-                            outbound["total"],
-                            inbound["system"],
-                            outbound["system"],
-                            inbound["tools"],
-                            outbound["tools"],
-                            inbound["messages"],
-                            outbound["messages"],
-                            inbound["message_count"],
-                            outbound["message_count"],
-                            inbound["last_marker_tail"],
-                            outbound["last_marker_tail"],
-                            "true" if dropped else "false",
-                            "true" if tail_grew else "false",
-                        )
-            except Exception:
-                pass
-            return _hd_orig_select(**kwargs)
-
-        _hd_fwd.select_outbound_body = _hd_select_with_bp_log
-    except Exception:
-        pass
-
-    # Shareable proxy.log: HEADROOM_LOG_PAYLOAD_PREVIEW=0 drops the verbatim
-    # payload_preview from headroom_retrieve events, keeping byte counts.
-    try:
-        import headroom.cache.compression_store as _hd_store
-
-        _hd_orig_payload_log = _hd_store._payload_for_retrieval_log
-
-        def _hd_payload_log(payload):
-            raw = _hd_os.environ.get("HEADROOM_LOG_PAYLOAD_PREVIEW")
-            if raw is not None and raw.strip().lower() in ("0", "false", "no", "off"):
-                return {
-                    "payload_chars": len(payload),
-                    "payload_preview_chars": 0,
-                    "payload_truncated": len(payload) > 0,
-                    "payload_preview": "",
-                }
-            return _hd_orig_payload_log(payload)
-
-        _hd_store._payload_for_retrieval_log = _hd_payload_log
-    except Exception:
-        pass
-
-    # Never inject proactive-expansion text into the block carrying the
-    # client's cache breakpoint. Skipping the injection for that turn is
-    # safe (it is best-effort context enrichment); mutating the block is
-    # not (prefix bust at that message on every later turn).
-    try:
-        import headroom.proxy.handlers.anthropic as _hd_anth
-
-        _hd_orig_append = (
-            _hd_anth.AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn
-        )
-
-        def _hd_guarded_append(messages, context_text, *, frozen_message_count):
-            try:
-                if messages and isinstance(messages[-1], dict):
-                    content = messages[-1].get("content")
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                if "cache_control" in block:
-                                    return messages
-                                break
-            except Exception:
-                pass
-            return _hd_orig_append(
-                messages, context_text, frozen_message_count=frozen_message_count
-            )
-
-        _hd_anth.AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn = staticmethod(
-            _hd_guarded_append
-        )
-    except Exception:
-        pass
-
     # Context-limit guard (upstream PR #2942; remove once a wheel ships it).
-    # See point 4 of the module docstring for the failure mode this breaks.
+    # See the module docstring for the failure mode this breaks.
     try:
         if _hd_os.environ.get("HEADROOM_CONTEXT_GUARD", "1").strip().lower() not in (
             "0",
@@ -846,6 +560,59 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 return resp
 
             _hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response
+    except Exception:
+        pass
+
+    # Response-cache poisoning guard (owed upstream). SemanticCache.set is
+    # gated only on `status_code == 200`, so an empty body, an unparseable
+    # one, or an error payload that some path returned as 200 is stored and
+    # replayed verbatim for the full TTL (default 1h) to every matching
+    # non-streaming request. Observed 2026-08-13: three /v1/messages replays
+    # served in 6-10ms from one poisoned entry, and the only recovery was
+    # restarting the proxy. Provider-generic (Anthropic and OpenAI both use a
+    # top-level "error"), so it protects every handler, not just the CCR path
+    # that surfaced it. Kill switch: HEADROOM_RESPONSE_CACHE_GUARD=0.
+    try:
+        if _hd_os.environ.get("HEADROOM_RESPONSE_CACHE_GUARD", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            import json as _hd_sc_json
+            import logging as _hd_sc_logging
+
+            import headroom.proxy.semantic_cache as _hd_sc
+
+            _hd_sc_log = _hd_sc_logging.getLogger("headroom.proxy")
+            _hd_sc_orig_set = _hd_sc.SemanticCache.set
+
+            def _hd_sc_cacheable(body):
+                if not body:
+                    return False
+                try:
+                    parsed = _hd_sc_json.loads(body)
+                except Exception:
+                    return False
+                if not isinstance(parsed, dict):
+                    return False
+                # An error body stored under a 200 is the worst case: every
+                # replay re-serves it and the client never retries.
+                return not (parsed.get("type") == "error" or "error" in parsed)
+
+            async def _hd_sc_set(self, messages, model, response_body, *args, **kwargs):
+                if not _hd_sc_cacheable(response_body):
+                    _hd_sc_log.warning(
+                        "event=response_cache_store_refused model=%s bytes=%d",
+                        model,
+                        len(response_body or b""),
+                    )
+                    return None
+                return await _hd_sc_orig_set(
+                    self, messages, model, response_body, *args, **kwargs
+                )
+
+            _hd_sc.SemanticCache.set = _hd_sc_set
     except Exception:
         pass
 "#;
@@ -2234,8 +2001,10 @@ impl ToolManager {
                     // it on per request (HEADROOM_COMPRESS_USER_MESSAGES can
                     // only force-ENABLE, never disable), so the OFF posture is
                     // enforced by SITECUSTOMIZE_PY flipping the persona field
-                    // back — see that constant for the mangled-CLAUDE.md bug
-                    // this prevents. Trade-off: gives up the modest
+                    // back. (The 0.34.0 tag-split bug that also mangled
+                    // CLAUDE.md system-reminders was fixed upstream in 0.35.0
+                    // by #2887; the flip stays because plain user text would
+                    // still compress.) Trade-off: gives up the modest
                     // Codex/OpenAI user-text savings (0.5 read-discount, 0.0
                     // write-penalty) that HEADROOM_COMPRESS_USER_MESSAGES=1 enabled.
                     // Output-token shaping (new in headroom-ai 0.27.0). The proxy
@@ -3135,7 +2904,7 @@ impl ToolManager {
             });
         }
 
-        if !self.runtime.managed_python().exists() {
+        if !self.managed_venv_has_pip() {
             log::info!("bootstrap: creating managed virtualenv");
             progress(BootstrapStepUpdate {
                 step: "Creating environment",
@@ -3362,6 +3131,23 @@ impl ToolManager {
         }
 
         Ok(())
+    }
+
+    /// `python -m venv` copies the interpreter into place *before* it runs
+    /// ensurepip, so an attempt killed mid-way (quit, reboot, AV quarantine)
+    /// leaves a `python` with no pip. Gating bootstrap on the interpreter alone
+    /// made that state permanent: `create_managed_venv` — which carries the pip
+    /// verification — was skipped on every later launch and the install died
+    /// with "No module named pip" forever. Re-running venv creation re-runs
+    /// ensurepip, so treating a pip-less venv as absent self-heals it.
+    fn managed_venv_has_pip(&self) -> bool {
+        self.runtime.managed_python().exists()
+            && run_python_command(
+                &self.runtime.managed_python(),
+                &["-m", "pip", "--version"],
+                &self.runtime.root_dir,
+            )
+            .is_ok()
     }
 
     fn create_managed_venv(&self) -> Result<()> {
@@ -5951,9 +5737,9 @@ impl PluginHost {
 
     fn install_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         match self {
-            PluginHost::ClaudeCode => {
-                vec!["plugin", "install", plugin.plugin_ref, "--scope", "user"]
-            }
+            // No `--scope user`: it is Claude Code's default, and CLIs older
+            // than the flag reject the whole command with "unknown option".
+            PluginHost::ClaudeCode => vec!["plugin", "install", plugin.plugin_ref],
             PluginHost::Codex => vec!["plugin", "add", plugin.plugin_ref],
         }
     }
@@ -6743,6 +6529,24 @@ fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
     }
 }
 
+/// The unified `--no-ccr` flag replaced the split `--no-ccr-marker` /
+/// `--no-ccr-inject-tool` pair in headroom-ai 0.31.0 (upstream ecc93991);
+/// 0.30.0 and earlier exit 2 with "No such option", which would fail boot
+/// validation on the 0.28.0 fallback runtime exactly as --no-http2 did on
+/// 0.26.0 (Sentry RUST-4A). Verified against the tagged CLI: v0.30.0 carries
+/// the split pair, v0.31.0+ the unified flag. Unknown/unparseable version means
+/// the receipt is from a current install, so assume the pinned runtime.
+fn runtime_supports_no_ccr(installed_version: Option<&str>) -> bool {
+    let Some(version) = installed_version else {
+        return true;
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 31),
+        _ => true,
+    }
+}
+
 /// The "coding" savings persona only exists in `agent_savings._PROFILES` from
 /// headroom-ai 0.30.0. On the 0.28.0 fallback runtime (chosen when 0.30.0 boot
 /// validation times out) the set is {agent-90, balanced}, so `coding` makes the
@@ -6782,6 +6586,24 @@ fn headroom_entrypoint_startup_args(
         args.push("--no-http2".to_string());
     }
     args.push("--log-messages".to_string());
+    // CCR off: with headroom_retrieve injected into the tools array, every
+    // stream:true turn is rewritten to a buffered stream:false upstream call
+    // and re-synthesized as SSE (`buffered_stream_ccr`, upstream #1451/#2479).
+    // That wrapper commits `http.response.start` with status 200 +
+    // text/event-stream after a 1s keepalive, before the upstream outcome is
+    // known; when the buffered call then returns anything that is not a
+    // StreamingResponse (unparseable body, or a real 429/500/529) it can only
+    // emit a bare `event: error` with no message_start, so the client sees
+    // "API returned an empty or malformed response (HTTP 200)" and, because the
+    // status is 200, never retries. Upstream's own help text names --no-ccr as
+    // the right setting for streaming clients. Turning it off also restores
+    // real streaming and puts those turns back through
+    // StreamingMixin._stream_response, which is where SITECUSTOMIZE_PY's
+    // context-limit guard (#2942) attaches — the buffered path bypassed it
+    // entirely. Present since 0.33.0, so this is not a 0.35.0 regression.
+    if runtime_supports_no_ccr(installed_version) {
+        args.push("--no-ccr".to_string());
+    }
     if learn_enabled {
         args.extend(headroom_learn_startup_args());
     }
@@ -7112,24 +6934,24 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/82/f8/d9416f0fd07cf1da050853fd84ab0b85261c94f0bb40e6ed0a3d214a74ca/headroom_ai-0.34.0-cp310-abi3-macosx_11_0_arm64.whl",
-            "381391ab816daf0894a40fd6523f54abf55c30a57273879c2f6e6b501ab997c3",
+            "https://files.pythonhosted.org/packages/b0/27/a67c70358769ff1844326e1b9695bfa9ed2f298aeb7001bb32e74c92c7d5/headroom_ai-0.35.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "54dc9be2b8f7b0397f35d15b73f48db3eefdd3b3c613630bcaee695a4fbf509e",
         ),
         ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/80/c2/18127c595f1098cc65ef8aa40dbb6ae2c33656928fc1f6469022d9a2f8db/headroom_ai-0.34.0-cp310-abi3-macosx_10_12_x86_64.whl",
-            "ab190aee94cbd9757413ac06cb15972a38baeff2d1283112b71de4ba685fe381",
+            "https://files.pythonhosted.org/packages/af/7d/4f6199cf9ede6eec15df036ba06e52ce36025a82e23988397db6ff16d3a6/headroom_ai-0.35.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "ef8622df6230a6e63a44ca5d25a8aaca985d3573dbe83db9a74556286f4bee0f",
         ),
         ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/9e/f7/fc978da714ba3b1693bfa779c251312a6ca8e3fcd093b81913662e96b673/headroom_ai-0.34.0-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "8d1763844dcd6d1736dddb6acbc754fd736652580a673b44f6beb1167648cbdc",
+            "https://files.pythonhosted.org/packages/7d/4f/972f50843a9c419967b443ef41121de4687bbdab91682ac1e4b800366c68/headroom_ai-0.35.0-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "ec261ca9c3a8599c4a1b8bc7b69301d39bd434448b64bd043b510fd5ee14d358",
         ),
         ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/93/09/2b5a3470207cb4c8d75bf737d0bc8e59c5ab80b3c28f5d46b2aaa97913df/headroom_ai-0.34.0-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "061d974b4f4e95b8fc9611fc4d059331e43fd2bd4737243bbed5fcb3af82775f",
+            "https://files.pythonhosted.org/packages/56/ea/b5f112b90ea2033276c35a7bddd4bdfd4429a1c011b2f109fa5a809bac14/headroom_ai-0.35.0-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "abdbbabc314b09e0f27b166f0be43dc386b8de338048a66fe804bc1d3cf2bff4",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/9a/59/19b97ea93e684d2676a9d7772f5615f27ef333c90cfd6851901f78f22677/headroom_ai-0.34.0-cp310-abi3-win_amd64.whl",
-            "2adbb309bfe34a6685c832a59eea32db0f4a837c01439f9b99051039ca81bf22",
+            "https://files.pythonhosted.org/packages/fc/8c/297b742144144c8411ca021436004a15318a6f5cce033093d9333f693089/headroom_ai-0.35.0-cp310-abi3-win_amd64.whl",
+            "c80533399c911761fb47f49ac02db35c33ef4eb628c6568c213d7d7f0b594bef",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -8517,10 +8339,11 @@ mod tests {
     }
 
     #[test]
-    fn sitecustomize_reprotects_user_turn_text_from_lossy_compression() {
-        // headroom-ai 0.34.0's coding persona compresses user-role text
-        // blocks, which mangles CLAUDE.md system-reminders (no env can
-        // disable it). The injection must flip the persona field back.
+    fn sitecustomize_keeps_user_turn_text_out_of_lossy_compression() {
+        // From headroom-ai 0.34.0 the coding persona compresses user-role
+        // text blocks and no env can disable it. Verbatim user turns are
+        // deliberate desktop posture (see the SITECUSTOMIZE_PY docstring);
+        // the injection must flip the persona field back.
         assert!(super::SITECUSTOMIZE_PY.contains("compress_user_messages=False"));
         assert!(super::SITECUSTOMIZE_PY.contains(r#"_PROFILES.get("coding")"#));
         // Must stay guarded: fallback runtimes (< 0.30.0) lack the persona.
@@ -8528,19 +8351,35 @@ mod tests {
     }
 
     #[test]
-    fn sitecustomize_cache_patches_are_gated_on_backend_env() {
-        // The breakpoint-diagnostics / payload-preview / expansion-guard
-        // patches import the full proxy stack; they must only run in the
-        // backend process, never in markitdown or other venv Pythons.
-        assert!(super::SITECUSTOMIZE_PY
-            .contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
-        assert!(super::SITECUSTOMIZE_PY.contains("event=cache_breakpoints"));
-        assert!(super::SITECUSTOMIZE_PY.contains("HEADROOM_LOG_PAYLOAD_PREVIEW"));
-        assert!(super::SITECUSTOMIZE_PY.contains("_append_context_to_latest_non_frozen_user_turn"));
-        // Marker-mirroring fix: the wheel's single-marker consolidation breaks
-        // Anthropic's ~20-block breakpoint lookback on tool-heavy turns.
-        assert!(super::SITECUSTOMIZE_PY.contains("normalize_message_cache_control"));
-        assert!(super::SITECUSTOMIZE_PY.contains("_hd_normalize_mirror"));
+    fn sitecustomize_dropped_patches_upstreamed_in_0_35_0() {
+        // The breakpoint-diagnostics / payload-preview / expansion-guard /
+        // marker-mirroring patches shipped upstream in 0.35.0 (#2919);
+        // keeping the desktop copies would double-log cache_breakpoints
+        // and shadow the native implementations.
+        assert!(!super::SITECUSTOMIZE_PY.contains("event=cache_breakpoints"));
+        assert!(!super::SITECUSTOMIZE_PY.contains("HEADROOM_LOG_PAYLOAD_PREVIEW"));
+        assert!(!super::SITECUSTOMIZE_PY.contains("normalize_message_cache_control"));
+    }
+
+    /// SemanticCache.set stores any body gated only on `status_code == 200`,
+    /// so one empty/unparseable/error response is replayed for the full TTL
+    /// (1h) and only a proxy restart clears it — the amplifier that turned a
+    /// single bad upstream response into a wedged session on 2026-08-13.
+    #[test]
+    fn sitecustomize_guards_response_cache_against_poisoning() {
+        let py = super::SITECUSTOMIZE_PY;
+        // Must patch the class the proxy actually instantiates
+        // (headroom.proxy.semantic_cache.SemanticCache, not cache.semantic).
+        assert!(py.contains("import headroom.proxy.semantic_cache as _hd_sc"));
+        assert!(py.contains("_hd_sc.SemanticCache.set = _hd_sc_set"));
+        // The wrapper must stay async: callers `await self.cache.set(...)`.
+        assert!(py.contains("async def _hd_sc_set("));
+        assert!(py.contains("await _hd_sc_orig_set("));
+        // Error payloads under a 200 are the worst case to cache.
+        assert!(py.contains(r#"parsed.get("type") == "error""#));
+        assert!(py.contains("HEADROOM_RESPONSE_CACHE_GUARD"));
+        // Backend process only: it imports the proxy stack.
+        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
     }
 
     #[test]
@@ -8548,8 +8387,13 @@ mod tests {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
         // the model's real window (churn report 2026-08-12). Verified against
-        // installed 0.34.0 by scratchpad/verify_sitecustomize.py on 2026-08-12.
+        // installed 0.34.0 by scratchpad/verify_sitecustomize.py on 2026-08-12;
+        // all three patched seams re-verified present with unchanged
+        // signatures in the 0.35.0 wheel on 2026-08-13 (#2942 still open).
         let py = super::SITECUSTOMIZE_PY;
+        // The guard imports the full proxy stack; it must only run in the
+        // backend process, never in markitdown or other venv Pythons.
+        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
         // All three seams are patched...
         assert!(py.contains("_hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response"));
         assert!(py.contains("_hd_cg_prov.AnthropicProvider.get_context_limit = _hd_cg_limit"));
@@ -9719,6 +9563,41 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
     }
 
+    /// CCR tool injection forces every stream:true turn through the buffered
+    /// non-stream path, whose keepalive wrapper commits HTTP 200 before the
+    /// upstream outcome is known and then cannot report a real error — the
+    /// client sees an empty/malformed 200 and cannot retry. The unified
+    /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
+    /// click would exit 2 and boot validation would fail like RUST-4A.
+    #[test]
+    fn entrypoint_args_gate_no_ccr_on_runtime_version() {
+        backend_port::reset_for_tests();
+
+        // 0.30.0 and earlier expose the split --no-ccr-marker /
+        // --no-ccr-inject-tool pair, not the unified flag.
+        assert!(!headroom_entrypoint_startup_args(Some("0.28.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        assert!(!headroom_entrypoint_startup_args(Some("0.30.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("0.31.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("0.35.0"), true)
+            .contains(&"--no-ccr".to_string()));
+        // Unknown or malformed receipt version: assume pinned runtime.
+        assert!(headroom_entrypoint_startup_args(None, true).contains(&"--no-ccr".to_string()));
+        assert!(headroom_entrypoint_startup_args(Some("garbage"), true)
+            .contains(&"--no-ccr".to_string()));
+        // The `python -m headroom.proxy.server` argparse defines no CCR
+        // option at all; passing it there would exit 2 on every fallback boot.
+        assert!(!headroom_python_startup_args().contains(&"--no-ccr".to_string()));
+        // Version-gated flags stay out of the staleness signature: a runtime
+        // that cannot take the flag would otherwise never match and the
+        // desktop would stop/restart the proxy on every check.
+        assert!(!super::expected_proxy_arg_signature(true).contains(&"--no-ccr"));
+
+        backend_port::reset_for_tests();
+    }
+
     /// Regression (Sentry RUST-1M): the "coding" savings persona only exists in
     /// _PROFILES from 0.30.0. On the 0.28.0 fallback runtime, passing it makes
     /// the proxy raise on startup and exit before opening the port. Must gate on
@@ -10073,6 +9952,40 @@ after
         .expect("receipt");
         let manager = ToolManager::new(runtime.clone());
         (root, runtime, manager)
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn managed_venv_has_pip_rejects_a_venv_whose_pip_is_missing() {
+        // A venv interrupted during ensurepip keeps its interpreter but has no
+        // pip. Bootstrap used to gate on the interpreter alone, so it skipped
+        // venv creation forever and every install died with "No module named
+        // pip" (RUST-66 / RUST-6M).
+        let (_root, runtime, manager) = seed_test_runtime("venv-pip-probe");
+        assert!(!manager.managed_venv_has_pip(), "no interpreter yet");
+
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 1\n");
+        assert!(
+            !manager.managed_venv_has_pip(),
+            "interpreter present but `-m pip --version` fails"
+        );
+
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+        assert!(manager.managed_venv_has_pip(), "pip answers");
+    }
+
+    #[test]
+    fn claude_plugin_install_args_omit_the_scope_flag() {
+        // `--scope user` is Claude Code's default and older CLIs reject the
+        // flag outright, failing the whole install (RUST-6K).
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|p| p.id == "caveman")
+            .expect("caveman addon");
+        assert_eq!(
+            crate::tool_manager::PluginHost::ClaudeCode.install_args(plugin),
+            vec!["plugin", "install", plugin.plugin_ref]
+        );
     }
 
     #[test]

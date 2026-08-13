@@ -72,15 +72,19 @@ import { SetupStallModal } from "./components/SetupStallModal";
 import {
   buildSetupStallMailto,
   describeInvokeError,
+  formatCents,
+  getNextHigherUpgradePlanId,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
+  matchesSubscriptionPeriod,
   forgoneSavingsLabel,
   paybackLabel,
   recentDailySavingsUsd,
+  setServerPlanPrices,
   tierRecommendationSourceLabel,
   upgradePlanIntentLabel,
   type BillingPeriod,
@@ -101,7 +105,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
-  billableInputSavingsRate,
+  compressibleInputSavingsRate,
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
@@ -186,6 +190,7 @@ import type {
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
+  SaveOffer,
 } from "./lib/types";
 
 interface NavItem {
@@ -595,6 +600,17 @@ const CONTACT_FORM_URL = (
 
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
 
+// Values must match User::CANCELLATION_REASONS server-side; anything else is
+// rejected by /desktop/cancellation_intent.
+const CANCELLATION_REASONS: { value: string; label: string }[] = [
+  { value: "too_expensive", label: "Too expensive" },
+  { value: "not_enough_savings", label: "Not saving me enough tokens" },
+  { value: "not_using_it", label: "Not using it enough" },
+  { value: "switched", label: "Switched to something else" },
+  { value: "technical_problems", label: "Ran into technical problems" },
+  { value: "other", label: "Something else" }
+];
+
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
 const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
@@ -622,6 +638,13 @@ function SavingsChartTooltip({
   }
 
   const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
+  // The backend's by_provider rollup has no cache dimension, so the bucket's
+  // compressible share is pro-rated across its providers. Exact whenever one
+  // connector was active in the hour (the common case); an approximation only
+  // when two ran concurrently with different cache hit rates.
+  const costScale = point.actualCostUsd > 0 ? point.compressibleCostUsd / point.actualCostUsd : 1;
+  const tokenScale =
+    point.totalTokensSent > 0 ? point.compressibleTokensSent / point.totalTokensSent : 1;
 
   return (
     <div className="savings-chart__tooltip">
@@ -639,9 +662,13 @@ function SavingsChartTooltip({
                     chartMode === "usd" ? "saved-usd" : "saved-tokens"
                   }`}
                 />
+                {/* "Input saved", not "Saved": the output-shaping group below
+                    is bucket-level (upstream's by_provider rollup has no output
+                    dimension), so an unqualified "Saved" here would read as the
+                    connector's whole contribution. */}
                 {chartMode === "usd"
-                  ? `Saved ${currencyExact(provider.estimatedSavingsUsd)}`
-                  : `Saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
+                  ? `Input saved ${currencyExact(provider.estimatedSavingsUsd)}`
+                  : `Input saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
               </span>
               <span className="savings-chart__tooltip-item">
                 <i
@@ -650,9 +677,11 @@ function SavingsChartTooltip({
                     chartMode === "usd" ? "actual-usd" : "actual-tokens"
                   }`}
                 />
+                {/* "Spent" for brevity; the figure is the compressible slice,
+                    matching the bar and the chip's denominator. */}
                 {chartMode === "usd"
-                  ? `Spent ${currencyExact(provider.actualCostUsd)}`
-                  : `Spent ${compactNumber(provider.totalTokensSent)} tokens`}
+                  ? `Spent ${currencyExact(provider.actualCostUsd * costScale)}`
+                  : `Spent ${compactNumber(provider.totalTokensSent * tokenScale)} tokens`}
               </span>
             </div>
           ))
@@ -666,14 +695,14 @@ function SavingsChartTooltip({
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
               />
-              Saved {currencyExact(point.estimatedSavingsUsd)}
+              Input saved {currencyExact(point.estimatedSavingsUsd)}
             </span>
             <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
               />
-              Spent {currencyExact(point.actualCostUsd)}
+              Spent {currencyExact(point.compressibleCostUsd)}
             </span>
           </div>
         ) : (
@@ -684,14 +713,14 @@ function SavingsChartTooltip({
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
               />
-              Saved {compactNumber(point.estimatedTokensSaved)} tokens
+              Input saved {compactNumber(point.estimatedTokensSaved)} tokens
             </span>
             <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
               />
-              Spent {compactNumber(point.totalTokensSent)} tokens
+              Spent {compactNumber(point.compressibleTokensSent)} tokens
             </span>
           </div>
         )}
@@ -940,7 +969,7 @@ function DailySavingsChart({
   // BILLABLE input for the visible window, in the active unit. Output shaping
   // stays out of every percentage (it keeps its own measured reduction chip);
   // cache reads stay out of the denominator (~0.1x, deliberately untouched).
-  const billableRate = billableInputSavingsRate(
+  const compressibleRate = compressibleInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow,
     chartMode
   );
@@ -1063,31 +1092,31 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {billableRate !== null ||
+            {compressibleRate !== null ||
             windowOutput !== null ||
             (windowIncludesToday && outputReduction) ? (
               <span className="savings-chart__overlay-chips">
-                {billableRate !== null && (
+                {compressibleRate !== null && (
                   <WindowRateChip
                     dot="input"
-                    label={`Input −${Math.round(billableRate.pct)}%`}
+                    label={`Input −${Math.round(compressibleRate.pct)}%`}
                     title="Input compression"
                     badge="measured"
-                    value={`${Math.round(billableRate.pct)}%`}
+                    value={`${Math.round(compressibleRate.pct)}%`}
                     rows={[
                       {
                         dt: "Removed",
                         dd:
                           chartMode === "usd"
-                            ? currency(billableRate.saved)
-                            : compactNumber(billableRate.saved)
+                            ? currency(compressibleRate.saved)
+                            : compactNumber(compressibleRate.saved)
                       },
                       {
-                        dt: "Billable input",
+                        dt: "Compressible input",
                         dd:
                           chartMode === "usd"
-                            ? currency(billableRate.saved + billableRate.billable)
-                            : compactNumber(billableRate.saved + billableRate.billable)
+                            ? currency(compressibleRate.saved + compressibleRate.remaining)
+                            : compactNumber(compressibleRate.saved + compressibleRate.remaining)
                       }
                     ]}
                     note="Cache reads (billed at ~10%) are excluded from the baseline; Headroom leaves the cached prefix intact."
@@ -1121,8 +1150,10 @@ function DailySavingsChart({
               barCategoryGap="5%"
               barGap={1}
               data={chartData}
-              // Clears the overlay: total + label + the chip row added in 0.7.9.
-              margin={{ top: 96, right: 2, left: 2, bottom: 0 }}
+              // Clears the overlay: total + label + the chip row added in 0.7.9
+              // measure ~72px from the canvas top, so this is that plus a few
+              // px of breathing room -- not slack to be reclaimed twice.
+              margin={{ top: 82, right: 2, left: 2, bottom: 0 }}
             >
               <defs>
                 <linearGradient id="actualUsdGradient" x1="0" x2="0" y1="0" y2="1">
@@ -1163,13 +1194,16 @@ function DailySavingsChart({
                 tick={{ fill: "#7a7169", fontSize: 10 }}
                 tickLine={false}
               />
-              <YAxis hide yAxisId="usd" />
-              <YAxis hide yAxisId="tokens" />
+              {/* Both axes are hidden, so recharts' default "nice" rounding
+                  buys nothing but empty space above the tallest bar: pin the
+                  domain to the data so the peak bucket fills the plot. */}
+              <YAxis domain={[0, "dataMax"]} hide yAxisId="usd" />
+              <YAxis domain={[0, "dataMax"]} hide yAxisId="tokens" />
               <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
               {chartMode === "usd" && (
                 <>
                   <Bar
-                    dataKey="actualCostUsd"
+                    dataKey="compressibleCostUsd"
                     fill="url(#actualUsdGradient)"
                     maxBarSize={16}
                     stackId="usd"
@@ -1199,7 +1233,7 @@ function DailySavingsChart({
               {chartMode === "tokens" && (
                 <>
                   <Bar
-                    dataKey="totalTokensSent"
+                    dataKey="compressibleTokensSent"
                     fill="url(#actualTokensGradient)"
                     maxBarSize={16}
                     stackId="tokens"
@@ -1527,8 +1561,9 @@ export default function App() {
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
-  // Monthly first: the intro offer's 50% headline is the default presentation.
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
+  // Annual first: it is the cheaper per-month number and the tab the "Save 25%"
+  // badge points at. A subscriber's own period overrides this once it loads.
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -1685,7 +1720,9 @@ export default function App() {
   const [showUninstallDialog, setShowUninstallDialog] = useState(false);
   const [uninstallBusy, setUninstallBusy] = useState(false);
   const [uninstallError, setUninstallError] = useState<string | null>(null);
-  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
+  // "cancel" is not a plan: it is the cancel-subscription action, which shares the
+  // busy state so only the button that was clicked reads "Opening...".
+  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | "cancel" | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [pendingPlanChange, setPendingPlanChange] = useState<{
     fromTier: HeadroomSubscriptionTier;
@@ -1696,6 +1733,14 @@ export default function App() {
   const [planChangeError, setPlanChangeError] = useState<string | null>(null);
   const [reactivateBusy, setReactivateBusy] = useState(false);
   const [reactivateError, setReactivateError] = useState<string | null>(null);
+  const [saveOffer, setSaveOffer] = useState<SaveOffer | null>(null);
+  const [saveOfferBusy, setSaveOfferBusy] = useState(false);
+  const [saveOfferError, setSaveOfferError] = useState<string | null>(null);
+  const [saveOfferRedeemed, setSaveOfferRedeemed] = useState(false);
+  const [cancelReasonOpen, setCancelReasonOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelNote, setCancelNote] = useState("");
+  const [cancelBusy, setCancelBusy] = useState(false);
   const [contactEmail, setContactEmail] = useState("");
   const [contactMessage, setContactMessage] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
@@ -1734,6 +1779,10 @@ export default function App() {
   // must not fire notifications while first-install bootstrap is still running.
   const runtimeInstalledRef = useRef(false);
   const claudeProjectsSignatureRef = useRef(serializeState([] as ClaudeCodeProject[]));
+  // Mirror the server's price table into the pricing helpers before anything
+  // reads a price this render. Idempotent and derived purely from state, so a
+  // repeated render (StrictMode) is a no-op.
+  setServerPlanPrices(pricingStatus?.planPrices);
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
@@ -1751,7 +1800,9 @@ export default function App() {
     pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
     pricingStatus?.account?.subscriptionEndsAt,
     pricingStatus?.activePercentOff ?? 0,
-    pricingStatus?.introOffer ?? null
+    pricingStatus?.introOffer ?? null,
+    pricingStatus?.account?.subscriptionRenewalCents,
+    pricingStatus?.account?.subscriptionRenewalEndsAt
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -1873,6 +1924,17 @@ export default function App() {
     setShowAllUpgradePlans(false);
     if (pricingAudience !== "individual") setBillingPeriod("annual");
   }, [pricingAudience]);
+
+  // Open on the plan the subscriber actually has, not the monthly default:
+  // showing an annual subscriber monthly prices misstates what they pay. Keyed
+  // on the account's period alone, so it fires on load and on a plan change but
+  // never fights the toggle.
+  const accountBillingPeriod = pricingStatus?.account?.subscriptionBillingPeriod;
+  useEffect(() => {
+    if (accountBillingPeriod === "annual" || accountBillingPeriod === "monthly") {
+      setBillingPeriod(accountBillingPeriod);
+    }
+  }, [accountBillingPeriod]);
 
   useEffect(() => {
     if (!pricingStatus?.authenticated) {
@@ -2410,6 +2472,17 @@ export default function App() {
     setStepBasePercent(bootstrapProgress.overallPercent);
   }, [bootstrapProgress, showInstallProgress, stepSignature]);
 
+  // Reaching the final screen IS the end of onboarding, so satisfy the tray's
+  // gate here instead of on one specific exit. Every other way off this screen
+  // -- the blur-autohide right below, closing the window, quitting -- used to
+  // leave `setup_wizard_complete` false while the launcher kept landing here
+  // (getInitialLauncherStage sends any returning user straight to
+  // post_install). The tray gate then disagreed with the stage machine and
+  // reopened this same screen on every click, forever.
+  useEffect(() => {
+    if (!isLastScreen) return;
+    void invoke("complete_setup_wizard");
+  }, [isLastScreen]);
 
   useEffect(() => {
     if (!isLastScreen || awaitingFirstSavings) return;
@@ -3957,7 +4030,17 @@ export default function App() {
         case "pro":
         case "max5x":
         case "max20x": {
-          if (activeHeadroomPlanId === planId) return { kind: "internal" as const };
+          // Same tier on the other billing period is a real change (Polar swaps
+          // the product), not the plan you are already on.
+          if (
+            activeHeadroomPlanId === planId &&
+            matchesSubscriptionPeriod(
+              billingPeriod,
+              pricingStatus?.account?.subscriptionBillingPeriod
+            )
+          ) {
+            return { kind: "internal" as const };
+          }
           // Polar prorates the product swap with the existing discount applied,
           // so every plan change on an active subscription uses the PATCH path.
           if (activeHeadroomPlanId) {
@@ -4044,12 +4127,9 @@ export default function App() {
       setUpgradeActionError(null);
 
       try {
-        // Deep-link to the user's subscription page so they land one click
-        // away from "Change plan" instead of at the portal root.
-        const url = await invoke<string>("get_headroom_billing_portal_url", {
-          target: "subscription"
-        });
-        await openExternalLink(url);
+        // Plain trip to the portal. Cancelling has its own entry point that asks
+        // why first; someone updating a card should not meet a retention pitch.
+        await openBillingPortal();
       } catch (error) {
         setUpgradeActionError(
           error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
@@ -4108,6 +4188,88 @@ export default function App() {
     if (planChangeBusy) return;
     setPendingPlanChange(null);
     setPlanChangeError(null);
+  }
+
+  async function openBillingPortal() {
+    // Deep-link to the user's subscription page so they land one click away
+    // from "Change plan" instead of at the portal root.
+    const url = await invoke<string>("get_headroom_billing_portal_url", {
+      target: "subscription"
+    });
+    await openExternalLink(url);
+  }
+
+  function openCancelReason() {
+    setCancelReason("");
+    setCancelNote("");
+    setUpgradeActionError(null);
+    setCancelReasonOpen(true);
+  }
+
+  async function handleCancelContinue() {
+    if (!cancelReason || cancelBusy) return;
+    setCancelBusy(true);
+    // Fails open: the reason is a nice-to-have, being trapped in the app is not.
+    const offer = await invoke<SaveOffer | null>("submit_headroom_cancellation_intent", {
+      reason: cancelReason,
+      note: cancelNote.trim() || null
+    }).catch(() => null);
+    setCancelBusy(false);
+    setCancelReasonOpen(false);
+
+    if (offer) {
+      setSaveOfferError(null);
+      setSaveOfferRedeemed(false);
+      setSaveOffer(offer);
+      return;
+    }
+
+    setUpgradeActionBusy("cancel");
+    try {
+      await openBillingPortal();
+    } catch (error) {
+      setUpgradeActionError(
+        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+      );
+    } finally {
+      setUpgradeActionBusy(null);
+    }
+  }
+
+  async function handleRedeemSaveOffer() {
+    if (saveOfferBusy) return;
+    setSaveOfferBusy(true);
+    setSaveOfferError(null);
+    try {
+      await invoke("redeem_headroom_save_offer");
+      setSaveOfferRedeemed(true);
+      await refreshPricingStatus();
+    } catch (error) {
+      setSaveOfferError(
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not apply the offer."
+      );
+    } finally {
+      setSaveOfferBusy(false);
+    }
+  }
+
+  async function handleDeclineSaveOffer() {
+    if (saveOfferBusy) return;
+    setSaveOffer(null);
+    setUpgradeActionBusy("cancel");
+    try {
+      await openBillingPortal();
+    } catch (error) {
+      setUpgradeActionError(
+        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+      );
+    } finally {
+      setUpgradeActionBusy(null);
+    }
   }
 
   async function handleReactivateSubscription() {
@@ -5124,7 +5286,7 @@ export default function App() {
                 type="button"
               >
                 {period === "annual" ? (
-                  <>Annual <span className="upgrade-billing-toggle__save">Save 33%</span></>
+                  <>Annual <span className="upgrade-billing-toggle__save">Save 25%</span></>
                 ) : "Monthly"}
               </button>
             ))}
@@ -5298,6 +5460,8 @@ export default function App() {
           </button>
           <button
             className="primary-button primary-button--large primary-button--success"
+            // `complete_setup_wizard` already fired on entering this screen
+            // (see the isLastScreen effect), so this is only the exit.
             onClick={() => triggerHide()}
             type="button"
           >
@@ -5593,14 +5757,44 @@ export default function App() {
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
       ? pricingStatus.account.subscriptionTier ?? null
       : null;
-  const downgradePlanId = getNextLowerUpgradePlanId(activeHeadroomPlanId);
+  // Plan cards keep their slot on both tabs, but the "Active" chrome only
+  // belongs to the period the subscriber actually pays for.
+  const viewingSubscribedPeriod = matchesSubscriptionPeriod(
+    billingPeriod,
+    pricingStatus?.account?.subscriptionBillingPeriod
+  );
+  // A downgrade waits for the end of the term already paid for, so between
+  // confirming it and it landing the subscription still reports the old plan.
+  // Without this the change leaves no trace anywhere in the app.
+  const pendingPlanChangeInfo = (() => {
+    const account = pricingStatus?.account;
+    const tier = account?.subscriptionPendingTier;
+    const effectiveAt = account?.subscriptionPendingEffectiveAt;
+    if (!tier || !effectiveAt) return null;
+    const period = account?.subscriptionPendingBillingPeriod === "monthly" ? "monthly" : "annual";
+    const on = new Date(effectiveAt).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric"
+    });
+    // Same tier on a shorter cycle is a billing switch, not a plan change.
+    const note = tier === account?.subscriptionTier
+      ? `Switches to ${period} billing on ${on}`
+      : `Switches to ${upgradePlanIntentLabel(tier)} (${period}) on ${on}`;
+    return { tier, billingPeriod: period, note };
+  })();
+  // The card beside the active plan: the nearest step up, since that is what
+  // this view is for. Only the top tier has none, and there the tier below it
+  // is the sole remaining move.
+  const companionPlanId =
+    getNextHigherUpgradePlanId(activeHeadroomPlanId) ?? getNextLowerUpgradePlanId(activeHeadroomPlanId);
   const visibleUpgradePlans = (() => {
     if (showAllUpgradePlans || upgradePlansState.plans.length <= 2) {
       return upgradePlansState.plans;
     }
 
-    if (pricingAudience === "individual" && activeHeadroomPlanId && downgradePlanId) {
-      const visiblePlanIds = new Set<UpgradePlanId>([activeHeadroomPlanId, downgradePlanId]);
+    if (pricingAudience === "individual" && activeHeadroomPlanId && companionPlanId) {
+      const visiblePlanIds = new Set<UpgradePlanId>([activeHeadroomPlanId, companionPlanId]);
       const activeWindowPlans = upgradePlansState.plans.filter((plan) => visiblePlanIds.has(plan.id));
       if (activeWindowPlans.length === 2) {
         return activeWindowPlans;
@@ -6693,7 +6887,7 @@ export default function App() {
                     type="button"
                   >
                     {period === "annual" ? (
-                      <>Annual <span className="upgrade-billing-toggle__save">Save 33%</span></>
+                      <>Annual <span className="upgrade-billing-toggle__save">Save 25%</span></>
                     ) : "Monthly"}
                   </button>
                 ))}
@@ -6740,7 +6934,15 @@ export default function App() {
                   ? `primary-button upgrade-plan-card__button${downgradeButtonClassName}`
                   : `secondary-button upgrade-plan-card__button${downgradeButtonClassName}`;
 
-              const isActivePlan = plan.id === activeHeadroomPlanId;
+              const isActivePlan = plan.id === activeHeadroomPlanId && viewingSubscribedPeriod;
+              // The plan a scheduled change is already headed for. Its CTA
+              // still reads "Downgrade to X" otherwise, inviting a second
+              // click at a change that is done.
+              const isPendingTarget =
+                !!pendingPlanChangeInfo &&
+                plan.id === pendingPlanChangeInfo.tier &&
+                billingPeriod === pendingPlanChangeInfo.billingPeriod &&
+                !isActivePlan;
               return (
                 <article
                   className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}
@@ -6765,11 +6967,12 @@ export default function App() {
                       <div className="upgrade-plan-card__price-note">{plan.centeredPriceLabel}</div>
                     ) : (
                       <div>
-                        {plan.originalPrice && !activeHeadroomPlanId ? (
+                        {plan.originalPrice && (plan.saleBadge || !activeHeadroomPlanId) ? (
                           <div className="upgrade-plan-card__sale-row">
                             <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
                             <span className="upgrade-plan-card__sale-badge">
-                              {introSaleBadgeLabel(pricingStatus?.introOffer) ??
+                              {plan.saleBadge ??
+                                introSaleBadgeLabel(pricingStatus?.introOffer) ??
                                 `${pricingStatus?.activePercentOff ?? 50}% off`}
                             </span>
                           </div>
@@ -6790,14 +6993,23 @@ export default function App() {
                     {plan.purchaseInfo ? (
                       <p className="upgrade-plan-card__purchase-info">
                         {plan.purchaseInfo.cancelAtPeriodEnd && plan.purchaseInfo.endsOn
-                          ? plan.id === "free"
-                            ? `Activates on ${plan.purchaseInfo.endsOn}`
-                            : `Downgrades to Free on ${plan.purchaseInfo.endsOn}`
-                          : isActivePlan
-                          ? plan.purchaseInfo.discountPct > 0
-                            ? `Renews ${plan.purchaseInfo.paidPerMonthLabel}/mo on ${plan.purchaseInfo.renewsOn} (${plan.purchaseInfo.discountPct}% off)`
-                            : `Renews ${plan.price}/mo on ${plan.purchaseInfo.renewsOn}`
-                          : null}
+                          ? `Ends on ${plan.purchaseInfo.endsOn}`
+                          : isActivePlan && pendingPlanChangeInfo
+                          ? // The stored renewal price is this plan's, and this
+                            // plan is not the one that renews.
+                            pendingPlanChangeInfo.note
+                          : isActivePlan ? (
+                            <>
+                              Renews at{" "}
+                              <span className="upgrade-plan-card__renewal-price">
+                                {plan.purchaseInfo.renewalPriceLabel}
+                              </span>{" "}
+                              on {plan.purchaseInfo.renewsOn}
+                              {plan.purchaseInfo.renewalNote
+                                ? ` (${plan.purchaseInfo.renewalNote})`
+                                : ""}
+                            </>
+                          ) : null}
                       </p>
                     ) : null}
                   </div>
@@ -6852,39 +7064,47 @@ export default function App() {
                       >
                         {reactivateBusy ? "Resuming..." : `Resume ${plan.name} plan`}
                       </button>
-                    ) : plan.id === "free" && plan.purchaseInfo?.cancelAtPeriodEnd ? (
-                      <button
-                        className={buttonClassName}
-                        disabled
-                        type="button"
-                      >
-                        {plan.ctaLabel}
-                      </button>
                     ) : isActivePlan ? (
                       <div className="upgrade-plan-card__action-stack">
                         <button
                           className={buttonClassName}
-                          disabled={plan.disabled || upgradeActionBusy === plan.id}
+                          disabled={upgradeActionBusy === plan.id}
                           onClick={() => void handleUpgradeAction(plan.id)}
                           type="button"
                         >
                           {upgradeActionBusy === plan.id ? "Opening..." : plan.ctaLabel}
                         </button>
-                        {/* Only in-app entry to the billing portal (cancel/downgrade)
-                            now that the Free card is gone for active subscribers. */}
-                        <button
-                          className="upgrade-plan-card__manage-link"
-                          disabled={upgradeActionBusy === "free"}
-                          onClick={() => void handleUpgradeAction("free")}
-                          type="button"
-                        >
-                          {upgradeActionBusy === "free" ? "Opening..." : "Cancel or manage billing"}
-                        </button>
+                        {/* Only in-app entry to the billing portal (card, invoices,
+                            downgrade) now that the Free card is gone for active
+                            subscribers. Cancelling is deliberately its own action so
+                            updating a card does not come with a retention pitch. */}
+                        <div className="upgrade-plan-card__manage-row">
+                          <button
+                            className="upgrade-plan-card__manage-link"
+                            disabled={upgradeActionBusy === "free"}
+                            onClick={() => void handleUpgradeAction("free")}
+                            type="button"
+                          >
+                            {upgradeActionBusy === "free" ? "Opening..." : "Manage billing"}
+                          </button>
+                          <button
+                            className="upgrade-plan-card__manage-link"
+                            disabled={upgradeActionBusy === "cancel"}
+                            onClick={openCancelReason}
+                            type="button"
+                          >
+                            {upgradeActionBusy === "cancel" ? "Opening..." : "Cancel subscription"}
+                          </button>
+                        </div>
                       </div>
+                    ) : isPendingTarget ? (
+                      <button className={buttonClassName} disabled type="button">
+                        {plan.id === activeHeadroomPlanId ? "Switch scheduled" : "Change scheduled"}
+                      </button>
                     ) : (
                       <button
                         className={buttonClassName}
-                        disabled={plan.disabled || upgradeActionBusy === plan.id}
+                        disabled={upgradeActionBusy === plan.id}
                         onClick={() => void handleUpgradeAction(plan.id)}
                         type="button"
                       >
@@ -7540,24 +7760,51 @@ export default function App() {
               pendingPlanChange.fromTier,
               pendingPlanChange.toTier
             );
-            const action = isDowngrade ? "downgrade" : "upgrade";
-            const actionTitle = isDowngrade ? "Downgrade" : "Upgrade";
+            // Same tier, different billing period: a switch, not an upgrade.
+            const isPeriodSwitch = pendingPlanChange.fromTier === pendingPlanChange.toTier;
+            const action = isPeriodSwitch ? "switch" : isDowngrade ? "downgrade" : "upgrade";
+            // The current plan is priced on the period it was bought on, not
+            // the one being switched to.
+            const currentBillingPeriod =
+              pricingStatus?.account?.subscriptionBillingPeriod === "annual"
+                ? "annual"
+                : pricingStatus?.account?.subscriptionBillingPeriod === "monthly"
+                ? "monthly"
+                : pendingPlanChange.billingPeriod;
             const currentPriceLabel = getPlanRenewalPriceLabel(
               pendingPlanChange.fromTier,
-              pendingPlanChange.billingPeriod,
+              currentBillingPeriod,
               {
                 fromTier: pendingPlanChange.fromTier,
                 currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
               }
             );
-            const newPriceLabel = getPlanRenewalPriceLabel(
-              pendingPlanChange.toTier,
-              pendingPlanChange.billingPeriod,
-              {
-                fromTier: pendingPlanChange.fromTier,
-                currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
-              }
+            // The target card already prices this tier for this period with the
+            // account discount carried at its exact ratio. Re-deriving it from
+            // the amount currently paid quoted $0 to anyone mid 100%-off period,
+            // and 12x the real figure on an annual -> monthly switch (an annual
+            // cycle amount divided by one month).
+            const targetCard = upgradePlansState.plans.find(
+              (plan) => plan.id === pendingPlanChange.toTier
             );
+            const newPriceLabel = targetCard
+              ? `${targetCard.price} / month`
+              : getPlanRenewalPriceLabel(pendingPlanChange.toTier, pendingPlanChange.billingPeriod);
+            // Mirrors the server's rule: a step down the ladder, or the same
+            // tier on a shorter cycle, waits for the term already paid for
+            // rather than crediting back the unused part of it.
+            const isDeferred =
+              isDowngrade ||
+              (isPeriodSwitch &&
+                currentBillingPeriod === "annual" &&
+                pendingPlanChange.billingPeriod === "monthly");
+            const renewsOnLabel = pricingStatus?.account?.subscriptionRenewsAt
+              ? new Date(pricingStatus.account.subscriptionRenewsAt).toLocaleDateString(undefined, {
+                  year: "numeric",
+                  month: "long",
+                  day: "numeric"
+                })
+              : null;
             return (
               <div
                 className="modal-backdrop"
@@ -7578,11 +7825,17 @@ export default function App() {
                     {pendingPlanChange.billingPeriod === "annual" ? "annually" : "monthly"}.
                   </p>
                   <p>
-                    {isDowngrade
-                      ? "You'll receive a prorated credit toward your next billing cycle for the unused time on your current plan."
+                    {isDeferred
+                      ? `Nothing changes today: you keep the ${
+                          upgradePlanIntentLabel(pendingPlanChange.fromTier) ?? "current"
+                        } plan you have paid for${
+                          renewsOnLabel ? ` until ${renewsOnLabel}` : " until the end of the term"
+                        }, and the new plan starts then. No charge and no credit today.`
                       : "You'll be charged a prorated amount today for the remaining time in your current billing period, with your existing discount applied."}
                   </p>
-                  {pricingStatus?.account?.subscriptionRenewsAt ? (
+                  {/* A period switch moves the renewal date, so the stored one
+                      would be stale here; a deferred change already named it. */}
+                  {!isPeriodSwitch && !isDeferred && pricingStatus?.account?.subscriptionRenewsAt ? (
                     <p>
                       Your subscription will then renew on{" "}
                       <strong>
@@ -7616,7 +7869,9 @@ export default function App() {
                       type="button"
                     >
                       {planChangeBusy
-                        ? isDowngrade
+                        ? isPeriodSwitch
+                          ? "Switching…"
+                          : isDowngrade
                           ? "Downgrading…"
                           : "Upgrading…"
                         : `Confirm ${action}`}
@@ -7626,6 +7881,144 @@ export default function App() {
               </div>
             );
           })() : null}
+
+          {cancelReasonOpen ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => {
+                if (!cancelBusy) setCancelReasonOpen(false);
+              }}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>Why are you cancelling?</h3>
+                <p>
+                  This goes straight to us and takes one click. It is the only way
+                  we find out what is not working.
+                </p>
+                <div className="reason-list">
+                  {CANCELLATION_REASONS.map((reason) => (
+                    <label className="reason-list__item" key={reason.value}>
+                      <input
+                        checked={cancelReason === reason.value}
+                        disabled={cancelBusy}
+                        name="cancellation-reason"
+                        onChange={() => setCancelReason(reason.value)}
+                        type="radio"
+                        value={reason.value}
+                      />
+                      <span>{reason.label}</span>
+                    </label>
+                  ))}
+                </div>
+                <textarea
+                  className="reason-note"
+                  disabled={cancelBusy}
+                  onChange={(event) => setCancelNote(event.target.value)}
+                  placeholder="Anything else you want to add? (optional)"
+                  rows={3}
+                  value={cancelNote}
+                />
+                <div className="modal-actions">
+                  <button
+                    className="secondary-button"
+                    disabled={cancelBusy}
+                    onClick={() => setCancelReasonOpen(false)}
+                    type="button"
+                  >
+                    Never mind
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={!cancelReason || cancelBusy}
+                    onClick={() => void handleCancelContinue()}
+                    type="button"
+                  >
+                    {cancelBusy ? "One moment..." : "Continue"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {saveOffer ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => {
+                if (!saveOfferBusy) setSaveOffer(null);
+              }}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                {saveOfferRedeemed ? (
+                  <>
+                    <h3>You're all set</h3>
+                    <p>
+                      Your plan stays active at{" "}
+                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
+                      for the next {saveOffer.durationMonths} months. The new price
+                      takes effect{" "}
+                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}.
+                    </p>
+                    <div className="modal-actions">
+                      <button
+                        className="primary-button"
+                        onClick={() => setSaveOffer(null)}
+                        type="button"
+                      >
+                        Done
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <h3>Before you go: {saveOffer.percentOff}% off for {saveOffer.durationMonths} months</h3>
+                    <p>
+                      Stay on your plan and pay{" "}
+                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
+                      instead of{" "}
+                      <strong>{formatCents(saveOffer.currentMonthlyCents)} / month</strong>{" "}
+                      for the next {saveOffer.durationMonths} months
+                      {saveOffer.billingPeriod === "annual" ? ", billed annually" : ""}.
+                      That is {saveOffer.percentOff}% off the price your plan renews
+                      at.
+                    </p>
+                    <p>
+                      The new price starts{" "}
+                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}
+                      , and any discount you are on until then is unaffected. Nothing
+                      else about your plan changes, and you can still cancel any time.
+                    </p>
+                    {saveOfferError ? (
+                      <p className="install-progress__error">{saveOfferError}</p>
+                    ) : null}
+                    <div className="modal-actions">
+                      <button
+                        className="secondary-button"
+                        disabled={saveOfferBusy}
+                        onClick={() => void handleDeclineSaveOffer()}
+                        type="button"
+                      >
+                        Continue to cancel
+                      </button>
+                      <button
+                        className="primary-button"
+                        disabled={saveOfferBusy}
+                        onClick={() => void handleRedeemSaveOffer()}
+                        type="button"
+                      >
+                        {saveOfferBusy
+                          ? "Applying..."
+                          : `Keep it at ${formatCents(saveOffer.offerMonthlyCents)} / mo`}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          ) : null}
 
           {showAppUpdateDialog && appUpdateAvailable ? (
             <div className="modal-backdrop" role="dialog" aria-modal="true">

@@ -2834,6 +2834,32 @@ async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<Strin
 }
 
 #[tauri::command]
+async fn get_headroom_save_offer(app: AppHandle) -> Result<Option<pricing::SaveOffer>, String> {
+    let offer = pricing::get_save_offer()?;
+    if offer.is_some() {
+        analytics::track_event(&app, "save_offer_shown", None);
+    }
+    Ok(offer)
+}
+
+/// Step one of cancelling: record the reason, get back the offer (if any) to
+/// pitch. The reason lands server-side even when there is nothing to offer.
+#[tauri::command]
+async fn submit_headroom_cancellation_intent(
+    reason: String,
+    note: Option<String>,
+) -> Result<Option<pricing::SaveOffer>, String> {
+    pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
+}
+
+#[tauri::command]
+async fn redeem_headroom_save_offer(app: AppHandle) -> Result<(), String> {
+    pricing::redeem_save_offer()?;
+    analytics::track_event(&app, "save_offer_redeemed", None);
+    Ok(())
+}
+
+#[tauri::command]
 fn get_headroom_learn_status(
     state: State<'_, AppState>,
     project_path: Option<String>,
@@ -3587,6 +3613,14 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
     // self-heal loop doesn't fight the user by auto-resuming.
     state.set_runtime_auto_paused(false);
     state.stop_headroom();
+    // Users grandfathered in before `setup_wizard_complete` existed satisfy the
+    // onboarding gate only via "launch_count > 1 && a client is configured".
+    // The clear below empties configured_clients, which flipped that gate false
+    // and sent the next tray click into the launcher instead of the dashboard.
+    // Freeze the answer we already have before clearing.
+    if state.setup_wizard_satisfied() {
+        state.mark_setup_wizard_complete();
+    }
     client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_paused", None);
     Ok(())
@@ -4139,6 +4173,9 @@ pub fn run() {
             change_headroom_subscription_plan,
             reactivate_headroom_subscription,
             get_headroom_billing_portal_url,
+            get_headroom_save_offer,
+            submit_headroom_cancellation_intent,
+            redeem_headroom_save_offer,
             get_activity_feed,
             list_live_learnings,
             list_live_learnings_for_projects,
@@ -4886,11 +4923,19 @@ fn execute_headroom_learn_run(
     }
 }
 
+/// The tray's pause/resume item, kept here so the tray updater loop can flip its
+/// label. `TrayIcon` has no menu getter.
+static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
+    std::sync::OnceLock::new();
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
+    // Text flips to "Resume Headroom" while paused, from the tray updater loop.
+    let pause = tauri::menu::MenuItem::with_id(app, "pause", "Pause Headroom", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &separator, &quit])?;
+    let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
+    let _ = TRAY_PAUSE_ITEM.set(pause.clone());
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
@@ -4934,6 +4979,23 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 } else {
                     let _ = show_launcher_window(app);
                 }
+            }
+            "pause" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let paused = {
+                        let state: tauri::State<'_, AppState> = app.state();
+                        state.runtime_is_paused()
+                    };
+                    let result = if paused {
+                        start_headroom(app).await
+                    } else {
+                        pause_headroom(app).await
+                    };
+                    if let Err(err) = result {
+                        log::warn!("tray pause toggle failed: {err}");
+                    }
+                });
             }
             "quit" => {
                 exit_headroom(app, QuitSource::TrayMenu);
@@ -5009,6 +5071,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
         let mut last_tooltip: Option<String> = None;
+        let mut last_pause_label: Option<&str> = None;
         let mut unhealthy_streak: u8 = 0;
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -5088,6 +5151,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     }
                     TrayRuntimeVisual::Off => "Headroom — off",
                 };
+
+                let pause_label = if visual == TrayRuntimeVisual::Paused {
+                    "Resume Headroom"
+                } else {
+                    "Pause Headroom"
+                };
+                if last_pause_label != Some(pause_label) {
+                    if let Some(item) = TRAY_PAUSE_ITEM.get() {
+                        let _ = item.set_text(pause_label);
+                        last_pause_label = Some(pause_label);
+                    }
+                }
 
                 let mut icon_changed = false;
                 match visual {

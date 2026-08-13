@@ -10,8 +10,14 @@ export interface SavingsChartDatum {
   bucketLabel: string;
   estimatedSavingsUsd: number;
   estimatedTokensSaved: number;
+  // Full bucket spend, cache reads included. Kept for the per-provider
+  // pro-rating in the tooltip; the bars plot the compressible figures below.
   actualCostUsd: number;
   totalTokensSent: number;
+  // What the bars plot: spend with the provider cache-read portion removed.
+  // See `compressibleSpend`.
+  compressibleCostUsd: number;
+  compressibleTokensSent: number;
   // Output-shaping savings, stacked on top of compression in the chart. Zero
   // for buckets predating the layer, so the bar simply shows one segment.
   outputSavingsUsd: number;
@@ -108,7 +114,7 @@ export function cacheHitPair(
 }
 
 /** Canonical input-compression rate for a window of buckets: the share of the
- * BILLABLE input Headroom removed, in the requested unit. Cache reads are
+ * COMPRESSIBLE input Headroom removed, in the requested unit. Cache reads are
  * excluded from the denominator (they bill at ~0.1x and Headroom deliberately
  * never touches the cached prefix); output shaping is never part of this rate.
  *
@@ -117,7 +123,7 @@ export function cacheHitPair(
  * from the bucket's actual input cost. Only buckets with cache coverage
  * count, so numerator and denominator always describe the same slice; null
  * when the window has no coverage. */
-export function billableInputSavingsRate(
+export function compressibleInputSavingsRate(
   points: Array<{
     cacheReadTokens?: number | null;
     cacheSavingsUsd?: number | null;
@@ -129,22 +135,23 @@ export function billableInputSavingsRate(
   mode: "usd" | "tokens"
 ) {
   let saved = 0;
-  let billable = 0;
+  // What survived compression and was still paid for at full input price.
+  let remaining = 0;
   for (const point of points) {
     if (point.cacheReadTokens == null) continue;
     if (mode === "tokens") {
       saved += Math.max(0, point.estimatedTokensSaved);
-      billable += Math.max(0, point.totalTokensSent - point.cacheReadTokens);
+      remaining += Math.max(0, point.totalTokensSent - point.cacheReadTokens);
     } else {
       if (point.cacheSavingsUsd == null) continue;
       const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
       saved += Math.max(0, point.estimatedSavingsUsd);
-      billable += Math.max(0, point.actualCostUsd - readCostUsd);
+      remaining += Math.max(0, point.actualCostUsd - readCostUsd);
     }
   }
-  const baseline = saved + billable;
+  const baseline = saved + remaining;
   if (baseline <= 0) return null;
-  return { pct: Math.min(100, (saved / baseline) * 100), saved, billable };
+  return { pct: Math.min(100, (saved / baseline) * 100), saved, remaining };
 }
 
 /** Output-shaper reduction over a window of buckets, from the locally-sampled
@@ -283,6 +290,28 @@ export function buildHourlySavingsWindow(data: HourlySavingsPoint[], day: Date) 
   });
 }
 
+/** Bucket spend with the provider cache-read portion stripped out: the slice
+ * of the bill Headroom can actually act on. Cache reads bill at ~0.1x and the
+ * cached prefix is deliberately left intact, so counting them makes every bar
+ * dwarf its own savings segment and contradicts the compression-rate chip
+ * above it (which uses the same denominator, see `compressibleInputSavingsRate`).
+ * Read cost is recovered from the read discount the same way: `usd / 9`.
+ *
+ * Falls back to the full figure on buckets with no cache coverage - local
+ * tracker buckets, and days aged out of the backend's checkpoint history. */
+export function compressibleSpend(point: {
+  cacheReadTokens?: number | null;
+  cacheSavingsUsd?: number | null;
+  actualCostUsd: number;
+  totalTokensSent: number;
+}) {
+  const readCostUsd = point.cacheSavingsUsd == null ? 0 : Math.max(0, point.cacheSavingsUsd) / 9;
+  return {
+    compressibleCostUsd: Math.max(0, point.actualCostUsd - readCostUsd),
+    compressibleTokensSent: Math.max(0, point.totalTokensSent - (point.cacheReadTokens ?? 0))
+  };
+}
+
 export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): SavingsChartDatum[] {
   return data.map((point) => ({
     bucketKey: point.date,
@@ -291,6 +320,7 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
     estimatedTokensSaved: point.estimatedTokensSaved,
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
+    ...compressibleSpend(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
     totalCostBeforeOptimization: point.actualCostUsd + point.estimatedSavingsUsd,
@@ -373,6 +403,7 @@ export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): Savings
     estimatedTokensSaved: point.estimatedTokensSaved,
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
+    ...compressibleSpend(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
     totalCostBeforeOptimization: point.actualCostUsd + point.estimatedSavingsUsd,

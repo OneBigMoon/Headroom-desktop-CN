@@ -569,6 +569,15 @@ export interface HeadroomAccountProfile {
   subscriptionDiscountDurationInMonths?: number | null;
   subscriptionCancelAtPeriodEnd?: boolean;
   subscriptionEndsAt?: string | null;
+  /** What the next renewal actually bills per cycle, when the server knows it
+   * better than the client can derive it. Only a redeemed save offer sets it. */
+  subscriptionRenewalCents?: number | null;
+  subscriptionRenewalEndsAt?: string | null;
+  /** A downgrade scheduled for the next cycle. Until it lands the subscription
+   * still reports the plan being paid for, so these are the only sign of it. */
+  subscriptionPendingTier?: HeadroomSubscriptionTier | null;
+  subscriptionPendingBillingPeriod?: string | null;
+  subscriptionPendingEffectiveAt?: string | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;
@@ -600,7 +609,13 @@ export interface HeadroomPricingStatus {
   activePercentOff?: number;
   pricingCohorts?: PricingCohort[];
   introOffer?: IntroOffer | null;
+  planPrices?: PlanPrices | null;
 }
+
+/// Per-month list prices in cents, keyed tier -> billing period, served by
+/// headroom-web so a price change ships without an app release. Absent from
+/// servers predating the field; `PLAN_PRICES` in appHelpers is the fallback.
+export type PlanPrices = Record<string, Record<string, number>>;
 
 export interface PricingCohort {
   key: string;
@@ -617,6 +632,19 @@ export interface IntroOffer {
   active: boolean;
   percentOff: number;
   durationMonths: number;
+}
+
+/// Cancellation save offer computed by headroom-web: an extra percentOff on
+/// top of whatever the subscriber already pays, for durationMonths. Cents are
+/// per month even on annual plans, matching how the plan cards quote prices.
+export interface SaveOffer {
+  percentOff: number;
+  durationMonths: number;
+  billingPeriod: BillingPeriod;
+  currentMonthlyCents: number;
+  offerMonthlyCents: number;
+  /// Formatted date the offer price first bills; absent on older servers.
+  startsOn?: string | null;
 }
 
 export type TierRecommendationSource = "claude" | "codex" | "both";

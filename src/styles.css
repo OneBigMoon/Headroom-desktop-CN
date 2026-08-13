@@ -1170,6 +1170,11 @@ select {
   gap: 8px;
 }
 
+.upgrade-plan-card__manage-row {
+  display: flex;
+  gap: 14px;
+}
+
 .upgrade-plan-card__manage-link {
   background: none;
   border: none;
@@ -1273,6 +1278,12 @@ select {
   font-size: var(--text-xs);
   color: #4a7a6a;
   line-height: 1.45;
+}
+
+/* Inherits the line's color so it stays legible in both themes. */
+.upgrade-plan-card__renewal-price {
+  font-weight: 600;
+  text-decoration: underline;
 }
 
 .upgrade-plan-card__active-badge {
@@ -3286,6 +3297,51 @@ details[open] .optimize-minimal__details summary::after {
   justify-content: flex-end;
   gap: 8px;
   align-items: center;
+}
+
+.reason-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 10px;
+}
+
+.reason-list__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-weight: 400;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.reason-list__item:hover {
+  background: var(--surface-overlay);
+}
+
+/* Undo the boxed .modal-card input styling so the radio renders as a radio. */
+.reason-list__item input[type="radio"] {
+  border: none;
+  border-radius: 0;
+  background: none;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.reason-note {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  resize: vertical;
+  margin-bottom: 12px;
 }
 
 .api-key-guide {

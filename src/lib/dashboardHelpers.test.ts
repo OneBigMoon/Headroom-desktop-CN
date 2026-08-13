@@ -5,7 +5,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
-  billableInputSavingsRate,
+  compressibleInputSavingsRate,
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
@@ -124,6 +124,34 @@ describe("dashboard helpers", () => {
     // Per-provider breakdown carries through; padded hours default to empty.
     expect(chartData[4].byProvider).toEqual(data[0].byProvider);
     expect(chartData[3].byProvider).toEqual([]);
+  });
+
+  it("plots the compressible slice of spend, not the cache-read-inflated total", () => {
+    const covered: HourlySavingsPoint[] = [
+      {
+        hour: "2024-03-05T04:00",
+        estimatedSavingsUsd: 1,
+        estimatedTokensSaved: 100,
+        actualCostUsd: 10,
+        totalTokensSent: 1000,
+        cacheReadTokens: 600,
+        // $9 of discount earned => $1 of actual read cost.
+        cacheSavingsUsd: 9,
+        byProvider: []
+      }
+    ];
+
+    const chartData = buildHourlySavingsChartData(covered);
+    expect(chartData[0]).toMatchObject({
+      actualCostUsd: 10,
+      totalTokensSent: 1000,
+      compressibleCostUsd: 9,
+      compressibleTokensSent: 400
+    });
+
+    // No cache coverage: nothing to subtract, bars keep the full figure.
+    const uncovered = buildHourlySavingsChartData([{ ...covered[0], cacheReadTokens: undefined, cacheSavingsUsd: undefined }]);
+    expect(uncovered[0]).toMatchObject({ compressibleCostUsd: 10, compressibleTokensSent: 1000 });
   });
 
   it("builds monthly chart data and finds earliest visible history", () => {
@@ -364,7 +392,7 @@ describe("cacheHitPair", () => {
   });
 });
 
-describe("billableInputSavingsRate", () => {
+describe("compressibleInputSavingsRate", () => {
   const bucket = {
     cacheReadTokens: 900,
     cacheSavingsUsd: 9, // read discount $9 -> read cost $1
@@ -376,25 +404,25 @@ describe("billableInputSavingsRate", () => {
 
   it("tokens mode: saved vs non-cached input", () => {
     // 25 / (25 + (1000 - 900))
-    expect(billableInputSavingsRate([bucket], "tokens")!.pct).toBeCloseTo(20);
+    expect(compressibleInputSavingsRate([bucket], "tokens")!.pct).toBeCloseTo(20);
   });
 
   it("usd mode: prices reads via the discount and excludes them", () => {
     // 0.5 / (0.5 + (3 - 9/9))
-    expect(billableInputSavingsRate([bucket], "usd")!.pct).toBeCloseTo(20);
+    expect(compressibleInputSavingsRate([bucket], "usd")!.pct).toBeCloseTo(20);
   });
 
   it("skips buckets without coverage in both modes", () => {
     const uncovered = { ...bucket, cacheReadTokens: null, cacheSavingsUsd: null };
-    expect(billableInputSavingsRate([uncovered], "tokens")).toBeNull();
-    expect(billableInputSavingsRate([uncovered], "usd")).toBeNull();
-    expect(billableInputSavingsRate([bucket, uncovered], "tokens")!.pct).toBeCloseTo(20);
+    expect(compressibleInputSavingsRate([uncovered], "tokens")).toBeNull();
+    expect(compressibleInputSavingsRate([uncovered], "usd")).toBeNull();
+    expect(compressibleInputSavingsRate([bucket, uncovered], "tokens")!.pct).toBeCloseTo(20);
   });
 
   it("usd mode requires the dollar counter, tokens mode does not", () => {
     const tokensOnly = { ...bucket, cacheSavingsUsd: null };
-    expect(billableInputSavingsRate([tokensOnly], "tokens")!.pct).toBeCloseTo(20);
-    expect(billableInputSavingsRate([tokensOnly], "usd")).toBeNull();
+    expect(compressibleInputSavingsRate([tokensOnly], "tokens")!.pct).toBeCloseTo(20);
+    expect(compressibleInputSavingsRate([tokensOnly], "usd")).toBeNull();
   });
 });
 

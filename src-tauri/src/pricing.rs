@@ -11,7 +11,7 @@ use crate::models::{
     ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow,
     CodexAccountProfile, CodexPlanTier, CodexRateLimitSnapshot, CodexUsage, HeadroomAccountProfile,
     HeadroomAuthCodeRequest, HeadroomPricingStatus, HeadroomSubscriptionTier, IntroOffer,
-    PricingCohort, PricingGateReason, TierMismatch, TierRecommendationSource,
+    PlanPrices, PricingCohort, PricingGateReason, TierMismatch, TierRecommendationSource,
 };
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
@@ -444,6 +444,8 @@ struct RemoteAccountEnvelope {
     pricing_ladder: Option<PricingLadderPayload>,
     #[serde(default)]
     intro_offer: Option<IntroOffer>,
+    #[serde(default)]
+    plan_prices: Option<PlanPrices>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -471,6 +473,16 @@ struct RemoteAccountResponse {
     subscription_cancel_at_period_end: bool,
     #[serde(default)]
     subscription_ends_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    subscription_renewal_cents: Option<i64>,
+    #[serde(default)]
+    subscription_renewal_ends_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    subscription_pending_tier: Option<HeadroomSubscriptionTier>,
+    #[serde(default)]
+    subscription_pending_billing_period: Option<String>,
+    #[serde(default)]
+    subscription_pending_effective_at: Option<DateTime<Utc>>,
     invite_code: Option<String>,
     accepted_invites_count: usize,
     invite_bonus_percent: f64,
@@ -489,6 +501,8 @@ struct VerifyCodeResponse {
     pricing_ladder: Option<PricingLadderPayload>,
     #[serde(default)]
     intro_offer: Option<IntroOffer>,
+    #[serde(default)]
+    plan_prices: Option<PlanPrices>,
 }
 
 /// The `pricingLadder` object headroom-web nests in account/config payloads.
@@ -509,12 +523,14 @@ struct PricingPromo {
     active_percent_off: i64,
     cohorts: Vec<PricingCohort>,
     intro_offer: Option<IntroOffer>,
+    plan_prices: Option<PlanPrices>,
 }
 
 fn build_promo(
     active_percent_off: i64,
     ladder: &Option<PricingLadderPayload>,
     intro_offer: &Option<IntroOffer>,
+    plan_prices: &Option<PlanPrices>,
 ) -> PricingPromo {
     PricingPromo {
         active_percent_off,
@@ -523,6 +539,7 @@ fn build_promo(
             .map(|l| l.cohorts.clone())
             .unwrap_or_default(),
         intro_offer: intro_offer.clone(),
+        plan_prices: plan_prices.clone(),
     }
 }
 
@@ -573,6 +590,28 @@ struct BillingPortalResponse {
     url: String,
 }
 
+/// Cancellation save offer terms, as computed server-side. Cents are per month
+/// even on annual plans, matching how the plan cards quote prices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveOffer {
+    pub percent_off: u32,
+    pub duration_months: u32,
+    pub billing_period: String,
+    pub current_monthly_cents: i64,
+    pub offer_monthly_cents: i64,
+    /// Formatted date the offer price first bills. Usually the next renewal,
+    /// but later when a deeper intro discount has to run out first. Defaulted
+    /// so a server that predates the field still parses.
+    #[serde(default)]
+    pub starts_on: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SaveOfferResponse {
+    offer: Option<SaveOffer>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiErrorResponse {
@@ -596,14 +635,14 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
             let envelope_result = fetch_remote_account(token, &identity);
             let promo = envelope_result
                 .as_ref()
-                .map(|e| build_promo(e.active_percent_off, &e.pricing_ladder, &e.intro_offer))
+                .map(|e| build_promo(e.active_percent_off, &e.pricing_ladder, &e.intro_offer, &e.plan_prices))
                 .unwrap_or_default();
             let account_result = envelope_result.map(|e| e.account);
             let (auth, acc, err) = merge_background_account_sync(Some(token), account_result);
             (auth, acc, err, promo)
         } else {
             let promo = fetch_public_config()
-                .map(|c| build_promo(c.active_percent_off, &c.pricing_ladder, &c.intro_offer))
+                .map(|c| build_promo(c.active_percent_off, &c.pricing_ladder, &c.intro_offer, &c.plan_prices))
                 .unwrap_or_default();
             (false, None, None, promo)
         };
@@ -1040,6 +1079,7 @@ pub(crate) fn verify_auth_code_with_base_url(
             body.active_percent_off,
             &body.pricing_ladder,
             &body.intro_offer,
+            &body.plan_prices,
         ),
         last_known_good_plan_tier,
         tier_mismatch,
@@ -1152,6 +1192,7 @@ pub(crate) fn activate_account_with_base_url(
             body.active_percent_off,
             &body.pricing_ladder,
             &body.intro_offer,
+            &body.plan_prices,
         ),
         last_known_good_plan_tier,
         tier_mismatch,
@@ -1446,6 +1487,121 @@ pub(crate) fn get_billing_portal_url_with_base_url(
         .map_err(|err| format!("Could not parse billing portal response: {err}"))
 }
 
+/// The save offer to show before handing someone off to the cancel flow, or
+/// `None` when there is nothing to offer. Fetching also marks the offer as
+/// seen, which is what suppresses the cancellation winback email.
+pub fn get_save_offer() -> Result<Option<SaveOffer>, String> {
+    get_save_offer_with_base_url(&api_base_url())
+}
+
+pub(crate) fn get_save_offer_with_base_url(base_url: &str) -> Result<Option<SaveOffer>, String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before managing your plan.".to_string())?;
+    let response = http_client()?
+        .get(join_url(base_url, "desktop/save_offer"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|err| format!("Could not check for an offer: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(
+            api_error.unwrap_or_else(|| format!("Could not check for an offer (status {status})."))
+        );
+    }
+
+    response
+        .json::<SaveOfferResponse>()
+        .map(|body| body.offer)
+        .map_err(|err| format!("Could not parse offer response: {err}"))
+}
+
+/// Records why someone is cancelling and returns the save offer to pitch back,
+/// in one round trip. The reason is recorded server-side either way, so a user
+/// who bails after this point is still counted.
+pub fn submit_cancellation_intent(reason: &str, note: &str) -> Result<Option<SaveOffer>, String> {
+    submit_cancellation_intent_with_base_url(&api_base_url(), reason, note)
+}
+
+pub(crate) fn submit_cancellation_intent_with_base_url(
+    base_url: &str,
+    reason: &str,
+    note: &str,
+) -> Result<Option<SaveOffer>, String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before managing your plan.".to_string())?;
+    let response = http_client()?
+        .post(join_url(base_url, "desktop/cancellation_intent"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "reason": reason, "note": note }))
+        .send()
+        .map_err(|err| format!("Could not reach Headroom: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(api_error
+            .unwrap_or_else(|| format!("Could not start the cancel flow (status {status}).")));
+    }
+
+    response
+        .json::<SaveOfferResponse>()
+        .map(|body| body.offer)
+        .map_err(|err| format!("Could not parse offer response: {err}"))
+}
+
+pub fn redeem_save_offer() -> Result<(), String> {
+    redeem_save_offer_with_base_url(&api_base_url())
+}
+
+pub(crate) fn redeem_save_offer_with_base_url(base_url: &str) -> Result<(), String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before managing your plan.".to_string())?;
+    let response = http_client()?
+        .post(join_url(base_url, "desktop/save_offer"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|err| format!("Could not apply the offer: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(
+            api_error.unwrap_or_else(|| format!("Could not apply the offer (status {status})."))
+        );
+    }
+
+    Ok(())
+}
+
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
     let access_token = state.current_bearer_token().ok_or_else(|| {
         "No Claude AI token captured yet — make sure Claude Code is running and authenticated via Claude AI (not an API key), then try again after the first request passes through the proxy.".to_string()
@@ -1637,6 +1793,7 @@ fn evaluate_pricing_status_with_mismatch(
         active_percent_off: promo.active_percent_off,
         pricing_cohorts: promo.cohorts,
         intro_offer: promo.intro_offer,
+        plan_prices: promo.plan_prices,
     }
 }
 
@@ -2501,6 +2658,11 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         subscription_discount_duration_in_months: value.subscription_discount_duration_in_months,
         subscription_cancel_at_period_end: value.subscription_cancel_at_period_end,
         subscription_ends_at: value.subscription_ends_at,
+        subscription_renewal_cents: value.subscription_renewal_cents,
+        subscription_renewal_ends_at: value.subscription_renewal_ends_at,
+        subscription_pending_tier: value.subscription_pending_tier,
+        subscription_pending_billing_period: value.subscription_pending_billing_period,
+        subscription_pending_effective_at: value.subscription_pending_effective_at,
         invite_code: value.invite_code,
         accepted_invites_count: value.accepted_invites_count,
         invite_bonus_percent: value.invite_bonus_percent.min(50.0).max(0.0),
@@ -2733,6 +2895,8 @@ struct PublicConfig {
     #[serde(default)]
     intro_offer: Option<IntroOffer>,
     #[serde(default)]
+    plan_prices: Option<PlanPrices>,
+    #[serde(default)]
     paywall_first: bool,
 }
 
@@ -2947,6 +3111,7 @@ mod tests {
                 active_percent_off: 50,
                 cohorts: vec![],
                 intro_offer: None,
+                plan_prices: None,
             }
         } else {
             PricingPromo::default()
@@ -2999,6 +3164,11 @@ mod tests {
             subscription_discount_duration_in_months: None,
             subscription_cancel_at_period_end: false,
             subscription_ends_at: None,
+            subscription_renewal_cents: None,
+            subscription_renewal_ends_at: None,
+            subscription_pending_tier: None,
+            subscription_pending_billing_period: None,
+            subscription_pending_effective_at: None,
             invite_code: Some("invite-code".into()),
             accepted_invites_count: 2,
             invite_bonus_percent: 10.0,
@@ -3479,6 +3649,11 @@ mod tests {
             subscription_discount_duration_in_months: None,
             subscription_cancel_at_period_end: false,
             subscription_ends_at: None,
+            subscription_renewal_cents: None,
+            subscription_renewal_ends_at: None,
+            subscription_pending_tier: None,
+            subscription_pending_billing_period: None,
+            subscription_pending_effective_at: None,
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: 0.0,
@@ -3502,6 +3677,11 @@ mod tests {
             subscription_discount_duration_in_months: None,
             subscription_cancel_at_period_end: false,
             subscription_ends_at: None,
+            subscription_renewal_cents: None,
+            subscription_renewal_ends_at: None,
+            subscription_pending_tier: None,
+            subscription_pending_billing_period: None,
+            subscription_pending_effective_at: None,
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: invite_bonus,
@@ -4150,6 +4330,11 @@ mod tests {
             subscription_discount_duration_in_months: None,
             subscription_cancel_at_period_end: false,
             subscription_ends_at: None,
+            subscription_renewal_cents: None,
+            subscription_renewal_ends_at: None,
+            subscription_pending_tier: None,
+            subscription_pending_billing_period: None,
+            subscription_pending_effective_at: None,
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: 999.0,
@@ -4175,6 +4360,11 @@ mod tests {
             subscription_discount_duration_in_months: None,
             subscription_cancel_at_period_end: false,
             subscription_ends_at: None,
+            subscription_renewal_cents: None,
+            subscription_renewal_ends_at: None,
+            subscription_pending_tier: None,
+            subscription_pending_billing_period: None,
+            subscription_pending_effective_at: None,
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: -10.0,
@@ -5055,6 +5245,157 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(err, "Customer not found");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_save_offer_parses_terms() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({
+                "offer": {
+                    "percentOff": 33,
+                    "durationMonths": 12,
+                    "billingPeriod": "monthly",
+                    "currentMonthlyCents": 3000,
+                    "offerMonthlyCents": 2010,
+                    "startsOn": "September 13, 2026"
+                }
+            }),
+            "HTTP/1.1 200 OK",
+        );
+
+        let offer = super::get_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect("offer fetch succeeds")
+            .expect("an offer is present");
+        server.join().unwrap();
+
+        assert_eq!(offer.percent_off, 33);
+        assert_eq!(offer.duration_months, 12);
+        assert_eq!(offer.current_monthly_cents, 3000);
+        assert_eq!(offer.offer_monthly_cents, 2010);
+        assert_eq!(offer.starts_on.as_deref(), Some("September 13, 2026"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_save_offer_returns_none_when_ineligible() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({ "offer": null }), "HTTP/1.1 200 OK");
+
+        let offer = super::get_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect("offer fetch succeeds");
+        server.join().unwrap();
+
+        assert!(offer.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn redeem_save_offer_surfaces_api_error_message() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "This offer is no longer available." }),
+            "HTTP/1.1 422 Unprocessable Entity",
+        );
+
+        let err = super::redeem_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect_err("4xx surfaces as error");
+        server.join().unwrap();
+
+        assert_eq!(err, "This offer is no longer available.");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn redeem_save_offer_clears_session_on_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
+
+        let err = super::redeem_save_offer_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect_err("401");
+        server.join().unwrap();
+        assert!(err.contains("session expired"));
+
+        let stored = crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cancellation_intent_returns_the_offer_to_pitch() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({
+                "offer": {
+                    "percentOff": 33,
+                    "durationMonths": 12,
+                    "billingPeriod": "monthly",
+                    "currentMonthlyCents": 3000,
+                    "offerMonthlyCents": 2000
+                }
+            }),
+            "HTTP/1.1 200 OK",
+        );
+
+        let offer = super::submit_cancellation_intent_with_base_url(
+            &format!("http://127.0.0.1:{port}"),
+            "too_expensive",
+            "a bit steep",
+        )
+        .expect("intent posts")
+        .expect("an offer is present");
+        server.join().unwrap();
+
+        assert_eq!(offer.offer_monthly_cents, 2000);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cancellation_intent_returns_none_when_there_is_nothing_to_offer() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({ "offer": null }), "HTTP/1.1 200 OK");
+
+        let offer = super::submit_cancellation_intent_with_base_url(
+            &format!("http://127.0.0.1:{port}"),
+            "not_using_it",
+            "",
+        )
+        .expect("intent posts");
+        server.join().unwrap();
+
+        assert!(offer.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cancellation_intent_clears_session_on_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
+
+        let err = super::submit_cancellation_intent_with_base_url(
+            &format!("http://127.0.0.1:{port}"),
+            "switched",
+            "",
+        )
+        .expect_err("401");
+        server.join().unwrap();
+        assert!(err.contains("session expired"));
+
+        let stored = crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .unwrap();
+        assert!(stored.is_none());
     }
 
     #[test]
