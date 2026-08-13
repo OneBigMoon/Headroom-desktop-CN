@@ -5180,7 +5180,7 @@ export default function App() {
                 type="button"
               >
                 {period === "annual" ? (
-                  <>Annual <span className="upgrade-billing-toggle__save">Save 33%</span></>
+                  <>Annual <span className="upgrade-billing-toggle__save">Save 25%</span></>
                 ) : "Monthly"}
               </button>
             ))}
@@ -5354,7 +5354,14 @@ export default function App() {
           </button>
           <button
             className="primary-button primary-button--large primary-button--success"
-            onClick={() => triggerHide()}
+            onClick={() => {
+              // Also the exit for anyone who landed here without passing the
+              // proxy-verify Continue (which is the other caller). Without
+              // this the onboarding gate stays unsatisfied and the next tray
+              // click reopens this same screen: the button looks dead.
+              void invoke("complete_setup_wizard");
+              triggerHide();
+            }}
             type="button"
           >
             Get started
@@ -6749,7 +6756,7 @@ export default function App() {
                     type="button"
                   >
                     {period === "annual" ? (
-                      <>Annual <span className="upgrade-billing-toggle__save">Save 33%</span></>
+                      <>Annual <span className="upgrade-billing-toggle__save">Save 25%</span></>
                     ) : "Monthly"}
                   </button>
                 ))}

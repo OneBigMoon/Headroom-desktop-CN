@@ -19,7 +19,7 @@ const PLAN_PRICES: Record<
   "pro" | "max5x" | "max20x",
   Record<BillingPeriod, { full: string; fullCents: number }>
 > = {
-  pro:   { annual: { full: "$3.50", fullCents: 350  }, monthly: { full: "$5",  fullCents: 500  } },
+  pro:   { annual: { full: "$3",  fullCents: 300  }, monthly: { full: "$4",  fullCents: 400  } },
   max5x: { annual: { full: "$15",   fullCents: 1500 }, monthly: { full: "$20", fullCents: 2000 } },
   max20x:{ annual: { full: "$30",   fullCents: 3000 }, monthly: { full: "$40", fullCents: 4000 } },
 };

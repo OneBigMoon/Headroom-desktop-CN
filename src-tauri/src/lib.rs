@@ -3603,6 +3603,14 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
     // self-heal loop doesn't fight the user by auto-resuming.
     state.set_runtime_auto_paused(false);
     state.stop_headroom();
+    // Users grandfathered in before `setup_wizard_complete` existed satisfy the
+    // onboarding gate only via "launch_count > 1 && a client is configured".
+    // The clear below empties configured_clients, which flipped that gate false
+    // and sent the next tray click into the launcher instead of the dashboard.
+    // Freeze the answer we already have before clearing.
+    if state.setup_wizard_satisfied() {
+        state.mark_setup_wizard_complete();
+    }
     client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_paused", None);
     Ok(())
