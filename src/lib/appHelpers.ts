@@ -6,6 +6,7 @@ import type {
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
   IntroOffer,
+  PlanPrices,
   TierRecommendationSource,
 } from "./types";
 import { currencyExact } from "./dashboardHelpers";
@@ -15,6 +16,10 @@ import type { SetupStallKind } from "./setupHealthAlert";
 export type PricingAudience = "individual" | "teamEnterprise";
 export type { BillingPeriod };
 
+/// Fallback price table, compiled into the build. headroom-web serves the
+/// live table (`planPrices`); this is what we quote when the server predates
+/// that field, is unreachable, or omits a tier. Keep it in sync with
+/// Polar::ProductCatalog::LIST_CENTS on the server.
 const PLAN_PRICES: Record<
   "pro" | "max5x" | "max20x",
   Record<BillingPeriod, { full: string; fullCents: number }>
@@ -23,6 +28,33 @@ const PLAN_PRICES: Record<
   max5x: { annual: { full: "$15",   fullCents: 1500 }, monthly: { full: "$20", fullCents: 2000 } },
   max20x:{ annual: { full: "$30",   fullCents: 3000 }, monthly: { full: "$40", fullCents: 4000 } },
 };
+
+/// The server's price table, mirrored here at render time by
+/// `setServerPlanPrices`. Module-level rather than threaded through the
+/// pricing helpers because all of them (plan cards, payback anchor, renewal
+/// projections) need it, and it is server config rather than per-call input.
+let serverPlanPrices: PlanPrices | null = null;
+
+/// Point the price helpers at the server's table (null to fall back). Called
+/// during render from the pricing status, so a price change reaches the UI
+/// without an app release.
+export function setServerPlanPrices(prices: PlanPrices | null | undefined): void {
+  serverPlanPrices = prices ?? null;
+}
+
+/// Price for a tier/period: the server's number when it sent a usable one,
+/// else the compiled-in fallback. Non-finite or negative server values are
+/// rejected rather than rendered as "$NaN".
+function planPrice(
+  tier: "pro" | "max5x" | "max20x",
+  billingPeriod: BillingPeriod
+): { full: string; fullCents: number } {
+  const cents = serverPlanPrices?.[tier]?.[billingPeriod];
+  if (typeof cents === "number" && Number.isFinite(cents) && cents >= 0) {
+    return { full: formatCents(cents), fullCents: cents };
+  }
+  return PLAN_PRICES[tier][billingPeriod];
+}
 
 // Discounted price for a tier, mirroring the web `sale_price_cents` rounding
 // (half-up to the cent) so desktop and marketing prices never disagree.
@@ -44,11 +76,11 @@ function projectPerMonthCents(
   options?: { fromTier?: HeadroomSubscriptionTier; currentPaidCents?: number | null }
 ): number {
   // PLAN_PRICES.fullCents is per-month even on annual cycles.
-  const toFullPerMonth = PLAN_PRICES[toTier][billingPeriod].fullCents;
+  const toFullPerMonth = planPrice(toTier, billingPeriod).fullCents;
   const fromTier = options?.fromTier;
   const currentPaidCents = options?.currentPaidCents ?? null;
   if (!fromTier || currentPaidCents === null) return toFullPerMonth;
-  const fromFullPerMonth = PLAN_PRICES[fromTier][billingPeriod].fullCents;
+  const fromFullPerMonth = planPrice(fromTier, billingPeriod).fullCents;
   if (fromFullPerMonth <= 0) return toFullPerMonth;
   // Polar reports subscription_amount_cents per full billing cycle (12x
   // per-month for annual), so normalize to per-month before the ratio math.
@@ -106,7 +138,7 @@ export function paybackLabel(
   planId: HeadroomSubscriptionTier,
   billingPeriod: BillingPeriod
 ): string | null {
-  const monthly = PLAN_PRICES[planId][billingPeriod].fullCents / 100;
+  const monthly = planPrice(planId, billingPeriod).fullCents / 100;
   if (monthly <= 0) return null;
   const multiple = recentMonthlySavingsUsd / monthly;
   if (multiple < 2) return null;
@@ -246,7 +278,9 @@ export function getUpgradePlans(
   subscriptionCancelAtPeriodEnd: boolean = false,
   subscriptionEndsAt?: string | null,
   activePercentOff: number = 0,
-  introOffer: IntroOffer | null = null
+  introOffer: IntroOffer | null = null,
+  subscriptionRenewalCents?: number | null,
+  subscriptionRenewalEndsAt?: string | null
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -268,7 +302,7 @@ export function getUpgradePlans(
       const purchasePeriod = (subscriptionBillingPeriod === "annual" || subscriptionBillingPeriod === "monthly")
         ? subscriptionBillingPeriod
         : billingPeriod;
-      const fullCents = PLAN_PRICES[activeHeadroomPlanId][purchasePeriod].fullCents;
+      const fullCents = planPrice(activeHeadroomPlanId, purchasePeriod).fullCents;
 
       // Determine if the discount will still apply at renewal time.
       const discountAppliesAtRenewal = ((): boolean => {
@@ -294,10 +328,22 @@ export function getUpgradePlans(
         ? subscriptionAmountCents / 12
         : subscriptionAmountCents;
 
+      // The server's own figure wins when it has one: a discount attached
+      // mid-subscription (the cancellation save offer) can't be dated from
+      // subscriptionStartedAt, so the window check above reads it as expired.
+      const serverRenewalCents =
+        subscriptionRenewalCents != null &&
+        subscriptionRenewalEndsAt != null &&
+        new Date(subscriptionRenewalEndsAt) > new Date()
+          ? subscriptionRenewalCents
+          : null;
+
       // If the discount won't apply at renewal, show full price for the renewal.
-      const renewalCentsPerMonth = discountAppliesAtRenewal ? paidCentsPerMonth : fullCents;
-      const discountPct = discountAppliesAtRenewal && fullCents > 0
-        ? Math.round((1 - paidCentsPerMonth / fullCents) * 100)
+      const renewalCentsPerMonth = serverRenewalCents != null
+        ? (purchasePeriod === "annual" ? serverRenewalCents / 12 : serverRenewalCents)
+        : discountAppliesAtRenewal ? paidCentsPerMonth : fullCents;
+      const discountPct = fullCents > 0 && renewalCentsPerMonth < fullCents
+        ? Math.round((1 - renewalCentsPerMonth / fullCents) * 100)
         : 0;
       const paidPerMonthLabel = `$${(renewalCentsPerMonth / 100).toFixed(2).replace(/\.00$/, "")}`;
       const renewsOn = subscriptionRenewsAt
@@ -324,7 +370,7 @@ export function getUpgradePlans(
       features: string[],
       ctaLabel: string
     ): UpgradePlan {
-      const prices = PLAN_PRICES[id][billingPeriod];
+      const prices = planPrice(id, billingPeriod);
       // Upgrade-target cards show the discounted price because checkout
       // attaches the matching Polar discount server-side; the active plan card
       // uses purchaseInfo (actual paid amount) instead of a generic badge.

@@ -1020,6 +1020,13 @@ pub struct HeadroomAccountProfile {
     pub subscription_cancel_at_period_end: bool,
     #[serde(default)]
     pub subscription_ends_at: Option<DateTime<Utc>>,
+    /// What the next renewal actually bills, per billing cycle, when the server
+    /// knows it better than the client can derive it from the discount fields.
+    /// Only a redeemed save offer fills these in today.
+    #[serde(default)]
+    pub subscription_renewal_cents: Option<i64>,
+    #[serde(default)]
+    pub subscription_renewal_ends_at: Option<DateTime<Utc>>,
     pub invite_code: Option<String>,
     pub accepted_invites_count: usize,
     pub invite_bonus_percent: f64,
@@ -1075,7 +1082,19 @@ pub struct HeadroomPricingStatus {
     /// every plan). `None` when the server doesn't advertise one.
     #[serde(default)]
     pub intro_offer: Option<IntroOffer>,
+    /// Per-month list prices in cents, keyed tier -> billing period, served by
+    /// headroom-web so a price change ships without an app release. `None`
+    /// from servers predating the field, and the frontend then falls back to
+    /// its compiled-in table.
+    #[serde(default)]
+    pub plan_prices: Option<PlanPrices>,
 }
+
+/// Per-month list prices in cents: tier ("pro" | "max5x" | "max20x") ->
+/// billing period ("annual" | "monthly") -> cents. Deliberately untyped keys:
+/// the desktop passes the table through to the frontend verbatim, so a new
+/// tier added server-side needs no Rust change.
+pub type PlanPrices = std::collections::HashMap<String, std::collections::HashMap<String, i64>>;
 
 /// Intro-offer terms surfaced by headroom-web account/config payloads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

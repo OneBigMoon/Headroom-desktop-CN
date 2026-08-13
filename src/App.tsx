@@ -82,6 +82,7 @@ import {
   forgoneSavingsLabel,
   paybackLabel,
   recentDailySavingsUsd,
+  setServerPlanPrices,
   tierRecommendationSourceLabel,
   upgradePlanIntentLabel,
   type BillingPeriod,
@@ -596,6 +597,17 @@ const CONTACT_FORM_URL = (
 ).trim();
 
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
+
+// Values must match User::CANCELLATION_REASONS server-side; anything else is
+// rejected by /desktop/cancellation_intent.
+const CANCELLATION_REASONS: { value: string; label: string }[] = [
+  { value: "too_expensive", label: "Too expensive" },
+  { value: "not_enough_savings", label: "Not saving me enough tokens" },
+  { value: "not_using_it", label: "Not using it enough" },
+  { value: "switched", label: "Switched to something else" },
+  { value: "technical_problems", label: "Ran into technical problems" },
+  { value: "other", label: "Something else" }
+];
 
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
@@ -1687,7 +1699,9 @@ export default function App() {
   const [showUninstallDialog, setShowUninstallDialog] = useState(false);
   const [uninstallBusy, setUninstallBusy] = useState(false);
   const [uninstallError, setUninstallError] = useState<string | null>(null);
-  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
+  // "cancel" is not a plan: it is the cancel-subscription action, which shares the
+  // busy state so only the button that was clicked reads "Opening...".
+  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | "cancel" | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [pendingPlanChange, setPendingPlanChange] = useState<{
     fromTier: HeadroomSubscriptionTier;
@@ -1702,6 +1716,10 @@ export default function App() {
   const [saveOfferBusy, setSaveOfferBusy] = useState(false);
   const [saveOfferError, setSaveOfferError] = useState<string | null>(null);
   const [saveOfferRedeemed, setSaveOfferRedeemed] = useState(false);
+  const [cancelReasonOpen, setCancelReasonOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelNote, setCancelNote] = useState("");
+  const [cancelBusy, setCancelBusy] = useState(false);
   const [contactEmail, setContactEmail] = useState("");
   const [contactMessage, setContactMessage] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
@@ -1740,6 +1758,10 @@ export default function App() {
   // must not fire notifications while first-install bootstrap is still running.
   const runtimeInstalledRef = useRef(false);
   const claudeProjectsSignatureRef = useRef(serializeState([] as ClaudeCodeProject[]));
+  // Mirror the server's price table into the pricing helpers before anything
+  // reads a price this render. Idempotent and derived purely from state, so a
+  // repeated render (StrictMode) is a no-op.
+  setServerPlanPrices(pricingStatus?.planPrices);
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
@@ -1757,7 +1779,9 @@ export default function App() {
     pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
     pricingStatus?.account?.subscriptionEndsAt,
     pricingStatus?.activePercentOff ?? 0,
-    pricingStatus?.introOffer ?? null
+    pricingStatus?.introOffer ?? null,
+    pricingStatus?.account?.subscriptionRenewalCents,
+    pricingStatus?.account?.subscriptionRenewalEndsAt
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -1879,6 +1903,17 @@ export default function App() {
     setShowAllUpgradePlans(false);
     if (pricingAudience !== "individual") setBillingPeriod("annual");
   }, [pricingAudience]);
+
+  // Open on the plan the subscriber actually has, not the monthly default:
+  // showing an annual subscriber monthly prices misstates what they pay. Keyed
+  // on the account's period alone, so it fires on load and on a plan change but
+  // never fights the toggle.
+  const accountBillingPeriod = pricingStatus?.account?.subscriptionBillingPeriod;
+  useEffect(() => {
+    if (accountBillingPeriod === "annual" || accountBillingPeriod === "monthly") {
+      setBillingPeriod(accountBillingPeriod);
+    }
+  }, [accountBillingPeriod]);
 
   useEffect(() => {
     if (!pricingStatus?.authenticated) {
@@ -2416,6 +2451,17 @@ export default function App() {
     setStepBasePercent(bootstrapProgress.overallPercent);
   }, [bootstrapProgress, showInstallProgress, stepSignature]);
 
+  // Reaching the final screen IS the end of onboarding, so satisfy the tray's
+  // gate here instead of on one specific exit. Every other way off this screen
+  // -- the blur-autohide right below, closing the window, quitting -- used to
+  // leave `setup_wizard_complete` false while the launcher kept landing here
+  // (getInitialLauncherStage sends any returning user straight to
+  // post_install). The tray gate then disagreed with the stage machine and
+  // reopened this same screen on every click, forever.
+  useEffect(() => {
+    if (!isLastScreen) return;
+    void invoke("complete_setup_wizard");
+  }, [isLastScreen]);
 
   useEffect(() => {
     if (!isLastScreen || awaitingFirstSavings) return;
@@ -4050,16 +4096,8 @@ export default function App() {
       setUpgradeActionError(null);
 
       try {
-        // Cancellation happens in Polar's hosted portal, so this is the only
-        // place we can put a save offer in front of it. A failure here must not
-        // block anyone from reaching billing, so the fetch swallows its error.
-        const offer = await invoke<SaveOffer | null>("get_headroom_save_offer").catch(() => null);
-        if (offer) {
-          setSaveOfferError(null);
-          setSaveOfferRedeemed(false);
-          setSaveOffer(offer);
-          return;
-        }
+        // Plain trip to the portal. Cancelling has its own entry point that asks
+        // why first; someone updating a card should not meet a retention pitch.
         await openBillingPortal();
       } catch (error) {
         setUpgradeActionError(
@@ -4130,6 +4168,43 @@ export default function App() {
     await openExternalLink(url);
   }
 
+  function openCancelReason() {
+    setCancelReason("");
+    setCancelNote("");
+    setUpgradeActionError(null);
+    setCancelReasonOpen(true);
+  }
+
+  async function handleCancelContinue() {
+    if (!cancelReason || cancelBusy) return;
+    setCancelBusy(true);
+    // Fails open: the reason is a nice-to-have, being trapped in the app is not.
+    const offer = await invoke<SaveOffer | null>("submit_headroom_cancellation_intent", {
+      reason: cancelReason,
+      note: cancelNote.trim() || null
+    }).catch(() => null);
+    setCancelBusy(false);
+    setCancelReasonOpen(false);
+
+    if (offer) {
+      setSaveOfferError(null);
+      setSaveOfferRedeemed(false);
+      setSaveOffer(offer);
+      return;
+    }
+
+    setUpgradeActionBusy("cancel");
+    try {
+      await openBillingPortal();
+    } catch (error) {
+      setUpgradeActionError(
+        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+      );
+    } finally {
+      setUpgradeActionBusy(null);
+    }
+  }
+
   async function handleRedeemSaveOffer() {
     if (saveOfferBusy) return;
     setSaveOfferBusy(true);
@@ -4154,7 +4229,7 @@ export default function App() {
   async function handleDeclineSaveOffer() {
     if (saveOfferBusy) return;
     setSaveOffer(null);
-    setUpgradeActionBusy("free");
+    setUpgradeActionBusy("cancel");
     try {
       await openBillingPortal();
     } catch (error) {
@@ -5354,14 +5429,9 @@ export default function App() {
           </button>
           <button
             className="primary-button primary-button--large primary-button--success"
-            onClick={() => {
-              // Also the exit for anyone who landed here without passing the
-              // proxy-verify Continue (which is the other caller). Without
-              // this the onboarding gate stays unsatisfied and the next tray
-              // click reopens this same screen: the button looks dead.
-              void invoke("complete_setup_wizard");
-              triggerHide();
-            }}
+            // `complete_setup_wizard` already fired on entering this screen
+            // (see the isLastScreen effect), so this is only the exit.
+            onClick={() => triggerHide()}
             type="button"
           >
             Get started
@@ -6933,16 +7003,28 @@ export default function App() {
                         >
                           {upgradeActionBusy === plan.id ? "Opening..." : plan.ctaLabel}
                         </button>
-                        {/* Only in-app entry to the billing portal (cancel/downgrade)
-                            now that the Free card is gone for active subscribers. */}
-                        <button
-                          className="upgrade-plan-card__manage-link"
-                          disabled={upgradeActionBusy === "free"}
-                          onClick={() => void handleUpgradeAction("free")}
-                          type="button"
-                        >
-                          {upgradeActionBusy === "free" ? "Opening..." : "Cancel or manage billing"}
-                        </button>
+                        {/* Only in-app entry to the billing portal (card, invoices,
+                            downgrade) now that the Free card is gone for active
+                            subscribers. Cancelling is deliberately its own action so
+                            updating a card does not come with a retention pitch. */}
+                        <div className="upgrade-plan-card__manage-row">
+                          <button
+                            className="upgrade-plan-card__manage-link"
+                            disabled={upgradeActionBusy === "free"}
+                            onClick={() => void handleUpgradeAction("free")}
+                            type="button"
+                          >
+                            {upgradeActionBusy === "free" ? "Opening..." : "Manage billing"}
+                          </button>
+                          <button
+                            className="upgrade-plan-card__manage-link"
+                            disabled={upgradeActionBusy === "cancel"}
+                            onClick={openCancelReason}
+                            type="button"
+                          >
+                            {upgradeActionBusy === "cancel" ? "Opening..." : "Cancel subscription"}
+                          </button>
+                        </div>
                       </div>
                     ) : (
                       <button
@@ -7689,6 +7771,66 @@ export default function App() {
               </div>
             );
           })() : null}
+
+          {cancelReasonOpen ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => {
+                if (!cancelBusy) setCancelReasonOpen(false);
+              }}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>Why are you cancelling?</h3>
+                <p>
+                  This goes straight to us and takes one click. It is the only way
+                  we find out what is not working.
+                </p>
+                <div className="reason-list">
+                  {CANCELLATION_REASONS.map((reason) => (
+                    <label className="reason-list__item" key={reason.value}>
+                      <input
+                        checked={cancelReason === reason.value}
+                        disabled={cancelBusy}
+                        name="cancellation-reason"
+                        onChange={() => setCancelReason(reason.value)}
+                        type="radio"
+                        value={reason.value}
+                      />
+                      <span>{reason.label}</span>
+                    </label>
+                  ))}
+                </div>
+                <textarea
+                  className="reason-note"
+                  disabled={cancelBusy}
+                  onChange={(event) => setCancelNote(event.target.value)}
+                  placeholder="Anything else you want to add? (optional)"
+                  rows={3}
+                  value={cancelNote}
+                />
+                <div className="modal-actions">
+                  <button
+                    className="secondary-button"
+                    disabled={cancelBusy}
+                    onClick={() => setCancelReasonOpen(false)}
+                    type="button"
+                  >
+                    Never mind
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={!cancelReason || cancelBusy}
+                    onClick={() => void handleCancelContinue()}
+                    type="button"
+                  >
+                    {cancelBusy ? "One moment..." : "Continue"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           {saveOffer ? (
             <div

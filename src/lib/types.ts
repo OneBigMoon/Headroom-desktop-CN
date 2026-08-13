@@ -569,6 +569,10 @@ export interface HeadroomAccountProfile {
   subscriptionDiscountDurationInMonths?: number | null;
   subscriptionCancelAtPeriodEnd?: boolean;
   subscriptionEndsAt?: string | null;
+  /** What the next renewal actually bills per cycle, when the server knows it
+   * better than the client can derive it. Only a redeemed save offer sets it. */
+  subscriptionRenewalCents?: number | null;
+  subscriptionRenewalEndsAt?: string | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;
@@ -600,7 +604,13 @@ export interface HeadroomPricingStatus {
   activePercentOff?: number;
   pricingCohorts?: PricingCohort[];
   introOffer?: IntroOffer | null;
+  planPrices?: PlanPrices | null;
 }
+
+/// Per-month list prices in cents, keyed tier -> billing period, served by
+/// headroom-web so a price change ships without an app release. Absent from
+/// servers predating the field; `PLAN_PRICES` in appHelpers is the fallback.
+export type PlanPrices = Record<string, Record<string, number>>;
 
 export interface PricingCohort {
   key: string;

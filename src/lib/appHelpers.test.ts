@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   buildSetupStallMailto,
@@ -12,6 +12,7 @@ import {
   isTierDowngrade,
   paybackLabel,
   recentDailySavingsUsd,
+  setServerPlanPrices,
   upgradePlanIntentLabel,
 } from "./appHelpers";
 import type { ClientConnectorStatus, RuntimeStatus } from "./types";
@@ -133,6 +134,52 @@ describe("app helpers", () => {
       ["max5x", "Upgrade to Max x5"],
       ["max20x", "Upgrade to Max x20"],
     ]);
+  });
+
+  describe("server-driven prices", () => {
+    afterEach(() => setServerPlanPrices(null));
+
+    it("quotes the server's prices over the compiled-in table", () => {
+      setServerPlanPrices({
+        pro: { annual: 500, monthly: 700 },
+        max5x: { annual: 2000, monthly: 2500 },
+        max20x: { annual: 4000, monthly: 5000 },
+      });
+
+      expect(getUpgradePlans("individual").plans.map((p) => [p.id, p.price])).toEqual([
+        ["max5x", "$20"],
+        ["pro", "$5"],
+        ["max20x", "$40"],
+      ]);
+      // Every price consumer follows, not just the plan cards.
+      expect(getPlanRenewalPriceLabel("max5x", "monthly")).toBe("$25 / month");
+      expect(paybackLabel(10, "pro", "annual")).toContain("2x");
+    });
+
+    it("falls back per tier when the server omits or corrupts a price", () => {
+      setServerPlanPrices({
+        max5x: { annual: 2000, monthly: 2500 },
+        // pro absent entirely; max20x annual unusable.
+        max20x: { annual: Number.NaN, monthly: 5000 },
+      });
+
+      expect(getUpgradePlans("individual").plans.map((p) => [p.id, p.price])).toEqual([
+        ["max5x", "$20"],
+        ["pro", "$3"],
+        ["max20x", "$30"],
+      ]);
+    });
+
+    it("returns to the compiled-in table when the server sends nothing", () => {
+      setServerPlanPrices({ pro: { annual: 500, monthly: 700 } });
+      setServerPlanPrices(undefined);
+
+      expect(getUpgradePlans("individual").plans.map((p) => [p.id, p.price])).toEqual([
+        ["max5x", "$15"],
+        ["pro", "$3"],
+        ["max20x", "$30"],
+      ]);
+    });
   });
 
   it("shows full annual prices when launch discount is inactive", () => {
@@ -384,6 +431,31 @@ describe("app helpers", () => {
       expect(activePlan(result)?.purchaseInfo).toMatchObject({
         paidPerMonthLabel: "$3",
         discountPct: 0,
+      });
+    });
+
+    it("prefers the server's renewal price over the discount-window guess", () => {
+      // The save offer attaches a fresh 12-month discount to a subscription that
+      // started 2 years ago, so the window check reads it as long expired. The
+      // server's own figure ($1/mo * 12 = 1200) has to win anyway.
+      const result = getUpgradePlans(
+        ...baseArgs, 1800, "annual", "2026-12-01", "2024-01-01", "repeating", 12,
+        false, null, 0, null, 1200, "2027-12-01"
+      );
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$1",
+        discountPct: 67,
+      });
+    });
+
+    it("ignores the server's renewal price once its window has passed", () => {
+      const result = getUpgradePlans(
+        ...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "forever",
+        null, false, null, 0, null, 1200, "2020-01-01"
+      );
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$1.50",
+        discountPct: 50,
       });
     });
 

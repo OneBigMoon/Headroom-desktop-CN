@@ -8132,6 +8132,7 @@ mod tests {
             active_percent_off: 0,
             pricing_cohorts: Vec::new(),
             intro_offer: None,
+            plan_prices: None,
         }
     }
 

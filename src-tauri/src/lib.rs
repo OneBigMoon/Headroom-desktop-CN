@@ -2842,6 +2842,16 @@ async fn get_headroom_save_offer(app: AppHandle) -> Result<Option<pricing::SaveO
     Ok(offer)
 }
 
+/// Step one of cancelling: record the reason, get back the offer (if any) to
+/// pitch. The reason lands server-side even when there is nothing to offer.
+#[tauri::command]
+async fn submit_headroom_cancellation_intent(
+    reason: String,
+    note: Option<String>,
+) -> Result<Option<pricing::SaveOffer>, String> {
+    pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
+}
+
 #[tauri::command]
 async fn redeem_headroom_save_offer(app: AppHandle) -> Result<(), String> {
     pricing::redeem_save_offer()?;
@@ -4164,6 +4174,7 @@ pub fn run() {
             reactivate_headroom_subscription,
             get_headroom_billing_portal_url,
             get_headroom_save_offer,
+            submit_headroom_cancellation_intent,
             redeem_headroom_save_offer,
             get_activity_feed,
             list_live_learnings,
