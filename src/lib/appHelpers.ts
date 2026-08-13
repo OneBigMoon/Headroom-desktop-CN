@@ -409,19 +409,21 @@ export function getUpgradePlans(
       // Upgrade-target cards show the discounted price because checkout
       // attaches the matching Polar discount server-side; the active plan card
       // uses purchaseInfo (actual paid amount) instead of a generic badge.
-      // Subscribers with a discount that survives renewal (forever, or repeating
-      // still in window) keep it on plan swaps (Polar carries it over), so their
-      // own percent wins over the intro offer. The activePercentOff/50 fallback
-      // serves legacy cohort servers that still signal launchDiscountActive.
+      // The intro/launch offers only exist on a *new* checkout. An existing
+      // subscriber changing tier goes through subscriptions#change_plan, which
+      // swaps the Polar product and carries over only the discount already on
+      // the subscription - so their own percent is the only one that can apply,
+      // and quoting them the intro price promised a discount they'd never get.
+      // The activePercentOff/50 fallback serves legacy cohort servers that
+      // still signal launchDiscountActive.
       const accountDiscountPct = activePurchaseInfo?.discountPct ?? 0;
-      const introPct = introPercentOff(introOffer);
-      const effectivePercentOff = accountDiscountPct > 0
-        ? accountDiscountPct
-        : introPct > 0 ? introPct
-        : activePercentOff > 0 ? activePercentOff : 50;
-      const showDiscount =
-        (introPct > 0 || launchDiscountActive || accountDiscountPct > 0) &&
-        id !== activeHeadroomPlanId;
+      const newCheckout = !hasActiveHeadroomSubscription;
+      const introPct = newCheckout ? introPercentOff(introOffer) : 0;
+      const legacyPct = newCheckout && launchDiscountActive
+        ? (activePercentOff > 0 ? activePercentOff : 50)
+        : 0;
+      const effectivePercentOff = accountDiscountPct || introPct || legacyPct;
+      const showDiscount = effectivePercentOff > 0 && id !== activeHeadroomPlanId;
       const price = showDiscount
         ? discountedPriceLabel(prices.fullCents, effectivePercentOff)
         : prices.full;

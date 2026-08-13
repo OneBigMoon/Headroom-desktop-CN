@@ -239,14 +239,27 @@ describe("app helpers", () => {
     ]);
   });
 
-  it("shows discounted prices on upgrade-target cards for an active subscriber with the launch discount", () => {
-    const result = getUpgradePlans("individual", "max20x", undefined, "pro", true, true);
+  it("shows list prices on upgrade-target cards for a subscriber with no carried-over discount", () => {
+    // change_plan swaps the Polar product and attaches no new discount, so an
+    // existing subscriber is quoted list price regardless of the intro offer.
+    const result = getUpgradePlans("individual", "max20x", undefined, "pro", true, true, "annual", 300);
 
     const byId = (id: string) => result.plans.find((plan) => plan.id === id);
-    // Active plan card keeps its full list price (purchaseInfo conveys the real amount).
     expect(byId("pro")?.price).toBe("$3");
     expect(byId("pro")?.originalPrice).toBeUndefined();
-    // Upgrade targets show the discounted price with the full price struck through.
+    expect([byId("max5x")?.price, byId("max5x")?.originalPrice]).toEqual(["$15", undefined]);
+    expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$30", undefined]);
+  });
+
+  it("carries a subscriber's own surviving discount onto upgrade-target cards", () => {
+    // Paying $1.50/mo on the $3 pro plan under a forever discount -> 50% off
+    // survives the swap, so the other cards quote 50% off too.
+    const result = getUpgradePlans(
+      "individual", "max20x", undefined, "pro", true, false, "annual",
+      1800, "annual", "2027-03-31T00:00:00Z", "2026-03-31T00:00:00Z", "forever"
+    );
+
+    const byId = (id: string) => result.plans.find((plan) => plan.id === id);
     expect([byId("max5x")?.price, byId("max5x")?.originalPrice]).toEqual(["$7.50", "$15"]);
     expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$15", "$30"]);
   });
