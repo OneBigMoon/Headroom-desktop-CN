@@ -448,6 +448,16 @@ describe("app helpers", () => {
       expect(max5x?.price).not.toBe(max5x?.originalPrice);
     });
 
+    it("prices target cards off the exact ratio, not the rounded percent", () => {
+      // Exactly a third off pro annual (2400 = $2/mo * 12). Rounding to "33% off"
+      // and re-applying it to max5x quotes $10.05; the ratio quotes $10.
+      const result = getUpgradePlans(...baseArgs, 2400, "annual", "2026-12-01", "2025-12-01", "forever");
+      const max5x = result.plans.find((p) => p.id === "max5x");
+      expect(max5x?.price).toBe("$10");
+      expect(max5x?.originalPrice).toBe("$15");
+      expect(max5x?.saleBadge).toBe("33% off forever");
+    });
+
     it("does not discount upgrade-target cards for a once-off discount", () => {
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "once");
       const max5x = result.plans.find((p) => p.id === "max5x");

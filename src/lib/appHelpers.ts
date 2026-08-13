@@ -183,6 +183,10 @@ export interface UpgradePlanPurchaseInfo {
   /// "$360/yr" on annual, "$30/mo" on monthly.
   renewalPriceLabel: string;
   discountPct: number;
+  /// Renewal price as a fraction of sticker. The percent above is rounded for
+  /// display; pricing another tier off it turns an exact third into $10.05, so
+  /// carry the discount across plan cards with this instead.
+  renewalRatio: number;
   /// "33% off for 12 months" / "40% off forever". Absent when nothing is off.
   renewalNote?: string;
   cancelAtPeriodEnd?: boolean;
@@ -204,6 +208,8 @@ export interface UpgradePlan {
   ctaLabel: string;
   ctaVariant: "primary" | "secondary";
   ctaTone?: "default" | "downgrade";
+  /// Label for the strikethrough sale row, when the card is discounted.
+  saleBadge?: string;
   disabled?: boolean;
   purchaseInfo?: UpgradePlanPurchaseInfo;
 }
@@ -362,8 +368,9 @@ export function getUpgradePlans(
       const renewalCentsPerMonth = serverRenewalCents != null
         ? (purchasePeriod === "annual" ? serverRenewalCents / 12 : serverRenewalCents)
         : discountAppliesAtRenewal ? paidCentsPerMonth : fullCents;
+      const renewalRatio = fullCents > 0 ? renewalCentsPerMonth / fullCents : 1;
       const discountPct = fullCents > 0 && renewalCentsPerMonth < fullCents
-        ? Math.round((1 - renewalCentsPerMonth / fullCents) * 100)
+        ? Math.round((1 - renewalRatio) * 100)
         : 0;
       const perMonthLabel = (cents: number) => `$${(cents / 100).toFixed(2).replace(/\.00$/, "")}`;
       // The card's sticker price is per month, but an annual subscription is
@@ -400,6 +407,7 @@ export function getUpgradePlans(
         renewsOn,
         renewalPriceLabel,
         discountPct,
+        renewalRatio,
         renewalNote,
         cancelAtPeriodEnd: subscriptionCancelAtPeriodEnd,
         endsOn
@@ -433,15 +441,24 @@ export function getUpgradePlans(
         : 0;
       const effectivePercentOff = accountDiscountPct || introPct || legacyPct;
       const showDiscount = effectivePercentOff > 0 && id !== activeHeadroomPlanId;
-      const price = showDiscount
-        ? discountedPriceLabel(prices.fullCents, effectivePercentOff)
-        : prices.full;
+      // An account discount prices off the exact ratio it renews at, not the
+      // rounded percent, so a third off $15 quotes $10 and not $10.05.
+      const price = !showDiscount
+        ? prices.full
+        : accountDiscountPct > 0 && activePurchaseInfo
+        ? formatCents(Math.round(prices.fullCents * activePurchaseInfo.renewalRatio))
+        : discountedPriceLabel(prices.fullCents, effectivePercentOff);
       return {
         id,
         name,
         tagline,
         price,
         ...(showDiscount ? { originalPrice: prices.full } : {}),
+        // Subscribers see no intro/launch badge, so without this their carried
+        // discount showed up as a bare lowered number with nothing explaining it.
+        ...(showDiscount && accountDiscountPct > 0 && activePurchaseInfo?.renewalNote
+          ? { saleBadge: activePurchaseInfo.renewalNote }
+          : {}),
         ...(id === activeHeadroomPlanId && periodMatches && activePurchaseInfo
           ? { purchaseInfo: activePurchaseInfo }
           : {}),

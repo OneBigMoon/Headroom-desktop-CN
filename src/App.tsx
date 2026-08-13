@@ -6924,11 +6924,12 @@ export default function App() {
                       <div className="upgrade-plan-card__price-note">{plan.centeredPriceLabel}</div>
                     ) : (
                       <div>
-                        {plan.originalPrice && !activeHeadroomPlanId ? (
+                        {plan.originalPrice && (plan.saleBadge || !activeHeadroomPlanId) ? (
                           <div className="upgrade-plan-card__sale-row">
                             <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
                             <span className="upgrade-plan-card__sale-badge">
-                              {introSaleBadgeLabel(pricingStatus?.introOffer) ??
+                              {plan.saleBadge ??
+                                introSaleBadgeLabel(pricingStatus?.introOffer) ??
                                 `${pricingStatus?.activePercentOff ?? 50}% off`}
                             </span>
                           </div>
@@ -6954,7 +6955,7 @@ export default function App() {
                             : `Downgrades to Free on ${plan.purchaseInfo.endsOn}`
                           : isActivePlan ? (
                             <>
-                              Renews{" "}
+                              Renews at{" "}
                               <span className="upgrade-plan-card__renewal-price">
                                 {plan.purchaseInfo.renewalPriceLabel}
                               </span>{" "}
