@@ -573,6 +573,11 @@ export interface HeadroomAccountProfile {
    * better than the client can derive it. Only a redeemed save offer sets it. */
   subscriptionRenewalCents?: number | null;
   subscriptionRenewalEndsAt?: string | null;
+  /** A downgrade scheduled for the next cycle. Until it lands the subscription
+   * still reports the plan being paid for, so these are the only sign of it. */
+  subscriptionPendingTier?: HeadroomSubscriptionTier | null;
+  subscriptionPendingBillingPeriod?: string | null;
+  subscriptionPendingEffectiveAt?: string | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;

@@ -1027,6 +1027,15 @@ pub struct HeadroomAccountProfile {
     pub subscription_renewal_cents: Option<i64>,
     #[serde(default)]
     pub subscription_renewal_ends_at: Option<DateTime<Utc>>,
+    /// A downgrade scheduled for the next cycle. The subscription keeps
+    /// reporting the plan being paid for until it lands, so these fields are
+    /// the only sign the change exists.
+    #[serde(default)]
+    pub subscription_pending_tier: Option<HeadroomSubscriptionTier>,
+    #[serde(default)]
+    pub subscription_pending_billing_period: Option<String>,
+    #[serde(default)]
+    pub subscription_pending_effective_at: Option<DateTime<Utc>>,
     pub invite_code: Option<String>,
     pub accepted_invites_count: usize,
     pub invite_bonus_percent: f64,

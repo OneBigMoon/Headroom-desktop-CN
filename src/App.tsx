@@ -5754,6 +5754,26 @@ export default function App() {
     billingPeriod,
     pricingStatus?.account?.subscriptionBillingPeriod
   );
+  // A downgrade waits for the end of the term already paid for, so between
+  // confirming it and it landing the subscription still reports the old plan.
+  // Without this the change leaves no trace anywhere in the app.
+  const pendingPlanChangeInfo = (() => {
+    const account = pricingStatus?.account;
+    const tier = account?.subscriptionPendingTier;
+    const effectiveAt = account?.subscriptionPendingEffectiveAt;
+    if (!tier || !effectiveAt) return null;
+    const period = account?.subscriptionPendingBillingPeriod === "monthly" ? "monthly" : "annual";
+    const on = new Date(effectiveAt).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric"
+    });
+    // Same tier on a shorter cycle is a billing switch, not a plan change.
+    const note = tier === account?.subscriptionTier
+      ? `Switches to ${period} billing on ${on}`
+      : `Switches to ${upgradePlanIntentLabel(tier)} (${period}) on ${on}`;
+    return { tier, billingPeriod: period, note };
+  })();
   // The card beside the active plan: the nearest step up, since that is what
   // this view is for. Only the top tier has none, and there the tier below it
   // is the sole remaining move.
@@ -6906,6 +6926,14 @@ export default function App() {
                   : `secondary-button upgrade-plan-card__button${downgradeButtonClassName}`;
 
               const isActivePlan = plan.id === activeHeadroomPlanId && viewingSubscribedPeriod;
+              // The plan a scheduled change is already headed for. Its CTA
+              // still reads "Downgrade to X" otherwise, inviting a second
+              // click at a change that is done.
+              const isPendingTarget =
+                !!pendingPlanChangeInfo &&
+                plan.id === pendingPlanChangeInfo.tier &&
+                billingPeriod === pendingPlanChangeInfo.billingPeriod &&
+                !isActivePlan;
               return (
                 <article
                   className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}
@@ -6957,6 +6985,10 @@ export default function App() {
                       <p className="upgrade-plan-card__purchase-info">
                         {plan.purchaseInfo.cancelAtPeriodEnd && plan.purchaseInfo.endsOn
                           ? `Ends on ${plan.purchaseInfo.endsOn}`
+                          : isActivePlan && pendingPlanChangeInfo
+                          ? // The stored renewal price is this plan's, and this
+                            // plan is not the one that renews.
+                            pendingPlanChangeInfo.note
                           : isActivePlan ? (
                             <>
                               Renews at{" "}
@@ -7056,6 +7088,10 @@ export default function App() {
                           </button>
                         </div>
                       </div>
+                    ) : isPendingTarget ? (
+                      <button className={buttonClassName} disabled type="button">
+                        {plan.id === activeHeadroomPlanId ? "Switch scheduled" : "Change scheduled"}
+                      </button>
                     ) : (
                       <button
                         className={buttonClassName}
@@ -7745,6 +7781,21 @@ export default function App() {
             const newPriceLabel = targetCard
               ? `${targetCard.price} / month`
               : getPlanRenewalPriceLabel(pendingPlanChange.toTier, pendingPlanChange.billingPeriod);
+            // Mirrors the server's rule: a step down the ladder, or the same
+            // tier on a shorter cycle, waits for the term already paid for
+            // rather than crediting back the unused part of it.
+            const isDeferred =
+              isDowngrade ||
+              (isPeriodSwitch &&
+                currentBillingPeriod === "annual" &&
+                pendingPlanChange.billingPeriod === "monthly");
+            const renewsOnLabel = pricingStatus?.account?.subscriptionRenewsAt
+              ? new Date(pricingStatus.account.subscriptionRenewsAt).toLocaleDateString(undefined, {
+                  year: "numeric",
+                  month: "long",
+                  day: "numeric"
+                })
+              : null;
             return (
               <div
                 className="modal-backdrop"
@@ -7765,13 +7816,17 @@ export default function App() {
                     {pendingPlanChange.billingPeriod === "annual" ? "annually" : "monthly"}.
                   </p>
                   <p>
-                    {isDowngrade || (isPeriodSwitch && pendingPlanChange.billingPeriod === "monthly")
-                      ? "You'll receive a prorated credit toward your next billing cycle for the unused time on your current plan."
+                    {isDeferred
+                      ? `Nothing changes today: you keep the ${
+                          upgradePlanIntentLabel(pendingPlanChange.fromTier) ?? "current"
+                        } plan you have paid for${
+                          renewsOnLabel ? ` until ${renewsOnLabel}` : " until the end of the term"
+                        }, and the new plan starts then. No charge and no credit today.`
                       : "You'll be charged a prorated amount today for the remaining time in your current billing period, with your existing discount applied."}
                   </p>
                   {/* A period switch moves the renewal date, so the stored one
-                      would be stale here. */}
-                  {!isPeriodSwitch && pricingStatus?.account?.subscriptionRenewsAt ? (
+                      would be stale here; a deferred change already named it. */}
+                  {!isPeriodSwitch && !isDeferred && pricingStatus?.account?.subscriptionRenewsAt ? (
                     <p>
                       Your subscription will then renew on{" "}
                       <strong>
