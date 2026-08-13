@@ -104,7 +104,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
-  billableInputSavingsRate,
+  compressibleInputSavingsRate,
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
@@ -637,6 +637,13 @@ function SavingsChartTooltip({
   }
 
   const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
+  // The backend's by_provider rollup has no cache dimension, so the bucket's
+  // compressible share is pro-rated across its providers. Exact whenever one
+  // connector was active in the hour (the common case); an approximation only
+  // when two ran concurrently with different cache hit rates.
+  const costScale = point.actualCostUsd > 0 ? point.compressibleCostUsd / point.actualCostUsd : 1;
+  const tokenScale =
+    point.totalTokensSent > 0 ? point.compressibleTokensSent / point.totalTokensSent : 1;
 
   return (
     <div className="savings-chart__tooltip">
@@ -665,9 +672,11 @@ function SavingsChartTooltip({
                     chartMode === "usd" ? "actual-usd" : "actual-tokens"
                   }`}
                 />
+                {/* "Spent" for brevity; the figure is the compressible slice,
+                    matching the bar and the chip's denominator. */}
                 {chartMode === "usd"
-                  ? `Spent ${currencyExact(provider.actualCostUsd)}`
-                  : `Spent ${compactNumber(provider.totalTokensSent)} tokens`}
+                  ? `Spent ${currencyExact(provider.actualCostUsd * costScale)}`
+                  : `Spent ${compactNumber(provider.totalTokensSent * tokenScale)} tokens`}
               </span>
             </div>
           ))
@@ -688,7 +697,7 @@ function SavingsChartTooltip({
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
               />
-              Spent {currencyExact(point.actualCostUsd)}
+              Spent {currencyExact(point.compressibleCostUsd)}
             </span>
           </div>
         ) : (
@@ -706,7 +715,7 @@ function SavingsChartTooltip({
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
               />
-              Spent {compactNumber(point.totalTokensSent)} tokens
+              Spent {compactNumber(point.compressibleTokensSent)} tokens
             </span>
           </div>
         )}
@@ -955,7 +964,7 @@ function DailySavingsChart({
   // BILLABLE input for the visible window, in the active unit. Output shaping
   // stays out of every percentage (it keeps its own measured reduction chip);
   // cache reads stay out of the denominator (~0.1x, deliberately untouched).
-  const billableRate = billableInputSavingsRate(
+  const compressibleRate = compressibleInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow,
     chartMode
   );
@@ -1078,31 +1087,31 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {billableRate !== null ||
+            {compressibleRate !== null ||
             windowOutput !== null ||
             (windowIncludesToday && outputReduction) ? (
               <span className="savings-chart__overlay-chips">
-                {billableRate !== null && (
+                {compressibleRate !== null && (
                   <WindowRateChip
                     dot="input"
-                    label={`Input −${Math.round(billableRate.pct)}%`}
+                    label={`Input −${Math.round(compressibleRate.pct)}%`}
                     title="Input compression"
                     badge="measured"
-                    value={`${Math.round(billableRate.pct)}%`}
+                    value={`${Math.round(compressibleRate.pct)}%`}
                     rows={[
                       {
                         dt: "Removed",
                         dd:
                           chartMode === "usd"
-                            ? currency(billableRate.saved)
-                            : compactNumber(billableRate.saved)
+                            ? currency(compressibleRate.saved)
+                            : compactNumber(compressibleRate.saved)
                       },
                       {
-                        dt: "Billable input",
+                        dt: "Compressible input",
                         dd:
                           chartMode === "usd"
-                            ? currency(billableRate.saved + billableRate.billable)
-                            : compactNumber(billableRate.saved + billableRate.billable)
+                            ? currency(compressibleRate.saved + compressibleRate.remaining)
+                            : compactNumber(compressibleRate.saved + compressibleRate.remaining)
                       }
                     ]}
                     note="Cache reads (billed at ~10%) are excluded from the baseline; Headroom leaves the cached prefix intact."
@@ -1184,7 +1193,7 @@ function DailySavingsChart({
               {chartMode === "usd" && (
                 <>
                   <Bar
-                    dataKey="actualCostUsd"
+                    dataKey="compressibleCostUsd"
                     fill="url(#actualUsdGradient)"
                     maxBarSize={16}
                     stackId="usd"
@@ -1214,7 +1223,7 @@ function DailySavingsChart({
               {chartMode === "tokens" && (
                 <>
                   <Bar
-                    dataKey="totalTokensSent"
+                    dataKey="compressibleTokensSent"
                     fill="url(#actualTokensGradient)"
                     maxBarSize={16}
                     stackId="tokens"
