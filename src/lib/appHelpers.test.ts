@@ -475,6 +475,25 @@ describe("app helpers", () => {
       });
     });
 
+    it("spells out how long the discount runs", () => {
+      const forever = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "forever");
+      expect(activePlan(forever)?.purchaseInfo?.discountLabel).toBe("50% off forever");
+
+      const repeating = getUpgradePlans(...baseArgs, 1800, "annual", "2026-01-01", "2025-04-16", "repeating", 12);
+      expect(activePlan(repeating)?.purchaseInfo?.discountLabel).toBe("50% off for 12 months");
+
+      // A redeemed save offer arrives as the repeating 12-month discount it is,
+      // dated too far back for the window check to accept on its own.
+      const saveOffer = getUpgradePlans(
+        ...baseArgs, 1800, "annual", "2026-12-01", "2024-01-01", "repeating", 12,
+        false, null, 0, null, 1200, "2027-12-01"
+      );
+      expect(activePlan(saveOffer)?.purchaseInfo?.discountLabel).toBe("67% off for 12 months");
+
+      const none = getUpgradePlans(...baseArgs, 3600, "annual", "2026-12-01");
+      expect(activePlan(none)?.purchaseInfo?.discountLabel).toBeUndefined();
+    });
+
     it("shows full renewal price for repeating discount with missing window data", () => {
       // "repeating" but duration_in_months is null → treat as no discount at renewal
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "repeating", null);

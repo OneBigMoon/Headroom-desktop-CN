@@ -181,6 +181,8 @@ export interface UpgradePlanPurchaseInfo {
   renewsOn: string;
   paidPerMonthLabel: string;
   discountPct: number;
+  /// "33% off for 12 months" / "40% off forever". Absent when nothing is off.
+  discountLabel?: string;
   cancelAtPeriodEnd?: boolean;
   endsOn?: string;
 }
@@ -362,6 +364,16 @@ export function getUpgradePlans(
         ? Math.round((1 - renewalCentsPerMonth / fullCents) * 100)
         : 0;
       const paidPerMonthLabel = `$${(renewalCentsPerMonth / 100).toFixed(2).replace(/\.00$/, "")}`;
+      // How long the discount behind that price runs. The save offer needs no
+      // special case: applying it attaches a repeating 12-month discount, which
+      // comes back through the same two fields as any other.
+      const months = subscriptionDiscountDurationInMonths ?? 0;
+      const durationLabel = subscriptionDiscountDuration === "forever"
+        ? "forever"
+        : months > 0 ? `for ${months} month${months === 1 ? "" : "s"}` : null;
+      const discountLabel = discountPct > 0
+        ? `${discountPct}% off${durationLabel ? ` ${durationLabel}` : ""}`
+        : undefined;
       const renewsOn = subscriptionRenewsAt
         ? new Date(subscriptionRenewsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
         : null;
@@ -373,6 +385,7 @@ export function getUpgradePlans(
         renewsOn,
         paidPerMonthLabel,
         discountPct,
+        discountLabel,
         cancelAtPeriodEnd: subscriptionCancelAtPeriodEnd,
         endsOn
       };

@@ -638,6 +638,8 @@ export interface SaveOffer {
   billingPeriod: BillingPeriod;
   currentMonthlyCents: number;
   offerMonthlyCents: number;
+  /// Formatted date the offer price first bills; absent on older servers.
+  startsOn?: string | null;
 }
 
 export type TierRecommendationSource = "claude" | "codex" | "both";

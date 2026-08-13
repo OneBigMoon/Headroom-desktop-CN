@@ -6943,11 +6943,21 @@ export default function App() {
                           ? plan.id === "free"
                             ? `Activates on ${plan.purchaseInfo.endsOn}`
                             : `Downgrades to Free on ${plan.purchaseInfo.endsOn}`
-                          : isActivePlan
-                          ? plan.purchaseInfo.discountPct > 0
-                            ? `Renews ${plan.purchaseInfo.paidPerMonthLabel}/mo on ${plan.purchaseInfo.renewsOn} (${plan.purchaseInfo.discountPct}% off)`
-                            : `Renews ${plan.price}/mo on ${plan.purchaseInfo.renewsOn}`
-                          : null}
+                          : isActivePlan ? (
+                            <>
+                              Renews{" "}
+                              <span className="upgrade-plan-card__renewal-price">
+                                {plan.purchaseInfo.discountLabel
+                                  ? plan.purchaseInfo.paidPerMonthLabel
+                                  : plan.price}
+                                /mo
+                              </span>{" "}
+                              on {plan.purchaseInfo.renewsOn}
+                              {plan.purchaseInfo.discountLabel
+                                ? ` (${plan.purchaseInfo.discountLabel})`
+                                : ""}
+                            </>
+                          ) : null}
                       </p>
                     ) : null}
                   </div>
@@ -7879,7 +7889,8 @@ export default function App() {
                       Your plan stays active at{" "}
                       <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
                       for the next {saveOffer.durationMonths} months. The new price
-                      takes effect at your next renewal.
+                      takes effect{" "}
+                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}.
                     </p>
                     <div className="modal-actions">
                       <button
@@ -7905,8 +7916,10 @@ export default function App() {
                       at.
                     </p>
                     <p>
-                      The new price starts at your next renewal. Nothing else about
-                      your plan changes, and you can still cancel any time.
+                      The new price starts{" "}
+                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}
+                      , and any discount you are on until then is unaffected. Nothing
+                      else about your plan changes, and you can still cancel any time.
                     </p>
                     {saveOfferError ? (
                       <p className="install-progress__error">{saveOfferError}</p>

@@ -1280,6 +1280,12 @@ select {
   line-height: 1.45;
 }
 
+/* Inherits the line's color so it stays legible in both themes. */
+.upgrade-plan-card__renewal-price {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
 .upgrade-plan-card__active-badge {
   display: inline-block;
   margin-left: 0.45rem;

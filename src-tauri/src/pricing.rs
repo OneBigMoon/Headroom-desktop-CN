@@ -594,6 +594,11 @@ pub struct SaveOffer {
     pub billing_period: String,
     pub current_monthly_cents: i64,
     pub offer_monthly_cents: i64,
+    /// Formatted date the offer price first bills. Usually the next renewal,
+    /// but later when a deeper intro discount has to run out first. Defaulted
+    /// so a server that predates the field still parses.
+    #[serde(default)]
+    pub starts_on: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5229,7 +5234,8 @@ mod tests {
                     "durationMonths": 12,
                     "billingPeriod": "monthly",
                     "currentMonthlyCents": 3000,
-                    "offerMonthlyCents": 2010
+                    "offerMonthlyCents": 2010,
+                    "startsOn": "September 13, 2026"
                 }
             }),
             "HTTP/1.1 200 OK",
@@ -5244,6 +5250,7 @@ mod tests {
         assert_eq!(offer.duration_months, 12);
         assert_eq!(offer.current_monthly_cents, 3000);
         assert_eq!(offer.offer_monthly_cents, 2010);
+        assert_eq!(offer.starts_on.as_deref(), Some("September 13, 2026"));
     }
 
     #[test]
