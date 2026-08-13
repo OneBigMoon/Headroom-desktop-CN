@@ -244,17 +244,30 @@ pub fn is_no_space(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Runs a shell-profile write step, tolerating an unwritable profile (e.g. a
-/// read-only ~/.zshrc -> os error 13). The env that actually routes a client
-/// lives in app-owned config (~/.claude/settings.json, ~/.codex/config.toml), so
-/// a locked shell file costs terminal convenience, not core routing. Returns
-/// `Ok(None)` when the step was skipped for that reason.
+/// True when the error chain contains an io InvalidData -- in practice a
+/// `read_to_string` on a file that isn't valid UTF-8 (RUST-5X: a latin-1
+/// ~/.bashrc). Rewriting such a file would mangle the user's own bytes, so the
+/// step that wanted to rewrite it is skipped, same class as a locked file.
+pub fn is_invalid_utf8(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+    })
+}
+
+/// Runs a shell-profile write step, tolerating a profile we can't safely rewrite
+/// (a read-only ~/.zshrc -> os error 13, or a non-UTF-8 ~/.bashrc). The env that
+/// actually routes a client lives in app-owned config (~/.claude/settings.json,
+/// ~/.codex/config.toml), so an untouchable shell file costs terminal
+/// convenience, not core routing. Returns `Ok(None)` when the step was skipped
+/// for that reason.
 fn shell_step_best_effort(
     step: Result<(Vec<String>, Vec<String>)>,
 ) -> Result<Option<(Vec<String>, Vec<String>)>> {
     match step {
         Ok(updates) => Ok(Some(updates)),
-        Err(err) if is_permission_denied(&err) => Ok(None),
+        Err(err) if is_permission_denied(&err) || is_invalid_utf8(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -460,7 +473,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut steps = Vec::new();
             if shell_unwritable {
                 steps.push(
-                    "Your shell profile (e.g. ~/.zshrc) isn't writable, so the PATH/export couldn't be added. Core routing still works via the client's own config; to launch the client from a terminal, fix the file's permissions and re-run setup, or add the export manually."
+                    "Your shell profile (e.g. ~/.zshrc) couldn't be updated - it isn't writable, or it isn't valid UTF-8 text. Core routing still works via the client's own config; to launch the client from a terminal, fix the file and re-run setup, or add the export manually."
                         .into(),
                 );
             }
@@ -4590,8 +4603,19 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let existing = std::fs::read_to_string(file_path)
-        .with_context(|| format!("reading {}", file_path.display()))?;
+    let bytes =
+        std::fs::read(file_path).with_context(|| format!("reading {}", file_path.display()))?;
+    let Ok(existing) = String::from_utf8(bytes) else {
+        // ponytail: a non-UTF-8 profile is left untouched -- rewriting it from a
+        // lossy decode would mangle the user's own bytes. Cost: a stale managed
+        // block survives uninstall on such a file. Upgrade path if that matters:
+        // splice the block out at the byte level instead of via String.
+        log::info!(
+            "leaving {} alone: not valid UTF-8, cannot rewrite safely",
+            file_path.display()
+        );
+        return Ok(false);
+    };
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
 
@@ -4657,6 +4681,15 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(backup_path))
 }
 
+/// Reads a file for inspection only, replacing invalid UTF-8 instead of failing
+/// on it. Shell profiles can carry non-UTF-8 bytes (RUST-5X), and marker/export
+/// scanning only ever looks for ASCII. Never write the result back -- the lossy
+/// decode would replace the user's bytes with U+FFFD.
+fn read_to_string_lossy(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn shell_block_contains_in_files(
     shell_targets: &[PathBuf],
     block_id: &str,
@@ -4667,8 +4700,7 @@ fn shell_block_contains_in_files(
         if !file.exists() {
             continue;
         }
-        let content = std::fs::read_to_string(&file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let content = read_to_string_lossy(file)?;
         let start = format!("# >>> headroom:{block_id} >>>");
         let end = format!("# <<< headroom:{block_id} <<<");
 
@@ -4694,8 +4726,7 @@ fn shell_block_contains_text_in_files(
             continue;
         }
 
-        let content = std::fs::read_to_string(&file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let content = read_to_string_lossy(file)?;
         let start = format!("# >>> headroom:{block_id} >>>");
         let end = format!("# <<< headroom:{block_id} <<<");
 
@@ -4985,8 +5016,7 @@ fn file_has_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let content = std::fs::read_to_string(file_path)
-        .with_context(|| format!("reading {}", file_path.display()))?;
+    let content = read_to_string_lossy(file_path)?;
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
     Ok(content.contains(&start) && content.contains(&end))
@@ -7138,6 +7168,51 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn read_settings_json(path: &Path) -> serde_json::Value {
         let raw = fs::read_to_string(path).expect("read settings.json");
         serde_json::from_str(&raw).expect("parse settings.json")
+    }
+
+    /// RUST-5X: a shell profile with non-UTF-8 bytes (latin-1 comment) made
+    /// `read_to_string` fail and took the whole client setup down with it, so
+    /// Claude Code never got routed. The profile is convenience; core routing
+    /// via ~/.claude/settings.json must still land, and the user's bytes must
+    /// survive untouched.
+    #[test]
+    #[serial_test::serial]
+    fn apply_client_setup_survives_non_utf8_shell_profile() {
+        let home = TestHome::new();
+        // 0xFF is never valid UTF-8.
+        let latin1 = b"# caf\xe9 alias\nalias ll='ls -l'\n\xff\n";
+        let zshrc = home.path().join(".zshrc");
+        fs::write(&zshrc, latin1).unwrap();
+        fs::write(home.path().join(".zshenv"), latin1).unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {}}"#,
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        let result =
+            super::apply_client_setup("claude_code").expect("setup succeeds despite bad profile");
+        assert!(result.applied);
+        assert!(
+            result.shell_profile_unwritable,
+            "shell step reported as skipped"
+        );
+        assert_eq!(
+            fs::read(&zshrc).unwrap(),
+            latin1,
+            "user's non-UTF-8 profile left byte-identical"
+        );
+
+        // The part that actually routes Claude Code still happened.
+        let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:6767")
+        );
+        // Verification reads the same profiles and must not blow up either.
+        super::verify_client_setup("claude_code").expect("verification tolerates bad profile");
     }
 
     #[test]

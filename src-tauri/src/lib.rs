@@ -46,7 +46,6 @@ use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, Position, Rect, State, Window, WindowEvent,
 };
 use tauri::{Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
@@ -3668,14 +3667,37 @@ async fn hide_launcher_animated(app: AppHandle) {
     }
 }
 
+/// Whether the running executable's path still resolves on disk. Mirrors the
+/// `current_exe()?` + `canonicalize()?` pair that tauri-plugin-autostart does
+/// at init, so we can skip the plugin instead of panicking out of startup.
+fn exe_path_resolvable(exe: std::io::Result<std::path::PathBuf>) -> bool {
+    exe.and_then(|path| path.canonicalize()).is_ok()
+}
+
+/// The autostart plugin is only registered when the executable path resolves
+/// (see `run`), so every caller has to tolerate its absence. `app.autolaunch()`
+/// panics when the plugin was skipped; this returns `None` instead.
+fn autolaunch(
+    app: &AppHandle,
+) -> Option<tauri::State<'_, tauri_plugin_autostart::AutoLaunchManager>> {
+    app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
+}
+
+const AUTOSTART_UNAVAILABLE: &str =
+    "Autostart is unavailable: Headroom could not resolve its own application path. \
+     Move Headroom to /Applications and relaunch.";
+
 #[tauri::command]
 async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
-    app.autolaunch().is_enabled().map_err(|err| err.to_string())
+    let Some(manager) = autolaunch(&app) else {
+        return Ok(false);
+    };
+    manager.is_enabled().map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    let manager = app.autolaunch();
+    let manager = autolaunch(&app).ok_or(AUTOSTART_UNAVAILABLE)?;
     if enabled {
         manager.enable().map_err(|err| err.to_string())?;
     } else {
@@ -3763,7 +3785,9 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
 
     // Turn off the login item if it was ever enabled, so the system stops
     // listing Headroom as a background item even if the user later reinstalls.
-    let _ = app.autolaunch().disable();
+    if let Some(manager) = autolaunch(&app) {
+        let _ = manager.disable();
+    }
 
     let mut removed = client_adapters::perform_full_cleanup();
 
@@ -3918,16 +3942,32 @@ pub fn run() {
 
     let state = AppState::new().expect("failed to create app state");
 
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let mut builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
             let _ = show_launcher_window(app);
-        }))
-        .plugin(
+        }));
+
+    // tauri-plugin-autostart canonicalizes current_exe() while initializing and
+    // fails with ENOENT when the bundle path no longer resolves - the .app was
+    // moved, replaced mid-launch, or sits on an unmounted volume. Builder::build
+    // turns any plugin init failure into a panic, so that bricked startup
+    // entirely (RUST-6Q). Autostart is optional; launching is not. Every
+    // `autolaunch()` caller handles the plugin being absent.
+    if exe_path_resolvable(std::env::current_exe()) {
+        builder = builder.plugin(
             tauri_plugin_autostart::Builder::new()
                 .args([AUTOSTART_LAUNCH_ARG])
                 .build(),
-        )
+        );
+    } else {
+        log::warn!(
+            "autostart plugin skipped: current_exe() does not resolve (bundle moved or replaced); \
+             launching without login-item support"
+        );
+    }
+
+    let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init());
@@ -6257,8 +6297,8 @@ mod tests {
         classify_backend_readyz, classify_bootstrap_failure, classify_upgrade_error,
         client_setup_error_kind, compute_tray_window_position, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects, extract_llm_failure_warnings, fake_override,
-        fetch_transformations_feed_from, format_token_count, install_pending_update,
+        empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
+        fake_override, fetch_transformations_feed_from, format_token_count, install_pending_update,
         is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
         is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
@@ -6291,6 +6331,26 @@ mod tests {
         fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
             Box::pin(async move { self.install_result })
         }
+    }
+
+    #[test]
+    fn exe_path_resolvable_rejects_a_bundle_that_no_longer_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("Headroom");
+        std::fs::write(&exe, b"").expect("write exe");
+        assert!(exe_path_resolvable(Ok(exe.clone())));
+
+        // The RUST-6Q shape: the .app was moved or replaced while launching, so
+        // the path the process was started from no longer canonicalizes.
+        std::fs::remove_file(&exe).expect("remove exe");
+        assert!(!exe_path_resolvable(Ok(exe)));
+
+        assert!(!exe_path_resolvable(Err(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        ))));
+
+        // Sanity: a healthy process (this test binary) passes.
+        assert!(exe_path_resolvable(std::env::current_exe()));
     }
 
     fn sample_available_update(version: &str) -> AvailableAppUpdate {
