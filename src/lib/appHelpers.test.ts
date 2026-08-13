@@ -458,6 +458,21 @@ describe("app helpers", () => {
       expect(max5x?.saleBadge).toBe("33% off forever");
     });
 
+    it("states the carried discount once: renewal line on the bought period, badge on the other", () => {
+      const args = ["individual", undefined, undefined, "pro", true, false] as const;
+      const onBoughtPeriod = getUpgradePlans(...args, "annual", 1800, "annual", "2026-12-01", "2025-12-01", "forever");
+      const boughtCard = onBoughtPeriod.plans.find((p) => p.id === "pro");
+      expect(boughtCard?.saleBadge).toBeUndefined();
+      expect(boughtCard?.purchaseInfo?.renewalNote).toBe("50% off forever");
+
+      const onOtherPeriod = getUpgradePlans(...args, "monthly", 1800, "annual", "2026-12-01", "2025-12-01", "forever");
+      const switchCard = onOtherPeriod.plans.find((p) => p.id === "pro");
+      expect(switchCard?.price).toBe("$2");
+      expect(switchCard?.originalPrice).toBe("$4");
+      expect(switchCard?.saleBadge).toBe("50% off forever");
+      expect(switchCard?.purchaseInfo).toBeUndefined();
+    });
+
     it("does not discount upgrade-target cards for a once-off discount", () => {
       const result = getUpgradePlans(...baseArgs, 1800, "annual", "2026-12-01", "2025-12-01", "once");
       const max5x = result.plans.find((p) => p.id === "max5x");

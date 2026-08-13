@@ -73,6 +73,7 @@ import {
   buildSetupStallMailto,
   describeInvokeError,
   formatCents,
+  getNextHigherUpgradePlanId,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
@@ -1551,8 +1552,9 @@ export default function App() {
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
-  // Monthly first: the intro offer's 50% headline is the default presentation.
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
+  // Annual first: it is the cheaper per-month number and the tab the "Save 25%"
+  // badge points at. A subscriber's own period overrides this once it loads.
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -5752,14 +5754,18 @@ export default function App() {
     billingPeriod,
     pricingStatus?.account?.subscriptionBillingPeriod
   );
-  const downgradePlanId = getNextLowerUpgradePlanId(activeHeadroomPlanId);
+  // The card beside the active plan: the nearest step up, since that is what
+  // this view is for. Only the top tier has none, and there the tier below it
+  // is the sole remaining move.
+  const companionPlanId =
+    getNextHigherUpgradePlanId(activeHeadroomPlanId) ?? getNextLowerUpgradePlanId(activeHeadroomPlanId);
   const visibleUpgradePlans = (() => {
     if (showAllUpgradePlans || upgradePlansState.plans.length <= 2) {
       return upgradePlansState.plans;
     }
 
-    if (pricingAudience === "individual" && activeHeadroomPlanId && downgradePlanId) {
-      const visiblePlanIds = new Set<UpgradePlanId>([activeHeadroomPlanId, downgradePlanId]);
+    if (pricingAudience === "individual" && activeHeadroomPlanId && companionPlanId) {
+      const visiblePlanIds = new Set<UpgradePlanId>([activeHeadroomPlanId, companionPlanId]);
       const activeWindowPlans = upgradePlansState.plans.filter((plan) => visiblePlanIds.has(plan.id));
       if (activeWindowPlans.length === 2) {
         return activeWindowPlans;
@@ -6950,9 +6956,7 @@ export default function App() {
                     {plan.purchaseInfo ? (
                       <p className="upgrade-plan-card__purchase-info">
                         {plan.purchaseInfo.cancelAtPeriodEnd && plan.purchaseInfo.endsOn
-                          ? plan.id === "free"
-                            ? `Activates on ${plan.purchaseInfo.endsOn}`
-                            : `Downgrades to Free on ${plan.purchaseInfo.endsOn}`
+                          ? `Ends on ${plan.purchaseInfo.endsOn}`
                           : isActivePlan ? (
                             <>
                               Renews at{" "}
@@ -7019,19 +7023,11 @@ export default function App() {
                       >
                         {reactivateBusy ? "Resuming..." : `Resume ${plan.name} plan`}
                       </button>
-                    ) : plan.id === "free" && plan.purchaseInfo?.cancelAtPeriodEnd ? (
-                      <button
-                        className={buttonClassName}
-                        disabled
-                        type="button"
-                      >
-                        {plan.ctaLabel}
-                      </button>
                     ) : isActivePlan ? (
                       <div className="upgrade-plan-card__action-stack">
                         <button
                           className={buttonClassName}
-                          disabled={plan.disabled || upgradeActionBusy === plan.id}
+                          disabled={upgradeActionBusy === plan.id}
                           onClick={() => void handleUpgradeAction(plan.id)}
                           type="button"
                         >
@@ -7063,7 +7059,7 @@ export default function App() {
                     ) : (
                       <button
                         className={buttonClassName}
-                        disabled={plan.disabled || upgradeActionBusy === plan.id}
+                        disabled={upgradeActionBusy === plan.id}
                         onClick={() => void handleUpgradeAction(plan.id)}
                         type="button"
                       >
@@ -7738,14 +7734,17 @@ export default function App() {
                 currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
               }
             );
-            const newPriceLabel = getPlanRenewalPriceLabel(
-              pendingPlanChange.toTier,
-              pendingPlanChange.billingPeriod,
-              {
-                fromTier: pendingPlanChange.fromTier,
-                currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
-              }
+            // The target card already prices this tier for this period with the
+            // account discount carried at its exact ratio. Re-deriving it from
+            // the amount currently paid quoted $0 to anyone mid 100%-off period,
+            // and 12x the real figure on an annual -> monthly switch (an annual
+            // cycle amount divided by one month).
+            const targetCard = upgradePlansState.plans.find(
+              (plan) => plan.id === pendingPlanChange.toTier
             );
+            const newPriceLabel = targetCard
+              ? `${targetCard.price} / month`
+              : getPlanRenewalPriceLabel(pendingPlanChange.toTier, pendingPlanChange.billingPeriod);
             return (
               <div
                 className="modal-backdrop"

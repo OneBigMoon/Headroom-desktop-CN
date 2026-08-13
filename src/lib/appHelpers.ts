@@ -110,6 +110,8 @@ export function formatCents(cents: number): string {
 /// Per-month price label for the target tier (e.g. `$20 / month`), with the
 /// user's current discount ratio carried forward. Matches the upgrade view
 /// convention where annual prices are shown per-month for tier comparison.
+/// `currentPaidCents` must be a cycle amount for `billingPeriod` - passing an
+/// annual amount while asking for a monthly period reads 12x high.
 export function getPlanRenewalPriceLabel(
   toTier: HeadroomSubscriptionTier,
   billingPeriod: BillingPeriod,
@@ -210,7 +212,6 @@ export interface UpgradePlan {
   ctaTone?: "default" | "downgrade";
   /// Label for the strikethrough sale row, when the card is discounted.
   saleBadge?: string;
-  disabled?: boolean;
   purchaseInfo?: UpgradePlanPurchaseInfo;
 }
 
@@ -279,6 +280,21 @@ export function getNextLowerUpgradePlanId(
       return "pro";
     case "max20x":
       return "max5x";
+    default:
+      return null;
+  }
+}
+
+/// The tier above `planId`, or null at the top. The companion card next to an
+/// active plan: this is the upgrade view, so the nearest step up earns the slot.
+export function getNextHigherUpgradePlanId(
+  planId?: PaidUpgradePlanId | null
+): IndividualUpgradePlanId | null {
+  switch (planId) {
+    case "pro":
+      return "max5x";
+    case "max5x":
+      return "max20x";
     default:
       return null;
   }
@@ -440,7 +456,13 @@ export function getUpgradePlans(
         ? (activePercentOff > 0 ? activePercentOff : 50)
         : 0;
       const effectivePercentOff = accountDiscountPct || introPct || legacyPct;
-      const showDiscount = effectivePercentOff > 0 && id !== activeHeadroomPlanId;
+      // Each card states the discount once. On the active card of the period
+      // actually bought, the renewal line under the price already does it, so
+      // the badge would be the same fact twice; on the other period's tab there
+      // is no renewal line, and without the badge the switch offer reads as if
+      // it costs the discount.
+      const showDiscount =
+        effectivePercentOff > 0 && (id !== activeHeadroomPlanId || !periodMatches);
       // An account discount prices off the exact ratio it renews at, not the
       // rounded percent, so a third off $15 quotes $10 and not $10.05.
       const price = !showDiscount
@@ -456,8 +478,14 @@ export function getUpgradePlans(
         ...(showDiscount ? { originalPrice: prices.full } : {}),
         // Subscribers see no intro/launch badge, so without this their carried
         // discount showed up as a bare lowered number with nothing explaining it.
-        ...(showDiscount && accountDiscountPct > 0 && activePurchaseInfo?.renewalNote
-          ? { saleBadge: activePurchaseInfo.renewalNote }
+        // No duration unless it is forever: a repeating discount carries its
+        // *remaining* months across a plan change, not a fresh full term.
+        ...(showDiscount && accountDiscountPct > 0
+          ? {
+              saleBadge: `${accountDiscountPct}% off${
+                subscriptionDiscountDuration === "forever" ? " forever" : ""
+              }`
+            }
           : {}),
         ...(id === activeHeadroomPlanId && periodMatches && activePurchaseInfo
           ? { purchaseInfo: activePurchaseInfo }
@@ -496,12 +524,6 @@ export function getUpgradePlans(
 
     const withRelativeCta = (plan: UpgradePlan): UpgradePlan => {
       if (!activeHeadroomPlanId) {
-        return plan;
-      }
-
-      // Free card during a scheduled downgrade is the pending target - its
-      // CTA was set to "Downgrade scheduled" above and must not be overridden.
-      if (plan.purchaseInfo?.cancelAtPeriodEnd && plan.id !== activeHeadroomPlanId) {
         return plan;
       }
 
