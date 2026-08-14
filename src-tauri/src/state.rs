@@ -4340,11 +4340,28 @@ impl SavingsTracker {
         let cutoff_hour = format!("{cutoff_date}T00:00");
         let mut changed = false;
         for point in daily {
-            // Daily rollups are UTC-day keyed and settle at UTC midnight, so
-            // the live bucket is excluded by UTC today; hourly keys below stay
-            // local and are guarded by the local today_key.
-            if point.date.as_str() < cutoff_date || point.date.as_str() >= utc_today_key {
+            // Daily rollups are UTC-day keyed; hourly keys below stay local and
+            // are guarded by the local today_key.
+            //
+            // The live UTC day is archived too, as it accumulates. Waiting for
+            // it to settle loses it outright at heavy volume: the backend keeps
+            // 5000 history points, which can be under 24h, so by UTC midnight
+            // the day's rollup has become the buffer's first (backfill) bucket
+            // and drop_rollup_backfill discards it before we get here. That is
+            // how 2026-08-13 collapsed from the backend's real total to the
+            // $3.44 of traffic the local tracker had happened to observe.
+            if point.date.as_str() < cutoff_date || point.date.as_str() > utc_today_key {
                 continue;
+            }
+            // Only ever grow the live bucket. The tracker keys its own deltas by
+            // LOCAL day, so ahead of UTC it already holds hours the backend's
+            // UTC bucket has not reached; a mid-day snapshot must not shrink it.
+            if point.date.as_str() == utc_today_key {
+                if let Some(existing) = self.daily_savings.get(&point.date) {
+                    if point.total_tokens_sent <= existing.total_tokens_sent {
+                        continue;
+                    }
+                }
             }
             // A desynced backend rollup (compression savings but zero
             // tokens/cost, because its cost counter lags the savings
@@ -10056,7 +10073,7 @@ mod tests {
         let native_daily = vec![
             daily("2026-06-01", 999, 9.99), // pre-cutoff -> skipped
             daily("2026-06-10", 100, 1.0),  // settled -> ingested
-            daily("2026-06-16", 500, 5.0),  // today -> left to observe
+            daily("2026-06-16", 500, 5.0),  // live UTC day -> archived as it grows
         ];
         let native_hourly = vec![
             hourly("2026-06-10T09:00", 40), // settled day -> ingested
@@ -10070,7 +10087,7 @@ mod tests {
             .into_iter()
             .map(|p| p.date)
             .collect();
-        assert_eq!(daily_dates, vec!["2026-06-10"]);
+        assert_eq!(daily_dates, vec!["2026-06-10", "2026-06-16"]);
         let hourly_keys: Vec<String> = tracker
             .hourly_savings()
             .into_iter()
@@ -10086,6 +10103,58 @@ mod tests {
             today,
             today
         ));
+    }
+
+    #[test]
+    fn ingest_native_rollups_archives_the_live_day_but_never_shrinks_it() {
+        // The backend's history buffer can hold under 24h at heavy volume, so a
+        // day that is only archived once it settles is already gone: it has
+        // become the buffer's backfill bucket and drop_rollup_backfill removes
+        // it. Archiving the live day as it accumulates is what makes yesterday
+        // survive the wrap (2026-08-13 otherwise fell to $3.44).
+        let mut tracker = make_tracker();
+        let cutoff = "2026-06-02";
+        let today = "2026-06-16";
+
+        let mut live = daily("2026-06-16", 500, 5.0);
+        live.total_tokens_sent = 10_000;
+        assert!(tracker.ingest_native_rollups(&[live.clone()], &[], cutoff, today, today));
+
+        // The tracker keys its own deltas by LOCAL day, so ahead of UTC it can
+        // already hold hours this UTC bucket has not reached. A snapshot with
+        // less spend must not replace what is archived.
+        let mut smaller = daily("2026-06-16", 1, 0.01);
+        smaller.total_tokens_sent = 9_000;
+        assert!(!tracker.ingest_native_rollups(&[smaller], &[], cutoff, today, today));
+
+        let point = tracker
+            .daily_savings()
+            .into_iter()
+            .find(|p| p.date == "2026-06-16")
+            .expect("live day archived");
+        assert_eq!(point.estimated_tokens_saved, 500);
+
+        // Grown since the last render -> take the newer value.
+        let mut grown = daily("2026-06-16", 900, 9.0);
+        grown.total_tokens_sent = 20_000;
+        assert!(tracker.ingest_native_rollups(&[grown], &[], cutoff, today, today));
+        let point = tracker
+            .daily_savings()
+            .into_iter()
+            .find(|p| p.date == "2026-06-16")
+            .expect("live day archived");
+        assert_eq!(point.estimated_tokens_saved, 900);
+
+        // Next day the backend drops it as the backfill bucket; the archive
+        // still has the full-day value, so the merge no longer falls back to
+        // the tracker's own partial observation.
+        assert!(!tracker.ingest_native_rollups(&[], &[], cutoff, "2026-06-17", "2026-06-17"));
+        let merged = merge_daily_savings(tracker.daily_savings(), vec![], cutoff);
+        let day = merged
+            .iter()
+            .find(|p| p.date == "2026-06-16")
+            .expect("archived day survives");
+        assert_eq!(day.estimated_tokens_saved, 900);
     }
 
     #[test]
