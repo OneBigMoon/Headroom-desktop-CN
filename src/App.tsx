@@ -967,12 +967,13 @@ function DailySavingsChart({
   const hourlyChartData = buildHourlySavingsChartData(hourlyWindow);
   const chartData = view === "month" ? monthlyData : hourlyChartData;
   // Canonical rate under the headline: input compression as a share of the
-  // BILLABLE input for the visible window, in the active unit. Output shaping
+  // BILLABLE input for the visible window. Always priced in dollars regardless
+  // of the chart's unit toggle -- a rate is unit-free, and only the dollar
+  // figures share one scale (see compressibleInputSavingsRate). Output shaping
   // stays out of every percentage (it keeps its own measured reduction chip);
   // cache reads stay out of the denominator (~0.1x, deliberately untouched).
   const compressibleRate = compressibleInputSavingsRate(
-    view === "month" ? monthlyWindow : hourlyWindow,
-    chartMode
+    view === "month" ? monthlyWindow : hourlyWindow
   );
   // Window-scoped output reduction from the locally-sampled series. Falls
   // back to the all-time estimator chip only when the window includes now —
@@ -1105,19 +1106,10 @@ function DailySavingsChart({
                     badge="measured"
                     value={`${Math.round(compressibleRate.pct)}%`}
                     rows={[
-                      {
-                        dt: "Removed",
-                        dd:
-                          chartMode === "usd"
-                            ? currency(compressibleRate.saved)
-                            : compactNumber(compressibleRate.saved)
-                      },
+                      { dt: "Removed", dd: currency(compressibleRate.saved) },
                       {
                         dt: "Compressible input",
-                        dd:
-                          chartMode === "usd"
-                            ? currency(compressibleRate.saved + compressibleRate.remaining)
-                            : compactNumber(compressibleRate.saved + compressibleRate.remaining)
+                        dd: currency(compressibleRate.saved + compressibleRate.remaining)
                       }
                     ]}
                     note="Cache reads (billed at ~10%) are excluded from the baseline; Headroom leaves the cached prefix intact."
@@ -4476,12 +4468,16 @@ export default function App() {
     if (!b || b.totalInputTokens <= 0 || b.cacheReadTokens <= 0) return null;
     return Math.min(100, (b.cacheReadTokens / b.totalInputTokens) * 100);
   })();
+  // Priced in dollars, not tokens, for the same reason as the window chip:
+  // totalInputTokens is our tokenizer's count and cacheReadTokens is the
+  // provider's, so differencing them is invalid (and on real data can go
+  // negative). The two dollar figures come from one pricing function.
   const compressionOfRestPct = (() => {
     const b = dashboard.savingsBreakdown;
-    if (!b || b.totalInputTokens <= 0) return null;
-    const nonCachedInput = Math.max(0, b.totalInputTokens - b.cacheReadTokens);
-    const saved = dashboard.lifetimeEstimatedTokensSaved;
-    const baseline = saved + nonCachedInput;
+    if (!b || b.totalInputCostUsd <= 0) return null;
+    const nonCachedInputCost = Math.max(0, b.totalInputCostUsd - b.cacheSavingsUsd / 9);
+    const saved = dashboard.lifetimeEstimatedSavingsUsd;
+    const baseline = saved + nonCachedInputCost;
     if (baseline <= 0) return null;
     return Math.min(100, (saved / baseline) * 100);
   })();
@@ -4573,7 +4569,7 @@ export default function App() {
               </p>
             ) : (
               <AuthCodeForm
-                lead="Enter your email to start your free 7-day trial."
+                lead="Enter your email."
                 email={authEmail}
                 onEmailChange={setAuthEmail}
                 emailValid={authEmailValid}
@@ -5847,7 +5843,7 @@ export default function App() {
   const pendingUpgradePlanLabel = upgradePlanIntentLabel(pendingUpgradePlanId);
   const upgradeAuthMessage = pendingUpgradePlanLabel
     ? `Sign in with email to upgrade to the ${pendingUpgradePlanLabel} plan`
-    : "Sign in with email to unlock your 7-day Headroom trial";
+    : "Sign in with email";
   const accountDisplayEmail = (() => {
     const enteredEmail = authEmail.trim();
     return (

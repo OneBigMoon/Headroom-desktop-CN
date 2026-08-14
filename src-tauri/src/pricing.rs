@@ -1225,12 +1225,23 @@ pub(crate) fn activate_account_with_base_url(
 ///
 /// snake_case on purpose (Rails params), unlike the camelCase view models in
 /// `models.rs`.
+///
+/// The server derives the billable-input rate from the DOLLAR fields, never the
+/// token counts. `total_input_tokens` is our local tokenizer's count of the
+/// forwarded prompt while `cache_read_tokens` is the provider's own count, so
+/// differencing them mixes tokenizer scales and can go negative (see
+/// `outcome.py`: "must never be differenced"). The dollar pair comes from one
+/// pricing function and is safe. Tokens travel for display only.
 #[derive(Debug, Clone, Serialize)]
 pub struct SavingsReport {
     pub lifetime_savings_usd: f64,
     pub lifetime_tokens_saved: u64,
     pub total_input_tokens: u64,
     pub cache_read_tokens: u64,
+    /// What input actually cost, cache reads included.
+    pub total_input_cost_usd: f64,
+    /// The read DISCOUNT earned, not the read cost. Read cost = this / 9.
+    pub cache_savings_usd: f64,
     pub output_reduction_percent: Option<f64>,
     pub output_reduction_method: Option<String>,
     pub days: Vec<SavingsDay>,
@@ -1242,7 +1253,11 @@ pub struct SavingsDay {
     pub savings_usd: f64,
     pub tokens_saved: u64,
     pub tokens_sent: u64,
+    pub actual_cost_usd: f64,
     pub cache_read_tokens: Option<u64>,
+    /// None on buckets with no cache coverage; the server then has no billable
+    /// baseline for the day and reports "-" rather than a scale-mixed guess.
+    pub cache_savings_usd: Option<f64>,
     pub output_sampled_tokens_saved: Option<u64>,
     pub output_baseline_tokens: Option<u64>,
 }

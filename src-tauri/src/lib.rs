@@ -4326,6 +4326,8 @@ fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
         lifetime_tokens_saved: dashboard.lifetime_estimated_tokens_saved,
         total_input_tokens: breakdown.map(|b| b.total_input_tokens).unwrap_or(0),
         cache_read_tokens: breakdown.map(|b| b.cache_read_tokens).unwrap_or(0),
+        total_input_cost_usd: breakdown.map(|b| b.total_input_cost_usd).unwrap_or(0.0),
+        cache_savings_usd: breakdown.map(|b| b.cache_savings_usd).unwrap_or(0.0),
         output_reduction_percent: dashboard
             .output_reduction
             .as_ref()
@@ -4352,7 +4354,9 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
             savings_usd: point.estimated_savings_usd,
             tokens_saved: point.estimated_tokens_saved,
             tokens_sent: point.total_tokens_sent,
+            actual_cost_usd: point.actual_cost_usd,
             cache_read_tokens: point.cache_read_tokens,
+            cache_savings_usd: point.cache_savings_usd,
             output_sampled_tokens_saved: point.output_sampled_tokens_saved,
             output_baseline_tokens: point.output_baseline_tokens,
         })

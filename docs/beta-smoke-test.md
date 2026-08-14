@@ -14,8 +14,7 @@ Run these from a Claude Code session and report PASS / FAIL with the observed va
 
 ### 1. Version matches the new beta
 ```bash
-ls ~/Applications/Headroom.app/Contents/Info.plist >/dev/null && \
-  /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Applications/Headroom.app/Contents/Info.plist
+/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Applications/Headroom.app/Contents/Info.plist
 ```
 Expect: the `-rc.N` version you just installed.
 
@@ -183,13 +182,15 @@ Do not try to derive this from PERF `transforms=` instead. That field includes d
 The same class as check 11, one layer down: the desktop can *decide* on a flag and the live proxy never receive it. `--no-ccr` is deliberately excluded from `expected_proxy_arg_signature` in `tool_manager.rs` (a runtime too old to accept the flag would restart-loop, the same reason `--no-http2` is excluded), which means **adding it does not restart an already-running backend**. A build can ship the mitigation and run all day without it.
 
 ```bash
-PID=$(lsof -ti :6768 | head -1)
+PID=$(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)
 ps -o args= -p $PID | tr ' ' '\n' | grep -c -- '--no-ccr'
 ps eww -o command= -p $PID | grep -c 'pyinject'
 grep -c '_hd_sc_cacheable' \
   ~/Library/Application\ Support/Headroom/headroom/pyinject/sitecustomize.py
 ```
 Expect: `1` (flag live in the running process), `1` (PYTHONPATH points at the injection dir), and non-zero (the response-cache guard is in the file on disk, not just in the Rust literal). A `0` on line 1 with the flag present in `tool_manager.rs` means the backend predates the change - restart it and re-run, rather than trusting the source.
+
+Resolve the pid exactly as written. A bare `lsof -ti :6768` matches two processes - the backend that *listens* on 6768 and the desktop that holds a client connection to it - and `head -1` returns the lower pid, which is the desktop on any launch where it started first. Both counts then come back `0` and a healthy build reads as a hard FAIL (observed on the 0.8.1-rc.2 pass). `-sTCP:LISTEN` narrows it to the backend, but only when the protocol and port are a *single* selection (`-ti TCP:6768`): lsof ORs multiple `-i` arguments, so the plausible-looking `lsof -iTCP -sTCP:LISTEN -ti :6768` selects every TCP listener on the machine and `head -1` picks whatever unrelated daemon sorts first.
 
 Note the port: use the live backend port from check 9 if it fell back off `6768`.
 

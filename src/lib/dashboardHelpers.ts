@@ -114,40 +114,37 @@ export function cacheHitPair(
 }
 
 /** Canonical input-compression rate for a window of buckets: the share of the
- * COMPRESSIBLE input Headroom removed, in the requested unit. Cache reads are
- * excluded from the denominator (they bill at ~0.1x and Headroom deliberately
- * never touches the cached prefix); output shaping is never part of this rate.
+ * COMPRESSIBLE input spend Headroom removed. Cache reads are excluded from the
+ * denominator (they bill at ~0.1x and Headroom deliberately never touches the
+ * cached prefix); output shaping is never part of this rate.
  *
- * `usd` mode prices both sides with the provider's own figures: read cost is
- * recovered from the read discount (`cacheSavingsUsd / 9`) and subtracted
- * from the bucket's actual input cost. Only buckets with cache coverage
- * count, so numerator and denominator always describe the same slice; null
- * when the window has no coverage. */
+ * Always priced in dollars, whatever unit the chart is showing, because only
+ * the dollar figures are on one scale. `totalTokensSent` is our own tokenizer's
+ * count of the forwarded prompt while `cacheReadTokens` is the provider's own
+ * count of part of it -- upstream keeps them apart on purpose ("must never be
+ * differenced", proxy/outcome.py) and on 2026-08-14 a day's derived cache reads
+ * (195.8M) genuinely exceeded its forwarded input (163.4M), pinning the token
+ * form of this rate at a meaningless 100%. Read cost is recovered from the read
+ * discount (`cacheSavingsUsd / 9`) and subtracted from the bucket's actual input
+ * cost -- both from the same pricing function, so the subtraction is sound.
+ *
+ * Only buckets with cache coverage count, so numerator and denominator always
+ * describe the same slice; null when the window has no coverage. */
 export function compressibleInputSavingsRate(
   points: Array<{
-    cacheReadTokens?: number | null;
     cacheSavingsUsd?: number | null;
-    totalTokensSent: number;
-    estimatedTokensSaved: number;
     actualCostUsd: number;
     estimatedSavingsUsd: number;
-  }>,
-  mode: "usd" | "tokens"
+  }>
 ) {
   let saved = 0;
   // What survived compression and was still paid for at full input price.
   let remaining = 0;
   for (const point of points) {
-    if (point.cacheReadTokens == null) continue;
-    if (mode === "tokens") {
-      saved += Math.max(0, point.estimatedTokensSaved);
-      remaining += Math.max(0, point.totalTokensSent - point.cacheReadTokens);
-    } else {
-      if (point.cacheSavingsUsd == null) continue;
-      const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
-      saved += Math.max(0, point.estimatedSavingsUsd);
-      remaining += Math.max(0, point.actualCostUsd - readCostUsd);
-    }
+    if (point.cacheSavingsUsd == null) continue;
+    const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
+    saved += Math.max(0, point.estimatedSavingsUsd);
+    remaining += Math.max(0, point.actualCostUsd - readCostUsd);
   }
   const baseline = saved + remaining;
   if (baseline <= 0) return null;

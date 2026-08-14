@@ -402,27 +402,23 @@ describe("compressibleInputSavingsRate", () => {
     estimatedSavingsUsd: 0.5
   };
 
-  it("tokens mode: saved vs non-cached input", () => {
-    // 25 / (25 + (1000 - 900))
-    expect(compressibleInputSavingsRate([bucket], "tokens")!.pct).toBeCloseTo(20);
-  });
-
-  it("usd mode: prices reads via the discount and excludes them", () => {
+  it("prices reads via the discount and excludes them", () => {
     // 0.5 / (0.5 + (3 - 9/9))
-    expect(compressibleInputSavingsRate([bucket], "usd")!.pct).toBeCloseTo(20);
+    expect(compressibleInputSavingsRate([bucket])!.pct).toBeCloseTo(20);
   });
 
-  it("skips buckets without coverage in both modes", () => {
+  it("skips buckets without the dollar counter", () => {
     const uncovered = { ...bucket, cacheReadTokens: null, cacheSavingsUsd: null };
-    expect(compressibleInputSavingsRate([uncovered], "tokens")).toBeNull();
-    expect(compressibleInputSavingsRate([uncovered], "usd")).toBeNull();
-    expect(compressibleInputSavingsRate([bucket, uncovered], "tokens")!.pct).toBeCloseTo(20);
+    expect(compressibleInputSavingsRate([uncovered])).toBeNull();
+    expect(compressibleInputSavingsRate([bucket, uncovered])!.pct).toBeCloseTo(20);
   });
 
-  it("usd mode requires the dollar counter, tokens mode does not", () => {
-    const tokensOnly = { ...bucket, cacheSavingsUsd: null };
-    expect(compressibleInputSavingsRate([tokensOnly], "tokens")!.pct).toBeCloseTo(20);
-    expect(compressibleInputSavingsRate([tokensOnly], "usd")).toBeNull();
+  it("stays sane when provider cache reads exceed our own input count", () => {
+    // Real 2026-08-14 data: 195.8M derived cache reads against 163.4M forwarded
+    // input tokens, because the two counters use different tokenizers. The old
+    // token-based form clamped the denominator to 0 and reported 100%.
+    const skewed = { ...bucket, cacheReadTokens: 1_200, totalTokensSent: 1_000 };
+    expect(compressibleInputSavingsRate([skewed])!.pct).toBeCloseTo(20);
   });
 });
 
