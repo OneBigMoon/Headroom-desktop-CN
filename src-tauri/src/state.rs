@@ -2323,16 +2323,29 @@ impl AppState {
         if let Some(history) = history.as_ref() {
             let cutoff_date = savings_history_cutoff_date();
             let cutoff_hour = format!("{cutoff_date}T00:00");
-            let native_daily = drop_rollup_backfill(
-                history.daily_savings(),
-                daily_savings.iter().map(|p| p.date.as_str()).min(),
-                |p| p.date.as_str(),
-            );
-            let native_hourly = drop_rollup_backfill(
-                history.hourly_savings(),
-                hourly_savings.iter().map(|p| p.hour.as_str()).min(),
-                |p| p.hour.as_str(),
-            );
+            // Both drops target the same bucket -- the rollup's leading delta,
+            // measured from a zero baseline -- from different evidence, so only
+            // one may run. The parser's is exact (it can see the point cap was
+            // hit); this one is the fallback for an untrimmed history whose
+            // series still starts after the local tracker, e.g. a reset backend
+            // data dir. Running both ate a real day, and with only two buckets
+            // in the window it left nothing at all.
+            let (native_daily, native_hourly) = if history.backfill_bucket_dropped {
+                (history.daily_savings(), history.hourly_savings())
+            } else {
+                (
+                    drop_rollup_backfill(
+                        history.daily_savings(),
+                        daily_savings.iter().map(|p| p.date.as_str()).min(),
+                        |p| p.date.as_str(),
+                    ),
+                    drop_rollup_backfill(
+                        history.hourly_savings(),
+                        hourly_savings.iter().map(|p| p.hour.as_str()).min(),
+                        |p| p.hour.as_str(),
+                    ),
+                )
+            };
 
             // Lock the backend's authoritative settled rollups into the local
             // archive so they survive its history trimming and fill gaps from
@@ -5252,6 +5265,11 @@ struct HeadroomSavingsHistoryResponse {
     /// compression / output-shaping / cache-discount decomposition shown in
     /// the savings drill-down.
     lifetime: Option<crate::models::SavingsBreakdown>,
+    /// The upstream history was point-capped, so the parser already removed the
+    /// spurious against-zero leading bucket. `drop_rollup_backfill` must then
+    /// leave the series alone: applying both drops eats a real day, and with
+    /// only two buckets in the window it emptied the series outright.
+    backfill_bucket_dropped: bool,
 }
 
 impl HeadroomSavingsHistoryResponse {
@@ -5678,7 +5696,8 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
     // that slides forward as old checkpoints age out. Drop that boundary bucket
     // so the chart shows real per-bucket savings. Untrimmed histories (new
     // users) keep their genuine first bucket. Lifetime totals are unaffected.
-    if upstream_history_trimmed(&root) {
+    let backfill_bucket_dropped = upstream_history_trimmed(&root);
+    if backfill_bucket_dropped {
         drop_oldest_rollup_bucket(&mut daily);
         drop_oldest_rollup_bucket(&mut hourly);
     }
@@ -5692,6 +5711,7 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
             hourly,
             daily,
             lifetime,
+            backfill_bucket_dropped,
         })
     }
 }
@@ -9269,6 +9289,21 @@ mod tests {
         assert_eq!(parsed.daily[0].tokens_saved, 100);
         assert_eq!(parsed.hourly.len(), 1);
         assert_eq!(parsed.hourly[0].tokens_saved, 100);
+
+        // ...and the caller must be told, so drop_rollup_backfill does not take
+        // a second bite. Both target the same bucket; running both on a
+        // two-bucket window left the native series empty, so the chart silently
+        // fell back to the tracker's own partial observation for TODAY.
+        assert!(parsed.backfill_bucket_dropped);
+        let survivors = drop_rollup_backfill(
+            parsed.daily_savings(),
+            Some("2026-03-30"), // tracker long predates the series
+            |p| p.date.as_str(),
+        );
+        assert!(
+            survivors.is_empty(),
+            "guard rests on this: a second drop empties the series"
+        );
     }
 
     #[test]
