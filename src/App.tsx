@@ -7499,9 +7499,8 @@ export default function App() {
                   </div>
                 </div>
                 <p>
-                  Reverses every change Headroom made: removes the managed Python runtime and the shell
-                  hooks, and restores <code>~/.claude/settings.json</code> and{" "}
-                  <code>~/.codex/config.toml</code> changes. Headroom will quit when done.
+                  Removes Headroom and everything it changed: the runtime, its addons, your
+                  coding agent configs, and the app itself. You will see the full list first.
                 </p>
                 <button
                   className="secondary-button secondary-button--small"
@@ -7747,13 +7746,21 @@ export default function App() {
                 <h3>Uninstall Headroom?</h3>
                 <p>This will:</p>
                 <ul className="api-key-guide">
-                  <li>Strip Headroom's hook and env from <code>~/.claude/settings.json</code> and <code>settings.local.json</code></li>
+                  <li>
+                    Undo the routing config for every agent Headroom set up: Claude Code
+                    (<code>~/.claude/settings.json</code> and <code>settings.local.json</code>),
+                    Codex (<code>~/.codex/config.toml</code>), Grok Build, and OpenCode, plus
+                    the export block in your shell profile. Any base URL you had before
+                    Headroom is restored.
+                  </li>
                   <li>Delete <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code></li>
                   <li>Delete <code>~/Library/Application Support/Headroom</code> (logs, caches, setup state)</li>
                   <li>Delete <code>~/.headroom</code> (Python runtime)</li>
                   <li>Remove the LaunchAgent plist from <code>~/Library/LaunchAgents/</code> and disable the login item</li>
                   <li>Delete <code>~/Library/Preferences/com.extraheadroom.headroom*</code> and <code>~/Library/Caches/com.extraheadroom.headroom</code></li>
                   <li>Delete Headroom's keychain entries (session token plus any API keys saved by older builds)</li>
+                  <li>Remove Headroom's addons and MCP servers from your coding agents (ponytail, caveman, serena, context7, codebase-memory, MarkItDown)</li>
+                  <li>Move the Headroom app to the Trash</li>
                 </ul>
                 <p className="uninstall-note">
                   Terminals already open keep <code>ANTHROPIC_BASE_URL</code>{" "}
