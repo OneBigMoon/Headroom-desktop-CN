@@ -569,11 +569,18 @@ select {
   text-align: left;
 }
 
+/* Collapsed by default: the full config-edit detail is reassuring to the users
+   who want it and alarming to the ones who don't. */
 .install-disclosure__lead {
-  margin: 0 0 6px;
+  margin: 0;
   font-size: var(--text-xs);
   font-weight: 600;
-  opacity: 0.8;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.install-disclosure[open] .install-disclosure__lead {
+  margin-bottom: 6px;
 }
 
 .install-disclosure__list {
@@ -587,14 +594,7 @@ select {
 .install-disclosure__list li {
   font-size: var(--text-xs);
   line-height: 1.4;
-  opacity: 0.75;
-}
-
-.install-disclosure__foot {
-  margin: 8px 0 0;
-  font-size: var(--text-xs);
-  line-height: 1.35;
-  opacity: 0.65;
+  color: var(--text-muted);
 }
 
 .install-progress {
@@ -5796,7 +5796,7 @@ html.window-hiding {
   align-items: center;
   gap: 14px;
   width: 100%;
-  max-width: 420px;
+  max-width: 480px;
   padding: 28px 24px;
   text-align: center;
   border: 1px solid var(--border-default);
@@ -6137,6 +6137,29 @@ html.window-hiding {
   color: var(--accent);
   font-size: var(--text-xs);
   margin: 0;
+}
+
+/* The code row and its confirmation are injected once a code is requested;
+   fade them in so the card grows deliberately instead of snapping. */
+.paywall__auth-reveal {
+  animation: auth-reveal 180ms ease-out;
+}
+
+@keyframes auth-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .paywall__auth-reveal {
+    animation: none;
+  }
 }
 
 .paywall__plans {

@@ -2,7 +2,7 @@
 // same form renders inside TermsGate (paywall-first onboarding) and the
 // launcher paywall stage without duplicating auth logic.
 export interface AuthCodeFormProps {
-  lead: string;
+  lead?: string;
   email: string;
   onEmailChange: (value: string) => void;
   emailValid: boolean;
@@ -34,7 +34,7 @@ export function AuthCodeForm({
 }: AuthCodeFormProps) {
   return (
     <div className="paywall__auth soft-card">
-      <p className="paywall__auth-lead">{lead}</p>
+      {lead ? <p className="paywall__auth-lead">{lead}</p> : null}
       <div className="paywall__auth-row">
         <input
           className="paywall__auth-input"
@@ -53,8 +53,9 @@ export function AuthCodeForm({
         </button>
       </div>
       {codeRequested ? (
-        <div className="paywall__auth-row">
+        <div className="paywall__auth-row paywall__auth-reveal">
           <input
+            autoFocus
             className="paywall__auth-input"
             onChange={(event) => onCodeChange(event.target.value)}
             placeholder="6-digit code"
@@ -71,7 +72,9 @@ export function AuthCodeForm({
         </div>
       ) : null}
       {error ? <p className="install-progress__error">{error}</p> : null}
-      {success && !error ? <p className="paywall__auth-success">{success}</p> : null}
+      {success && !error ? (
+        <p className="paywall__auth-success paywall__auth-reveal">{success}</p>
+      ) : null}
     </div>
   );
 }

@@ -4569,7 +4569,6 @@ export default function App() {
               </p>
             ) : (
               <AuthCodeForm
-                lead="Enter your email."
                 email={authEmail}
                 onEmailChange={setAuthEmail}
                 emailValid={authEmailValid}
@@ -4887,7 +4886,7 @@ export default function App() {
           <article>
             <strong>Privacy first</strong>
             <p>
-              Your prompts never touch our servers — everything runs locally on your machine.
+              Your prompts never touch our servers. Everything runs locally on your machine.
             </p>
           </article>
           <article>
@@ -4935,7 +4934,10 @@ export default function App() {
         ) : (
           <>
             {!bootstrapping && (
-              <p className="install-pre-notice">Takes a minute or two to install.</p>
+              <p className="install-pre-notice">
+                Takes 2-3 minutes to install all tools and configure your installed coding
+                agents to work with Headroom.
+              </p>
             )}
             <button
               className="primary-button primary-button--large primary-button--install"
@@ -4950,8 +4952,10 @@ export default function App() {
                   : "Install Headroom"}
             </button>
             {!bootstrapping && (
-              <div className="install-disclosure">
-                <p className="install-disclosure__lead">Clicking Install will:</p>
+              <details className="install-disclosure">
+                <summary className="install-disclosure__lead">
+                  See exactly what Install changes
+                </summary>
                 <ul className="install-disclosure__list">
                   <li>
                     Download a self-contained Python runtime (~2 GB) to <code>~/.headroom</code>.
@@ -4965,7 +4969,7 @@ export default function App() {
                     backup is written before any edit.
                   </li>
                 </ul>
-              </div>
+              </details>
             )}
           </>
         )}
