@@ -564,39 +564,6 @@ select {
   line-height: 1.28;
 }
 
-.install-disclosure {
-  margin: 4px 0 0;
-  text-align: left;
-}
-
-/* Collapsed by default: the full config-edit detail is reassuring to the users
-   who want it and alarming to the ones who don't. */
-.install-disclosure__lead {
-  margin: 0;
-  font-size: var(--text-xs);
-  font-weight: 600;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-
-.install-disclosure[open] .install-disclosure__lead {
-  margin-bottom: 6px;
-}
-
-.install-disclosure__list {
-  margin: 0;
-  padding-left: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.install-disclosure__list li {
-  font-size: var(--text-xs);
-  line-height: 1.4;
-  color: var(--text-muted);
-}
-
 .install-progress {
   margin-top: 14px;
   padding: 0;

@@ -4951,26 +4951,6 @@ export default function App() {
                   ? "Try again"
                   : "Install Headroom"}
             </button>
-            {!bootstrapping && (
-              <details className="install-disclosure">
-                <summary className="install-disclosure__lead">
-                  See exactly what Install changes
-                </summary>
-                <ul className="install-disclosure__list">
-                  <li>
-                    Download a self-contained Python runtime (~2 GB) to <code>~/.headroom</code>.
-                    Your system Python is untouched.
-                  </li>
-                  <li>
-                    Point your installed coding CLIs at Headroom: Claude Code via{" "}
-                    <code>ANTHROPIC_BASE_URL</code> in your shell profile and{" "}
-                    <code>~/.claude/settings.json</code>, and Codex via <code>OPENAI_BASE_URL</code>{" "}
-                    and a managed provider block in <code>~/.codex/config.toml</code>. A timestamped
-                    backup is written before any edit.
-                  </li>
-                </ul>
-              </details>
-            )}
           </>
         )}
         <div className="install-progress-shell">
