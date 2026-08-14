@@ -4352,6 +4352,7 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
         .map(|point| pricing::SavingsDay {
             date: point.date.clone(),
             savings_usd: point.estimated_savings_usd,
+            output_savings_usd: point.output_savings_usd,
             tokens_saved: point.estimated_tokens_saved,
             tokens_sent: point.total_tokens_sent,
             actual_cost_usd: point.actual_cost_usd,

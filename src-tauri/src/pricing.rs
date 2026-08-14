@@ -1250,7 +1250,11 @@ pub struct SavingsReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct SavingsDay {
     pub date: String,
+    /// Input compression only. The app's chart headline sums this WITH
+    /// `output_savings_usd` (both Headroom layers), so the server has to carry
+    /// them separately to show the same total and still rate the input layer.
     pub savings_usd: f64,
+    pub output_savings_usd: f64,
     pub tokens_saved: u64,
     pub tokens_sent: u64,
     pub actual_cost_usd: f64,
