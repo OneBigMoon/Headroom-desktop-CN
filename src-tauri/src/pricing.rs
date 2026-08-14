@@ -31,6 +31,10 @@ const AUTH_CODE_EXPIRY_SECONDS: u64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalPricingState {
+    // Defaulted like every sibling: without this, one field added or removed in
+    // a future build fails the whole parse, and the fallback below restarts the
+    // grace clock from now for every existing user.
+    #[serde(default = "Utc::now")]
     first_seen_at: DateTime<Utc>,
     #[serde(default)]
     reconcile_with_server: bool,
@@ -635,14 +639,28 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
             let envelope_result = fetch_remote_account(token, &identity);
             let promo = envelope_result
                 .as_ref()
-                .map(|e| build_promo(e.active_percent_off, &e.pricing_ladder, &e.intro_offer, &e.plan_prices))
+                .map(|e| {
+                    build_promo(
+                        e.active_percent_off,
+                        &e.pricing_ladder,
+                        &e.intro_offer,
+                        &e.plan_prices,
+                    )
+                })
                 .unwrap_or_default();
             let account_result = envelope_result.map(|e| e.account);
             let (auth, acc, err) = merge_background_account_sync(Some(token), account_result);
             (auth, acc, err, promo)
         } else {
             let promo = fetch_public_config()
-                .map(|c| build_promo(c.active_percent_off, &c.pricing_ladder, &c.intro_offer, &c.plan_prices))
+                .map(|c| {
+                    build_promo(
+                        c.active_percent_off,
+                        &c.pricing_ladder,
+                        &c.intro_offer,
+                        &c.plan_prices,
+                    )
+                })
                 .unwrap_or_default();
             (false, None, None, promo)
         };
@@ -1199,10 +1217,40 @@ pub(crate) fn activate_account_with_base_url(
     ))
 }
 
+/// Lifetime + recent-daily savings facts for the admin profile, sent alongside
+/// the milestone/heartbeat post. Raw counters only: the server owns the single
+/// copy of the rate formulas. `output_reduction_percent` is the exception --
+/// it is a counterfactual estimate produced by the shaper's own estimator, not
+/// something recomputable from counters, so it travels with its method label.
+///
+/// snake_case on purpose (Rails params), unlike the camelCase view models in
+/// `models.rs`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavingsReport {
+    pub lifetime_savings_usd: f64,
+    pub lifetime_tokens_saved: u64,
+    pub total_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_reduction_percent: Option<f64>,
+    pub output_reduction_method: Option<String>,
+    pub days: Vec<SavingsDay>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SavingsDay {
+    pub date: String,
+    pub savings_usd: f64,
+    pub tokens_saved: u64,
+    pub tokens_sent: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_baseline_tokens: Option<u64>,
+}
+
 /// Fire-and-forget: reports a milestone to the server so it can trigger
 /// the feedback email for users who were below the threshold at sign-up.
 /// Silently no-ops if the user is not signed in or the request fails.
-pub fn report_milestone(milestone_tokens_saved: u64) {
+pub fn report_milestone(milestone_tokens_saved: u64, savings: Option<&SavingsReport>) {
     let token = match read_session_token() {
         Ok(Some(t)) => t,
         _ => return,
@@ -1217,7 +1265,10 @@ pub fn report_milestone(milestone_tokens_saved: u64) {
         .header("Authorization", format!("Bearer {token}"));
     let _ = identity
         .apply_headers(builder)
-        .json(&serde_json::json!({ "milestone_tokens_saved": milestone_tokens_saved }))
+        .json(&serde_json::json!({
+            "milestone_tokens_saved": milestone_tokens_saved,
+            "savings": savings,
+        }))
         .send();
 }
 
@@ -2765,8 +2816,15 @@ pub fn refresh_paywall_first_flag() {
 fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let path = local_state_path();
     if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(state) = serde_json::from_slice::<LocalPricingState>(&bytes) {
-            return Ok(state);
+        match serde_json::from_slice::<LocalPricingState>(&bytes) {
+            Ok(state) => return Ok(state),
+            // Only reachable now for a truncated/non-JSON file: every field
+            // defaults, so a schema change alone parses. write_local_state
+            // below would overwrite it, so keep a copy first.
+            Err(err) => crate::client_adapters::quarantine_unparsable(
+                &path,
+                &format!("pricing state: {err}"),
+            ),
         }
     }
 
@@ -3092,6 +3150,27 @@ mod tests {
         let back: LocalPricingState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.paywall_first, Some(true));
         assert_eq!(back.first_seen_at, state.first_seen_at);
+    }
+
+    #[test]
+    fn local_pricing_state_survives_schema_drift_in_either_direction() {
+        // A newer build writes a field this build doesn't know: must be
+        // ignored, not fail the parse. (Failing would reset first_seen_at and
+        // hand the user a fresh 72h grace window on every launch.)
+        let newer = r#"{"first_seen_at":"2026-01-01T00:00:00Z","paywall_first":true,"some_future_flag":42}"#;
+        let state: LocalPricingState = serde_json::from_str(newer).unwrap();
+        assert_eq!(
+            state.first_seen_at.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+        assert_eq!(state.paywall_first, Some(true));
+
+        // And a build that drops/renames first_seen_at must still salvage the
+        // remaining fields rather than erroring out to the reset path.
+        let dropped = r#"{"paywall_first":false,"reconcile_with_server":true}"#;
+        let state: LocalPricingState = serde_json::from_str(dropped).unwrap();
+        assert_eq!(state.paywall_first, Some(false));
+        assert!(state.reconcile_with_server);
     }
 
     #[allow(clippy::too_many_arguments)]

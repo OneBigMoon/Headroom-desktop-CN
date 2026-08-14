@@ -6,6 +6,7 @@ import {
   __resetSetupStallThrottle,
   evaluateSetupStall,
   maybeFireSetupStallAlert,
+  setupStallBannerLine,
   setupStallNoTrafficMinutes,
   SETUP_STALL_NO_SAVINGS_AFTER_MS,
   SETUP_STALL_NO_SAVINGS_MIN_REQUESTS,
@@ -374,5 +375,79 @@ describe("maybeFireSetupStallAlert", () => {
 
     expect(await maybeFireSetupStallAlert(busyDashboard(), PAST_WINDOW)).not.toBeNull();
     expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("setupStallBannerLine", () => {
+  // The banner only speaks up on a return launch: a first run is allowed to be
+  // quiet because the user may simply not have opened a terminal yet.
+  function returning(overrides: Partial<DashboardState> = {}): DashboardState {
+    return stalledDashboard({ launchExperience: "dashboard", ...overrides });
+  }
+
+  it("stays quiet on a first run no matter how long the app has been up", () => {
+    expect(setupStallBannerLine(stalledDashboard(), PAST_WINDOW)).toBeNull();
+  });
+
+  it("stays quiet during boot on a return launch", () => {
+    expect(setupStallBannerLine(returning(), SETUP_STALL_NO_TRAFFIC_AFTER_MS - 1)).toBeNull();
+  });
+
+  it("names the pre-Headroom environment when no request has ever arrived", () => {
+    expect(setupStallBannerLine(returning(), PAST_WINDOW)).toContain("pre-Headroom settings");
+  });
+
+  // The modal requires an unverified connector, which keeps it silent when a
+  // connector's config verifies but traffic never actually flows. The banner
+  // must still speak, so a fully verified connector cannot suppress it.
+  it("speaks even when every connector reports verified", () => {
+    const verified = [connector({ verified: true })];
+    expect(evaluateSetupStall(returning(), PAST_WINDOW, { connectors: verified })).toBeNull();
+    expect(setupStallBannerLine(returning(), PAST_WINDOW, { connectors: verified })).not.toBeNull();
+  });
+
+  it("reports unoptimized traffic once enough requests have arrived", () => {
+    const line = setupStallBannerLine(
+      returning({ lifetimeRequests: SETUP_STALL_NO_SAVINGS_MIN_REQUESTS }),
+      SETUP_STALL_NO_SAVINGS_AFTER_MS + 1_000
+    );
+    expect(line).toContain("none are being optimized");
+  });
+
+  it("waits for volume before blaming the setup on a couple of requests", () => {
+    expect(
+      setupStallBannerLine(
+        returning({ lifetimeRequests: SETUP_STALL_NO_SAVINGS_MIN_REQUESTS - 1 }),
+        PAST_WINDOW
+      )
+    ).toBeNull();
+  });
+
+  it("retires once any savings exist", () => {
+    expect(
+      setupStallBannerLine(returning({ lifetimeEstimatedTokensSaved: 1 }), PAST_WINDOW)
+    ).toBeNull();
+    expect(
+      setupStallBannerLine(returning({ lifetimeEstimatedSavingsUsd: 0.01 }), PAST_WINDOW)
+    ).toBeNull();
+  });
+
+  it("says nothing when a gate is what is blocking optimization", () => {
+    expect(
+      setupStallBannerLine(returning(), PAST_WINDOW, { optimizationBlocked: true })
+    ).toBeNull();
+  });
+
+  it("says nothing while the install is still half-finished", () => {
+    expect(setupStallBannerLine(returning({ bootstrapComplete: false }), PAST_WINDOW)).toBeNull();
+    expect(
+      setupStallBannerLine(returning({ pythonRuntimeInstalled: false }), PAST_WINDOW)
+    ).toBeNull();
+  });
+
+  it("honours the debug override so the copy can be eyeballed", () => {
+    expect(setupStallBannerLine(returning(), 0, { forceKind: "no_savings" })).toContain(
+      "none are being optimized"
+    );
   });
 });

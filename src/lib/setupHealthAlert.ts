@@ -63,6 +63,16 @@ function stallBody(kind: SetupStallKind): string {
   return "Requests are reaching Headroom but none are being optimized. Something is likely misconfigured. Open Headroom to check.";
 }
 
+/// In-app phrasing of the same two failures. `stallBody` above is written for a
+/// native notification and ends with "Open Headroom to check", which reads as
+/// nonsense on a banner inside Headroom.
+function stallBannerBody(kind: SetupStallKind): string {
+  if (kind === "no_traffic") {
+    return "No request has come through Headroom yet. Your terminal or editor is probably still running with its pre-Headroom settings - restart it and they should pick the new settings up.";
+  }
+  return "Requests are reaching Headroom but none are being optimized, so nothing is being saved yet. Check that your coding tool is still connected below.";
+}
+
 export interface SetupStallContext {
   /// True when the account gate has optimization switched off (unpaid plan,
   /// signed out, weekly cap hit). Zero savings is the expected outcome then,
@@ -147,6 +157,67 @@ export function evaluateSetupStall(
     return null;
   }
   return { kind: "no_savings", title: STALL_TITLE, body: stallBody("no_savings") };
+}
+
+/// Line for the always-on Home banner, which otherwise reassures a user with
+/// zero savings to "check back later" - the wrong thing to tell someone whose
+/// install has never seen a request. Returns null when there is nothing honest
+/// to say, in which case the caller keeps the existing copy.
+///
+/// Deliberately NOT `evaluateSetupStall`: that one gates `no_traffic` behind
+/// `hasUnverifiedConnector`, so it stays silent when a connector verifies (its
+/// config is present) yet traffic never actually arrives. That silent state is
+/// the one we most need to surface. A passive banner line can carry that risk
+/// where the interrupting modal could not, so this drops the predicate and
+/// leans on the launch/lifetime gates below instead.
+///
+/// `uptimeMs` is time since THIS app run started, not since install (Headroom
+/// can autostart at login), so it cannot express "a while with nothing
+/// happening" on its own. `launchExperience` and `lifetimeRequests` both
+/// survive a restart, and together they do: not the first launch, and not one
+/// request in the install's entire history.
+export function setupStallBannerLine(
+  dashboard: DashboardState,
+  uptimeMs: number,
+  context: SetupStallContext = {}
+): string | null {
+  if (context.forceKind) {
+    return stallBannerBody(context.forceKind);
+  }
+  // A first run is allowed to be quiet: the user may simply not have opened a
+  // terminal yet, and the install flow has its own progress UI.
+  if (dashboard.launchExperience === "first_run") {
+    return null;
+  }
+  if (!dashboard.bootstrapComplete || !dashboard.pythonRuntimeInstalled) {
+    return null;
+  }
+  if (needsTermsAcceptance(dashboard.requiredTermsVersion, dashboard.acceptedTermsVersion)) {
+    return null;
+  }
+  // Zero savings is the expected outcome behind a gate and says nothing about
+  // the setup, same reasoning as evaluateSetupStall.
+  if (context.optimizationBlocked) {
+    return null;
+  }
+  const savingsRecorded =
+    dashboard.lifetimeEstimatedTokensSaved > 0 || dashboard.lifetimeEstimatedSavingsUsd > 0;
+  if (savingsRecorded) {
+    return null;
+  }
+
+  if (dashboard.lifetimeRequests === 0) {
+    // Do not accuse anything during boot.
+    return uptimeMs < SETUP_STALL_NO_TRAFFIC_AFTER_MS ? null : stallBannerBody("no_traffic");
+  }
+
+  if (
+    dashboard.lifetimeRequests < SETUP_STALL_NO_SAVINGS_MIN_REQUESTS ||
+    uptimeMs < SETUP_STALL_NO_SAVINGS_AFTER_MS
+  ) {
+    return null;
+  }
+  return stallBannerBody("no_savings");
 }
 
 /// Fire the alert at most once per local day, and never once savings exist.

@@ -162,6 +162,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The pip final-failure warn embeds pip's stderr tail, so message-based
+    // grouping opened a fresh issue per tail for one underlying failure
+    // (RUST-6M/6N/6P, all the same half-built venv). It reaches Sentry via the
+    // per-category fingerprinted capture at the emit site instead.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("pip install attempt ")
+        && msg.contains("failed (final)")
+    {
+        return true;
+    }
     // Ad-hoc codesign of venv native extensions is best-effort (EDR nicety):
     // codesign exits non-zero when a single .so can't be re-signed, but the
     // rest are signed and the smoke test is the real gate. A per-file failure
@@ -458,6 +468,27 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
             "some other proxy_intercept warning"
+        ));
+    }
+
+    #[test]
+    fn skips_bridged_pip_final_failure_warning() {
+        // RUST-6M/6N/6P: the stderr tail is in the message, so message-based
+        // grouping opened a new issue per tail. The per-category fingerprinted
+        // capture at the emit site is the Sentry path.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "pip install attempt 3/3 failed (final): exit=1; stderr tail: Check the permissions."
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "pip install attempt 3/3 failed (final): exit=1; stderr tail: No module named pip"
+        ));
+        // The retry line is log::info (never bridged) and any other pip warn
+        // still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "pip install produced no usable venv"
         ));
     }
 

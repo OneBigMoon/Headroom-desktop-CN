@@ -63,6 +63,7 @@ import {
 } from "./lib/urgentNotifications";
 import {
   maybeFireSetupStallAlert,
+  setupStallBannerLine,
   SETUP_STALL_CHECK_INTERVAL_MS,
   SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
@@ -1597,6 +1598,9 @@ export default function App() {
   // record. Held in state (not rendered immediately) so the modal is waiting
   // whenever the user next opens the tray, rather than stealing focus.
   const [setupStall, setSetupStall] = useState<SetupStallAlert | null>(null);
+  // Same signals as the modal above, but for the always-on Home banner, whose
+  // default copy tells a user with zero savings to check back later.
+  const [stallBannerLine, setStallBannerLine] = useState<string | null>(null);
   const [debugOverrides, setDebugOverrides] = useState<DebugOverrides | null>(null);
   const [connectors, setConnectors] = useState<ClientConnectorStatus[]>([]);
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
@@ -2557,6 +2561,9 @@ export default function App() {
     // Forced runs are for eyeballing the modal, so they ignore the "already
     // earning savings" retirement that would otherwise never let it show.
     if (!forcedSetupStall && savingsEverRecorded) {
+      // Savings have landed: retire the banner line too, or it would stick at
+      // whatever it last said once this effect stops running.
+      setStallBannerLine(null);
       return;
     }
 
@@ -2576,6 +2583,15 @@ export default function App() {
         return;
       }
       applyDashboardIfChanged(latest);
+      // Banner first: it is a passive line with its own (wider) gates, and it
+      // must not depend on the modal's once-per-day throttle below.
+      setStallBannerLine(
+        setupStallBannerLine(latest, uptimeMs, {
+          optimizationBlocked: optimizationBlockedRef.current,
+          connectors: connectorsRef.current,
+          forceKind: forcedSetupStall,
+        })
+      );
       const alert = await maybeFireSetupStallAlert(latest, uptimeMs, {
         optimizationBlocked: optimizationBlockedRef.current,
         connectors: connectorsRef.current,
@@ -6140,7 +6156,13 @@ export default function App() {
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
-                  <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>
+                  stallBannerLine ? (
+                    // Nothing has ever been saved on this install, so the
+                    // reassuring "check back later" below would be a lie.
+                    <p className="callout-banner__subtitle">{stallBannerLine}</p>
+                  ) : (
+                    <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>
+                  )
                 )}
                 {(calloutBanner.tone === "auto-paused" || calloutBanner.tone === "paused") && (
                   <div className="callout-banner__resume">

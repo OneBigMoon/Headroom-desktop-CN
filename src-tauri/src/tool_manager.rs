@@ -7876,7 +7876,13 @@ fn compact_pip_failure(err: &anyhow::Error) -> String {
     };
     let trimmed = source.trim_end();
     let tail = if trimmed.len() > TAIL_BUDGET {
-        let start = trimmed.len() - TAIL_BUDGET;
+        // Byte offset, so walk forward to a char boundary before slicing:
+        // pip on a non-English Windows locale emits multi-byte stderr and
+        // `&trimmed[start..]` would panic mid-character.
+        let mut start = trimmed.len() - TAIL_BUDGET;
+        while !trimmed.is_char_boundary(start) {
+            start += 1;
+        }
         let aligned = trimmed[start..]
             .find('\n')
             .map(|i| start + i + 1)
@@ -7890,6 +7896,46 @@ fn compact_pip_failure(err: &anyhow::Error) -> String {
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".into());
     format!("exit={exit}; stderr tail: {tail}")
+}
+
+/// Coarse cause class for a pip failure, used as the Sentry fingerprint.
+///
+/// The compact message embeds pip's stderr tail, and Sentry groups bridged log
+/// lines by message text — so every distinct tail opened its own issue for what
+/// is one failure (RUST-6M/6N/6P were all the same machine's half-built venv).
+/// One flat bucket would be the opposite mistake: resolving a shipped fix would
+/// regress the instant an unrelated cause reappeared (RUST-5Q). These classes
+/// match the buckets triage already sorts these into by hand.
+fn pip_failure_category(compact: &str) -> &'static str {
+    let lower = compact.to_ascii_lowercase();
+    if lower.contains("no module named pip") {
+        "no-pip"
+    } else if lower.contains("no usable temporary directory") {
+        "no-tempdir"
+    } else if crate::is_disk_full_signal(&lower) {
+        "disk-full"
+    } else if lower.contains("permission denied")
+        || lower.contains("check the permissions")
+        || lower.contains("access is denied")
+        || lower.contains("errno 13")
+    {
+        "permission"
+    } else if lower.contains("no such file or directory") || lower.contains("errno 2") {
+        "missing-file"
+    } else if lower.contains("failed building wheel")
+        || lower.contains("microsoft visual c++")
+        || lower.contains("error: subprocess-exited-with-error")
+    {
+        "build"
+    } else if lower.contains("could not fetch url")
+        || lower.contains("connection")
+        || lower.contains("timed out")
+        || lower.contains("temporary failure in name resolution")
+    {
+        "network"
+    } else {
+        "other"
+    }
 }
 
 /// Streaming variant of `run_pip_install_with_retries`. Each line emitted by
@@ -7937,6 +7983,24 @@ where
                             MAX_ATTEMPTS
                         );
                     } else {
+                        // Explicit per-category fingerprint; the bridged warn is
+                        // local-only (skip_sentry rule) so this doesn't double-
+                        // report. See `pip_failure_category`.
+                        let category = pip_failure_category(&compact);
+                        sentry::with_scope(
+                            |scope| {
+                                scope.set_fingerprint(Some(&["pip-install-failed", category]));
+                            },
+                            || {
+                                sentry::capture_message(
+                                    &format!(
+                                        "pip install failed after {MAX_ATTEMPTS} attempts \
+                                         [{category}]: {compact}"
+                                    ),
+                                    sentry::Level::Warning,
+                                );
+                            },
+                        );
                         log::warn!(
                             "pip install attempt {}/{} failed (final): {}",
                             attempt,
@@ -8274,13 +8338,13 @@ mod tests {
     use super::rotate_log_if_large;
     use super::{
         apply_serena_gitignore, bootstrap_requirements_lock_for_target,
-        classify_kompress_prefetch_failure, diagnose_proxy_port,
+        classify_kompress_prefetch_failure, compact_pip_failure, diagnose_proxy_port,
         extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, pending_addon_update, pinned_headroom_release,
+        path_with_binary_dir, pending_addon_update, pinned_headroom_release, pip_failure_category,
         pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
@@ -11701,5 +11765,61 @@ exit 0
             .collect();
         assert!(names.iter().any(|n| n.contains(".headroom-backup-")));
         assert!(!names.iter().any(|n| n.ends_with(".headroom-tmp")));
+    }
+
+    fn pip_failure(stderr: &str) -> anyhow::Error {
+        anyhow::Error::new(CommandFailure {
+            program: "python".into(),
+            args: vec!["-m".into(), "pip".into(), "install".into()],
+            stdout: String::new(),
+            stderr: stderr.into(),
+            exit_code: Some(1),
+            signal: None,
+        })
+    }
+
+    #[test]
+    fn compact_pip_failure_survives_multibyte_stderr() {
+        // Non-English Windows locale: the 300-byte tail offset lands mid-
+        // character, which used to panic on the slice.
+        let stderr = "エラー: パッケージをインストールできませんでした。".repeat(20);
+        let compact = compact_pip_failure(&pip_failure(&stderr));
+        assert!(compact.starts_with("exit=1; stderr tail: "));
+        assert!(compact.contains("エラー"));
+    }
+
+    #[test]
+    fn pip_failure_category_splits_the_buckets_triage_uses() {
+        // One issue per cause class, not per stderr tail (RUST-6M/6N/6P) and
+        // not one flat grab-bag (RUST-5Q).
+        let cases = [
+            ("exit=1; stderr tail: No module named pip", "no-pip"),
+            (
+                "exit=1; stderr tail: FileNotFoundError: [Errno 2] No usable temporary directory",
+                "no-tempdir",
+            ),
+            (
+                "exit=1; stderr tail: OSError: [Errno 28] No space left on device",
+                "disk-full",
+            ),
+            ("exit=1; stderr tail: Check the permissions.", "permission"),
+            (
+                "exit=1; stderr tail: ERROR: Could not install packages due to an OSError: \
+                 [Errno 2] No such file or directory: 'C:\\\\...\\\\INSTALLERvp0i8uew.tmp'",
+                "missing-file",
+            ),
+            (
+                "exit=1; stderr tail: ERROR: Failed building wheel for hnswlib",
+                "build",
+            ),
+            (
+                "exit=1; stderr tail: Could not fetch URL https://pypi.org/simple/",
+                "network",
+            ),
+            ("exit=1; stderr tail: something new", "other"),
+        ];
+        for (compact, expected) in cases {
+            assert_eq!(pip_failure_category(compact), expected, "for: {compact}");
+        }
     }
 }

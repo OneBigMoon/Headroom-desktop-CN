@@ -10,7 +10,7 @@ After installing a new beta (`-rc.N`) build, paste this file into Claude Code an
 
 ## Checks (Claude Code pass)
 
-Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 8, 9, and 10 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Check 14 has a step that must run **before** you install the rc - read it first. Checks 1, 5, 8, 9, 10, 11, 12, 14, and 15 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new beta
 ```bash
@@ -95,6 +95,14 @@ The desktop ships its own Python venv and `headroom` CLI; if either is broken, t
 ```
 Expect: a `headroom, version X.Y.Z` line and a path under `.../runtime/venv/lib/python3.12/site-packages/headroom/__init__.py`. No `ModuleNotFoundError`, no `pydantic-core` mismatch traceback (see `extract_required_pydantic_core_version` in `tool_manager.rs` for the exact failure mode).
 
+Addons share that venv, so a wheel bump can resolve a transitive dependency out from under one of them without touching `headroom` itself. Each pinned addon's receipt must still match what its artifact actually reports - the update logic compares the receipt against the pin, so a stale receipt makes it offer (or withhold) an update on a false premise:
+```bash
+R=~/Library/Application\ Support/Headroom/headroom
+echo "receipt: $(jq -r .version "$R/tools/markitdown.json")  artifact: $("$R/bin/markitdown" --version)"
+jq -r '.plugins | to_entries[] | "\(.key): \(.value[0].version // "?")"' ~/.claude/plugins/installed_plugins.json
+```
+Expect: the two markitdown versions are equal, and each plugin resolves to a version string. Plugin addons (ponytail, caveman) are the deliberate exception - `PLUGIN_DISPLAY_VERSION` is the literal `latest`, they track a marketplace rather than a pin, and `installed_addon_version` reads `installed_plugins.json` rather than the receipt. A plugin receipt lagging the installed version is therefore expected and not a failure; only the pinned addons (markitdown, serena, context7, codebase-memory) must agree.
+
 ### 9. Backend port fallback when 6768 is held
 The desktop's internal proxy port (default `6768`) can be claimed by other macOS processes — most often `rapportd` at login. The desktop should scan `6769..=6790` and pick a free one instead of failing.
 
@@ -142,6 +150,119 @@ security find-generic-password -s com.extraheadroom.headroom.account -a session-
 test -f ~/Library/Application\ Support/Headroom/config/headroom-pricing-state.json && jq -e '.first_seen_at' ~/Library/Application\ Support/Headroom/config/headroom-pricing-state.json
 ```
 Expect: if the build is supposed to be signed in, line 1 reports `signed in`; line 2 prints a non-null `first_seen_at` timestamp. A signed-in build that flips to `not signed in` after relaunch is a regression — keychain access is broken or the token was wiped.
+
+### 11. Computed transforms actually reached the wire
+
+Checks 2 and 7 confirm the proxy *reports* savings. They cannot tell you the optimized body was the one sent - the proxy can compress a request, log the savings, and then forward the client's original bytes. This is the failure class behind the `API returned an empty or malformed response (HTTP 200)` incident on 2026-08-13 (upstream #2952/#2953) and the wider silent-discard bug (#2990). It is invisible in `/stats`, on the dashboard, and in `activity-facts.json`, because every one of those reads the *pre-send* accounting.
+
+The proxy log settles it on a single line. `source=` is the bytes actually forwarded and `mutation_reasons=` is what the pipeline changed, so `body_mutated=true ... source=passthrough` is a literal contradiction: work was done and the original bytes went out anyway.
+
+**11a. The empty-200 class must be gone (hard FAIL).** Scope to the *current* log - rotated logs still hold pre-fix history and will report non-zero forever.
+```bash
+grep -c 'ccr_streaming_retrieve_buffered[^ ]* source=passthrough' \
+  ~/.headroom/logs/proxy.log
+```
+Expect: `0`. Anything above zero means a streaming CCR request forwarded `stream:true` bytes on a buffered path, and the client is about to receive an unparseable, unretryable 200. Verified discriminating: `0` on the current log, `6` across the pre-fix rotated logs.
+
+**11b. General discard rate (regression watch, not yet a FAIL).**
+```bash
+grep -c 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log
+grep 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log \
+  | sed -n 's/.*mutation_reasons=\([^ ]*\).*/\1/p' | tr ',' '\n' | sort | uniq -c
+```
+Expect *today*: non-zero, listing only `output_shaper` and/or `image_compression`. That is upstream #2990 - on any turn whose history carries a signed `thinking` block, `select_outbound_body` forwards client bytes and discards every mutation, while PERF still counts them as delivered. Baseline observed on 0.8.1-rc.1 / headroom-ai 0.35.0: ~2,900 `output_shaper` and ~765 `image_compression` discards across ~6,400 outbound requests.
+
+Two things make this a FAIL rather than a known-issue note:
+- any reason appearing that is **not** `output_shaper` / `image_compression` - a new transform just joined the silent-discard set;
+- a **non-zero count at all**, once a wheel bump lands upstream PR #3015. Delete this paragraph and promote 11b to "expect `0`" at that bump.
+
+Do not try to derive this from PERF `transforms=` instead. That field includes detector-only and no-op entries (`router:noop`, `router:protected:error_output`), so joining it against `source=` reports ~1,100 false positives per log file. `mutation_reasons` is only written when the body actually changed.
+
+### 12. The running proxy has the flags and patches the desktop configured
+
+The same class as check 11, one layer down: the desktop can *decide* on a flag and the live proxy never receive it. `--no-ccr` is deliberately excluded from `expected_proxy_arg_signature` in `tool_manager.rs` (a runtime too old to accept the flag would restart-loop, the same reason `--no-http2` is excluded), which means **adding it does not restart an already-running backend**. A build can ship the mitigation and run all day without it.
+
+```bash
+PID=$(lsof -ti :6768 | head -1)
+ps -o args= -p $PID | tr ' ' '\n' | grep -c -- '--no-ccr'
+ps eww -o command= -p $PID | grep -c 'pyinject'
+grep -c '_hd_sc_cacheable' \
+  ~/Library/Application\ Support/Headroom/headroom/pyinject/sitecustomize.py
+```
+Expect: `1` (flag live in the running process), `1` (PYTHONPATH points at the injection dir), and non-zero (the response-cache guard is in the file on disk, not just in the Rust literal). A `0` on line 1 with the flag present in `tool_manager.rs` means the backend predates the change - restart it and re-run, rather than trusting the source.
+
+Note the port: use the live backend port from check 9 if it fell back off `6768`.
+
+The definitive probe of whether `sitecustomize.py` was actually *imported* (rather than merely present and on the path) is `kill -USR1 $PID`, which the injected code turns into a faulthandler thread dump in the proxy log. **It is destructive when it fails**: if injection did not happen, Python has no SIGUSR1 handler and the OS default terminates the proxy. That is an acceptable trade on a beta box - the signal is unambiguous either way and the restart is cheap - but do not run it against a session you care about.
+
+### 13. No request was billed for a response the client could not use
+
+The response-side half of check 11. A request can be optimized, accounted, and still hand the client something unusable - the proxy records a 200 and moves on. Two signatures, both one-liners, both scoped to the current log:
+
+```bash
+grep -c 'PERF model=claude-[^ ]* .*tok_out=0 ' ~/.headroom/logs/proxy.log
+grep -c 'response_cache_store_refused' ~/.headroom/logs/proxy.log
+```
+Expect: `0` and `0`.
+
+Line 1 is a real generating model that produced no output tokens - the client-visible shape of the empty-200 bug. Requiring `model=claude-` is what makes it usable: `passthrough:count_tokens` requests legitimately report `tok_out=0` and would otherwise swamp the count. Verified discriminating: `0` on the current log, `20` on the pre-fix rotated log, 28 across all history.
+
+Line 2 is the desktop's own `SemanticCache.set` guard in `SITECUSTOMIZE_PY` refusing to store a body that is empty, non-JSON, or an error envelope. It has never fired in ~6,400 requests, which is the point: `0` is healthy, and any non-zero means the runtime is producing bodies bad enough that the semantic cache would have replayed them for the full 1h TTL. Treat a hit as a wheel-bump regression and read the surrounding request, not as the guard doing routine work.
+
+If the cache ever does replay a poisoned body, the signature is a `/v1/messages` 200 in under 20ms with `tok_out=0`:
+```bash
+grep 'PERF model=claude-' ~/.headroom/logs/proxy.log | awk '{for(i=1;i<=NF;i++){if($i~/^total_ms=/)t=substr($i,10)+0; if($i~/^tok_out=/)o=substr($i,9)+0} if(t<20&&o==0)n++} END{print n+0}'
+```
+Expect: `0`. Only a proxy restart clears a poisoned entry, so this stays non-zero until the backend is bounced.
+
+### 14. User state survived the upgrade
+
+Checks 1-13 all describe a working install. None of them notice that the upgrade silently reset it, because a wiped state file looks exactly like a healthy fresh one. Every persisted file here is read back through `serde`, so one field added or renamed in the new build is enough to fail a parse and hand the user a default: a restarted grace clock, an empty savings history, or a client-setup record that no longer knows which shell files we wrote (which is also what uninstall reads to clean up).
+
+**Run this block BEFORE installing the rc**, on the build you are upgrading from:
+```bash
+S=~/Library/Application\ Support/Headroom
+mkdir -p /tmp/hr-preupgrade
+jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json" > /tmp/hr-preupgrade/pricing.json
+jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json" > /tmp/hr-preupgrade/setup.json
+jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json" > /tmp/hr-preupgrade/facts.json
+# For check 15: the user's own CLAUDE.md content, excluding our managed blocks.
+awk '/headroom:(learn:start|markitdown_office >>>)/{skip=1} !skip{n+=length($0)+1} /headroom:(learn:end|markitdown_office <<<)/{skip=0} END{print FILENAME, n+0}' \
+  ~/.claude/CLAUDE.md > /tmp/hr-preupgrade/claude-md.txt
+cat /tmp/hr-preupgrade/*.json /tmp/hr-preupgrade/claude-md.txt
+```
+
+**After installing and launching the rc**, re-run the same three `jq` expressions and diff:
+```bash
+S=~/Library/Application\ Support/Headroom
+diff <(jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json") /tmp/hr-preupgrade/pricing.json
+diff <(jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json") /tmp/hr-preupgrade/setup.json
+jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json"
+ls "$S/config/" | grep -c '\.corrupt$'
+```
+Expect: `first_seen_at` byte-identical (`paywall_first` may legitimately change - the server owns it), the configured-client and shell-file key sets unchanged, and `0` quarantine files. (Use `grep -c`, not `ls *.corrupt`: zsh aborts the whole line with `no matches found` when the glob is empty, which is the healthy case.)
+
+`activity-facts.json` is the deliberate exception: a `schemaVersion` bump intentionally drops the tile slots, so it needs its own comparison rather than a `diff`. What must survive a bump is `allTimeRecordTokens` and `lastWeeklyRecapWeekKey` - wiping those re-fires the weekly recap and resets all-time records for every user, which has happened on four bumps so far.
+
+A non-empty `*.corrupt` listing is the highest-signal failure in this doc. `quarantine_unparsable` only creates one when a state file failed to parse and was about to be overwritten, so the file itself is the evidence: `jq . <the .corrupt file>` to see which field the new build could not read. The fix belongs on the struct (`#[serde(default)]`, per the Persistence Rules in CLAUDE.md), not on the file.
+
+### 15. CLAUDE.md files are intact after the upgrade
+
+Two independent writers edit the user's CLAUDE.md, and neither is a Headroom-owned file - a bad write damages the user's own instructions. The desktop's `upsert_managed_block` maintains `# >>> headroom:markitdown_office >>>` in `~/.claude/CLAUDE.md`; the Python `headroom learn` command maintains `<!-- headroom:learn:start -->` blocks in both the global and every project CLAUDE.md. Both find their markers by literal string search on the whole file, so an interrupted write, a hand-edited half-block, or a second writer racing the first duplicates markers instead of replacing the block.
+
+```bash
+for f in ~/.claude/CLAUDE.md ~/Code/headroom-desktop/CLAUDE.md; do
+  echo "== $f"
+  echo "  markitdown: $(grep -c '^# >>> headroom:markitdown_office >>>' "$f")/$(grep -c '^# <<< headroom:markitdown_office <<<' "$f")"
+  echo "  learn:      $(grep -c '<!-- headroom:learn:start -->' "$f")/$(grep -c '<!-- headroom:learn:end -->' "$f")"
+  awk '/headroom:(learn:start|markitdown_office >>>)/{skip=1} !skip{n+=length($0)+1} /headroom:(learn:end|markitdown_office <<<)/{skip=0} END{print "  user bytes outside managed blocks: " n+0}' "$f"
+done
+```
+Expect: every pair is `0/0` or `1/1` - never `2/2` (duplicated block) and never `1/0` (truncated mid-write). The user-bytes figure has no fixed value; capture it in the check 14 pre-install snapshot and confirm it does not shrink across the upgrade. On this machine it is 81 for the global file (which is nearly all managed blocks) and ~3,000 for the desktop project file.
+
+A `2/2` is the duplicate-block bug: `strip_marker_block` loops for exactly this reason, and `upsert_managed_block` treats reordered `end`-before-`start` markers as absent and appends fresh rather than rebuilding around them. Both behaviours have unit tests (`managed_block_upsert_replaces_existing_block_without_duplication`, `managed_block_upsert_treats_reordered_markers_as_absent`, `updating_one_managed_block_does_not_touch_other_blocks_or_user_content`), so a failure here means a new writer, not a regression in those.
+
+Note what this check does **not** cover: the CLAUDE.md damage users reported in 0.34.0 was never on disk. Upstream's user-turn compression split the file's content mid-tag as it was sent to the model, so the file was fine and the model saw mangled instructions. That class is invisible to any filesystem check - it is caught by check 11 (mutations reaching the wire) and by reading a `/v1/messages` request body, not here. Fixed upstream in #2887, shipped in 0.35.0.
 
 ## Codex checks (Codex pass)
 
@@ -199,5 +320,7 @@ When RTK is disabled (check 3's gate), the managed binary path above does not ex
 ## When something fails
 
 - Proxy log silent → check `~/Library/Application Support/Headroom/headroom/logs/` for a newer log file or a crash file.
+- Check 11 or 13 non-zero after a wheel bump → the regression is in the bundled `headroom-ai`, not in desktop code. Confirm the version with check 8, then search upstream before assuming it is ours: `gh api "search/issues?q=repo:headroomlabs-ai/headroom+<symptom>"`. Checks 11 and 13 exist because this class is silent in `/stats` and on the dashboard - the log is the only place the wire truth appears.
+- Check 14 or 15 non-zero → this one is ours, and it is data loss, so stop the promotion. A `.corrupt` file names the field the new build could not read; a duplicated managed block names the writer that raced. The fix goes on the struct (`#[serde(default)]`) or in the writer, never by hand-repairing the user's file - the same build will do it again to everyone else.
 - RTK missing → check the managed block in `~/.zshrc` / `~/.zprofile` is intact and the shell has been reloaded.
 - MCP tool missing → restart Claude Code; the MCP server registration happens at session start.

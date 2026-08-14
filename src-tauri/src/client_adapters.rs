@@ -1657,7 +1657,11 @@ pub fn restore_client_setups() {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Container-level default, not per-field: one field added or removed in a
+// future build must not fail the whole parse and hand back an empty state,
+// which reads as "no clients configured" and orphans every shell block we
+// wrote (uninstall then can't find them to remove).
+#[serde(rename_all = "camelCase", default)]
 struct ClientSetupState {
     configured_clients: BTreeMap<String, String>,
     /// Snapshot of configured_clients taken at last pause/quit, used to restore on next startup.
@@ -1717,6 +1721,9 @@ fn load_setup_state() -> ClientSetupState {
                         "load_setup_state: failed to read/parse {} twice ({first_err:#}; {second_err:#}); returning default",
                         path.display()
                     );
+                    // The next write_setup_state would overwrite the file with
+                    // the empty default; keep the original for recovery.
+                    quarantine_unparsable(&path, "client setup state");
                     ClientSetupState::default()
                 }
             }
@@ -1789,6 +1796,30 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
         format!("renaming {} -> {}", tmp_path.display(), path.display())
     })
+}
+
+/// Move an unparsable state file aside instead of letting the next write
+/// silently overwrite it. Single fixed `.corrupt` slot per file, so repeated
+/// failures overwrite each other rather than growing without bound.
+/// Best-effort: a failure here must never block the caller's fresh start.
+pub(crate) fn quarantine_unparsable(path: &Path, reason: &str) {
+    if !path.exists() {
+        return;
+    }
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".corrupt");
+    let dest = PathBuf::from(s);
+    match std::fs::rename(path, &dest) {
+        Ok(()) => log::warn!(
+            "quarantined unparsable {} -> {} ({reason})",
+            path.display(),
+            dest.display()
+        ),
+        Err(err) => log::warn!(
+            "could not quarantine unparsable {} ({reason}): {err}",
+            path.display()
+        ),
+    }
 }
 
 fn setup_state_path() -> PathBuf {
@@ -5798,6 +5829,14 @@ mod tests {
 
     #[test]
     fn remove_headroom_mcp_json_entries_removes_by_name_and_footprint() {
+        // app_data_dir() derives from HOME, and this test reads it once to
+        // build the fixture while remove_headroom_mcp_json_entries reads it
+        // again to match. Sibling tests repoint HOME at a tempdir, so without
+        // the lock the two reads can straddle a flip and disagree (~1 run in 6
+        // of the full suite).
+        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let app_dir = crate::storage::app_data_dir().display().to_string();
         let mut servers = json!({
             "headroom": { "command": "python3", "args": ["mcp", "serve"] },
@@ -5853,6 +5892,51 @@ mod tests {
         assert!(!is_no_space(&denied));
 
         assert!(!is_no_space(&anyhow::anyhow!("No space left on device")));
+    }
+
+    #[test]
+    fn client_setup_state_survives_schema_drift_in_either_direction() {
+        // A newer build's extra field must be ignored, and a build that
+        // drops/renames configured_clients must still yield the rest. A parse
+        // failure here returns the empty default, which reads as "nothing
+        // configured": the tray reports Claude Code disconnected and uninstall
+        // can no longer find the shell blocks listed in managedShellFiles.
+        let newer = r#"{"configuredClients":{"claude_code":"2026-03-27T10:00:00Z"},
+            "managedShellFiles":{"claude_code":["/Users/test/.zshrc"]},
+            "someFutureFlag":42}"#;
+        let state: ClientSetupState = serde_json::from_str(newer).unwrap();
+        assert!(state.configured_clients.contains_key("claude_code"));
+        assert!(state.managed_shell_files.contains_key("claude_code"));
+
+        let dropped =
+            r#"{"managedShellFiles":{"codex_cli":["/Users/test/.zshrc"]},"rtkDisabled":true}"#;
+        let state: ClientSetupState = serde_json::from_str(dropped).unwrap();
+        assert!(state.managed_shell_files.contains_key("codex_cli"));
+        assert!(state.rtk_disabled);
+    }
+
+    #[test]
+    fn quarantine_unparsable_moves_the_file_aside_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client-setup.json");
+        std::fs::write(&path, b"{ truncated").unwrap();
+
+        super::quarantine_unparsable(&path, "test");
+        assert!(
+            !path.exists(),
+            "original is moved, not left to be overwritten"
+        );
+        let corrupt = dir.path().join("client-setup.json.corrupt");
+        assert_eq!(std::fs::read(&corrupt).unwrap(), b"{ truncated");
+
+        // Repeat failures reuse the one slot instead of accumulating files.
+        std::fs::write(&path, b"{ again").unwrap();
+        super::quarantine_unparsable(&path, "test");
+        assert_eq!(std::fs::read(&corrupt).unwrap(), b"{ again");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Missing file is a no-op, not an error.
+        super::quarantine_unparsable(&dir.path().join("absent.json"), "test");
     }
 
     #[test]

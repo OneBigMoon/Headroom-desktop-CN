@@ -599,6 +599,11 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         let state: State<'_, AppState> = app.state();
         let (mut dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
 
+        // Built from the REAL dashboard, before the demo-data injector below.
+        let report = (!pending_milestones.token.is_empty()
+            || pending_milestones.cumulative_report.is_some())
+        .then(|| savings_report(&dashboard));
+
         for milestone_tokens_saved in &pending_milestones.token {
             analytics::track_event(
                 &app,
@@ -613,11 +618,11 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
                     "launch_experience": state.launch_experience_label()
                 })),
             );
-            pricing::report_milestone(*milestone_tokens_saved);
+            pricing::report_milestone(*milestone_tokens_saved, report.as_ref());
         }
 
         if let Some(total) = pending_milestones.cumulative_report {
-            pricing::report_milestone(total);
+            pricing::report_milestone(total, report.as_ref());
         }
 
         check_zero_spend_anomaly(&dashboard);
@@ -4308,6 +4313,54 @@ fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
     }
 }
 
+/// How many recent days of savings travel with the milestone/heartbeat post.
+const SAVINGS_REPORT_DAYS: usize = 30;
+
+/// Projects the dashboard's real savings figures into the payload
+/// headroom-web stores for the admin profile. Must be called on the dashboard
+/// BEFORE `maybe_inject_fake_daily_savings`, or demo data reaches the server.
+fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
+    let breakdown = dashboard.savings_breakdown.as_ref();
+    pricing::SavingsReport {
+        lifetime_savings_usd: dashboard.lifetime_estimated_savings_usd,
+        lifetime_tokens_saved: dashboard.lifetime_estimated_tokens_saved,
+        total_input_tokens: breakdown.map(|b| b.total_input_tokens).unwrap_or(0),
+        cache_read_tokens: breakdown.map(|b| b.cache_read_tokens).unwrap_or(0),
+        output_reduction_percent: dashboard
+            .output_reduction
+            .as_ref()
+            .map(|o| o.reduction_percent),
+        output_reduction_method: dashboard
+            .output_reduction
+            .as_ref()
+            .map(|o| o.method.clone()),
+        days: recent_savings_days(&dashboard.daily_savings),
+    }
+}
+
+/// The most recent `SAVINGS_REPORT_DAYS` days that saw any traffic, oldest
+/// first. Empty days are skipped so a user who was away for a week still
+/// reports a full window of real activity.
+fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay> {
+    let mut days: Vec<_> = points
+        .iter()
+        .filter(|point| point.estimated_tokens_saved > 0 || point.total_tokens_sent > 0)
+        .rev()
+        .take(SAVINGS_REPORT_DAYS)
+        .map(|point| pricing::SavingsDay {
+            date: point.date.clone(),
+            savings_usd: point.estimated_savings_usd,
+            tokens_saved: point.estimated_tokens_saved,
+            tokens_sent: point.total_tokens_sent,
+            cache_read_tokens: point.cache_read_tokens,
+            output_sampled_tokens_saved: point.output_sampled_tokens_saved,
+            output_baseline_tokens: point.output_baseline_tokens,
+        })
+        .collect();
+    days.reverse();
+    days
+}
+
 fn is_prerelease_version(version: &str) -> bool {
     version.contains('-')
 }
@@ -6306,12 +6359,12 @@ mod tests {
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, resolve_release_updater_config, select_updater_endpoints,
-        store_checked_update, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        select_updater_endpoints, store_checked_update, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -6382,6 +6435,29 @@ mod tests {
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         }
+    }
+
+    #[test]
+    fn recent_savings_days_keeps_last_30_active_days_oldest_first() {
+        let mut points: Vec<_> = (1..=40)
+            .map(|i| daily_point(&format!("2026-06-{i:02}"), 0.5, 1_000, 1.0, 9_000))
+            .collect();
+        // Two idle days in the middle must not consume window slots.
+        points[35] = daily_point("2026-06-36", 0.0, 0, 0.0, 0);
+        points[36] = daily_point("2026-06-37", 0.0, 0, 0.0, 0);
+
+        let days = recent_savings_days(&points);
+
+        assert_eq!(days.len(), 30);
+        assert_eq!(days.first().unwrap().date, "2026-06-09");
+        assert_eq!(days.last().unwrap().date, "2026-06-40");
+        assert!(days.iter().all(|d| d.tokens_saved == 1_000));
+    }
+
+    #[test]
+    fn recent_savings_days_is_empty_without_traffic() {
+        let points = vec![daily_point("2026-06-01", 0.0, 0, 0.0, 0)];
+        assert!(recent_savings_days(&points).is_empty());
     }
 
     #[test]
