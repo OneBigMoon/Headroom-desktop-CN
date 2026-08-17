@@ -4463,24 +4463,23 @@ export default function App() {
   // two forces side by side instead: how much of lifetime input the client's
   // cache served (cheap, never claimed by Headroom), and how much of the
   // REMAINING (compressible) input Headroom removed.
-  const cacheHitPct = (() => {
+  // All three rows go through cacheHitPair, which prices both rates in
+  // dollars (see its doc for why tokens are invalid here). The all-time row
+  // feeds it the lifetime breakdown as a single synthetic bucket;
+  // cacheReadTokens is used only as an existence signal for coverage, never
+  // ratioed against our own token counts.
+  const cachePairAllTime = (() => {
     const b = dashboard.savingsBreakdown;
-    if (!b || b.totalInputTokens <= 0 || b.cacheReadTokens <= 0) return null;
-    return Math.min(100, (b.cacheReadTokens / b.totalInputTokens) * 100);
+    if (!b || b.cacheReadTokens <= 0) return null;
+    return cacheHitPair([
+      {
+        cacheSavingsUsd: b.cacheSavingsUsd,
+        actualCostUsd: b.totalInputCostUsd,
+        estimatedSavingsUsd: dashboard.lifetimeEstimatedSavingsUsd
+      }
+    ]);
   })();
-  // Priced in dollars, not tokens, for the same reason as the window chip:
-  // totalInputTokens is our tokenizer's count and cacheReadTokens is the
-  // provider's, so differencing them is invalid (and on real data can go
-  // negative). The two dollar figures come from one pricing function.
-  const compressionOfRestPct = (() => {
-    const b = dashboard.savingsBreakdown;
-    if (!b || b.totalInputCostUsd <= 0) return null;
-    const nonCachedInputCost = Math.max(0, b.totalInputCostUsd - b.cacheSavingsUsd / 9);
-    const saved = dashboard.lifetimeEstimatedSavingsUsd;
-    const baseline = saved + nonCachedInputCost;
-    if (baseline <= 0) return null;
-    return Math.min(100, (saved / baseline) * 100);
-  })();
+  const compressionOfRestPct = cachePairAllTime?.compressedPct ?? null;
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
   // aged out of retention are excluded from both rates). The all-time row
@@ -7695,13 +7694,7 @@ export default function App() {
                   {[
                     { label: "Today", pair: cachePairToday },
                     { label: "This month", pair: cachePairMonth },
-                    {
-                      label: "All time",
-                      pair:
-                        cacheHitPct !== null && compressionOfRestPct !== null
-                          ? { hitPct: cacheHitPct, compressedPct: compressionOfRestPct }
-                          : null
-                    }
+                    { label: "All time", pair: cachePairAllTime }
                   ].map(({ label, pair }) => (
                     <div className="savings-breakdown__row" key={label}>
                       <span>{label}</span>

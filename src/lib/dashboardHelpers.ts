@@ -86,26 +86,39 @@ export function savingsRate(saved: number, spent: number) {
  * rates describe the same covered slice of the window. Null when no bucket in
  * the window has coverage. `hitPct` is the share of forwarded input served
  * from the provider's prompt cache; `compressedPct` is the share of the
- * REMAINING (compressible) input Headroom removed. */
+ * REMAINING (compressible) input Headroom removed.
+ *
+ * Priced in dollars for the reason documented on
+ * `compressibleInputSavingsRate` below: cacheReadTokens (provider count) and
+ * totalTokensSent (our tokenizer) must never be differenced or ratioed, and
+ * on real data reads exceed forwarded input, which pinned the token form of
+ * this pair at a meaningless "100% hits / 100% compressed". The read
+ * discount (`cacheSavingsUsd`) and the bucket's input cost come from one
+ * pricing function: reads bill at ~0.1x, so read cost = discount / 9 and the
+ * reads' full-price value = discount * 10/9. */
 export function cacheHitPair(
   points: Array<{
-    cacheReadTokens?: number | null;
-    totalTokensSent: number;
-    estimatedTokensSaved: number;
+    cacheSavingsUsd?: number | null;
+    actualCostUsd: number;
+    estimatedSavingsUsd: number;
   }>
 ) {
-  let read = 0;
-  let total = 0;
+  let cacheSavings = 0;
+  let actual = 0;
   let saved = 0;
   for (const point of points) {
-    if (point.cacheReadTokens == null) continue;
-    read += Math.max(0, point.cacheReadTokens);
-    total += Math.max(0, point.totalTokensSent);
-    saved += Math.max(0, point.estimatedTokensSaved);
+    if (point.cacheSavingsUsd == null) continue;
+    cacheSavings += Math.max(0, point.cacheSavingsUsd);
+    actual += Math.max(0, point.actualCostUsd);
+    saved += Math.max(0, point.estimatedSavingsUsd);
   }
-  if (total <= 0) return null;
-  const hitPct = Math.min(100, (read / total) * 100);
-  const rest = Math.max(0, total - read);
+  // Full-price value of the window's input: what was paid plus the discount
+  // the cache earned.
+  const fullPriceInput = actual + cacheSavings;
+  if (fullPriceInput <= 0) return null;
+  const hitPct = Math.min(100, (((cacheSavings * 10) / 9) / fullPriceInput) * 100);
+  // What survived the cache and was paid at full input price.
+  const rest = Math.max(0, actual - cacheSavings / 9);
   const baseline = saved + rest;
   // A fully-cached window leaves nothing to compress: report 0% of an empty
   // remainder rather than hiding the (excellent) hit rate.

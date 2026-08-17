@@ -363,32 +363,45 @@ describe("mergeProviderSavingsForDisplay", () => {
 });
 
 describe("cacheHitPair", () => {
-  it("computes both rates over covered buckets only", () => {
+  it("computes both rates in dollars over covered buckets only", () => {
     const pair = cacheHitPair([
-      { cacheReadTokens: 900, totalTokensSent: 1000, estimatedTokensSaved: 50 },
+      // Read discount $9 -> read cost $1, reads' full-price value $10.
+      { cacheSavingsUsd: 9, actualCostUsd: 3, estimatedSavingsUsd: 0.5 },
       // No cache coverage: excluded from BOTH rates, not just the hit rate.
-      { totalTokensSent: 5000, estimatedTokensSaved: 999 },
-      { cacheReadTokens: 100, totalTokensSent: 1000, estimatedTokensSaved: 150 }
+      { actualCostUsd: 50, estimatedSavingsUsd: 999 },
+      { cacheSavingsUsd: 4.5, actualCostUsd: 2.5, estimatedSavingsUsd: 1.5 }
     ]);
     expect(pair).not.toBeNull();
-    // read 1000 / total 2000
-    expect(pair!.hitPct).toBeCloseTo(50);
-    // saved 200 / (saved 200 + rest 1000)
-    expect(pair!.compressedPct).toBeCloseTo((200 / 1200) * 100);
+    // reads at full price 15 / full-price input (5.5 + 13.5)
+    expect(pair!.hitPct).toBeCloseTo((15 / 19) * 100);
+    // saved 2 / (saved 2 + rest (5.5 - 1.5))
+    expect(pair!.compressedPct).toBeCloseTo((2 / 6) * 100);
   });
 
   it("returns null when no bucket carries cache data", () => {
-    expect(
-      cacheHitPair([{ totalTokensSent: 1000, estimatedTokensSaved: 100 }])
-    ).toBeNull();
+    expect(cacheHitPair([{ actualCostUsd: 3, estimatedSavingsUsd: 1 }])).toBeNull();
     expect(cacheHitPair([])).toBeNull();
   });
 
-  it("clamps reads above total to a 100% hit rate", () => {
+  it("does not saturate when provider cache reads exceed our token count", () => {
+    // The 2026-08-17 regression: the token form of this pair ratioed the
+    // provider's cache reads against our own tokenizer's forwarded count;
+    // reads exceeded input, pinning the display at "100% hits, 100% of the
+    // rest compressed". The dollar form has no cross-tokenizer ratio at all.
     const pair = cacheHitPair([
-      { cacheReadTokens: 2000, totalTokensSent: 1000, estimatedTokensSaved: 0 }
+      { cacheSavingsUsd: 9, actualCostUsd: 3, estimatedSavingsUsd: 0.5 }
+    ]);
+    expect(pair!.hitPct).toBeCloseTo((10 / 12) * 100);
+    expect(pair!.compressedPct).toBeCloseTo(20);
+  });
+
+  it("reports a fully-cached window as 0% of an empty remainder", () => {
+    const pair = cacheHitPair([
+      // Actual cost is exactly the read cost: nothing was left to compress.
+      { cacheSavingsUsd: 9, actualCostUsd: 1, estimatedSavingsUsd: 0 }
     ]);
     expect(pair!.hitPct).toBe(100);
+    expect(pair!.compressedPct).toBe(0);
   });
 });
 
