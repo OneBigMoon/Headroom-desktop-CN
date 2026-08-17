@@ -9339,9 +9339,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // read-only bits and get the delete through.
         //
         // Shaped like the real failure: a venv-ish tree with a read-only file
-        // inside a read-only nested directory. On Unix the read-only DIRECTORY is
-        // what blocks unlinking its children; on Windows the read-only FILE is.
-        // This covers both, so it is a real check here and on Windows.
+        // inside a read-only nested directory. On Unix the read-only DIRECTORY
+        // blocks unlinking its children, so the rescue pass is load-bearing. On
+        // Windows, std's remove_dir_all deletes read-only entries itself since
+        // rust-lang/rust#129800 (FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE),
+        // so there this only checks the helper handles a read-only tree.
         let root = std::env::temp_dir().join(format!("rdo_retry_{}", std::process::id()));
         // Via the helper, not plain remove: a read-only tree left by an earlier
         // run (recycled pid) would otherwise survive setup and break this test.
@@ -9357,7 +9359,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             std::fs::set_permissions(p, perms).unwrap();
         }
         // Precondition: a plain remove_dir_all really is blocked, else this test
-        // would pass even with the rescue pass deleted.
+        // would pass even with the rescue pass deleted. Unix-only: modern
+        // Windows std ignores the read-only attribute (see header comment), so
+        // no such precondition can hold there.
+        #[cfg(unix)]
         assert!(
             std::fs::remove_dir_all(&root).is_err(),
             "read-only tree must block a plain remove_dir_all, or this test proves nothing"
