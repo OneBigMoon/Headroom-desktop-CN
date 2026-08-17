@@ -4091,6 +4091,10 @@ struct PersistedSavingsState {
     /// starting: without it, cold start falls back to the (understating)
     /// bucket sum and the total visibly dips for the first minutes.
     last_output_estimator_tokens_saved: Option<u64>,
+    /// Companion baseline for the reading above. Persisted only so the next
+    /// launch can seed its sampling watermark as a *pair* -- see
+    /// `sample_output_reduction`.
+    last_output_estimator_baseline_tokens: Option<u64>,
 }
 
 struct SavingsTracker {
@@ -4124,13 +4128,16 @@ struct SavingsTracker {
     /// See `PersistedSavingsState::output_daily_samples`.
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
-    /// Last raw (tokens_saved, baseline_tokens) reading of the shaper's
-    /// durable estimator. Not persisted, same rationale as
-    /// `tool_schema_process_total`: the first post-launch reading seeds a
-    /// baseline, never a delta, and a reading below the watermark reseeds.
+    /// High-water (tokens_saved, baseline_tokens) of the shaper's durable
+    /// estimator. Not persisted directly: the first post-launch reading seeds
+    /// it (never emitting a delta, so a closed-app gap isn't billed to the
+    /// launch bucket), and it only ever advances -- see
+    /// `sample_output_reduction` for why a dip must not move it down.
     output_sample_watermark: Option<(u64, u64)>,
     /// See `PersistedSavingsState::last_output_estimator_tokens_saved`.
     last_output_estimator_tokens_saved: Option<u64>,
+    /// See `PersistedSavingsState::last_output_estimator_baseline_tokens`.
+    last_output_estimator_baseline_tokens: Option<u64>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -4241,6 +4248,9 @@ impl SavingsTracker {
             last_output_estimator_tokens_saved: persisted_state
                 .as_ref()
                 .and_then(|state| state.last_output_estimator_tokens_saved),
+            last_output_estimator_baseline_tokens: persisted_state
+                .as_ref()
+                .and_then(|state| state.last_output_estimator_baseline_tokens),
             last_written_at: None,
         };
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
@@ -4886,25 +4896,64 @@ impl SavingsTracker {
     /// Bucket the poll-over-poll delta of the output shaper's durable
     /// cumulative counters into the local day/hour sample maps. Between polls
     /// several requests may land; the whole gap is attributed to the sampling
-    /// moment (same tradeoff as `session_new_input_history`). A reading below
-    /// the watermark means the estimator state was rebuilt — reseed without
-    /// emitting a delta, so a reset can only lose a sample, never inflate one.
+    /// moment (same tradeoff as `session_new_input_history`).
+    ///
+    /// The invariant is that a counter that goes backwards may cost us a
+    /// sample but must never manufacture one. Two ways it goes backwards:
+    ///
+    /// - The backend restarted onto a lagging durable checkpoint, so it
+    ///   re-earns ground already banked. Holding the mark makes the catch-up
+    ///   free, which is right — it was counted the first time.
+    /// - The estimator was genuinely wiped and restarts near zero. Its climb
+    ///   is real new work, so the mark has to rebase or the sampler goes
+    ///   silent forever.
+    ///
+    /// Seeding matters as much as the dip. A fresh launch seeds from the
+    /// higher of the live reading and the last persisted one: seeding on a
+    /// regressed reading alone bills the backend's entire catch-up climb to
+    /// the launch bucket (2026-08-17: 906k phantom saved tokens, ~2.8x, from
+    /// one backend restart 15s after the app started).
     fn sample_output_reduction(&mut self, stats: &HeadroomDashboardStats) {
         let Some(reduction) = stats.output_reduction.as_ref() else {
             return;
         };
+        let current = (reduction.tokens_saved, reduction.baseline_tokens);
+        let previous = self.output_sample_watermark;
+        // Read before the writes below clobber them: on the first poll of a
+        // launch these still hold the *previous* run's last reading, which is
+        // exactly what the seed needs.
+        let persisted = (
+            self.last_output_estimator_tokens_saved.unwrap_or(0),
+            self.last_output_estimator_baseline_tokens.unwrap_or(0),
+        );
         // Cache the raw reading as-is (not a high-water mark): the cold-start
         // fallback must mirror what the live path would show, including the
         // "re-seeded estimator below the bucket sum" case its caller guards.
-        self.last_output_estimator_tokens_saved = Some(reduction.tokens_saved);
-        let current = (reduction.tokens_saved, reduction.baseline_tokens);
-        let previous = self.output_sample_watermark.replace(current);
+        self.last_output_estimator_tokens_saved = Some(current.0);
+        self.last_output_estimator_baseline_tokens = Some(current.1);
+
         let Some((prev_saved, prev_baseline)) = previous else {
+            // First reading of this launch: seed, never emit. The gap since
+            // the last run belongs to no bucket we can name.
+            self.output_sample_watermark =
+                Some((current.0.max(persisted.0), current.1.max(persisted.1)));
             return;
         };
+
         if current.0 < prev_saved || current.1 < prev_baseline {
+            // ponytail: "wiped" = fell below half the mark. A lagging
+            // checkpoint dips by a poll's worth of work; a wipe drops to ~0.
+            // Tighten if a real reset ever lands shallower than that.
+            let wiped = current.0 < prev_saved / 2;
+            self.output_sample_watermark = Some(if wiped {
+                current
+            } else {
+                (prev_saved, prev_baseline)
+            });
             return;
         }
+
+        self.output_sample_watermark = Some(current);
         let delta_saved = current.0 - prev_saved;
         let delta_baseline = current.1 - prev_baseline;
         if delta_saved == 0 && delta_baseline == 0 {
@@ -4946,6 +4995,7 @@ impl SavingsTracker {
             output_daily_samples: self.output_daily_samples.clone(),
             output_hourly_samples: self.output_hourly_samples.clone(),
             last_output_estimator_tokens_saved: self.last_output_estimator_tokens_saved,
+            last_output_estimator_baseline_tokens: self.last_output_estimator_baseline_tokens,
         }
     }
 
@@ -7896,6 +7946,91 @@ mod tests {
         assert_eq!(hourly_total, 450);
     }
 
+    fn output_stats(saved: u64, baseline: u64) -> HeadroomDashboardStats {
+        HeadroomDashboardStats {
+            session_requests: None,
+            session_estimated_savings_usd: None,
+            session_estimated_tokens_saved: None,
+            session_savings_pct: None,
+            session_actual_cost_usd: None,
+            session_total_tokens_sent: None,
+            savings_history: Vec::new(),
+            output_reduction: Some(OutputReduction {
+                method: "estimated".into(),
+                reduction_percent: 39.0,
+                ci_low_percent: 36.0,
+                ci_high_percent: 42.0,
+                requests: 1,
+                tokens_saved: saved,
+                baseline_tokens: baseline,
+            }),
+            tool_schema_tokens_saved: None,
+        }
+    }
+
+    #[test]
+    fn shallow_estimator_dip_is_not_rebilled_when_it_climbs_back() {
+        // A backend that restarts onto a lagging durable checkpoint reports
+        // below where it left off and then re-earns ground already banked.
+        // Rebasing to the dip would bill that catch-up a second time.
+        let mut tracker = make_tracker();
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let saved_today = |t: &SavingsTracker| {
+            t.output_daily_samples
+                .get(&day_key)
+                .map_or(0, |bucket| bucket.saved_tokens)
+        };
+
+        tracker.sample_output_reduction(&output_stats(1_000, 3_000));
+        tracker.sample_output_reduction(&output_stats(1_400, 4_000));
+        assert_eq!(saved_today(&tracker), 400);
+
+        // Shallow dip, then the whole climb back to where it was.
+        tracker.sample_output_reduction(&output_stats(1_200, 3_500));
+        tracker.sample_output_reduction(&output_stats(1_400, 4_000));
+        assert_eq!(
+            saved_today(&tracker),
+            400,
+            "re-earned ground must be free, not counted twice"
+        );
+
+        // Genuine progress past the old mark still counts.
+        tracker.sample_output_reduction(&output_stats(1_500, 4_200));
+        assert_eq!(saved_today(&tracker), 500);
+    }
+
+    #[test]
+    fn launch_seeds_from_the_persisted_reading_not_a_regressed_one() {
+        // The 2026-08-17 bug: the app relaunched, the backend restarted 15s
+        // later onto a stale checkpoint, and the first poll seeded on that
+        // regressed value -- billing the entire catch-up (906k tokens, ~2.8x)
+        // to the launch-day bucket.
+        let mut tracker = make_tracker();
+        tracker.last_output_estimator_tokens_saved = Some(27_000);
+        tracker.last_output_estimator_baseline_tokens = Some(65_000);
+        assert!(tracker.output_sample_watermark.is_none(), "fresh launch");
+
+        tracker.sample_output_reduction(&output_stats(26_000, 63_000));
+        assert_eq!(
+            tracker.output_sample_watermark,
+            Some((27_000, 65_000)),
+            "seed at the high-water of live and persisted, not the dip"
+        );
+
+        tracker.sample_output_reduction(&output_stats(27_100, 65_200));
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = tracker
+            .output_daily_samples
+            .get(&day_key)
+            .copied()
+            .expect("day bucket");
+        assert_eq!(
+            day.saved_tokens, 100,
+            "only progress past the persisted mark"
+        );
+        assert_eq!(day.baseline_tokens, 200);
+    }
+
     #[test]
     fn cached_output_estimator_total_survives_reload() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7937,6 +8072,7 @@ mod tests {
             output_hourly_samples: std::collections::BTreeMap::new(),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: None,
+            last_output_estimator_baseline_tokens: None,
             last_written_at: None,
         }
     }
@@ -10139,6 +10275,7 @@ mod tests {
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
             last_output_estimator_tokens_saved: None,
+            last_output_estimator_baseline_tokens: None,
         };
         std::fs::write(
             config_file(&base_dir, "savings-state.json"),
