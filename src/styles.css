@@ -1,5 +1,5 @@
 :root {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  font-family: var(--font-sans);
   color: #241f1d;
   background: transparent;
   color-scheme: light dark;
@@ -7,6 +7,12 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Type families — use these, never a raw font stack. Mono is for numbers,
+     code, paths, and log output only; UI labels stay in sans. */
+  --font-sans:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+  --font-mono:    ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   /* Type scale */
   --text-xxs:  0.69rem;   /* ~11px — tiny labels, nav text, upgrade pills */
@@ -195,7 +201,7 @@ select {
 }
 
 .intro-shell__copy h1 {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+  font-family: var(--font-display);
   font-size: clamp(2rem, 5vw, 3rem);
   line-height: 0.98;
   margin: 18px 0 22px;
@@ -388,7 +394,7 @@ select {
   border-radius: 10px;
   border: 1px solid var(--border-default);
   background: var(--surface-sunken);
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   line-height: 1.32;
   white-space: pre-wrap;
@@ -599,7 +605,6 @@ select {
 
 .install-progress__teaser {
   margin: 12px 0 0;
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
   font-size: var(--text-base);
   color: rgba(89, 81, 74, 0.45);
   letter-spacing: 0.02em;
@@ -1008,7 +1013,7 @@ select {
 
 .upgrade-hero h1 {
   margin: 0;
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: var(--font-display);
   font-size: clamp(1.9rem, 4vw, 2.8rem);
   line-height: 0.96;
   max-width: 100%;
@@ -1679,7 +1684,7 @@ select {
 
 .upgrade-auth-view__header h1 {
   margin: 0;
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: var(--font-display);
   font-size: clamp(1.7rem, 3vw, 2.2rem);
   line-height: 0.98;
 }
@@ -2584,7 +2589,7 @@ select {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   line-height: 1.28;
   color: #413933;
@@ -3400,7 +3405,7 @@ details[open] .optimize-minimal__details summary::after {
 }
 
 .optimize-minimal__mono {
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   color: #6a615a;
   background: var(--surface-sunken);
@@ -3579,7 +3584,7 @@ details[open] .optimize-minimal__details summary::after {
   gap: 10px 28px;
   align-items: center;
   font-size: var(--text-sm);
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   color: #685f59;
   overflow-x: auto;
   white-space: nowrap;
@@ -3604,7 +3609,6 @@ details[open] .optimize-minimal__details summary::after {
 .runtime-status__section-title {
   font-size: var(--text-sm);
   line-height: 1.2;
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
   color: #4b433d;
   font-weight: 700;
 }
@@ -3687,7 +3691,7 @@ details[open] .optimize-minimal__details summary::after {
   padding: 8px 10px;
   background: #1e1e1e;
   color: #d4d4d4;
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 0.7rem;
   line-height: 1.45;
   border-radius: 6px;
@@ -3701,7 +3705,6 @@ details[open] .optimize-minimal__details summary::after {
   margin: 0;
   font-size: var(--text-sm);
   color: #685f59;
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
 }
 
 .runtime-status strong {
@@ -5112,7 +5115,7 @@ html.window-hiding {
 }
 
 .activity-feed__model {
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 .activity-feed__row--savings {
@@ -5125,7 +5128,7 @@ html.window-hiding {
 
 .activity-feed__delta {
   color: #7c7168;
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 .activity-feed__transforms {
@@ -5143,7 +5146,7 @@ html.window-hiding {
   color: #5d544c;
   padding: 2px 6px;
   border-radius: 999px;
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 .activity-feed__savings-usd {
@@ -5175,7 +5178,7 @@ html.window-hiding {
 
 .activity-feed__target-values {
   color: var(--text-muted);
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
   word-break: break-all;
 }
 
@@ -5270,7 +5273,6 @@ html.window-hiding {
 }
 
 .activity-feed__importance {
-  font-family: ui-monospace, "SF Mono", monospace;
   color: #7c7168;
 }
 
@@ -5348,7 +5350,7 @@ html.window-hiding {
 }
 
 .activity-feed__detail-mono {
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
 }
 
@@ -5357,7 +5359,7 @@ html.window-hiding {
   padding: 8px 10px;
   max-height: 240px;
   overflow: auto;
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   line-height: 1.45;
   color: var(--text-secondary);
@@ -5519,7 +5521,7 @@ html.window-hiding {
 }
 
 .install-prompt__body code {
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   background: rgba(58, 44, 22, 0.08);
   border-radius: 4px;
@@ -5540,7 +5542,7 @@ html.window-hiding {
 .install-prompt__cmd-text {
   flex: 1;
   min-width: 0;
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   color: #3a2c16;
   overflow-x: auto;
@@ -5890,7 +5892,7 @@ html.window-hiding {
 }
 
 .addon-card__version {
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: var(--text-xxs);
   color: var(--text-muted);
   background: var(--surface-sunken);
