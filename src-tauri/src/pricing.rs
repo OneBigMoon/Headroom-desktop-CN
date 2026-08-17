@@ -90,6 +90,17 @@ struct IdentityPayload {
     codex_rate_limit_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_billing_type: Option<String>,
+    /// Shape of the live Codex usage windows, `primary=99@43200;secondary=12@10080`
+    /// (used percent @ window minutes). The weekly gate meters against these and
+    /// `secondary` is optional per plan, so without this we cannot tell from the
+    /// fleet whether a clamped subscriber is being metered or silently allowed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_usage_windows: Option<String>,
+    /// When the local tier-mismatch clock started, if a mismatch is currently
+    /// open. The clamp fires `TIER_MISMATCH_GRACE_DAYS` after this, so the
+    /// server can derive both the mismatch cohort and who is actually clamped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier_mismatch_since: Option<String>,
     /// Highest Terms-of-Service version the user has accepted locally. Rides
     /// along on every grace/start so the server's device-keyed trial record
     /// captures acceptance. `None` (omitted) when nothing accepted yet.
@@ -122,6 +133,15 @@ impl IdentityPayload {
         let mut payload = Self::build(Some(&claude), codex.as_ref());
         let accepted = state.accepted_terms_version();
         payload.accepted_terms_version = (accepted > 0).then_some(accepted);
+        payload.codex_usage_windows = state
+            .codex_rate_limits
+            .lock()
+            .as_ref()
+            .map(codex_usage_windows_summary);
+        payload.tier_mismatch_since = load_or_initialize_local_state()
+            .ok()
+            .and_then(|local| local.mismatch_since)
+            .map(|since| since.to_rfc3339());
         payload
     }
 
@@ -148,6 +168,8 @@ impl IdentityPayload {
             codex_organization_type: codex.and_then(|p| p.organization_type.clone()),
             codex_rate_limit_tier: codex.and_then(|p| p.rate_limit_tier.clone()),
             codex_billing_type: codex.and_then(|p| p.billing_type.clone()),
+            codex_usage_windows: None,
+            tier_mismatch_since: None,
             accepted_terms_version: None,
         }
     }
@@ -202,6 +224,12 @@ impl IdentityPayload {
         }
         if let Some(value) = self.codex_billing_type.as_deref() {
             builder = builder.header("X-Headroom-Codex-Billing-Type", value);
+        }
+        if let Some(value) = self.codex_usage_windows.as_deref() {
+            builder = builder.header("X-Headroom-Codex-Usage-Windows", value);
+        }
+        if let Some(value) = self.tier_mismatch_since.as_deref() {
+            builder = builder.header("X-Headroom-Tier-Mismatch-Since", value);
         }
         if let Some(version) = self.accepted_terms_version {
             builder = builder.header("X-Headroom-Terms-Version", version.to_string());
@@ -824,6 +852,65 @@ fn fetch_codex_usage(
     ))
 }
 
+/// Shortest usage window the weekly ladder may be metered against, in minutes.
+/// The 25%/50% thresholds are calibrated to a week; applying them to a 5-hour
+/// window would pause a paying user within the first afternoon.
+const MIN_METERED_WINDOW_MINUTES: i64 = 1_440;
+
+/// The window the gate meters against: the longest one the plan reports, not
+/// `secondary` specifically.
+///
+/// `secondary` is genuinely optional — a `GET /wham/usage` on a free ChatGPT
+/// account returns a 30-day `primary_window` and a null `secondary_window` —
+/// and reading it alone collapsed "this plan reports no weekly window" into
+/// `WeeklyGateOutcome::NoData`, which allows. A clamped under-subscribed
+/// account on such a plan was therefore never metered at all: the gate failed
+/// open and silently.
+///
+/// Windows shorter than [`MIN_METERED_WINDOW_MINUTES`] are ignored rather than
+/// metered harshly. A window with no declared length is kept (that is today's
+/// behaviour for `secondary`) but sorts last, so a declared long window wins.
+///
+/// ponytail: a plan whose only window is shorter than a day still fails open.
+/// The `X-Headroom-Codex-Usage-Windows` telemetry added alongside this exists
+/// to find out whether such a plan is real before writing a rule for it.
+fn metered_window(snapshot: &CodexRateLimitSnapshot) -> Option<&crate::models::CodexUsageWindow> {
+    [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|w| {
+            w.window_minutes
+                .is_none_or(|m| m >= MIN_METERED_WINDOW_MINUTES)
+        })
+        .max_by_key(|w| w.window_minutes.unwrap_or(0))
+}
+
+/// Compact wire summary of the Codex usage windows, as
+/// `primary=99@43200;secondary=12@10080` (used percent @ window minutes), or
+/// `none` when a snapshot carries only a credits balance. Reported to
+/// headroom-web so we can see which ChatGPT plans actually publish a weekly
+/// window — the gate depends on it and we previously had no field visibility.
+fn codex_usage_windows_summary(snapshot: &CodexRateLimitSnapshot) -> String {
+    let part = |name: &str, window: Option<&crate::models::CodexUsageWindow>| {
+        window.map(|w| match w.window_minutes {
+            Some(minutes) => format!("{name}={:.0}@{minutes}", w.used_percent),
+            None => format!("{name}={:.0}", w.used_percent),
+        })
+    };
+    let parts: Vec<String> = [
+        part("primary", snapshot.primary.as_ref()),
+        part("secondary", snapshot.secondary.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(";")
+    }
+}
+
 /// Derive the display-facing `CodexUsage` (gate state + copy) from a captured
 /// snapshot, applying the activation-scoped weekly gate.
 fn codex_usage_from_snapshot(
@@ -834,7 +921,12 @@ fn codex_usage_from_snapshot(
 ) -> CodexUsage {
     let recommended_subscription_tier =
         Some(headroom_tier_for_codex_plan(&plan_tier).unwrap_or(HeadroomSubscriptionTier::Pro));
-    let weekly_used_percent = snapshot.secondary.as_ref().map(|w| w.used_percent);
+    // Report the window the gate actually used. Reading `secondary` here left
+    // this null for every plan measured, which silently killed the Codex
+    // forgone-savings upgrade line (it multiplies by this window's reset).
+    let metered = metered_window(&snapshot);
+    let weekly_used_percent = metered.map(|w| w.used_percent);
+    let weekly_resets_in_seconds = metered.and_then(|w| w.seconds_until_reset);
 
     let gate = codex_plan_gate(
         weekly_used_percent,
@@ -855,6 +947,7 @@ fn codex_usage_from_snapshot(
         gate_reason: gate.gate_reason,
         recommended_subscription_tier,
         weekly_used_percent,
+        weekly_resets_in_seconds,
         gate_message: gate.gate_message,
         effective_nudge_thresholds_percent: gate.nudge_thresholds_percent.to_vec(),
         effective_disable_threshold_percent: gate.disable_threshold_percent,
@@ -2874,7 +2967,11 @@ fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
         &serde_json::to_vec_pretty(state)
             .map_err(|err| format!("Failed to serialize pricing state: {err}"))?,
     )
-    .map_err(|err| format!("Failed to write pricing state {}: {err}", path.display()))
+    // `{err:#}` not `{err}`: atomic_write returns an anyhow chain whose outer
+    // context is only "writing <tmp path>". Display alone dropped the io::Error
+    // underneath, so Sentry RUST-6R reported a truncated message that could not
+    // distinguish ENOSPC from EACCES.
+    .map_err(|err| format!("Failed to write pricing state {}: {err:#}", path.display()))
 }
 
 fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingState, String> {
@@ -4694,6 +4791,180 @@ mod tests {
         );
         assert!(free.optimization_allowed, "Free Codex is never paused");
         assert!(free.gate_reason.is_none());
+    }
+
+    fn codex_window(
+        used_percent: f64,
+        window_minutes: Option<i64>,
+    ) -> crate::models::CodexUsageWindow {
+        crate::models::CodexUsageWindow {
+            used_percent,
+            window_label: None,
+            window_minutes,
+            seconds_until_reset: None,
+        }
+    }
+
+    fn codex_snapshot(
+        primary: Option<crate::models::CodexUsageWindow>,
+        secondary: Option<crate::models::CodexUsageWindow>,
+    ) -> super::CodexRateLimitSnapshot {
+        super::CodexRateLimitSnapshot {
+            limit_name: None,
+            primary,
+            secondary,
+            credits_balance: None,
+            credits_unlimited: false,
+        }
+    }
+
+    #[test]
+    fn codex_gate_meters_long_primary_when_plan_reports_no_weekly_window() {
+        // Regression: `GET /wham/usage` returns a null `secondary_window` on
+        // every plan measured so far, putting the long window in `primary`
+        // instead (2026-08-17, live accounts: free = 30-day primary, Plus =
+        // 7-day primary, both with secondary null). Metering `secondary` alone
+        // made that indistinguishable from "under the limit", so a clamped
+        // subscriber was never gated.
+        let snapshot = codex_snapshot(Some(codex_window(30.0, Some(43_200))), None);
+        let usage = super::codex_usage_from_snapshot(
+            snapshot,
+            crate::models::CodexPlanTier::Pro,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(
+            !usage.optimization_allowed,
+            "ChatGPT Pro at 30% of its only (30-day) window is past the 25% cap"
+        );
+        assert!(matches!(
+            usage.gate_reason,
+            Some(crate::models::PricingGateReason::CodexWeeklyUsageLimitReached)
+        ));
+        assert_eq!(
+            usage.weekly_used_percent,
+            Some(30.0),
+            "the reported percent must be the window the gate used, not the empty secondary slot"
+        );
+    }
+
+    #[test]
+    fn codex_gate_meters_the_plus_weekly_window_reported_as_primary() {
+        // Exact shape measured on a live ChatGPT Plus account 2026-08-17:
+        // `primary_window` = 604800s (10080 minutes), `secondary_window` = null.
+        // Plus is the largest paid Codex cohort in the fleet, so this shape --
+        // not the assumed 5h-primary/weekly-secondary pair -- is the common case.
+        let plus = |used| codex_snapshot(Some(codex_window(used, Some(10_080))), None);
+
+        let under = super::codex_usage_from_snapshot(
+            plus(40.0),
+            crate::models::CodexPlanTier::Plus,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(
+            under.optimization_allowed,
+            "Plus at 40% is below its 50% cap"
+        );
+
+        let over = super::codex_usage_from_snapshot(
+            plus(55.0),
+            crate::models::CodexPlanTier::Plus,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(
+            !over.optimization_allowed,
+            "Plus at 55% of its weekly window must pause, even though it arrived as `primary`"
+        );
+        assert_eq!(
+            super::codex_usage_windows_summary(&plus(55.0)),
+            "primary=55@10080",
+            "the telemetry must show the window length, since the slot name does not identify it"
+        );
+        assert_eq!(
+            over.weekly_used_percent,
+            Some(55.0),
+            "a Plus user's weekly percent must be reported, not swallowed by the null secondary"
+        );
+    }
+
+    #[test]
+    fn codex_gate_prefers_the_longest_window_and_ignores_short_ones() {
+        // A 5-hour primary must never drive the weekly ladder: 25% of five
+        // hours would pause a paying user within the afternoon.
+        let both = codex_snapshot(
+            Some(codex_window(90.0, Some(300))),
+            Some(codex_window(10.0, Some(10_080))),
+        );
+        assert!(
+            super::codex_usage_from_snapshot(
+                both,
+                crate::models::CodexPlanTier::Pro,
+                super::CodexActivation::Metered,
+                0.0,
+            )
+            .optimization_allowed,
+            "weekly window at 10% governs, not the 5h window at 90%"
+        );
+
+        // ponytail ceiling, asserted so it is a decision and not a surprise:
+        // a plan whose only window is shorter than a day still fails open.
+        let short_only = codex_snapshot(Some(codex_window(90.0, Some(300))), None);
+        assert!(
+            super::codex_usage_from_snapshot(
+                short_only,
+                crate::models::CodexPlanTier::Pro,
+                super::CodexActivation::Metered,
+                0.0,
+            )
+            .optimization_allowed,
+            "no window of at least a day: no weekly signal, stays allowed"
+        );
+
+        // An undeclared window length keeps today's behaviour (secondary is
+        // assumed weekly) rather than being dropped.
+        let no_length = codex_snapshot(None, Some(codex_window(30.0, None)));
+        assert!(
+            !super::codex_usage_from_snapshot(
+                no_length,
+                crate::models::CodexPlanTier::Pro,
+                super::CodexActivation::Metered,
+                0.0,
+            )
+            .optimization_allowed,
+            "secondary without a declared length still meters"
+        );
+    }
+
+    #[test]
+    fn codex_usage_windows_summary_reports_window_shape() {
+        assert_eq!(
+            super::codex_usage_windows_summary(&codex_snapshot(
+                Some(codex_window(99.4, Some(43_200))),
+                Some(codex_window(12.0, Some(10_080))),
+            )),
+            "primary=99@43200;secondary=12@10080"
+        );
+        assert_eq!(
+            super::codex_usage_windows_summary(&codex_snapshot(
+                Some(codex_window(99.0, Some(43_200))),
+                None
+            )),
+            "primary=99@43200"
+        );
+        assert_eq!(
+            super::codex_usage_windows_summary(&codex_snapshot(
+                None,
+                Some(codex_window(12.0, None))
+            )),
+            "secondary=12"
+        );
+        assert_eq!(
+            super::codex_usage_windows_summary(&codex_snapshot(None, None)),
+            "none",
+            "credits-only snapshot still reports that it carried no windows"
+        );
     }
 
     #[test]

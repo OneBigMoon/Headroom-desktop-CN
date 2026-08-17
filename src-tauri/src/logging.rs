@@ -172,6 +172,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Same split as the pip line above: one partial-plugin-install message
+    // covered five unrelated causes under one fingerprint (RUST-6K), so it was
+    // untriageable AND unresolvable -- any resolve regressed on the next
+    // sibling shape. It reaches Sentry via the per-category fingerprinted
+    // capture at the emit site instead.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.contains("installed for some hosts but not all")
+    {
+        return true;
+    }
     // Ad-hoc codesign of venv native extensions is best-effort (EDR nicety):
     // codesign exits non-zero when a single .so can't be re-signed, but the
     // rest are signed and the smoke test is the real gate. A per-file failure
@@ -489,6 +499,23 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::tool_manager",
             "pip install produced no usable venv"
+        ));
+    }
+
+    #[test]
+    fn partial_plugin_install_warn_is_local_only() {
+        // RUST-6K: the bridged warn grouped five causes under one fingerprint.
+        // It now reaches Sentry only via the fingerprinted capture at the emit
+        // site, so the warn itself must be demoted to local-only.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "ponytail installed for some hosts but not all: Codex: command failed (exit 1): \
+             codex plugin add ponytail@ponytail"
+        ));
+        // Unrelated plugin warns still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "caveman smoke test failed after upgrade: stale receipt removed"
         ));
     }
 

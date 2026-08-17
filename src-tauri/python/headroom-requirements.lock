@@ -45,8 +45,28 @@
 #     does NOT include. We resolve [all,vector] so hnswlib==0.8.0 stays present
 #     (the proxy memory adapters import it).
 #   - torch 2.11.0 -> 2.12.1 (ml/voice floor raised to >=2.12.1). 2.12.1 ships
-#     only macosx_14_0_arm64 wheels; safe because the app's minimumSystemVersion
-#     is 14.0, so every supported user gets a wheel.
+#     only macosx_14_0_arm64 wheels. CORRECTION (2026-08-17): the original note
+#     here claimed this was "safe because minimumSystemVersion is 14.0, so every
+#     supported user gets a wheel" -- that checked the OS floor and missed the
+#     ARCH. The app ships as a universal binary, so Intel Macs are a supported
+#     target, and they get no wheel at all. See the arch markers below.
+#
+# ARCH MARKERS (2026-08-17, Sentry RUST-6S / RUST-21). This lock is resolved for
+# arm64 but installed on both mac arches. Three pins have no macOS x86_64 wheel,
+# so `pip install -r` aborted the WHOLE bootstrap on every Intel Mac -- no venv,
+# no backend. Failing since at least 2026-04-25 (RUST-21, archived, 91 events).
+# torch/sentence-transformers are EXCLUDED on Intel Mac, matching headroom-ai's
+# own metadata, which already declares them arm64-only on darwin:
+#   torch>=2.12.1 ; (platform_machine != 'x86_64' and extra == 'ml')
+#                   or (sys_platform != 'darwin' and extra == 'ml')
+# Their importers in headroom (memory/adapters/embedders.py,
+# proxy/memory_handler.py) all guard with try/except ImportError, so Intel
+# degrades to non-ML embedding instead of failing. onnxruntime is required
+# unconditionally by the `proxy` extra (>=1.16.0), so Intel gets the newest
+# version that still ships an x86_64 wheel (1.23.2, last before upstream dropped
+# Intel mac at 1.24.0; no known advisories). Keep both arches' pins in sync on
+# every bump: check `pip index versions <pkg>` for a macosx x86_64 wheel before
+# raising a native pin, not just the OS floor.
 #   - broad point-version churn (anthropic, openai, litellm, transformers,
 #     onnxruntime, protobuf 6->7, etc.) from the fresh resolution.
 aiohappyeyeballs==2.6.2
@@ -64,7 +84,20 @@ cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.4.2
 courlan==1.4.0
-cryptography==50.0.0
+cryptography==50.0.0; platform_machine != "x86_64" or sys_platform != "darwin"
+# Intel mac: 48.0.1 is the last release with a universal2 wheel (49.0.0 dropped
+# it). 50.0.0 has an sdist but building it needs a Rust toolchain users do not
+# have, so Intel had no installable option at all. Real constraints in this set
+# are msal (<51,>=2.5), pdfminer-six (>=36) and azure-identity (>=2.5), all
+# satisfied. 48.0.1 carries GHSA-g6cj-pr64-35w5 (PKCS#7 EnvelopedData decryption
+# oracle), GHSA-jwv3-5hgf-82ww (X.509 path-building DoS) and GHSA-m2h6-j472-rp4c
+# (wildcard DNS escaping permittedSubtrees). All three were verified unreachable
+# on 2026-08-17: nothing in headroom, litellm, pdfminer, msal or azure calls the
+# PKCS#7 decryption API or the x509.verification path builder (msal uses pkcs12,
+# unrelated). RE-CHECK THAT on any bump that adds a cert-verification or
+# S/MIME dependency. Durable fix: build a 50.x universal2 wheel into
+# vendor-wheels-v1 (same mechanism hnswlib already uses) and drop this line.
+cryptography==48.0.1; platform_machine == "x86_64" and sys_platform == "darwin"
 datasets==5.0.0
 dateparser==1.4.1
 dill==0.4.1
@@ -114,7 +147,8 @@ multiprocess==0.70.19
 narwhals==2.22.1
 networkx==3.6.1
 numpy==2.5.0
-onnxruntime==1.27.0
+onnxruntime==1.27.0; platform_machine != "x86_64" or sys_platform != "darwin"
+onnxruntime==1.23.2; platform_machine == "x86_64" and sys_platform == "darwin"
 openai==2.44.0
 opencv-python==4.13.0.92
 openpyxl==3.1.5
@@ -153,7 +187,7 @@ rpds-py==2026.6.3
 safetensors==0.8.0
 scikit-learn==1.9.0
 scipy==1.18.0
-sentence-transformers==5.6.0
+sentence-transformers==5.6.0; platform_machine != "x86_64" or sys_platform != "darwin"
 sentencepiece==0.2.1
 setuptools==81.0.0
 shapely==2.1.2
@@ -169,7 +203,7 @@ tiktoken==0.13.0
 tld==0.13.2
 tokenizers==0.22.2
 tomlkit==0.15.1
-torch==2.12.1
+torch==2.12.1; platform_machine != "x86_64" or sys_platform != "darwin"
 tqdm==4.68.3
 trafilatura==2.1.0
 transformers==5.12.1

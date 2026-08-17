@@ -1948,20 +1948,18 @@ impl ToolManager {
                     log::warn!("[tool_manager] writing cache_ttl_seed.json failed: {err}");
                 }
 
-                // Wrap with `nice` so headroom yields CPU to foreground apps
-                // (Claude Code, terminal, etc.) when the machine is contended.
-                // On idle systems headroom still runs at full speed.
-                // +2 (not +5): under sustained contention from many concurrent
-                // agents a too-niced backend gets starved enough that even the
-                // watchdog's tolerant 5s re-probe misses, triggering spurious
-                // auto-pause. +2 still yields, without the starvation.
-                #[cfg(unix)]
-                let mut command = {
-                    let mut c = Command::new("/usr/bin/nice");
-                    c.arg("-n").arg("2").arg(executable).args(args);
-                    c
-                };
-                #[cfg(windows)]
+                // Runs at default priority, deliberately. This used to be
+                // wrapped in `nice` (+5, then +2 after the first round of
+                // starvation) on the theory that the backend is background
+                // work that should yield to foreground apps. It isn't: every
+                // Claude Code request blocks on it, so deprioritizing it
+                // deprioritizes exactly what the user is waiting for. Worse,
+                // it inverted under load -- the case it existed for. A niced
+                // backend on a contended machine misses the watchdog's health
+                // probes, gets force-killed, truncates in-flight SSE streams,
+                // and the restart costs more CPU than the nicing ever saved
+                // (2026-08-17: 34 restarts in one morning at load 55 on 8
+                // cores). The Windows path never niced at all.
                 let mut command = {
                     let mut c = Command::new(executable);
                     c.args(args);
@@ -5310,8 +5308,25 @@ impl ToolManager {
         set_serena_global_gitignore(false);
         let venv = self.serena_venv_dir();
         if venv.exists() {
-            std::fs::remove_dir_all(&venv)
-                .with_context(|| format!("removing {}", venv.display()))?;
+            // Retrying helper, not a bare remove_dir_all: it clears read-only
+            // bits across the tree, which is the half of Windows "Access is
+            // denied" we can actually fix (Sentry RUST-6T).
+            crate::client_adapters::remove_dir_all_retry(&venv).map_err(|err| {
+                // The other half is an open handle -- an agent session still
+                // running serena's MCP server out of this venv. We will not kill
+                // a user's editor to win a delete, so name the cause instead: a
+                // bare "Access is denied" leaves them with nothing to act on.
+                if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    anyhow!(
+                        "removing {} was denied. Serena may still be running as an MCP server \
+                         in an open Claude Code or Codex session -- close those and uninstall \
+                         again. Underlying error: {err}",
+                        venv.display()
+                    )
+                } else {
+                    anyhow::Error::new(err).context(format!("removing {}", venv.display()))
+                }
+            })?;
         }
         let receipt = self.runtime.tools_dir.join("serena.json");
         if receipt.exists() {
@@ -5635,9 +5650,23 @@ impl ToolManager {
             let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
             self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))?;
         } else {
-            // Re-adding an already-known marketplace is a benign error, ignore it.
-            let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin));
-            self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))?;
+            // Re-adding an already-known marketplace is a benign error, so its
+            // failure is not fatal on its own -- but it must not be discarded
+            // either. When `marketplace add` fails for a real reason (offline,
+            // git failure, unwritable snapshot dir) the install that follows
+            // reports only "plugin <x> was not found in marketplace <y>", which
+            // names a consequence and hides every cause (Sentry RUST-6K). Carry
+            // the add error and attach it if the install then fails.
+            let marketplace_err = self
+                .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                .err();
+            self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
+                .map_err(|err| match marketplace_err {
+                    Some(add_err) => {
+                        err.context(format!("marketplace add failed first: {add_err:#}"))
+                    }
+                    None => err,
+                })?;
         }
         if !host.plugin_present(plugin) {
             bail!("install completed but the plugin was not registered");
@@ -5682,10 +5711,25 @@ impl ToolManager {
             bail!("installing the {id} plugin failed: {}", errors.join("; "));
         }
         if !errors.is_empty() {
-            log::warn!(
-                "{id} installed for some hosts but not all: {}",
-                errors.join("; ")
+            let detail = errors.join("; ");
+            // Explicit per-category fingerprint; the bridged warn is local-only
+            // (skip_sentry rule) so this doesn't double-report. Mirrors the pip
+            // install path -- see `plugin_install_failure_category`.
+            let category = plugin_install_failure_category(&detail);
+            sentry::with_scope(
+                |scope| {
+                    scope.set_fingerprint(Some(&["plugin-install-partial", category]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!(
+                            "{id} installed for some hosts but not all [{category}]: {detail}"
+                        ),
+                        sentry::Level::Warning,
+                    );
+                },
             );
+            log::warn!("{id} installed for some hosts but not all: {detail}");
         }
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
@@ -7938,6 +7982,43 @@ fn pip_failure_category(compact: &str) -> &'static str {
     }
 }
 
+/// Cause class for a partial plugin install, so each shape gets its own Sentry
+/// issue instead of one grab-bag. Same rationale as [`pip_failure_category`]:
+/// RUST-6K collected five unrelated causes (a missing marketplace, a config the
+/// host CLI refuses to parse, no CLI on PATH, and CLI version skew) under one
+/// title, which made it untriageable -- and unresolvable, since any resolve
+/// regresses the moment a sibling shape reappears.
+fn plugin_install_failure_category(compact: &str) -> &'static str {
+    let lower = compact.to_ascii_lowercase();
+    if lower.contains("not found in marketplace") {
+        // Our marketplace registration did not take. Cause now travels with it
+        // (see install_plugin_into), so this bucket carries the real reason.
+        "marketplace-missing"
+    } else if lower.contains("cli not found on path") {
+        "cli-missing"
+    } else if lower.contains("unknown option")
+        || lower.contains("unrecognized subcommand")
+        || lower.contains("is no longer supported")
+    {
+        "cli-version-skew"
+    } else if lower.contains("failed to load configuration")
+        || lower.contains("duplicate key")
+        || lower.contains("toml parse error")
+    {
+        // The host CLI cannot read its own config, so nothing we do lands.
+        "host-config-invalid"
+    } else if crate::is_disk_full_signal(&lower) {
+        "disk-full"
+    } else if lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || lower.contains("errno 13")
+    {
+        "permission"
+    } else {
+        "other"
+    }
+}
+
 /// Streaming variant of `run_pip_install_with_retries`. Each line emitted by
 /// pip on stdout/stderr is piped through `on_line` as it arrives, so callers
 /// can translate noteworthy pip events ("Collecting X", "Downloading Y",
@@ -8345,15 +8426,16 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
         path_with_binary_dir, pending_addon_update, pinned_headroom_release, pip_failure_category,
-        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
-        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
+        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
+        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
+        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -9263,7 +9345,17 @@ mod tests {
 
     #[test]
     fn proxy_argv_matches_when_all_expected_flags_present() {
-        let argv = "/usr/bin/nice -n 5 /Users/x/headroom proxy --port 6768 --log-messages \
+        let argv = "/Users/x/headroom proxy --port 6768 --log-messages \
+                    --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
+        assert!(proxy_argv_contains_expected_flags(argv, true));
+    }
+
+    #[test]
+    fn proxy_argv_matches_legacy_nice_wrapped_orphan() {
+        // Builds before 2026-08-17 spawned the backend under `nice`. Upgrading
+        // users still have one of those running, and it must be recognized as
+        // ours rather than treated as a foreign occupant of the port.
+        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 --log-messages \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
@@ -11821,5 +11913,52 @@ exit 0
         for (compact, expected) in cases {
             assert_eq!(pip_failure_category(compact), expected, "for: {compact}");
         }
+    }
+
+    #[test]
+    fn plugin_install_failure_category_splits_the_rust_6k_grab_bag() {
+        // Every string below is a real RUST-6K event body. They arrived under ONE
+        // fingerprint, which is why that issue could never be resolved: a resolve
+        // regressed on the next sibling shape. One bucket per cause class.
+        let cases = [
+            (
+                "Codex: command failed (exit 1): /opt/homebrew/bin/codex plugin add \
+                 ponytail@ponytail\nstdout:\n\nstderr:\nError: plugin `ponytail` was not found \
+                 in marketplace `ponytail`",
+                "marketplace-missing",
+            ),
+            (
+                "Codex: command failed (exit 1): /opt/homebrew/bin/codex plugin add \
+                 ponytail@ponytail\nstdout:\n\nstderr:\nError: failed to load configuration\n\
+                 Caused by:\n    0: ~/.codex/config.toml:646:18: duplicate key",
+                "host-config-invalid",
+            ),
+            ("Codex: CLI not found on PATH", "cli-missing"),
+            (
+                "Claude Code: command failed (exit 1): ~/.local/bin/claude plugin install \
+                 caveman@caveman --scope user\nstdout:\n\nstderr:\nerror: unknown option '--scope'",
+                "cli-version-skew",
+            ),
+            (
+                "Codex: command failed (exit 1): codex plugin add caveman@caveman\nstderr:\n\
+                 Error: failed to load configuration\n\nCaused by:\n    0: \
+                 ~/.codex/config.toml:209:12: `wire_api = \"chat\"` is no longer supported.",
+                "cli-version-skew",
+            ),
+            ("Codex: something we have not seen", "other"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (detail, expected) in cases {
+            assert_eq!(
+                plugin_install_failure_category(detail),
+                expected,
+                "for: {detail}"
+            );
+            seen.insert(expected);
+        }
+        assert!(
+            seen.len() >= 5,
+            "the five RUST-6K shapes must land in distinct buckets, got: {seen:?}"
+        );
     }
 }

@@ -4246,7 +4246,9 @@ impl SavingsTracker {
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
         // in-memory stats; it is retried on every observe tick anyway.
         if let Err(err) = tracker.persist_state() {
-            log::warn!("initial savings-state persist failed: {err}");
+            // `{err:#}`: persist_state returns an anyhow chain, so plain Display
+            // would bridge only the outer context to Sentry and hide the cause.
+            log::warn!("initial savings-state persist failed: {err:#}");
         }
         Ok(tracker)
     }
@@ -5332,35 +5334,82 @@ impl HeadroomSavingsHistoryResponse {
     }
 }
 
+/// How often a failing `/stats` fetch may warn. Silence is what let a 500ms
+/// timeout eat three days of output-shaping samples unnoticed, but the
+/// dashboard retries every 12s and `log::warn!` bridges to Sentry, so an
+/// unthrottled warn would flood it.
+/// ponytail: in-memory, resets on restart (one warn per launch while broken)
+/// and never resets on recovery, so a flap inside the window stays quiet.
+const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
+static STATS_FETCH_WARNED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn warn_stats_fetch_failed(reason: &str) {
+    let mut last = STATS_FETCH_WARNED_AT.lock();
+    if last.is_some_and(|at| at.elapsed() < STATS_FETCH_WARN_INTERVAL) {
+        return;
+    }
+    *last = Some(Instant::now());
+    log::warn!(
+        "headroom /stats fetch failed ({reason}); dashboard loses the layers only \
+         this endpoint reports (output shaping, tool schema)"
+    );
+}
+
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     if !is_headroom_proxy_reachable() {
         return None;
     }
 
+    // 500ms was silently fatal: `/stats` rebuilds its whole payload per call
+    // and crossed half a second as history grew, so every fetch timed out and
+    // the dashboard lost the layers only this endpoint reports (output
+    // shaping, tool schema) while `/stats-history` kept the rest looking live.
+    // `?cached=1` is the backend's documented dashboard fast path (5s snapshot,
+    // same fields); measured 2.3s on an expired snapshot, 0.1s warm.
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
 
     let hosts = ["127.0.0.1", "localhost"];
+    let mut last_failure: Option<String> = None;
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats");
+        let url = format!("http://{host}:6767/stats?cached=1");
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
-            _ => continue,
+            Ok(response) => {
+                last_failure = Some(format!("HTTP {}", response.status()));
+                continue;
+            }
+            // A timeout means the listener accepted and then stalled. Both host
+            // names resolve to that same listener, so retrying the other alias
+            // only doubles the stall inside a dashboard build.
+            Err(err) if err.is_timeout() => {
+                warn_stats_fetch_failed("timed out after 5s");
+                return None;
+            }
+            Err(err) => {
+                last_failure = Some(err.to_string());
+                continue;
+            }
         };
 
         let body = match response.text() {
             Ok(body) => body,
-            Err(_) => continue,
+            Err(err) => {
+                last_failure = Some(err.to_string());
+                continue;
+            }
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
             return Some(parsed);
         }
+        last_failure = Some("payload had no recognised savings fields".to_string());
     }
 
+    warn_stats_fetch_failed(last_failure.as_deref().unwrap_or("no local host answered"));
     None
 }
 
@@ -6499,7 +6548,7 @@ fn parse_f64_from_text(text: &str) -> Option<f64> {
 
 pub(crate) fn headroom_proxy_reachable() -> bool {
     // Status/UI boundary: tolerant by design. The tight 1.5s probe flaps red
-    // under load when the niced backend is busy with compression/embedding,
+    // under load when the backend is busy with compression/embedding,
     // even though traffic still flows ("red light, works"). Use a 5s ceiling
     // matching the watchdog's tolerance — a healthy /readyz still answers in
     // milliseconds, so the dot stays responsive; the larger budget only bites
@@ -7002,10 +7051,11 @@ mod tests {
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, support_tier_for_platform,
-        tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes, AppState,
-        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, OutputReduction, PersistedSavingsState, SavingsObservation,
-        SavingsRecord, SavingsTracker,
+        tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
+        warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
+        DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
+        OutputReduction, PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
     };
 
     #[test]
@@ -7143,6 +7193,11 @@ mod tests {
         // Nothing unhealthy (shouldn't be a 503, but be safe): not upstream-only.
         let all_ready = r#"{"checks":{"upstream":{"ready":true}}}"#;
         assert!(!proxy_readyz_503_body_is_upstream_only(all_ready));
+        // RUST-5E: a never-loaded kompress model tagged along on every
+        // sleep-wake blip and made the process look crashed. Soft check, ignore.
+        let with_kompress =
+            r#"{"checks":{"upstream":{"ready":false},"kompress":{"ready":false,"optional":true}}}"#;
+        assert!(proxy_readyz_503_body_is_upstream_only(with_kompress));
     }
 
     #[test]
@@ -8953,6 +9008,37 @@ mod tests {
         )
         .expect("parsed stats");
         assert!(parsed.output_reduction.is_none());
+    }
+
+    #[test]
+    fn stats_fetch_warn_is_throttled_within_the_window() {
+        // The dashboard retries /stats every 12s and this warn bridges to
+        // Sentry, so only the first failure in a window may speak.
+        *STATS_FETCH_WARNED_AT.lock() = None;
+
+        warn_stats_fetch_failed("timed out after 5s");
+        let first = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
+
+        warn_stats_fetch_failed("timed out after 5s");
+        assert_eq!(
+            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped"),
+            first,
+            "a repeat inside the window must not warn again"
+        );
+
+        // Instant has no epoch to subtract from on a freshly-booted machine.
+        if let Some(stale) =
+            Instant::now().checked_sub(STATS_FETCH_WARN_INTERVAL + Duration::from_secs(1))
+        {
+            *STATS_FETCH_WARNED_AT.lock() = Some(stale);
+            warn_stats_fetch_failed("timed out after 5s");
+            assert!(
+                (*STATS_FETCH_WARNED_AT.lock()).expect("re-stamped") > stale,
+                "a failure after the window elapsed must warn again"
+            );
+        }
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
     }
 
     #[test]

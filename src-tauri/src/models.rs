@@ -985,8 +985,16 @@ pub struct CodexUsage {
     pub gate_reason: Option<PricingGateReason>,
     /// Headroom tier to recommend, derived from the detected OpenAI plan.
     pub recommended_subscription_tier: Option<HeadroomSubscriptionTier>,
-    /// The weekly (secondary-window) utilization the gate was evaluated against.
+    /// Utilization of the window the gate was actually evaluated against: the
+    /// longest one the plan publishes, which is NOT necessarily `secondary`.
+    /// Measured 2026-08-17, both free (30-day) and Plus (7-day) report their
+    /// long window as `primary` with `secondary` null, so reading `secondary`
+    /// here left this permanently null for most of the fleet.
     pub weekly_used_percent: Option<f64>,
+    /// Seconds until that same window resets. Mirrors `claude.weekly_resets_at`
+    /// so the forgone-savings upgrade copy has a horizon to multiply by.
+    #[serde(default)]
+    pub weekly_resets_in_seconds: Option<i64>,
     /// Display copy for the codex usage state (active / nudging / near-limit).
     pub gate_message: String,
     /// The tier-dependent nudge ladder the gate applied (10/15/20 for

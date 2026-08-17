@@ -920,19 +920,87 @@ pub fn clear_client_setups() -> Result<()> {
 /// process killed in `stop_headroom` may still flush a log line into the
 /// directory tree mid-walk, re-creating an entry so the final `rmdir` fails
 /// with "Directory not empty". A short backoff lets the writer finish.
-fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
+///
+/// A `PermissionDenied` is different: it is usually NOT transient, so retrying
+/// alone never clears it. The two causes that reach us are a read-only
+/// attribute somewhere in the tree -- which blocks the delete outright on
+/// Windows, and blocks it via a read-only *directory* on Unix -- and a live
+/// process holding an open handle to a file inside it (Sentry RUST-6T: an agent
+/// session still running serena's MCP server out of the venv being removed).
+/// The first is fixable here, so on the first `PermissionDenied` we clear
+/// read-only bits across the tree and try again. The second is not ours to fix
+/// by force; callers surface it so the user can close the session.
+pub(crate) fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
     let mut last = Ok(());
+    let mut cleared_readonly = false;
     for attempt in 0..5 {
         match std::fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied && !cleared_readonly {
+                    // Once per call: if this does not free the tree, the cause is
+                    // an open handle and further passes are wasted work.
+                    cleared_readonly = true;
+                    clear_readonly_recursive(path);
+                }
                 last = Err(e);
                 std::thread::sleep(Duration::from_millis(100 * (attempt + 1)));
             }
         }
     }
     last
+}
+
+/// Best-effort: drop the read-only bit on `path` and everything under it, so a
+/// following `remove_dir_all` is not blocked by it. Depth-first, because a
+/// read-only directory has to stay writable until its children are gone.
+///
+/// `DirEntry::metadata` does not traverse symlinks or Windows reparse points, so
+/// a junction or symlink is never descended into -- this cannot walk out of the
+/// tree or loop. Every failure is ignored: this only ever runs as a rescue pass
+/// before a delete that has already failed once.
+fn clear_readonly_recursive(path: &Path) {
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            match entry.metadata() {
+                Ok(md) if md.is_dir() => clear_readonly_recursive(&entry.path()),
+                Ok(md) => clear_readonly(&entry.path(), md.permissions()),
+                Err(_) => {}
+            }
+        }
+    }
+    // The directory itself last: on Unix its write bit is what permits unlinking
+    // the children above, so clearing it earlier would be undone by nothing but
+    // is pointless before they are gone.
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        clear_readonly(path, md.permissions());
+    }
+}
+
+fn clear_readonly(path: &Path, perms: std::fs::Permissions) {
+    if !perms.readonly() {
+        return;
+    }
+    // Deliberately NOT `set_readonly(false)`: on Unix that sets the write bit for
+    // group and other as well. This runs on a delete that has already failed, so
+    // the delete may fail again (an open handle is not fixable here) -- and then
+    // whatever we widened is left behind permanently on the user's disk. Grant
+    // the minimum that permits the unlink: owner write.
+    let mut perms = perms;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = perms.mode();
+        perms.set_mode(mode | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no per-class write bit here; the read-only attribute is the
+        // whole mechanism, and clearing it is what unblocks the delete.
+        perms.set_readonly(false);
+    }
+    let _ = std::fs::set_permissions(path, perms);
 }
 
 /// Undo every edit Headroom made to *other* tools' state: agent settings, shell
@@ -2818,6 +2886,38 @@ fn strip_codex_root_model_provider(content: &str) -> String {
         .join("\n")
 }
 
+/// Drop an unmarked `[model_providers.headroom]` table so the managed block's
+/// copy isn't a duplicate table key. This is the table-scope analog of
+/// [`strip_codex_root_model_provider`]: a second `[model_providers.headroom]`
+/// makes Codex refuse to load its *entire* config, so one stale table breaks
+/// every `codex` invocation, not just our routing (Sentry RUST-6K).
+///
+/// Such a table is left behind by an OSS `pip install headroom` (which wrote the
+/// provider with no marker comments) or by a user who hand-added it before
+/// marker blocks existed. It is only ever removed for the `headroom` provider
+/// name -- our own namespace, and byte-identical in intent to the block we are
+/// about to write. Every other provider table is left untouched.
+///
+/// Marker-wrapped copies are already gone by the time this runs
+/// ([`strip_codex_managed_toml`]), so this only sees unmarked leftovers.
+fn strip_codex_headroom_provider_table(content: &str) -> String {
+    let mut dropping = false;
+    content
+        .lines()
+        .filter(|raw| {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                // A new table header always ends any drop; it starts one only
+                // for our own provider name.
+                dropping = line == "[model_providers.headroom]";
+                return !dropping;
+            }
+            !dropping
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Restore a preserved pre-Headroom root `model_provider` after teardown, so a
 /// gateway/alternate-provider user isn't silently left on api.openai.com. No-op
 /// if the config already has a root `model_provider` (user re-added their own).
@@ -2854,6 +2954,9 @@ fn render_codex_config(existing: &str) -> String {
     // Drop a foreign root model_provider too, else our managed
     // `model_provider = "headroom"` collides with it as a duplicate root key.
     let mid = strip_codex_root_model_provider(&mid);
+    // Same collision one scope down: an unmarked `[model_providers.headroom]`
+    // table would duplicate the one in the managed block below.
+    let mid = strip_codex_headroom_provider_table(&mid);
     let mid = mid.trim();
 
     let mut out = codex_marker_block(CODEX_ROOT_BLOCK_ID, &codex_root_keys_body());
@@ -8897,6 +9000,49 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn render_codex_config_drops_an_unmarked_headroom_provider_table() {
+        // Regression for Sentry RUST-6K: an OSS `pip install headroom` (or a
+        // hand-added table from before marker blocks) leaves an UNMARKED
+        // [model_providers.headroom]. Adding our marked copy alongside it made
+        // the whole config invalid TOML ("duplicate key"), and Codex then
+        // refused to load ANY of it -- breaking every `codex` invocation, not
+        // just our routing.
+        let existing = "model = \"gpt-5.4\"\n\
+                        \n\
+                        [model_providers.headroom]\n\
+                        name = \"Headroom (old oss install)\"\n\
+                        base_url = \"http://127.0.0.1:8787/v1\"\n\
+                        \n\
+                        [model_providers.other]\n\
+                        base_url = \"http://elsewhere/v1\"\n";
+
+        let rendered = render_codex_config(existing);
+
+        assert_eq!(
+            rendered.matches("[model_providers.headroom]").count(),
+            1,
+            "exactly one headroom provider table after render, got:\n{rendered}"
+        );
+        assert!(
+            rendered.parse::<toml::Value>().is_ok(),
+            "rendered config is valid toml, got:\n{rendered}"
+        );
+        // The stale table's body must go with its header, not linger as orphan
+        // keys absorbed into whatever table precedes them.
+        assert!(
+            !rendered.contains("8787"),
+            "stale provider body is removed with its header, got:\n{rendered}"
+        );
+        // Everything that is not ours is untouched.
+        assert!(
+            rendered.contains("[model_providers.other]")
+                && rendered.contains("http://elsewhere/v1")
+                && rendered.contains("model = \"gpt-5.4\""),
+            "foreign providers and user content are preserved, got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn codex_foreign_model_provider_is_root_scope_only() {
         assert_eq!(
             super::codex_foreign_model_provider("model_provider = \"gateway\"\n").as_deref(),
@@ -9183,6 +9329,49 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_dir_all_retry_clears_readonly_instead_of_giving_up() {
+        // Sentry RUST-6T: uninstall died on Windows "Access is denied (os error
+        // 5)". Retrying cannot fix a read-only tree -- the error is deterministic,
+        // so all 5 attempts fail identically. The rescue pass must clear the
+        // read-only bits and get the delete through.
+        //
+        // Shaped like the real failure: a venv-ish tree with a read-only file
+        // inside a read-only nested directory. On Unix the read-only DIRECTORY is
+        // what blocks unlinking its children; on Windows the read-only FILE is.
+        // This covers both, so it is a real check here and on Windows.
+        let root = std::env::temp_dir().join(format!("rdo_retry_{}", std::process::id()));
+        // Via the helper, not plain remove: a read-only tree left by an earlier
+        // run (recycled pid) would otherwise survive setup and break this test.
+        super::remove_dir_all_retry(&root).ok();
+        let nested = root.join("Lib").join("site-packages");
+        std::fs::create_dir_all(&nested).unwrap();
+        let locked_file = nested.join("RECORD");
+        std::fs::write(&locked_file, b"x").unwrap();
+
+        for p in [locked_file.as_path(), nested.as_path()] {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(p, perms).unwrap();
+        }
+        // Precondition: a plain remove_dir_all really is blocked, else this test
+        // would pass even with the rescue pass deleted.
+        assert!(
+            std::fs::remove_dir_all(&root).is_err(),
+            "read-only tree must block a plain remove_dir_all, or this test proves nothing"
+        );
+
+        super::remove_dir_all_retry(&root).expect("read-only tree must be removed");
+        assert!(!root.exists(), "tree still present after retry helper");
+    }
+
+    #[test]
+    fn remove_dir_all_retry_is_ok_on_a_missing_path() {
+        let missing = std::env::temp_dir().join(format!("rdo_absent_{}", std::process::id()));
+        std::fs::remove_dir_all(&missing).ok();
+        assert!(super::remove_dir_all_retry(&missing).is_ok());
     }
 
     #[test]

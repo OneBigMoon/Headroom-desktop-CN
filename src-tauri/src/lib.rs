@@ -1770,8 +1770,8 @@ pub(crate) fn build_watchdog_give_up_report(
 /// on 6767) and classify the outcome, also returning the raw response body
 /// (truncated) for non-2xx responses so the give-up Sentry event carries the
 /// backend's own per-check breakdown instead of just our classification.
-/// The watchdog uses a 5s budget so a niced backend that's merely slow under
-/// heavy compression load isn't mistaken for a dead one.
+/// The watchdog uses a 5s budget so a backend that's merely slow under heavy
+/// compression load isn't mistaken for a dead one.
 fn probe_backend_readyz_with_body(timeout: std::time::Duration) -> (String, Option<String>) {
     let port = crate::backend_port::get();
     let client = match reqwest::blocking::Client::builder()
@@ -1852,6 +1852,16 @@ fn classify_backend_readyz(
 /// Comma-joined, sorted names of the unhealthy components in a `/readyz`
 /// payload — those whose `checks.<name>.ready` is `false`. Empty when the body
 /// has no `checks` object or every check is ready.
+///
+/// Soft components (`"optional": true`) are excluded: the backend itself drops
+/// them from its own readiness verdict, so they never cause the 503 and must
+/// not shape our diagnosis of it. Kompress is the one that matters — its model
+/// downloads lazily, so on installs without the ML extras it reports
+/// `ready: false` forever. Left in, it rode along on every sleep-wake
+/// `upstream` blip and turned `http_503:upstream` into
+/// `http_503:kompress,upstream`, defeating `readyz_failure_is_upstream_only`
+/// and auto-pausing 10 healthy users (Sentry RUST-5E). Matched by name too,
+/// because backends before ~0.33 emit no `optional` flag.
 pub(crate) fn readyz_failed_checks_csv(body: &serde_json::Value) -> String {
     let Some(checks) = body.get("checks").and_then(|c| c.as_object()) else {
         return String::new();
@@ -1859,6 +1869,9 @@ pub(crate) fn readyz_failed_checks_csv(body: &serde_json::Value) -> String {
     let mut failed: Vec<&str> = checks
         .iter()
         .filter(|(_, v)| v.get("ready").and_then(|r| r.as_bool()) == Some(false))
+        .filter(|(name, v)| {
+            name.as_str() != "kompress" && v.get("optional").and_then(|o| o.as_bool()) != Some(true)
+        })
         .map(|(name, _)| name.as_str())
         .collect();
     failed.sort_unstable();
@@ -4537,6 +4550,16 @@ impl LearnAgent {
             other => Err(format!("Unknown Headroom Learn agent: {other}")),
         }
     }
+
+    /// Stable Sentry tag value; inverse of `parse`.
+    fn as_tag(self) -> &'static str {
+        match self {
+            LearnAgent::Claude => "claude",
+            LearnAgent::Codex => "codex",
+            LearnAgent::Opencode => "opencode",
+            LearnAgent::Grok => "grok",
+        }
+    }
 }
 
 pub(crate) fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
@@ -4854,6 +4877,39 @@ fn execute_headroom_learn_run(
             let output_tail = crate::state::tail_lines(&merged, 32);
             if output.status.success() {
                 if let Some(warnings) = extract_llm_failure_warnings(&stderr) {
+                    // The CLI exits 0 here: the analyzer logged a WARNING and
+                    // returned zero recommendations. Without this capture the
+                    // whole class is invisible to us: users report a bare
+                    // "failed (exit 1):" and we have no idea whether it was a
+                    // usage limit, a dead local route, or our own 400. Warning
+                    // (not Error) because some causes are user-environment;
+                    // fingerprinted on the reason so the split is visible.
+                    let signature: String = warnings
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("no reason")
+                        .chars()
+                        .take(160)
+                        .collect();
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_tag("flow", "headroom_learn");
+                            scope.set_tag("learn_outcome", "llm_analysis_failed");
+                            scope.set_tag("learn_agent", agent.as_tag());
+                            scope.set_extra("reason", warnings.clone().into());
+                            scope.set_extra("project_name", project_name.to_string().into());
+                            scope.set_fingerprint(Some(
+                                ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
+                            ));
+                        },
+                        || {
+                            sentry::capture_message(
+                                &format!("headroom learn produced no recommendations: {signature}"),
+                                sentry::Level::Warning,
+                            );
+                        },
+                    );
                     (
                         format!(
                             "headroom learn could not produce recommendations for {project_name}."
@@ -4933,15 +4989,7 @@ fn execute_headroom_learn_run(
                     sentry::with_scope(
                         |scope| {
                             scope.set_tag("flow", "headroom_learn");
-                            scope.set_tag(
-                                "learn_agent",
-                                match agent {
-                                    LearnAgent::Claude => "claude",
-                                    LearnAgent::Codex => "codex",
-                                    LearnAgent::Opencode => "opencode",
-                                    LearnAgent::Grok => "grok",
-                                },
-                            );
+                            scope.set_tag("learn_agent", agent.as_tag());
                             scope.set_tag("exit_code", &exit_code_str);
                             scope.set_extra("exit_status", output.status.to_string().into());
                             scope.set_extra(
@@ -5205,7 +5253,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 } else if runtime.installed && !runtime.proxy_reachable {
                     // The fast reachability probe (1.5s via the 6767 intercept)
                     // missed, but it flaps on transient upstream-connectivity
-                    // blips and brief backend busyness (niced compression /
+                    // blips and brief backend busyness (compression /
                     // embedding) while the process is perfectly alive. Mirror
                     // the watchdog's tolerance instead of immediately flashing
                     // "proxy unreachable, attempting restart": re-probe the
@@ -5590,11 +5638,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             // Tolerant confirmation before counting a strike. The standard
             // reachability check (`is_headroom_proxy_reachable`) uses a tight
-            // 1.5s timeout via the 6767 intercept; the backend runs niced
-            // (`nice -n 2`), so under heavy compression/embedding load a
-            // perfectly healthy proxy can miss that window. Re-probe the
-            // backend's /readyz directly with a 5s budget — if it answers, the
-            // process is alive and merely busy, so don't count it as down.
+            // 1.5s timeout via the 6767 intercept, and a busy backend on a
+            // contended machine can miss that window while perfectly healthy.
+            // (This once compounded with a `nice`-wrapped backend, dropped
+            // 2026-08-17; the tolerance stays as defense in depth, since an
+            // oversubscribed box starves a default-priority process too.)
+            // Re-probe the backend's /readyz directly with a 5s budget — if it
+            // answers, the process is alive and merely busy, not down.
             let tolerant_outcome =
                 probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_secs(5));
             if tolerant_outcome == "ok" {
@@ -8140,6 +8190,38 @@ Some unrelated content.
         assert_eq!(readyz_failed_checks_csv(&body), "memory,upstream");
     }
 
+    /// RUST-5E: a sleep-wake `upstream` blip on a machine where the kompress
+    /// model never loaded produced `http_503:kompress,upstream`, which is not
+    /// upstream-*only*, so the watchdog force-killed a healthy backend and
+    /// auto-paused. Soft checks must not reach the outcome string.
+    #[test]
+    fn readyz_failed_checks_csv_drops_optional_checks() {
+        let body = serde_json::json!({
+            "checks": {
+                "upstream": { "ready": false },
+                // 0.33+ backends flag it; older ones only have the name.
+                "kompress": { "ready": false, "optional": true },
+                "embeddings": { "ready": false, "optional": true },
+            }
+        });
+        assert_eq!(readyz_failed_checks_csv(&body), "upstream");
+        assert!(readyz_failure_is_upstream_only(&format!(
+            "http_503:{}",
+            readyz_failed_checks_csv(&body)
+        )));
+
+        let legacy = serde_json::json!({
+            "checks": { "upstream": { "ready": false }, "kompress": { "ready": false } }
+        });
+        assert_eq!(readyz_failed_checks_csv(&legacy), "upstream");
+
+        // A genuinely wedged core still reports, optional siblings or not.
+        let wedged = serde_json::json!({
+            "checks": { "memory": { "ready": false }, "kompress": { "ready": false } }
+        });
+        assert_eq!(readyz_failed_checks_csv(&wedged), "memory");
+    }
+
     #[test]
     fn readyz_failed_checks_csv_empty_when_all_ready_or_no_checks() {
         let all_ready = serde_json::json!({ "checks": { "upstream": { "ready": true } } });
@@ -8293,6 +8375,20 @@ Some unrelated content.
         // `ps` counter going backwards (pid reuse / sampling skew): saturating
         // sub yields 0, not a panic or huge rate.
         assert!(!cpu_rate_indicates_burn(200, 100, 4.0));
+    }
+
+    #[test]
+    fn learn_agent_tags_round_trip_with_parse() {
+        // The Sentry tag values are a grouping contract: renaming one silently
+        // splits every historical event for that agent into a new bucket.
+        for agent in [
+            LearnAgent::Claude,
+            LearnAgent::Codex,
+            LearnAgent::Opencode,
+            LearnAgent::Grok,
+        ] {
+            assert_eq!(LearnAgent::parse(agent.as_tag()), Ok(agent));
+        }
     }
 
     #[test]

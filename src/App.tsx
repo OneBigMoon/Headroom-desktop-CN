@@ -1112,7 +1112,7 @@ function DailySavingsChart({
                         dd: currency(compressibleRate.saved + compressibleRate.remaining)
                       }
                     ]}
-                    note="Cache reads (billed at ~10%) are excluded from the baseline; Headroom leaves the cached prefix intact."
+                    note="Excludes cache reads."
                   />
                 )}
                 {windowOutput !== null ? (
@@ -1130,7 +1130,7 @@ function DailySavingsChart({
                         ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
                         : [])
                     ]}
-                    note="Estimate vs the shaper's learned baseline, sampled only while the app runs — short coverage can sit far from the all-time rate."
+                    note="Estimate vs the shaper's learned baseline, sampled while the app runs."
                   />
                 ) : windowIncludesToday && outputReduction ? (
                   <OutputReductionChip flip reduction={outputReduction} />
@@ -5731,7 +5731,9 @@ export default function App() {
         (new Date(pricingStatus.claude.weeklyResetsAt).getTime() - Date.now()) / 86_400_000;
       return forgoneSavingsLabel(recentDailySavings, days);
     }
-    const codexResetSecs = pricingStatus.codex?.secondary?.secondsUntilReset ?? null;
+    // The metered window, not `secondary` — Plus reports its weekly window as
+    // `primary`, which left this null and killed the Codex forgone-savings line.
+    const codexResetSecs = pricingStatus.codex?.weeklyResetsInSeconds ?? null;
     if (codexResetSecs && codexResetSecs > 0) {
       return forgoneSavingsLabel(recentDailySavings, codexResetSecs / 86_400);
     }

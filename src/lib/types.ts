@@ -553,6 +553,9 @@ export interface CodexUsage {
   gateReason?: PricingGateReason | null;
   recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
   weeklyUsedPercent?: number | null;
+  /// Seconds until the metered window resets. Not necessarily the `secondary`
+  /// window: Plus reports its 7-day window as `primary`.
+  weeklyResetsInSeconds?: number | null;
   gateMessage: string;
   effectiveNudgeThresholdsPercent?: number[] | null;
   effectiveDisableThresholdPercent?: number | null;
