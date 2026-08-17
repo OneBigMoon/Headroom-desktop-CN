@@ -1357,6 +1357,11 @@ pub struct SavingsDay {
     pub cache_savings_usd: Option<f64>,
     pub output_sampled_tokens_saved: Option<u64>,
     pub output_baseline_tokens: Option<u64>,
+    /// Aggregate per-client counters from the intercept proxy (local day
+    /// keys; see usage_counters.rs for the join caveat). None on days
+    /// observed by builds predating the counters.
+    pub client_requests: Option<std::collections::BTreeMap<String, u64>>,
+    pub rate_limit_429s: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// Fire-and-forget: reports a milestone to the server so it can trigger

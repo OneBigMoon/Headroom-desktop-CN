@@ -16,6 +16,7 @@ mod proxy_intercept;
 mod state;
 mod storage;
 mod tool_manager;
+mod usage_counters;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
 /// process-global, so home-mutating tests in different modules (client_adapters
@@ -4357,22 +4358,31 @@ fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
 /// first. Empty days are skipped so a user who was away for a week still
 /// reports a full window of real activity.
 fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay> {
+    // The counters use local day keys, exact for the merged series' recent
+    // (local-tracker) buckets and approximate for its older UTC rollup days —
+    // same boundary caveat the server's UserDailySaving already documents.
+    let counters = usage_counters::recent_days();
     let mut days: Vec<_> = points
         .iter()
         .filter(|point| point.estimated_tokens_saved > 0 || point.total_tokens_sent > 0)
         .rev()
         .take(SAVINGS_REPORT_DAYS)
-        .map(|point| pricing::SavingsDay {
-            date: point.date.clone(),
-            savings_usd: point.estimated_savings_usd,
-            output_savings_usd: point.output_savings_usd,
-            tokens_saved: point.estimated_tokens_saved,
-            tokens_sent: point.total_tokens_sent,
-            actual_cost_usd: point.actual_cost_usd,
-            cache_read_tokens: point.cache_read_tokens,
-            cache_savings_usd: point.cache_savings_usd,
-            output_sampled_tokens_saved: point.output_sampled_tokens_saved,
-            output_baseline_tokens: point.output_baseline_tokens,
+        .map(|point| {
+            let day_counters = counters.get(&point.date);
+            pricing::SavingsDay {
+                date: point.date.clone(),
+                savings_usd: point.estimated_savings_usd,
+                output_savings_usd: point.output_savings_usd,
+                tokens_saved: point.estimated_tokens_saved,
+                tokens_sent: point.total_tokens_sent,
+                actual_cost_usd: point.actual_cost_usd,
+                cache_read_tokens: point.cache_read_tokens,
+                cache_savings_usd: point.cache_savings_usd,
+                output_sampled_tokens_saved: point.output_sampled_tokens_saved,
+                output_baseline_tokens: point.output_baseline_tokens,
+                client_requests: day_counters.map(|c| c.client_requests.clone()),
+                rate_limit_429s: day_counters.map(|c| c.rate_limit_429s.clone()),
+            }
         })
         .collect();
     days.reverse();

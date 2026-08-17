@@ -293,6 +293,66 @@ impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
     }
 }
 
+/// AsyncRead wrapper that watches the first bytes of a spliced response for
+/// the status line and records an upstream 429 for the request's client
+/// bucket. Buffers at most one status line's worth of bytes, never content.
+struct Status429Sniffer<R> {
+    inner: R,
+    head: Vec<u8>,
+    done: bool,
+    client_key: &'static str,
+}
+
+/// A real status line ("HTTP/1.1 429 Too Many Requests\r\n") fits well within
+/// this; hitting the cap without a CRLF means a non-HTTP stream — stop looking.
+const STATUS_LINE_SNIFF_CAP: usize = 64;
+
+impl<R> Status429Sniffer<R> {
+    fn new(inner: R, client_key: &'static str) -> Self {
+        Self {
+            inner,
+            head: Vec::new(),
+            done: false,
+            client_key,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        if self.done || bytes.is_empty() {
+            return;
+        }
+        let take = STATUS_LINE_SNIFF_CAP.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&bytes[..take.min(bytes.len())]);
+        let line_complete = self.head.windows(2).any(|w| w == b"\r\n");
+        if line_complete || self.head.len() >= STATUS_LINE_SNIFF_CAP {
+            if line_complete && parse_response_status(&self.head) == Some(429) {
+                crate::usage_counters::record_429(self.client_key);
+            }
+            self.done = true;
+            self.head = Vec::new();
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Status429Sniffer<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(())))
+            && buf.filled().len() > before
+            && !self.done
+        {
+            let bytes = buf.filled()[before..].to_vec();
+            self.observe(&bytes);
+        }
+        poll
+    }
+}
+
 /// Backend response reader that stamps liveness and notices whether a Codex
 /// SSE stream delivered any terminal Responses API event. The small rolling
 /// tail catches event names split across TCP reads without buffering content.
@@ -600,20 +660,31 @@ async fn handle(
     let is_grok = extract_header_value(&buf, "user-agent")
         .is_some_and(|ua| ua.starts_with("grok-shell/") || ua.starts_with("grok/"));
 
+    // One classification for the process counters, the per-day usage
+    // counters, and the 429 sniffers below. Same keys as
+    // `intercept_request_counts`.
+    let client_key: &'static str = if is_opencode {
+        "opencode"
+    } else if is_grok {
+        "grok-build"
+    } else if is_codex {
+        "codex"
+    } else {
+        "claude-code"
+    };
+
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
     // attributed to an agent.
     if let Some(head) = parsed_head.as_ref() {
         if !is_local_proxy_path(&head.path) {
-            if is_opencode {
-                INTERCEPT_OPENCODE_REQUESTS.fetch_add(1, Ordering::AcqRel);
-            } else if is_grok {
-                INTERCEPT_GROK_REQUESTS.fetch_add(1, Ordering::AcqRel);
-            } else if is_codex {
-                INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel);
-            } else {
-                INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel);
-            }
+            match client_key {
+                "opencode" => INTERCEPT_OPENCODE_REQUESTS.fetch_add(1, Ordering::AcqRel),
+                "grok-build" => INTERCEPT_GROK_REQUESTS.fetch_add(1, Ordering::AcqRel),
+                "codex" => INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel),
+                _ => INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel),
+            };
+            crate::usage_counters::record_request(client_key);
         }
     }
 
@@ -856,7 +927,7 @@ async fn handle(
             let _ = backend_wr.shutdown().await;
         };
         let downstream = async {
-            let mut stamped = StampReader(backend_rd);
+            let mut stamped = Status429Sniffer::new(StampReader(backend_rd), client_key);
             let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
             let _ = client_wr.shutdown().await;
         };
@@ -1103,6 +1174,9 @@ async fn splice_with_codex_capture(
             stamp_backend_traffic();
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
+            }
+            if parse_response_status(&head) == Some(429) {
+                crate::usage_counters::record_429("codex");
             }
         }
 
@@ -1794,6 +1868,13 @@ async fn forward_direct_to_anthropic(
             return;
         }
     };
+    if resp.status().as_u16() == 429 {
+        crate::usage_counters::record_429(if is_codex_request_head(&parsed) {
+            "codex"
+        } else {
+            "claude-code"
+        });
+    }
 
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",
