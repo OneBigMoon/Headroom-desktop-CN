@@ -5354,6 +5354,7 @@ impl ToolManager {
     }
 
     fn register_serena_mcp(&self) -> Result<()> {
+        set_serena_browser_dashboard();
         let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
         self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "register", &entrypoint])
             .context("registering serena MCP server")
@@ -6220,6 +6221,82 @@ fn set_serena_global_gitignore(present: bool) {
         log::info!(
             "serena: {} .serena/ in {}",
             if present { "ignoring" } else { "un-ignoring" },
+            path.display()
+        );
+    }
+}
+
+/// Serena 1.7 defaults its dashboard "interface" on macOS to a menu-bar tray
+/// app (`DashboardManager.Mode.from_platform` returns tray_manager on Darwin).
+/// `--open-web-dashboard False` only suppresses the browser tab, and there is
+/// no CLI flag or env var for the interface, so the config key is the only
+/// lever. `browser` keeps the dashboard HTTP API up (our savings chip polls
+/// it) while spawning nothing visible. An explicit user-chosen interface is
+/// left alone; only the unset platform default is replaced. `None` = nothing
+/// to write.
+fn apply_serena_dashboard_interface(existing: &str) -> Option<String> {
+    const KEY: &str = "web_dashboard_interface:";
+    const WANT: &str = "web_dashboard_interface: browser";
+    let mut out = String::new();
+    let mut found = false;
+    for line in existing.lines() {
+        if !found && line.starts_with(KEY) {
+            found = true;
+            let value = line[KEY.len()..].split('#').next().unwrap_or("").trim();
+            match value {
+                "" | "null" | "~" => out.push_str(WANT),
+                _ => return None,
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !found {
+        if existing.trim().is_empty() {
+            // A file serena has never written: `projects` is the one key its
+            // loader hard-requires; everything else falls back to defaults
+            // (serena fills the rest in on its next config migration save).
+            out.push_str("projects: []\n");
+        }
+        out.push_str(WANT);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Best-effort like the gitignore nudge above: serena works either way, the
+/// tray icon is just noise, so failures log at info and never block install.
+fn set_serena_browser_dashboard() {
+    let home_dir = std::env::var_os("SERENA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".serena")));
+    let Some(dir) = home_dir else {
+        return;
+    };
+    let path = dir.join("serena_config.yml");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            // An existing file we cannot read must not be clobbered with a
+            // minimal one - that would drop the user's projects list.
+            log::info!("serena: reading {} failed: {err:#}", path.display());
+            return;
+        }
+    };
+    let Some(updated) = apply_serena_dashboard_interface(&existing) else {
+        return;
+    };
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        log::info!("serena: creating {} failed: {err:#}", dir.display());
+        return;
+    }
+    if let Err(err) = crate::client_adapters::atomic_write(&path, updated.as_bytes()) {
+        log::info!("serena: updating {} failed: {err:#}", path.display());
+    } else {
+        log::info!(
+            "serena: set web_dashboard_interface to browser in {}",
             path.display()
         );
     }
@@ -8439,7 +8516,8 @@ mod tests {
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::{
-        apply_serena_gitignore, bootstrap_requirements_lock_for_target,
+        apply_serena_dashboard_interface, apply_serena_gitignore,
+        bootstrap_requirements_lock_for_target,
         classify_kompress_prefetch_failure, compact_pip_failure, diagnose_proxy_port,
         extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
@@ -8572,6 +8650,46 @@ mod tests {
 
         // A hand-written pattern with no marker is the user's - left alone.
         assert!(apply_serena_gitignore(".serena/\n*.log\n", false).is_none());
+    }
+
+    #[test]
+    fn apply_serena_dashboard_interface_replaces_only_unset_default() {
+        // Unset key (serena's generated default) -> forced to browser.
+        assert_eq!(
+            apply_serena_dashboard_interface("projects: []\nweb_dashboard_interface:\n")
+                .expect("replace unset"),
+            "projects: []\nweb_dashboard_interface: browser\n"
+        );
+        assert_eq!(
+            apply_serena_dashboard_interface("web_dashboard_interface: null # default\n")
+                .expect("replace null"),
+            "web_dashboard_interface: browser\n"
+        );
+
+        // Missing file -> minimal config with the required projects key.
+        assert_eq!(
+            apply_serena_dashboard_interface("").expect("create minimal"),
+            "projects: []\nweb_dashboard_interface: browser\n"
+        );
+
+        // Existing config without the key -> appended, projects not duplicated.
+        assert_eq!(
+            apply_serena_dashboard_interface("projects: []\nlog_level: 20\n")
+                .expect("append to existing"),
+            "projects: []\nlog_level: 20\nweb_dashboard_interface: browser\n"
+        );
+
+        // Explicit user choice (or already browser) -> left alone.
+        assert!(apply_serena_dashboard_interface("web_dashboard_interface: app\n").is_none());
+        assert!(
+            apply_serena_dashboard_interface("web_dashboard_interface: browser\n").is_none()
+        );
+        // Commented-out template line is not the key.
+        assert_eq!(
+            apply_serena_dashboard_interface("projects: []\n# web_dashboard_interface:\n")
+                .expect("append despite comment"),
+            "projects: []\n# web_dashboard_interface:\nweb_dashboard_interface: browser\n"
+        );
     }
 
     #[test]

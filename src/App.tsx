@@ -6811,12 +6811,20 @@ export default function App() {
                 <h1>Addons</h1>
               </div>
               <p className="addons-card__blurb">
-                Additional tools that reduce token usage. Install to enable.
+                Additional tools that reduce token usage. Missing an addon you
+                want?{" "}
+                <button
+                  type="button"
+                  className="addon-card__link"
+                  onClick={() => void openExternalLink(buildAddonRequestMailto())}
+                >
+                  Request an addon
+                </button>
               </p>
             </header>
-            <div className="addons-card__body">
-            {addonError ? <p className="addons__error">{addonError}</p> : null}
-            <ul className="addons__list">
+          </article>
+          {addonError ? <p className="addons__error">{addonError}</p> : null}
+          <ul className="addons__list">
               {dashboard.tools
                 .filter((tool) => !tool.required && tool.id !== "rtk")
                 .sort((a, b) => addonDisplayRank(a.id) - addonDisplayRank(b.id))
@@ -6933,18 +6941,6 @@ export default function App() {
                 ) : null}
               </AddonCard>
             </ul>
-            <div className="addons__request">
-              <span className="addons__request-text">Missing an addon you want?</span>
-              <button
-                type="button"
-                className="addon-card__link"
-                onClick={() => void openExternalLink(buildAddonRequestMailto())}
-              >
-                Request an addon
-              </button>
-            </div>
-            </div>
-          </article>
         </div>
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
