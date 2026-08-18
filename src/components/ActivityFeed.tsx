@@ -910,7 +910,7 @@ function TrainSuggestionRow({
   const isNeverTrained = event.kind === "never_trained";
   const badgeLabel = isNeverTrained ? "Try Optimize" : "Rescan";
   const copy = isNeverTrained
-    ? `${event.sessionCount} session${event.sessionCount === 1 ? "" : "s"} on ${event.projectDisplayName} and no Scan run yet. Extract learnings into CLAUDE.md and MEMORY.md.`
+    ? `${event.sessionCount} session${event.sessionCount === 1 ? "" : "s"} on ${event.projectDisplayName} and no Scan run yet. Extract learnings into CLAUDE.local.md and MEMORY.md.`
     : `${event.activeDaysSinceLastLearn} active day${event.activeDaysSinceLastLearn === 1 ? "" : "s"} on ${event.projectDisplayName} since the last Scan run. Consider rerunning to pick up new patterns.`;
   const canNavigate = typeof onNavigate === "function";
   const handleActivate = () => {

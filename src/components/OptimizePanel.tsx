@@ -117,7 +117,7 @@ export function OptimizePanel({
           onClick={() => setModal("claude")}
           disabled={claudeDisabled}
         >
-          {claudeCount} learning{claudeCount === 1 ? "" : "s"} in CLAUDE.md
+          {claudeCount} learning{claudeCount === 1 ? "" : "s"} in CLAUDE.local.md
         </button>
         <button
           type="button"
@@ -130,13 +130,13 @@ export function OptimizePanel({
       </span>
 
       {modal === "claude" ? (
-        <Modal title="Learnings in CLAUDE.md" onClose={() => setModal(null)}>
+        <Modal title="Learnings in CLAUDE.local.md" onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">Loading…</p>
           ) : claudeCount === 0 ? (
             <p className="optimize-panel__empty">
-              No learnings in CLAUDE.md yet — run Learn or let live traffic
+              No learnings in CLAUDE.local.md yet — run Learn or let live traffic
               accumulate.
             </p>
           ) : (

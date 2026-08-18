@@ -3141,13 +3141,30 @@ async fn list_applied_patterns_for_projects(
 }
 
 fn read_applied_patterns_for_project(project_path: &str) -> crate::models::AppliedPatterns {
-    let claude_md = std::path::PathBuf::from(project_path).join("CLAUDE.md");
+    let claude_md = claude_learn_md_path(project_path);
     let memory_md = crate::tool_manager::claude_project_memory_file(project_path);
 
     crate::models::AppliedPatterns {
         claude_md: read_applied_block(&claude_md),
         memory_md: read_applied_block(&memory_md),
     }
+}
+
+/// Upstream `headroom learn` writes project learnings to the personal
+/// CLAUDE.local.md (issue #1072); older versions wrote the team-shared
+/// CLAUDE.md. Prefer whichever file currently holds a Headroom block,
+/// local first.
+fn claude_learn_md_path(project_path: &str) -> std::path::PathBuf {
+    let root = std::path::Path::new(project_path);
+    let local = root.join("CLAUDE.local.md");
+    if !read_applied_block(&local).is_empty() {
+        return local;
+    }
+    let shared = root.join("CLAUDE.md");
+    if !read_applied_block(&shared).is_empty() {
+        return shared;
+    }
+    local
 }
 
 #[tauri::command]
@@ -3158,7 +3175,7 @@ async fn delete_applied_pattern(
     bullet_text: String,
 ) -> Result<(), String> {
     let path = match file_kind.as_str() {
-        "claude" => std::path::PathBuf::from(&project_path).join("CLAUDE.md"),
+        "claude" => claude_learn_md_path(&project_path),
         "memory" => crate::tool_manager::claude_project_memory_file(&project_path),
         other => return Err(format!("Unknown file_kind: {other}")),
     };
@@ -4728,6 +4745,99 @@ fn extract_llm_failure_warnings(stderr: &str) -> Option<String> {
     }
 }
 
+/// Turn a `headroom learn` stdout line into the step shown under the scan timer,
+/// or None to leave the current step alone.
+///
+/// Deliberately a whitelist, not a pass-through: after `[WROTE]` the CLI prints
+/// the whole written file back, so "show the last line" would put memory-file
+/// contents in the UI.
+fn learn_step_label(line: &str) -> Option<String> {
+    let line = line.trim();
+    if let Some(model) = line.strip_prefix("Analyzing with ") {
+        // The long phase: one LLM call, minutes of silence. Name the backend so
+        // it's clear whose session is running.
+        let model = model.trim_end_matches('.');
+        let backend = match model {
+            "claude-cli" => "Claude Code",
+            "codex-cli" => "Codex",
+            "gemini-cli" => "Gemini",
+            other => other,
+        };
+        return Some(format!("Analyzing with {backend}"));
+    }
+    if let Some(count) = line.strip_prefix("Recommendations: ") {
+        return Some(format!("Found {count} patterns"));
+    }
+    if let Some(path) = line
+        .strip_prefix("[WROTE] ")
+        .or_else(|| line.strip_prefix("[WOULD WRITE] "))
+    {
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        return Some(format!("Updating {name}"));
+    }
+    if line.starts_with("No conversation data")
+        || line.starts_with("No failures or patterns")
+        || line.starts_with("No actionable patterns")
+    {
+        return Some(line.to_string());
+    }
+    None
+}
+
+/// Run the scan, forwarding its stage lines to the run status as they arrive.
+///
+/// Equivalent to `command.output()` for the caller: the full streams are
+/// reassembled so the existing success/failure handling is unchanged. The only
+/// difference is that stdout is observed line by line on the way through, since
+/// a scan runs a headless agent session against the user's own hooks and a bare
+/// timer gives them no way to see that.
+fn stream_headroom_learn_output(
+    state: &AppState,
+    command: &mut Command,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // stderr drains on its own thread: a child that fills one pipe while we
+    // read the other would deadlock.
+    let mut stderr_pipe = child.stderr.take();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    });
+
+    let mut stdout = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        // split() over lines(): keeps the bytes verbatim, so one non-UTF-8 byte
+        // can't abort the capture the caller depends on.
+        for chunk in BufReader::new(pipe).split(b'\n') {
+            let Ok(chunk) = chunk else { break };
+            if let Some(step) = learn_step_label(&String::from_utf8_lossy(&chunk)) {
+                state.set_headroom_learn_step(step);
+            }
+            stdout.extend_from_slice(&chunk);
+            stdout.push(b'\n');
+        }
+    }
+
+    let status = child.wait()?;
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn execute_headroom_learn_run(
     state: &AppState,
     agent: LearnAgent,
@@ -4848,6 +4958,10 @@ fn execute_headroom_learn_run(
                 .unwrap_or_else(|| std::path::PathBuf::from("/")),
         )
         .env("PYTHONNOUSERSITE", "1")
+        // The live step line depends on stage output arriving as it happens.
+        // click.echo already flushes per call, but a plain print() anywhere in
+        // the CLI would sit in an 8KB pipe buffer until exit.
+        .env("PYTHONUNBUFFERED", "1")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
         // Force the selected CLI backend: the analyzer picks LiteLLM over
@@ -4871,7 +4985,10 @@ fn execute_headroom_learn_run(
         };
         command.env("PATH", augmented);
     }
-    let output = command.output();
+    // Seed a step before the first line arrives: session scanning is silent, and
+    // an empty line that pops in later would shift the row.
+    state.set_headroom_learn_step("Reading sessions".into());
+    let output = stream_headroom_learn_output(state, &mut command);
 
     let (summary, success, error, output_tail, stdout, stderr, status_copy) = match output {
         Ok(output) => {
@@ -6418,9 +6535,9 @@ mod tests {
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, fetch_transformations_feed_from, format_token_count, install_pending_update,
         is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
-        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        is_port_conflict_failure, is_prerelease_version, learn_step_label,
+        lifetime_token_milestone_kind, noop_app_update_progress_emitter, onboarding_recovery_copy,
+        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -7786,6 +7903,45 @@ Some unrelated content.
     }
 
     #[tokio::test]
+    async fn read_applied_patterns_prefers_claude_local_md_over_legacy_claude_md() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_claude_md_with_headroom_block(tmp.path());
+        let local = tmp.path().join("CLAUDE.local.md");
+        std::fs::write(
+            &local,
+            "<!-- headroom:learn:start -->\n\
+             ## Headroom Learned Patterns\n\
+             ### Local Section\n\
+             - Local bullet.\n\
+             <!-- headroom:learn:end -->\n",
+        )
+        .expect("write CLAUDE.local.md");
+
+        let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
+        let titles: Vec<&str> = result.claude_md.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Local Section"],
+            "CLAUDE.local.md block wins over the legacy CLAUDE.md block"
+        );
+
+        // Deletes must target the same file the read came from.
+        delete_applied_pattern(
+            tmp.path().to_str().unwrap().to_string(),
+            "claude".into(),
+            "Local Section".into(),
+            "Local bullet.".into(),
+        )
+        .await
+        .expect("delete bullet from CLAUDE.local.md");
+        let on_disk = std::fs::read_to_string(&local).unwrap();
+        assert!(
+            !on_disk.contains("Local bullet."),
+            "bullet removed from CLAUDE.local.md, got:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_applied_pattern_removes_one_bullet_and_keeps_section() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
@@ -8425,6 +8581,72 @@ Some unrelated content.
         let extracted = extract_llm_failure_warnings(stderr).expect("warnings extracted");
         assert_eq!(extracted.matches("LLM analysis failed:").count(), 2);
         assert!(extracted.contains('\n'));
+    }
+
+    #[test]
+    fn learn_step_label_maps_the_cli_stages() {
+        assert_eq!(
+            learn_step_label("  Analyzing with claude-cli...").as_deref(),
+            Some("Analyzing with Claude Code")
+        );
+        assert_eq!(
+            learn_step_label("  Recommendations: 7").as_deref(),
+            Some("Found 7 patterns")
+        );
+        assert_eq!(
+            learn_step_label("  [WROTE] /Users/x/proj/CLAUDE.md").as_deref(),
+            Some("Updating CLAUDE.md")
+        );
+        assert_eq!(
+            learn_step_label("  No conversation data found.").as_deref(),
+            Some("No conversation data found.")
+        );
+    }
+
+    #[test]
+    fn learn_step_label_ignores_decoration_and_written_file_contents() {
+        // After [WROTE] the CLI echoes the file back. None of it may reach the
+        // UI, or the step line ends on a random memory bullet.
+        for line in [
+            "",
+            "============================================================",
+            "[claude] headroom-desktop",
+            "Path: /Users/x/proj",
+            "  ──────────────────────────────────────────────────",
+            "  - Working test command: cargo test --lib",
+            "  ## Headroom Learned Patterns",
+        ] {
+            assert_eq!(learn_step_label(line), None, "line leaked: {line:?}");
+        }
+    }
+
+    #[test]
+    fn stream_headroom_learn_output_reassembles_both_streams_and_forwards_steps() {
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-learn-stream-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        state.mark_headroom_learn_running_for_test();
+
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(
+            "printf '[claude] proj\\n  Analyzing with claude-cli...\\n  Recommendations: 3\\n'; \
+             printf 'warn line\\n' >&2; exit 7",
+        );
+        let output = super::stream_headroom_learn_output(&state, &mut command).expect("spawned");
+
+        // Same contract as `command.output()`: exit status and both streams intact.
+        assert_eq!(output.status.code(), Some(7));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Analyzing with claude-cli..."), "{stdout}");
+        assert!(stdout.contains("Recommendations: 3"), "{stdout}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "warn line");
+        // Last recognized line wins; the decorative header is not a step.
+        assert_eq!(
+            state.headroom_learn_status(None).current_step.as_deref(),
+            Some("Found 3 patterns")
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]

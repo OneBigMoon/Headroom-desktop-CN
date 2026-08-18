@@ -613,6 +613,10 @@ pub struct HeadroomLearnRuntimeState {
     summary: String,
     error: Option<String>,
     output_tail: Vec<String>,
+    /// Live one-liner for the run in progress, from the CLI's own stage output.
+    /// A scan spawns a headless agent session that fires the user's hooks, so a
+    /// bare timer reads as a black box; this is what the row shows instead.
+    current_step: Option<String>,
 }
 
 impl AppState {
@@ -680,6 +684,7 @@ impl AppState {
                 summary: "Select a project to run headroom learn.".into(),
                 error: None,
                 output_tail: Vec::new(),
+                current_step: None,
             }),
             launch_profile: Mutex::new(launch_profile),
             launch_profile_path,
@@ -2320,6 +2325,8 @@ impl AppState {
                 requests: o.requests,
             });
 
+        let learner_progress = stats.as_ref().and_then(|s| s.learner_progress.clone());
+
         if let Some(history) = history.as_ref() {
             let cutoff_date = savings_history_cutoff_date();
             let cutoff_hour = format!("{cutoff_date}T00:00");
@@ -2498,6 +2505,7 @@ impl AppState {
                 session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
+                learner_progress,
                 savings_breakdown,
                 daily_savings,
                 hourly_savings,
@@ -2687,7 +2695,24 @@ impl AppState {
         );
         state.error = None;
         state.output_tail = Vec::new();
+        state.current_step = None;
         Ok(())
+    }
+
+    /// Test hook: flip the run flag without the runtime and project prereqs
+    /// that `begin_headroom_learn_run` enforces.
+    #[cfg(test)]
+    pub(crate) fn mark_headroom_learn_running_for_test(&self) {
+        self.headroom_learn_state.lock().running = true;
+    }
+
+    /// Record what the running scan is doing. Ignored when no run is active, so
+    /// a line arriving after completion cannot leave a stale step on screen.
+    pub fn set_headroom_learn_step(&self, step: String) {
+        let mut state = self.headroom_learn_state.lock();
+        if state.running {
+            state.current_step = Some(step);
+        }
     }
 
     pub fn complete_headroom_learn_run(
@@ -2704,6 +2729,7 @@ impl AppState {
         state.summary = summary;
         state.error = error;
         state.output_tail = output_tail;
+        state.current_step = None;
         drop(state);
         // A completed run rewrites CLAUDE.md / MEMORY.md and updates the learn
         // log's mtime, so the cached project list (which depends on both) is
@@ -2761,6 +2787,7 @@ impl AppState {
             error: state.error,
             last_run_at,
             output_tail: state.output_tail,
+            current_step: state.current_step,
         }
     }
 
@@ -5251,6 +5278,9 @@ struct HeadroomDashboardStats {
     /// backend restarts), and the backend never writes it to its rollups, so
     /// the tracker accumulates the poll-over-poll delta itself.
     tool_schema_tokens_saved: Option<u64>,
+    /// Auto-learning progress (`/stats` `traffic_learner`); None on backends
+    /// that predate the block or when learning is disabled.
+    learner_progress: Option<crate::models::LearnerProgress>,
 }
 
 /// Counterfactual output-token reduction from the proxy's output shaper,
@@ -5414,10 +5444,14 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // and crossed half a second as history grew, so every fetch timed out and
     // the dashboard lost the layers only this endpoint reports (output
     // shaping, tool schema) while `/stats-history` kept the rest looking live.
-    // `?cached=1` is the backend's documented dashboard fast path (5s snapshot,
-    // same fields); measured 2.3s on an expired snapshot, 0.1s warm.
+    // `?cached=1` is the backend's dashboard fast path, but its snapshot TTL
+    // (5s) is shorter than our poll interval (12s), so in practice every
+    // fetch is a cold rebuild: ~3s idle, past 5s while the proxy is busy
+    // serving a session (RUST-6V). 15s turns those into slow successes; a
+    // fetch that still times out means the backend is genuinely starved.
+    const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
 
@@ -5436,7 +5470,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
             // names resolve to that same listener, so retrying the other alias
             // only doubles the stall inside a dashboard build.
             Err(err) if err.is_timeout() => {
-                warn_stats_fetch_failed("timed out after 5s");
+                warn_stats_fetch_failed(&format!("timed out after {STATS_FETCH_TIMEOUT_SECS}s"));
                 return None;
             }
             Err(err) => {
@@ -5493,6 +5527,30 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
     }
 
     None
+}
+
+/// Parse auto-learning progress from a `/stats` payload's `traffic_learner`
+/// block (headroomlabs-ai/headroom#3104). Null/absent (older backend or
+/// learning disabled) parses to `None`, so the UI falls back to static copy.
+fn parse_learner_progress(root: &Value) -> Option<crate::models::LearnerProgress> {
+    let node = value_at_path(root, &["traffic_learner"])?;
+    if !node.is_object() {
+        return None;
+    }
+    Some(crate::models::LearnerProgress {
+        pending_patterns: node
+            .get("pending_patterns")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        min_evidence: node
+            .get("min_evidence")
+            .and_then(Value::as_u64)
+            .unwrap_or(5),
+        patterns_saved: node
+            .get("patterns_saved")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
 }
 
 /// Parse the output-shaper reduction estimate from a `/stats` payload. Lives
@@ -5720,16 +5778,20 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
         )
     });
 
+    let learner_progress = parse_learner_progress(&root);
+
     if requests.is_none()
         && tokens.is_none()
         && usd.is_none()
         && session_total_tokens_sent.is_none()
         && actual_cost_usd.is_none()
         && output_reduction.is_none()
+        && learner_progress.is_none()
     {
         None
     } else {
         Some(HeadroomDashboardStats {
+            learner_progress,
             session_requests: requests,
             session_estimated_savings_usd: usd,
             session_estimated_tokens_saved: tokens,
@@ -6832,6 +6894,27 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
     }
 }
 
+/// Kill every process whose command line references the managed venv
+/// directory. Windows-only: pip cannot overwrite files a running process
+/// holds open, so an upgrade's `--force-reinstall` — and the rollback that
+/// retries the same operation — both die with permission errors when an
+/// IDE-spawned MCP server or stray python is still running from the venv
+/// (RUST-6Z/70: install failed, restored=false, runtime bricked).
+/// `stop_headroom` doesn't cover these: it only matches the proxy's own
+/// command patterns. Unix replaces in-use files fine, so this is a no-op
+/// there. Identity is verified by the venv path in the command line, never
+/// by port.
+pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    // Empty args pattern makes the exe-path clause the only real filter:
+    // any process whose command line mentions the venv dir.
+    if let Err(err) = kill_processes_by_command_pattern(venv_dir, "") {
+        log::warn!("killing venv lock holders before venv mutation failed: {err}");
+    }
+}
+
 /// Merge daily savings from tracker (pre-cutoff) and native headroom history (post-cutoff).
 /// Drop the first bucket of a backend rollup series when the local tracker
 /// already covers an earlier period.
@@ -7893,6 +7976,7 @@ mod tests {
     fn sample_output_reduction_buckets_deltas_and_reseeds_on_reset() {
         let mut tracker = make_tracker();
         let stats = |saved, baseline| HeadroomDashboardStats {
+            learner_progress: None,
             session_requests: None,
             session_estimated_savings_usd: None,
             session_estimated_tokens_saved: None,
@@ -7948,6 +8032,7 @@ mod tests {
 
     fn output_stats(saved: u64, baseline: u64) -> HeadroomDashboardStats {
         HeadroomDashboardStats {
+            learner_progress: None,
             session_requests: None,
             session_estimated_savings_usd: None,
             session_estimated_tokens_saved: None,
@@ -8223,6 +8308,28 @@ mod tests {
             most_recent_monday(NaiveDate::from_ymd_opt(2026, 5, 3).unwrap()),
             NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
         );
+    }
+
+    #[test]
+    fn learn_step_is_recorded_only_while_a_run_is_active() {
+        let base_dir = temp_test_dir("headroom-learn-step");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // No active run: a stray line must not put a step on screen.
+        state.set_headroom_learn_step("Analyzing with Claude Code".into());
+        assert_eq!(state.headroom_learn_status(None).current_step, None);
+
+        state.mark_headroom_learn_running_for_test();
+        state.set_headroom_learn_step("Analyzing with Claude Code".into());
+        assert_eq!(
+            state.headroom_learn_status(None).current_step.as_deref(),
+            Some("Analyzing with Claude Code")
+        );
+
+        state.complete_headroom_learn_run(true, "done".into(), None, Vec::new());
+        assert_eq!(state.headroom_learn_status(None).current_step, None);
+
+        let _ = fs::remove_dir_all(&base_dir);
     }
 
     #[test]
@@ -8776,6 +8883,7 @@ mod tests {
         // savings_history backfills the daily buckets the lifetime total (and
         // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
+            learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
             session_requests: Some(1),
@@ -8820,6 +8928,7 @@ mod tests {
 
         let first = tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(10),
@@ -8839,6 +8948,7 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(12),
@@ -8862,6 +8972,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(10),
@@ -8876,6 +8987,7 @@ mod tests {
 
         let reset = tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(2),
@@ -8898,6 +9010,7 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(4),
@@ -8965,6 +9078,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(4),
@@ -9071,6 +9185,39 @@ mod tests {
         assert_eq!(parsed.session_actual_cost_usd, Some(1.23));
         assert_eq!(parsed.session_total_tokens_sent, Some(3_600));
         assert_eq!(parsed.savings_history.len(), 1);
+        // No traffic_learner block in this payload (older backend shape).
+        assert!(parsed.learner_progress.is_none());
+    }
+
+    #[test]
+    fn parse_learner_progress_reads_traffic_learner_block() {
+        let parsed = parse_headroom_stats_from_json(
+            r#"{
+                "requests": { "total": 5 },
+                "traffic_learner": {
+                    "requests_processed": 40,
+                    "patterns_extracted": 7,
+                    "patterns_saved": 1,
+                    "pending_patterns": 3,
+                    "min_evidence": 5,
+                    "history_size": 12
+                }
+            }"#,
+        )
+        .expect("parsed stats");
+
+        let learner = parsed.learner_progress.expect("learner block parsed");
+        assert_eq!(learner.pending_patterns, 3);
+        assert_eq!(learner.min_evidence, 5);
+        assert_eq!(learner.patterns_saved, 1);
+
+        // Learning disabled: backend reports null, which must parse to None
+        // (not a zeroed struct implying "alive with nothing pending").
+        let disabled = parse_headroom_stats_from_json(
+            r#"{ "requests": { "total": 5 }, "traffic_learner": null }"#,
+        )
+        .expect("parsed stats");
+        assert!(disabled.learner_progress.is_none());
     }
 
     #[test]
@@ -9733,6 +9880,7 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(4),
@@ -9755,6 +9903,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(4),
@@ -9773,6 +9922,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(4),
@@ -9801,6 +9951,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(1),
@@ -9818,6 +9969,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(2),
@@ -9905,6 +10057,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(11),
@@ -9932,6 +10085,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(2),
@@ -9950,6 +10104,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(3),
@@ -9977,6 +10132,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(1),
@@ -9999,6 +10155,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(5),
@@ -10061,6 +10218,7 @@ mod tests {
         ] {
             tracker
                 .observe(&HeadroomDashboardStats {
+                    learner_progress: None,
                     output_reduction: None,
                     tool_schema_tokens_saved: None,
                     session_requests: Some(requests),
@@ -10088,6 +10246,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(5),
@@ -10106,6 +10265,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(6),
@@ -10134,6 +10294,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(10),
@@ -10148,6 +10309,7 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(11),
@@ -10196,6 +10358,7 @@ mod tests {
 
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
+                learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
                 session_requests: Some(11),
@@ -10629,6 +10792,7 @@ mod tests {
 
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
+            learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
             session_requests: Some(1),
@@ -10647,6 +10811,7 @@ mod tests {
 
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
+            learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
             session_requests: Some(3),

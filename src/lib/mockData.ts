@@ -15,6 +15,7 @@ export const mockDashboard: DashboardState = {
   sessionEstimatedTokensSaved: 0,
   sessionSavingsPct: 0,
   outputReduction: null,
+  learnerProgress: null,
   savingsBreakdown: null,
   dailySavings: [],
   hourlySavings: [],

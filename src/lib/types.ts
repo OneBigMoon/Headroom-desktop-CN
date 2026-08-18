@@ -148,6 +148,14 @@ export interface HourlySavingsPoint {
   byProvider: ProviderSavingsPoint[];
 }
 
+/** Auto-learning progress from the backend; null on older backends or when
+ * learning is disabled. Patterns save after minEvidence sightings. */
+export interface LearnerProgress {
+  pendingPatterns: number;
+  minEvidence: number;
+  patternsSaved: number;
+}
+
 export interface DashboardState {
   appVersion: string;
   launchExperience: LaunchExperience;
@@ -162,6 +170,7 @@ export interface DashboardState {
   sessionEstimatedTokensSaved: number;
   sessionSavingsPct: number;
   outputReduction: OutputReduction | null;
+  learnerProgress: LearnerProgress | null;
   savingsBreakdown: SavingsBreakdown | null;
   dailySavings: DailySavingsPoint[];
   hourlySavings: HourlySavingsPoint[];
@@ -340,6 +349,8 @@ export interface HeadroomLearnStatus {
   error?: string | null;
   lastRunAt?: string | null;
   outputTail: string[];
+  /** What the running scan is doing right now, from the CLI's stage output. */
+  currentStep?: string | null;
 }
 
 export interface HeadroomLearnPrereqStatus {

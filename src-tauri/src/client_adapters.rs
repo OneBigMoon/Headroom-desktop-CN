@@ -6614,6 +6614,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn zdotdir_unresolved_env_var_falls_back_to_none() {
+        // TestHome sets XDG_CONFIG_HOME under this lock, so without it the
+        // remove_var below races those tests (~1 run in 6 of the full suite).
+        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Reproduces os error 30: `$XDG_CONFIG_HOME` unset under a Finder launch
         // must NOT yield a relative `$XDG_CONFIG_HOME/zsh` path.
         std::env::remove_var("XDG_CONFIG_HOME");

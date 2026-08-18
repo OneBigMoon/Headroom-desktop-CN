@@ -41,7 +41,7 @@ describe("OptimizePanel", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: /2 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
     ).toBeEnabled();
     expect(
       screen.getByRole("button", { name: /1 reminder in MEMORY\.md/i })
@@ -58,7 +58,7 @@ describe("OptimizePanel", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: /0 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /0 learnings in CLAUDE.local\.md/i })
     ).toBeDisabled();
     expect(
       screen.getByRole("button", { name: /0 reminders in MEMORY\.md/i })
@@ -72,11 +72,11 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     await user.click(
-      screen.getByRole("button", { name: /2 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
     );
 
     const dialog = await screen.findByRole("dialog");
-    expect(dialog).toHaveTextContent("Learnings in CLAUDE.md");
+    expect(dialog).toHaveTextContent("Learnings in CLAUDE.local.md");
     expect(dialog).toHaveTextContent("Edit Tool Rules");
     expect(dialog).toHaveTextContent(
       "Always Read a file before attempting to Edit it."
@@ -89,7 +89,7 @@ describe("OptimizePanel", () => {
 
     // Pills land in disabled (count=0) state until applied loads.
     expect(
-      screen.getByRole("button", { name: /0 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /0 learnings in CLAUDE.local\.md/i })
     ).toBeDisabled();
     expect(invokeMock).toHaveBeenCalledWith("list_applied_patterns", {
       projectPath: "/proj"
@@ -97,7 +97,7 @@ describe("OptimizePanel", () => {
   });
 
   it("surfaces a delete-pattern failure inside the open modal", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("write CLAUDE.md: permission denied"));
+    invokeMock.mockRejectedValueOnce(new Error("write CLAUDE.local.md: permission denied"));
 
     render(
       <OptimizePanel projectPath="/proj" preloadedApplied={samplePatterns} />
@@ -105,13 +105,13 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     await user.click(
-      screen.getByRole("button", { name: /2 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
     );
     const deleteButtons = await screen.findAllByRole("button", { name: /^Delete$/ });
     await user.click(deleteButtons[0]);
 
     expect(
-      await screen.findByText(/write CLAUDE\.md: permission denied/i)
+      await screen.findByText(/write CLAUDE.local\.md: permission denied/i)
     ).toBeInTheDocument();
   });
 
@@ -137,7 +137,7 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     await user.click(
-      screen.getByRole("button", { name: /2 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
     );
 
     const deleteButtons = await screen.findAllByRole("button", { name: /^Delete$/ });
@@ -171,7 +171,7 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     await user.click(
-      screen.getByRole("button", { name: /1 learning in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /1 learning in CLAUDE.local\.md/i })
     );
 
     const expand = await screen.findByRole("button", { name: /^Show more$/ });
@@ -188,7 +188,7 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     await user.click(
-      screen.getByRole("button", { name: /2 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
     );
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
 
@@ -205,7 +205,7 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     await user.click(
-      screen.getByRole("button", { name: /2 learnings in CLAUDE\.md/i })
+      screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
     );
     const dialog = await screen.findByRole("dialog");
     // The backdrop is the dialog element itself; clicking outside the inner

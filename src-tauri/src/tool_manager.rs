@@ -2717,6 +2717,9 @@ impl ToolManager {
 
     fn headroom_learn_memory_paths(&self, project_path: &str) -> Vec<PathBuf> {
         vec![
+            // Current learn versions write CLAUDE.local.md; older ones wrote
+            // CLAUDE.md. The freshest candidate wins, so list both.
+            Path::new(project_path).join("CLAUDE.local.md"),
             Path::new(project_path).join("CLAUDE.md"),
             claude_project_memory_file(project_path),
         ]
@@ -3874,6 +3877,11 @@ impl ToolManager {
             percent: 5,
         });
 
+        // Windows: anything still running from the venv (IDE-spawned MCP
+        // servers, stray pythons) holds file locks that fail both the wheel
+        // install and its rollback with permission errors (RUST-6Z/70).
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
+
         // If a prior upgrade was interrupted (process killed between
         // move-aside and success-commit), the backup is the REAL venv.
         // Restore it before doing anything destructive.
@@ -4028,6 +4036,10 @@ impl ToolManager {
     /// `state.rs` upgrade coordinator when boot validation fails.
     /// Idempotent — no-op if no backup exists.
     pub fn rollback_headroom_upgrade(&self) -> Result<()> {
+        // Windows: clear venv file locks first — this path pip-reinstalls
+        // (in-place) or renames the venv (swap), and both fail on locked
+        // files (RUST-6Z/70).
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         // In-place rollback: no venv backup. Restore deps from the lock
         // snapshot (if the upgrade touched the lock), then pip-reinstall the
         // previous headroom-ai and restore the receipt.
@@ -4525,6 +4537,11 @@ impl ToolManager {
     }
 
     fn rollback_in_place_upgrade_inner(&self, ctx: &InPlaceUpgradeContext) -> bool {
+        // Re-kill venv lock holders: an IDE can respawn its MCP server
+        // between the failed install and this rollback, and a rollback that
+        // hits the same Windows file locks reports restored=false and leaves
+        // the runtime bricked (RUST-70).
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         // Restore deps first so headroom-ai lands on a consistent dep set.
         let deps_ok = match ctx.previous_lock_backup.as_deref() {
             Some(backup) => {
@@ -7911,7 +7928,11 @@ fn pip_line_to_progress(
 fn compact_pip_failure(err: &anyhow::Error) -> String {
     const TAIL_BUDGET: usize = 300;
     let Some(failure) = err.chain().find_map(|c| c.downcast_ref::<CommandFailure>()) else {
-        return err.to_string();
+        // No CommandFailure means the command never ran (spawn failed).
+        // `to_string()` prints only the top context ("starting <python> -m
+        // pip ...") and drops the io cause — RUST-6S shipped 15 events of
+        // exactly that, unreadable. `{:#}` keeps the whole chain.
+        return format!("{err:#}");
     };
     let source = if !failure.stderr.trim().is_empty() {
         failure.stderr.as_str()

@@ -146,6 +146,19 @@ pub struct OutputReduction {
     pub requests: u64,
 }
 
+/// Auto-learning progress from the backend's `/stats` `traffic_learner` block.
+/// Patterns need `min_evidence` sightings before they're saved, so early on
+/// the learner has nothing to show; `pending_patterns` lets the Optimize view
+/// prove learning is alive during that window. Backends without the block
+/// (< the wheel carrying headroomlabs-ai/headroom#3104) leave this None.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearnerProgress {
+    pub pending_patterns: u64,
+    pub min_evidence: u64,
+    pub patterns_saved: u64,
+}
+
 /// Lifetime savings decomposition parsed from the backend's `/stats-history`
 /// `lifetime` block. Powers the "How savings are calculated" drill-down.
 /// `cache_savings_usd` is the provider cache discount earned by the *client's*
@@ -286,6 +299,9 @@ pub struct DashboardState {
     /// `None` until a verbosity baseline is seeded (the dashboard hides the stat
     /// until then). Always honestly labelled (`method` + confidence band).
     pub output_reduction: Option<OutputReduction>,
+    /// Auto-learning progress; `None` when the backend doesn't report it.
+    #[serde(default)]
+    pub learner_progress: Option<LearnerProgress>,
     /// Lifetime decomposition behind the headline savings card. `None` until
     /// the backend's `/stats-history` has been fetched at least once.
     pub savings_breakdown: Option<SavingsBreakdown>,
@@ -478,6 +494,8 @@ pub struct HeadroomLearnStatus {
     pub error: Option<String>,
     pub last_run_at: Option<String>,
     pub output_tail: Vec<String>,
+    #[serde(default)]
+    pub current_step: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -575,6 +575,18 @@ const idleHeadroomLearnStatus: HeadroomLearnStatus = {
   outputTail: []
 };
 
+/** Live step of a running scan, on its own line under the row's timer. */
+function LearnStepLine({ step }: { step?: string | null }) {
+  if (!step) {
+    return null;
+  }
+  return (
+    <small className="optimize-project-row__step" aria-live="polite">
+      {step}
+    </small>
+  );
+}
+
 const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
   claudeCliAvailable: false,
   claudeCliPath: null,
@@ -2787,6 +2799,20 @@ export default function App() {
     }
   }
 
+  // Auto-learning gates every pattern behind minEvidence sightings, so a new
+  // user sees zero learnings for a while and reads the silence as "broken"
+  // (beta feedback). Show observation progress when the backend reports it,
+  // and explain the gate either way.
+  const learnerProgress = dashboard.learnerProgress;
+  const autoLearnMeta =
+    learnerProgress && learnerProgress.pendingPatterns > 0
+      ? `Learning from live traffic. ${learnerProgress.pendingPatterns} pattern${
+          learnerProgress.pendingPatterns === 1 ? "" : "s"
+        } under observation; each is saved once confirmed ${learnerProgress.minEvidence} times.`
+      : `Learns from live traffic in the background. A pattern is saved once it's been confirmed ${
+          learnerProgress?.minEvidence ?? 5
+        } times, so the first learnings can take a few sessions to appear.`;
+
   async function handleAutostartToggle(nextEnabled: boolean) {
     setAutostartBusy(true);
     try {
@@ -3127,7 +3153,7 @@ export default function App() {
         ? "Headroom learns from your Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
         : opencodeLearnEnabled || grokLearnEnabled
           ? "Headroom learns from your agent's sessions. When it repeats a mistake, Headroom updates the agent's memory so it doesn't happen again."
-          : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.";
+          : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.local.md.";
   useEffect(() => {
     // connectors === [] means get_client_connectors hasn't returned yet (the
     // Rust side always lists every managed client). Don't treat that launch
@@ -6282,7 +6308,7 @@ export default function App() {
                       <span className="optimize-card__auto-learn-meta">
                         {autoLearnEnabled === false
                           ? "Off — only manual scans add learnings."
-                          : "Learns from live traffic in the background."}
+                          : autoLearnMeta}
                       </span>
                     </div>
                     <button
@@ -6459,6 +6485,9 @@ export default function App() {
                                     }
                                   />
                                 </small>
+                                {isRunning ? (
+                                  <LearnStepLine step={headroomLearnStatus.currentStep} />
+                                ) : null}
                               </span>
                               <div className="optimize-project-row__actions">
                                 {showInlineResult ? (
@@ -6620,6 +6649,9 @@ export default function App() {
                                         </button>
                                       </span>
                                     </small>
+                                    {codexRunning ? (
+                                      <LearnStepLine step={headroomLearnStatus.currentStep} />
+                                    ) : null}
                                   </span>
                                   <div className="optimize-project-row__actions">
                                     {codexShowResult ? (
@@ -6722,6 +6754,9 @@ export default function App() {
                                     </button>
                                   </span>
                                 </small>
+                                {running ? (
+                                  <LearnStepLine step={headroomLearnStatus.currentStep} />
+                                ) : null}
                               </span>
                               <div className="optimize-project-row__actions">
                                 {showResult ? (
