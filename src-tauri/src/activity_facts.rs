@@ -350,6 +350,7 @@ impl ActivityFacts {
             transformation: self.last_transformation.clone(),
             record: self.last_record.clone(),
             rtk_today: None,
+            serena_today: None,
             learnings_milestone: self.last_learnings_milestone.clone(),
             weekly_recap: self.last_weekly_recap.clone(),
             train_suggestion: self.last_train_suggestion.clone(),

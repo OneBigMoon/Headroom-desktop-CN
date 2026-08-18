@@ -22,6 +22,7 @@ const emptyTiles: ActivityFeedSnapshot = {
   transformation: null,
   record: null,
   rtkToday: null,
+  serenaToday: null,
   learningsMilestone: null,
   weeklyRecap: null,
   trainSuggestion: null
@@ -80,34 +81,57 @@ describe("ActivityFeed", () => {
   });
 
   it("renders a placeholder card for every kind when proxy is up but no events", () => {
+    // RTK is opt-in: without rtkInstalled its tile is absent entirely, not
+    // an empty placeholder.
     const markup = renderToStaticMarkup(<ActivityFeed feed={baseFeed} error={null} />);
     expect(markup).not.toContain("No requests yet");
     expect(markup).toContain("activity-feed__list");
     const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
-    expect(emptyClassCount).toBe(6);
+    expect(emptyClassCount).toBe(5);
     for (const cls of [
       "activity-feed__item--train",
       "activity-feed__item--transformation",
-      "activity-feed__item--rtk",
       "activity-feed__item--record",
       "activity-feed__item--learnings-milestone",
       "activity-feed__item--weekly-recap"
     ]) {
       expect(markup).toContain(cls);
     }
+    expect(markup).not.toContain("activity-feed__item--rtk");
+    expect(markup).not.toContain("activity-feed__item--serena");
     expect(markup).toContain("No large compressions yet");
-    expect(markup).toContain("No RTK commands observed yet today.");
     expect(markup).toContain("No recap yet");
+  });
+
+  it("includes the RTK placeholder only when rtkInstalled is set", () => {
+    const markup = renderToStaticMarkup(
+      <ActivityFeed feed={baseFeed} error={null} rtkInstalled />
+    );
+    const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
+    expect(emptyClassCount).toBe(6);
+    expect(markup).toContain("activity-feed__item--rtk");
+    expect(markup).toContain("No RTK commands observed yet today.");
+    expect(markup).not.toContain("activity-feed__item--serena");
+  });
+
+  it("includes the Serena placeholder only when serenaInstalled is set", () => {
+    const markup = renderToStaticMarkup(
+      <ActivityFeed feed={baseFeed} error={null} serenaInstalled />
+    );
+    const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
+    expect(emptyClassCount).toBe(6);
+    expect(markup).toContain("activity-feed__item--serena");
+    expect(markup).toContain("No Serena tool calls observed yet today.");
+    expect(markup).not.toContain("activity-feed__item--rtk");
   });
 
   it("keeps placeholders for other kinds when one live event is present", () => {
     const feed = feedWith({ transformation: transformation() });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
-    expect(emptyClassCount).toBe(5);
+    expect(emptyClassCount).toBe(4);
     expect(markup).toContain("Recent large compression");
     expect(markup).not.toContain("No compressions yet");
-    expect(markup).toContain("No RTK commands observed yet today.");
   });
 
   it("marks the empty trainSuggestion card as clickable when a navigate handler is supplied", () => {
@@ -373,18 +397,21 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("renders tiles in the fixed TILE_ORDER (record → transformation → learningsMilestone → trainSuggestion → rtkToday → weeklyRecap)", () => {
+  it("renders tiles in the fixed TILE_ORDER (record → transformation → learningsMilestone → trainSuggestion → rtkToday → serenaToday → weeklyRecap)", () => {
     // With all kinds as empty placeholders on an empty feed, the TILE_ORDER
     // dictates DOM order: the record card lands first, then transformation,
     // etc. Asserts the contract that tile positions never reshuffle based on
     // event arrival.
-    const markup = renderToStaticMarkup(<ActivityFeed feed={baseFeed} error={null} />);
+    const markup = renderToStaticMarkup(
+      <ActivityFeed feed={baseFeed} error={null} rtkInstalled serenaInstalled />
+    );
     const order = [
       "activity-feed__item--record",
       "activity-feed__item--transformation",
       "activity-feed__item--learnings-milestone",
       "activity-feed__item--train",
       "activity-feed__item--rtk",
+      "activity-feed__item--serena",
       "activity-feed__item--weekly-recap"
     ];
     const positions = order.map((cls) => markup.indexOf(cls));
@@ -393,7 +420,20 @@ describe("ActivityFeed", () => {
     }
   });
 
-  it("renders an RTK today row with saved tokens and command count", () => {
+  it("renders a Serena row with calls leading and tokens as the delta", () => {
+    const feed = feedWith({
+      serenaToday: {
+        callsLine: "231 tool calls today",
+        tokensLine: "~48.2k tokens returned in 2h 5m"
+      }
+    });
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain(">Serena<");
+    expect(markup).toContain("231 tool calls today");
+    expect(markup).toContain("~48.2k tokens returned in 2h 5m");
+  });
+
+  it("renders an RTK today row when the slot has data, even without rtkInstalled", () => {
     const data: RtkTodayStats = {
       date: "2026-04-21",
       savedTokens: 1234,

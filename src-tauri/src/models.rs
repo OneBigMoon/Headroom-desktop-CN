@@ -217,8 +217,10 @@ pub struct DailySavingsPoint {
     /// Provider prompt-cache reads inside the bucket, derived from consecutive
     /// cumulative checkpoints in the backend's raw `history` array (the rollup
     /// series itself has no cache dimension). UTC-bucketed like the rollups.
-    /// None for local-tracker buckets and for days that have aged out of the
-    /// backend's history retention.
+    /// The local tracker archives the derived value at ingest, so coverage
+    /// survives the backend's history-ring trimming. None only for buckets
+    /// observed solely by the local tracker or archived before the field
+    /// existed (pre-0.8.3 days are unrecoverable: their checkpoints are gone).
     #[serde(default)]
     pub cache_read_tokens: Option<u64>,
     /// The provider read discount earned in the bucket, same derivation and
@@ -589,6 +591,16 @@ pub struct RtkTodayStats {
     pub commands: u64,
 }
 
+/// Serena activity for the feed tile. Lines are pre-formatted by the same
+/// code as the Addons-tab chip (`serena_savings_parts`) so the two surfaces
+/// can never phrase the same numbers differently. At least one line is Some.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerenaTodayStats {
+    pub calls_line: Option<String>,
+    pub tokens_line: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum RecordTag {
@@ -701,6 +713,7 @@ pub struct ActivityFeedSnapshot {
     pub transformation: Option<TransformationFeedEvent>,
     pub record: Option<RecordEvent>,
     pub rtk_today: Option<RtkTodayStats>,
+    pub serena_today: Option<SerenaTodayStats>,
     pub learnings_milestone: Option<LearningsMilestoneEvent>,
     pub weekly_recap: Option<WeeklyRecapEvent>,
     pub train_suggestion: Option<TrainSuggestionEvent>,

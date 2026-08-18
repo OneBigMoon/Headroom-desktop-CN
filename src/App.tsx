@@ -165,6 +165,7 @@ import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
 import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
+import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { TermsGate } from "./components/TermsGate";
 import type {
@@ -574,18 +575,6 @@ const idleHeadroomLearnStatus: HeadroomLearnStatus = {
   summary: "Select a project to run headroom learn.",
   outputTail: []
 };
-
-/** Live step of a running scan, on its own line under the row's timer. */
-function LearnStepLine({ step }: { step?: string | null }) {
-  if (!step) {
-    return null;
-  }
-  return (
-    <small className="optimize-project-row__step" aria-live="polite">
-      {step}
-    </small>
-  );
-}
 
 const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
   claudeCliAvailable: false,
@@ -1667,6 +1656,7 @@ export default function App() {
       transformation: null,
       record: null,
       rtkToday: null,
+      serenaToday: null,
       learningsMilestone: null,
       weeklyRecap: null,
       trainSuggestion: null
@@ -6417,24 +6407,11 @@ export default function App() {
                         const refreshLabel = isRunning
                           ? "Scanning…"
                           : "Scan now";
-                        const projectResultTone = headroomLearnStatus.success === true
-                          ? "success"
-                          : (headroomLearnStatus.success === false || headroomLearnStatus.error)
-                              ? "failure"
-                              : "idle";
-                        const projectResultLabel = headroomLearnStatus.success === true
-                          ? "Run succeeded"
-                          : (headroomLearnStatus.success === false || headroomLearnStatus.error)
-                              ? "Last run failed"
-                              : "No completed run yet";
                         const showInlineResult =
                           isLatestLearnProject &&
                           !headroomLearnStatus.running &&
-                          (
-                            headroomLearnStatus.success !== null ||
-                            Boolean(headroomLearnStatus.error) ||
-                            headroomLearnStatus.outputTail.length > 0
-                          );
+                          (headroomLearnStatus.success === false ||
+                            Boolean(headroomLearnStatus.error));
                         return (
                           <div
                             className={`optimize-project-row${isRunning || showInlineResult ? " optimize-project-row--active" : ""}`}
@@ -6445,13 +6422,14 @@ export default function App() {
                                 <strong>{project.displayName}</strong>
                                 <small>
                                   <span className="optimize-project-row__training" aria-live="polite">
-                                    {isRunning
-                                      ? `Scanning sessions${
-                                          typeof headroomLearnStatus.elapsedSeconds === "number"
-                                            ? ` · ${headroomLearnStatus.elapsedSeconds}s`
-                                            : ""
-                                        }`
-                                      : learnMeta}
+                                    {isRunning ? (
+                                      <LearnScanStatusLine
+                                        step={headroomLearnStatus.currentStep}
+                                        elapsedSeconds={headroomLearnStatus.elapsedSeconds}
+                                      />
+                                    ) : (
+                                      learnMeta
+                                    )}
                                     <button
                                       type="button"
                                       className={`optimize-project-row__refresh${isRunning ? " is-spinning" : ""}`}
@@ -6483,14 +6461,11 @@ export default function App() {
                                     }
                                   />
                                 </small>
-                                {isRunning ? (
-                                  <LearnStepLine step={headroomLearnStatus.currentStep} />
-                                ) : null}
                               </span>
                               <div className="optimize-project-row__actions">
                                 {showInlineResult ? (
-                                  <span className={`optimize-project-row__status optimize-minimal__result--${projectResultTone}`}>
-                                    {projectResultLabel}
+                                  <span className="optimize-project-row__status optimize-minimal__result--failure">
+                                    Last run failed
                                   </span>
                                 ) : null}
                               </div>
@@ -6531,23 +6506,8 @@ export default function App() {
                           const codexShowResult =
                             codexIsLatest &&
                             !headroomLearnStatus.running &&
-                            (headroomLearnStatus.success !== null ||
-                              Boolean(headroomLearnStatus.error) ||
-                              headroomLearnStatus.outputTail.length > 0);
-                          const codexResultTone =
-                            headroomLearnStatus.success === true
-                              ? "success"
-                              : headroomLearnStatus.success === false ||
-                                  headroomLearnStatus.error
-                                ? "failure"
-                                : "idle";
-                          const codexResultLabel =
-                            headroomLearnStatus.success === true
-                              ? "Run succeeded"
-                              : headroomLearnStatus.success === false ||
-                                  headroomLearnStatus.error
-                                ? "Last run failed"
-                                : "No completed run yet";
+                            (headroomLearnStatus.success === false ||
+                              Boolean(headroomLearnStatus.error));
                           if (!codexReady) {
                             const codexCmd = headroomLearnPrereq.codexCliAvailable
                               ? CODEX_CLI_LOGIN_CMD
@@ -6624,13 +6584,14 @@ export default function App() {
                                         className="optimize-project-row__training"
                                         aria-live="polite"
                                       >
-                                        {codexRunning
-                                          ? `Scanning sessions${
-                                              typeof headroomLearnStatus.elapsedSeconds === "number"
-                                                ? ` · ${headroomLearnStatus.elapsedSeconds}s`
-                                                : ""
-                                            }`
-                                          : "Scans ~/.codex/sessions into AGENTS.md"}
+                                        {codexRunning ? (
+                                          <LearnScanStatusLine
+                                            step={headroomLearnStatus.currentStep}
+                                            elapsedSeconds={headroomLearnStatus.elapsedSeconds}
+                                          />
+                                        ) : (
+                                          "Scans ~/.codex/sessions into AGENTS.md"
+                                        )}
                                         <button
                                           type="button"
                                           className={`optimize-project-row__refresh${codexRunning ? " is-spinning" : ""}`}
@@ -6647,16 +6608,11 @@ export default function App() {
                                         </button>
                                       </span>
                                     </small>
-                                    {codexRunning ? (
-                                      <LearnStepLine step={headroomLearnStatus.currentStep} />
-                                    ) : null}
                                   </span>
                                   <div className="optimize-project-row__actions">
                                     {codexShowResult ? (
-                                      <span
-                                        className={`optimize-project-row__status optimize-minimal__result--${codexResultTone}`}
-                                      >
-                                        {codexResultLabel}
+                                      <span className="optimize-project-row__status optimize-minimal__result--failure">
+                                        Last run failed
                                       </span>
                                     ) : null}
                                   </div>
@@ -6703,21 +6659,8 @@ export default function App() {
                       const showResult =
                         isLatest &&
                         !headroomLearnStatus.running &&
-                        (headroomLearnStatus.success !== null ||
-                          Boolean(headroomLearnStatus.error) ||
-                          headroomLearnStatus.outputTail.length > 0);
-                      const resultTone =
-                        headroomLearnStatus.success === true
-                          ? "success"
-                          : headroomLearnStatus.success === false || headroomLearnStatus.error
-                            ? "failure"
-                            : "idle";
-                      const resultLabel =
-                        headroomLearnStatus.success === true
-                          ? "Run succeeded"
-                          : headroomLearnStatus.success === false || headroomLearnStatus.error
-                            ? "Last run failed"
-                            : "No completed run yet";
+                        (headroomLearnStatus.success === false ||
+                          Boolean(headroomLearnStatus.error));
                       return (
                         <div className="optimize-projects" key={row.key}>
                           <div
@@ -6731,15 +6674,14 @@ export default function App() {
                                     className="optimize-project-row__training"
                                     aria-live="polite"
                                   >
-                                    {running
-                                      ? `Scanning sessions${
-                                          typeof headroomLearnStatus.elapsedSeconds === "number"
-                                            ? ` · ${headroomLearnStatus.elapsedSeconds}s`
-                                            : ""
-                                        }`
-                                      : ready
-                                        ? row.subtitle
-                                        : "Needs the Claude Code or a signed-in Codex CLI for analysis"}
+                                    {running ? (
+                                      <LearnScanStatusLine
+                                        step={headroomLearnStatus.currentStep}
+                                        elapsedSeconds={headroomLearnStatus.elapsedSeconds}
+                                      />
+                                    ) : ready
+                                      ? row.subtitle
+                                      : "Needs the Claude Code or a signed-in Codex CLI for analysis"}
                                     <button
                                       type="button"
                                       className={`optimize-project-row__refresh${running ? " is-spinning" : ""}`}
@@ -6752,16 +6694,11 @@ export default function App() {
                                     </button>
                                   </span>
                                 </small>
-                                {running ? (
-                                  <LearnStepLine step={headroomLearnStatus.currentStep} />
-                                ) : null}
                               </span>
                               <div className="optimize-project-row__actions">
                                 {showResult ? (
-                                  <span
-                                    className={`optimize-project-row__status optimize-minimal__result--${resultTone}`}
-                                  >
-                                    {resultLabel}
+                                  <span className="optimize-project-row__status optimize-minimal__result--failure">
+                                    Last run failed
                                   </span>
                                 ) : null}
                               </div>
@@ -6798,6 +6735,10 @@ export default function App() {
             error={activityFeedError}
             loaded={activityFeedLoaded}
             onNavigateToOptimize={() => setActiveView("optimization")}
+            rtkInstalled={runtimeStatus?.rtk.installed === true}
+            serenaInstalled={dashboard.tools.some(
+              (tool) => tool.id === "serena" && tool.status !== "not_installed"
+            )}
           />
         </div>
 

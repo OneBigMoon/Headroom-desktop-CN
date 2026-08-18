@@ -10,6 +10,7 @@ import type {
   RecordEvent,
   RecordTag,
   RtkTodayStats,
+  SerenaTodayStats,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   TransformationRequestMessage,
@@ -27,6 +28,11 @@ interface ActivityFeedProps {
   // tabs. Left optional so the component keeps rendering in contexts that
   // can't navigate (tests, embedded previews).
   onNavigateToOptimize?: () => void;
+  // RTK and Serena are opt-in, so their tiles (and empty placeholders) only
+  // render for users who installed them. Data in the slot still wins: stats
+  // from a just-uninstalled addon render rather than vanish mid-session.
+  rtkInstalled?: boolean;
+  serenaInstalled?: boolean;
 }
 
 // One entry per tile kind. `kind` matches the `ActivityFeedSnapshot` slot name
@@ -55,6 +61,12 @@ const EMPTY_TILE_COPY: Record<
     copy: "No RTK commands observed yet today.",
     itemModifier: "activity-feed__item--rtk"
   },
+  serenaToday: {
+    badgeClass: "activity-feed__badge--serena",
+    badgeLabel: "Serena",
+    copy: "No Serena tool calls observed yet today.",
+    itemModifier: "activity-feed__item--serena"
+  },
   record: {
     badgeClass: "activity-feed__badge--record",
     badgeLabel: "Record",
@@ -79,7 +91,9 @@ export function ActivityFeed({
   feed,
   error,
   loaded = true,
-  onNavigateToOptimize
+  onNavigateToOptimize,
+  rtkInstalled = false,
+  serenaInstalled = false
 }: ActivityFeedProps) {
   const { tiles } = feed;
   // "Waiting for proxy" only fires when we've got nothing to show AND the
@@ -143,9 +157,14 @@ export function ActivityFeed({
           )}
           {tiles.rtkToday ? (
             <RtkTodayRow event={tiles.rtkToday} />
-          ) : (
+          ) : rtkInstalled ? (
             <EmptyTile kind="rtkToday" />
-          )}
+          ) : null}
+          {tiles.serenaToday ? (
+            <SerenaTodayRow event={tiles.serenaToday} />
+          ) : serenaInstalled ? (
+            <EmptyTile kind="serenaToday" />
+          ) : null}
           {tiles.weeklyRecap ? (
             <WeeklyRecapRow event={tiles.weeklyRecap} />
           ) : (
@@ -793,6 +812,23 @@ function RtkTodayRow({ event }: { event: RtkTodayStats }) {
         <span className="activity-feed__delta">
           {event.commands.toLocaleString()} command{event.commands === 1 ? "" : "s"}
         </span>
+      </div>
+    </li>
+  );
+}
+
+function SerenaTodayRow({ event }: { event: SerenaTodayStats }) {
+  // The backend guarantees at least one line; calls lead when present.
+  const strong = event.callsLine ?? event.tokensLine;
+  const delta = event.callsLine ? event.tokensLine : null;
+  return (
+    <li className="activity-feed__item activity-feed__item--serena">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--serena">Serena</span>
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">{strong}</strong>
+        {delta ? <span className="activity-feed__delta">{delta}</span> : null}
       </div>
     </li>
   );

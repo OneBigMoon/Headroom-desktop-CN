@@ -9,6 +9,7 @@ const emptySnapshot: ActivityFeedResponse = {
     transformation: null,
     record: null,
     rtkToday: null,
+    serenaToday: null,
     learningsMilestone: null,
     weeklyRecap: null,
     trainSuggestion: null
@@ -43,7 +44,7 @@ describe("notificationActionView", () => {
 describe("activityFeedSignature", () => {
   it("returns a stable string for an empty snapshot", () => {
     const sig = activityFeedSignature(emptySnapshot);
-    expect(sig).toBe("1|t:-|r:-|b:-|l:-|wr:-|ts:-");
+    expect(sig).toBe("1|t:-|r:-|b:-|s:-|l:-|wr:-|ts:-");
   });
 
   it("differentiates proxyReachable false from proxyReachable true", () => {
@@ -114,6 +115,7 @@ describe("activityFeedSignature", () => {
         transformation: null,
         record: { observedAt: "2026-04-25T11:00:00Z" } as never,
         rtkToday: { date: "2026-04-25", savedTokens: 1234 } as never,
+        serenaToday: { callsLine: "3 tool calls today", tokensLine: null } as never,
         learningsMilestone: { observedAt: "2026-04-25T10:00:00Z" } as never,
         weeklyRecap: { weekStart: "2026-04-20" } as never,
         trainSuggestion: {
@@ -124,6 +126,7 @@ describe("activityFeedSignature", () => {
     });
     expect(sig).toContain("r:2026-04-25T11:00:00Z");
     expect(sig).toContain("b:2026-04-25:1234");
+    expect(sig).toContain("s:3 tool calls today:");
     expect(sig).toContain("l:2026-04-25T10:00:00Z");
     expect(sig).toContain("wr:2026-04-20");
     expect(sig).toContain("ts:/Users/x/proj:2026-04-25T09:00:00Z");

@@ -49,6 +49,9 @@ export function activityFeedSignature(feed: ActivityFeedResponse): string {
       : "t:-",
     tiles.record ? `r:${tiles.record.observedAt}` : "r:-",
     tiles.rtkToday ? `b:${tiles.rtkToday.date}:${tiles.rtkToday.savedTokens}` : "b:-",
+    tiles.serenaToday
+      ? `s:${tiles.serenaToday.callsLine ?? ""}:${tiles.serenaToday.tokensLine ?? ""}`
+      : "s:-",
     tiles.learningsMilestone ? `l:${tiles.learningsMilestone.observedAt}` : "l:-",
     tiles.weeklyRecap ? `wr:${tiles.weeklyRecap.weekStart}` : "wr:-",
     tiles.trainSuggestion

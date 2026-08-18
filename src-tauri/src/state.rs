@@ -2222,6 +2222,9 @@ impl AppState {
     pub fn activity_feed_snapshot(&self) -> crate::models::ActivityFeedSnapshot {
         let mut snapshot = self.activity_facts.lock().activity_feed_snapshot();
         snapshot.rtk_today = self.cached_rtk_today_stats();
+        // No state-level cache like rtk's: both serena sources already sit
+        // behind their own 60s caches inside ToolManager.
+        snapshot.serena_today = self.tool_manager.serena_today_stats();
         snapshot
     }
 
@@ -4062,6 +4065,14 @@ struct DailySavingsBucket {
     // persisted by older builds must keep parsing, hence container `default`.
     output_savings_usd: f64,
     output_tokens_saved: u64,
+    // Provider cache reads inside the bucket, copied from the backend-derived
+    // deltas at ingest. The backend's raw history is a point-capped ring, so
+    // the derivation goes None once a period's checkpoints age out; this
+    // archived copy is what keeps the compressible-input rate computable
+    // (and its chip visible) for old periods. None for buckets archived
+    // before this field existed or observed only by the local tracker.
+    cache_read_tokens: Option<u64>,
+    cache_savings_usd: Option<f64>,
 }
 
 /// One bucket of the locally-sampled output-shaper series: poll-over-poll
@@ -4343,9 +4354,10 @@ impl SavingsTracker {
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
-                // The local tracker has no cache dimension.
-                cache_read_tokens: None,
-                cache_savings_usd: None,
+                // Archived from the backend-derived deltas at ingest; None for
+                // buckets the local tracker observed on its own.
+                cache_read_tokens: bucket.cache_read_tokens,
+                cache_savings_usd: bucket.cache_savings_usd,
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
@@ -4364,8 +4376,8 @@ impl SavingsTracker {
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
-                cache_read_tokens: None,
-                cache_savings_usd: None,
+                cache_read_tokens: bucket.cache_read_tokens,
+                cache_savings_usd: bucket.cache_savings_usd,
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
                 // The local pre-cutoff tracker has no provider dimension.
@@ -4432,6 +4444,10 @@ impl SavingsTracker {
                     }
                 }
             }
+            // Once a day's checkpoints age out of the backend's history ring,
+            // the re-derived cache delta comes back None; the value archived
+            // while coverage lasted is the durable copy and must survive.
+            let archived = self.daily_savings.get(&point.date).copied();
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -4439,8 +4455,14 @@ impl SavingsTracker {
                 total_tokens_sent: point.total_tokens_sent,
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
+                cache_read_tokens: point
+                    .cache_read_tokens
+                    .or(archived.and_then(|b| b.cache_read_tokens)),
+                cache_savings_usd: point
+                    .cache_savings_usd
+                    .or(archived.and_then(|b| b.cache_savings_usd)),
             };
-            if self.daily_savings.get(&point.date) != Some(&bucket) {
+            if archived.as_ref() != Some(&bucket) {
                 self.daily_savings.insert(point.date.clone(), bucket);
                 changed = true;
             }
@@ -4451,6 +4473,8 @@ impl SavingsTracker {
             {
                 continue;
             }
+            // Same cache-coverage preservation as the daily loop above.
+            let archived = self.hourly_savings.get(&point.hour).copied();
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -4458,8 +4482,14 @@ impl SavingsTracker {
                 total_tokens_sent: point.total_tokens_sent,
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
+                cache_read_tokens: point
+                    .cache_read_tokens
+                    .or(archived.and_then(|b| b.cache_read_tokens)),
+                cache_savings_usd: point
+                    .cache_savings_usd
+                    .or(archived.and_then(|b| b.cache_savings_usd)),
             };
-            if self.hourly_savings.get(&point.hour) != Some(&bucket) {
+            if archived.as_ref() != Some(&bucket) {
                 self.hourly_savings.insert(point.hour.clone(), bucket);
                 changed = true;
             }
@@ -6381,6 +6411,8 @@ fn diff_hourly_buckets(
                 output_tokens_saved: bucket
                     .output_tokens_saved
                     .saturating_sub(prior.output_tokens_saved),
+                // Session observations carry no cache dimension.
+                ..Default::default()
             };
             if delta.estimated_savings_usd <= 0.0
                 && delta.estimated_tokens_saved == 0
@@ -8236,6 +8268,7 @@ mod tests {
                 total_tokens_sent: 0,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         daily.insert(
@@ -8247,6 +8280,7 @@ mod tests {
                 total_tokens_sent: 0,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         daily.insert(
@@ -8258,6 +8292,7 @@ mod tests {
                 total_tokens_sent: 0,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         daily.insert(
@@ -8269,6 +8304,7 @@ mod tests {
                 total_tokens_sent: 0,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         daily.insert(
@@ -8280,6 +8316,7 @@ mod tests {
                 total_tokens_sent: 0,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         let start = chrono::NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
@@ -10030,6 +10067,7 @@ mod tests {
                 total_tokens_sent: 600_000,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         tracker.hourly_savings.insert(
@@ -10041,6 +10079,7 @@ mod tests {
                 total_tokens_sent: 600_000,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
         tracker.daily_savings.insert(
@@ -10052,6 +10091,7 @@ mod tests {
                 total_tokens_sent: 600_000,
                 output_savings_usd: 0.0,
                 output_tokens_saved: 0,
+                ..Default::default()
             },
         );
 
@@ -10576,6 +10616,57 @@ mod tests {
             .find(|p| p.date == "2026-06-16")
             .expect("archived day survives");
         assert_eq!(day.estimated_tokens_saved, 900);
+    }
+
+    #[test]
+    fn ingest_native_rollups_keeps_archived_cache_coverage_when_checkpoints_age_out() {
+        let mut tracker = make_tracker();
+        let cutoff = "2026-06-02";
+
+        // While the day's checkpoints are still inside the backend's history
+        // ring, the derived cache deltas arrive and are archived.
+        let mut covered = daily("2026-06-10", 100, 1.0);
+        covered.total_tokens_sent = 10_000;
+        covered.cache_read_tokens = Some(5_000);
+        covered.cache_savings_usd = Some(0.9);
+        let mut covered_hour = hourly("2026-06-10T09:00", 40);
+        covered_hour.cache_read_tokens = Some(2_000);
+        covered_hour.cache_savings_usd = Some(0.4);
+        assert!(tracker.ingest_native_rollups(
+            &[covered],
+            &[covered_hour],
+            cutoff,
+            "2026-06-16",
+            "2026-06-16"
+        ));
+
+        // Later the checkpoints age out of the ring and the same buckets
+        // re-derive as None. The archived coverage must survive, and an
+        // otherwise-identical snapshot must not report a change.
+        let mut uncovered = daily("2026-06-10", 100, 1.0);
+        uncovered.total_tokens_sent = 10_000;
+        assert!(!tracker.ingest_native_rollups(
+            &[uncovered],
+            &[hourly("2026-06-10T09:00", 40)],
+            cutoff,
+            "2026-06-16",
+            "2026-06-16"
+        ));
+
+        let day = tracker
+            .daily_savings()
+            .into_iter()
+            .find(|p| p.date == "2026-06-10")
+            .expect("archived day");
+        assert_eq!(day.cache_read_tokens, Some(5_000));
+        assert_eq!(day.cache_savings_usd, Some(0.9));
+        let hour = tracker
+            .hourly_savings()
+            .into_iter()
+            .find(|p| p.hour == "2026-06-10T09:00")
+            .expect("archived hour");
+        assert_eq!(hour.cache_read_tokens, Some(2_000));
+        assert_eq!(hour.cache_savings_usd, Some(0.4));
     }
 
     #[test]

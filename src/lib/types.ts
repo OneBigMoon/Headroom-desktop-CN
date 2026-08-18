@@ -428,6 +428,13 @@ export interface RtkTodayStats {
   commands: number;
 }
 
+// Lines arrive pre-formatted by the backend (same code as the Addons-tab
+// chip); at least one is non-null.
+export interface SerenaTodayStats {
+  callsLine: string | null;
+  tokensLine: string | null;
+}
+
 export type RecordTag = "daily" | "weekly" | "allTime";
 
 export interface RecordEvent {
@@ -484,6 +491,7 @@ export interface ActivityFeedSnapshot {
   transformation: TransformationFeedEvent | null;
   record: RecordEvent | null;
   rtkToday: RtkTodayStats | null;
+  serenaToday: SerenaTodayStats | null;
   learningsMilestone: LearningsMilestoneEvent | null;
   weeklyRecap: WeeklyRecapEvent | null;
   trainSuggestion: TrainSuggestionEvent | null;

@@ -1146,19 +1146,19 @@ struct RtkDailyGainOutput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RtkGainSummary {
-    pub total_commands: u64,
-    pub total_saved: u64,
-    pub avg_savings_pct: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct RtkDailyEntry {
     date: String,
     #[serde(default)]
     commands: u64,
     #[serde(default)]
     saved_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RtkGainSummary {
+    pub total_commands: u64,
+    pub total_saved: u64,
+    pub avg_savings_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1507,6 +1507,27 @@ impl ToolManager {
             "caveman" => Some("~65% fewer output tokens (benchmark)".to_string()),
             _ => None,
         }
+    }
+
+    /// Serena slot for the Activity-tab feed: the same two measures as the
+    /// Addons-tab chip, pre-formatted by the shared `serena_savings_parts`.
+    /// None when serena is not installed or neither measure has data yet.
+    pub fn serena_today_stats(&self) -> Option<crate::models::SerenaTodayStats> {
+        if !self.serena_installed() {
+            return None;
+        }
+        let live = self
+            .serena_live_stats()
+            .map(|(tokens, session_start)| (tokens, session_start.map(|start| start.elapsed())));
+        let (calls_line, tokens_line) =
+            serena_savings_parts(self.serena_tool_calls_local_today(), live);
+        if calls_line.is_none() && tokens_line.is_none() {
+            return None;
+        }
+        Some(crate::models::SerenaTodayStats {
+            calls_line,
+            tokens_line,
+        })
     }
 
     /// Estimated tokens serena's tools have returned in the live session(s),
@@ -6004,32 +6025,42 @@ fn fetch_serena_output_tokens(base_url: &str) -> Option<u64> {
 
 /// "231 tool calls today, ~48k tokens returned in 2h 14m" — either half may
 /// be absent (and the duration within the second), None only when both are.
-fn serena_savings_label(
+/// `(calls_line, tokens_line)` — the two independently-optional halves of the
+/// serena activity phrasing, shared by the Addons-tab chip and the feed tile.
+fn serena_savings_parts(
     calls_today: Option<u64>,
     live: Option<(u64, Option<Duration>)>,
-) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(count) = calls_today {
+) -> (Option<String>, Option<String>) {
+    let calls_line = calls_today.map(|count| {
         if count == 1 {
-            parts.push("1 tool call today".to_string());
+            "1 tool call today".to_string()
         } else {
-            parts.push(format!("{count} tool calls today"));
+            format!("{count} tool calls today")
         }
-    }
-    match live {
-        Some((tokens, Some(age))) => parts.push(format!(
+    });
+    let tokens_line = match live {
+        Some((tokens, Some(age))) => Some(format!(
             "~{} tokens returned in {}",
             compact_token_count(tokens),
             compact_duration(age)
         )),
         // No session age (e.g. serena running from a non-managed install):
         // still name the window, or the figure reads as all-time.
-        Some((tokens, None)) => parts.push(format!(
+        Some((tokens, None)) => Some(format!(
             "~{} tokens returned this session",
             compact_token_count(tokens)
         )),
-        None => {}
-    }
+        None => None,
+    };
+    (calls_line, tokens_line)
+}
+
+fn serena_savings_label(
+    calls_today: Option<u64>,
+    live: Option<(u64, Option<Duration>)>,
+) -> Option<String> {
+    let (calls_line, tokens_line) = serena_savings_parts(calls_today, live);
+    let parts: Vec<String> = [calls_line, tokens_line].into_iter().flatten().collect();
     if parts.is_empty() {
         None
     } else {
@@ -9396,6 +9427,26 @@ mod tests {
 
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rtk_gain_summary_parses_summary_json() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain-summary");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo '{\"summary\":{\"total_commands\":7,\"total_saved\":1234,\"avg_savings_pct\":61.5},\"daily\":[]}';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        let summary = manager.rtk_gain_summary().expect("gain summary");
+        assert_eq!(summary.total_commands, 7);
+        assert_eq!(summary.total_saved, 1234);
+        assert_eq!(summary.avg_savings_pct, 61.5);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn rtk_today_stats_returns_matching_daily_row() {
         let (root, runtime, manager) = seed_test_runtime("rtk-today");
         let today = Local::now().date_naive().to_string();
@@ -9432,8 +9483,24 @@ mod tests {
     }
 
     #[test]
-    fn rtk_today_stats_returns_none_on_command_failure() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-today-fail");
+    fn rtk_gain_summary_returns_none_when_summary_absent() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain-missing");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo '{\"daily\":[]}';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        assert!(manager.rtk_gain_summary().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rtk_gain_summary_returns_none_on_command_failure() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain-fail");
         write_executable(
             &runtime.bin_dir.join("rtk"),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo 'boom' 1>&2;\n  exit 4\nfi\nexit 9\n",
@@ -9442,14 +9509,14 @@ mod tests {
             .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
             .expect("rtk receipt");
 
-        assert!(manager.rtk_today_stats().is_none());
+        assert!(manager.rtk_gain_summary().is_none());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn rtk_today_stats_returns_none_on_invalid_json() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-today-invalid-json");
+    fn rtk_gain_summary_returns_none_on_invalid_json() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain-invalid-json");
         write_executable(
             &runtime.bin_dir.join("rtk"),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo 'not-json';\n  exit 0\nfi\nexit 9\n",
@@ -9458,7 +9525,7 @@ mod tests {
             .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
             .expect("rtk receipt");
 
-        assert!(manager.rtk_today_stats().is_none());
+        assert!(manager.rtk_gain_summary().is_none());
 
         let _ = fs::remove_dir_all(root);
     }

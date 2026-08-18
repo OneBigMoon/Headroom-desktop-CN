@@ -81,10 +81,11 @@ export function savingsRate(saved: number, spent: number) {
 
 /** Cache-hit / compression pair over a window of savings buckets.
  *
- * Only buckets that carry cache data count (backend rollup coverage; local
- * tracker buckets and days aged out of history retention have none), so both
- * rates describe the same covered slice of the window. Null when no bucket in
- * the window has coverage. `hitPct` is the share of forwarded input served
+ * Only buckets that carry cache data count (backend rollup coverage, archived
+ * durably at ingest since 0.8.3; buckets only the local tracker observed and
+ * days that aged out before ever being archived have none), so both rates
+ * describe the same covered slice of the window. Null when no bucket in the
+ * window has coverage. `hitPct` is the share of forwarded input served
  * from the provider's prompt cache; `compressedPct` is the share of the
  * REMAINING (compressible) input Headroom removed.
  *

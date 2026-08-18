@@ -2733,15 +2733,6 @@ select {
   gap: 6px;
 }
 
-/* Live scan step. Colors come from `.optimize-project-row__name small`, which
-   already has a dark-mode override, so this rule is layout only. */
-.optimize-project-row__step {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .optimize-project-row__refresh {
   display: inline-flex;
   align-items: center;
@@ -3396,20 +3387,9 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.45;
 }
 
-.optimize-minimal__result {
+.optimize-project-row__status.optimize-minimal__result--failure {
+  color: var(--danger);
   font-weight: 600;
-}
-
-.optimize-minimal__result--running {
-  color: #1f6c8f;
-}
-
-.optimize-minimal__result--success {
-  color: #1a7a52;
-}
-
-.optimize-minimal__result--failure {
-  color: #9a3f3f;
 }
 
 .optimize-minimal__mono {
@@ -5213,6 +5193,13 @@ html.window-hiding {
 .activity-feed__badge--rtk {
   background: rgba(190, 95, 55, 0.15);
   color: #9a4a2b;
+}
+
+/* Token-only, so no dark-mode override is needed (unlike the raw-color
+   badges above, which are Stage 4 backlog). */
+.activity-feed__badge--serena {
+  background: var(--accent-tint);
+  color: var(--accent);
 }
 
 .activity-feed__badge--milestone {
