@@ -88,11 +88,12 @@ export function recommendedHeadroomTier(
     : claudeTier === "max20x" ? "max20x"
     : null;
   const fromCodex: HeadroomSubscriptionTier | null =
-    codexTier === "go" || codexTier === "plus" ? "pro"
-    : codexTier === "team" ||
-        codexTier === "business" ||
-        codexTier === "self_serve_business_usage_based" ||
-        codexTier === "edu"
+    codexTier === "go" ||
+    codexTier === "plus" ||
+    codexTier === "team" ||
+    codexTier === "business"
+      ? "pro"
+    : codexTier === "self_serve_business_usage_based" || codexTier === "edu"
       ? "max5x"
     : codexTier === "pro" ||
         codexTier === "enterprise" ||

@@ -465,12 +465,28 @@ function CompressionDiff({
   );
 }
 
+// Backends predating the upstream denominator fix (headroom#3106) measure
+// tokensSaved across all layers (tool schemas included) but count "in" over
+// messages only, so on schema-heavy turns "out" clamps to 0 and the percent
+// tops 100 ("4,436 -> 0, 208.4%"). Those two displays are meaningless for
+// such records - suppress them; the saved count itself is real and stays.
+function isClampedTokenPair(
+  saved: number,
+  original: number | null | undefined,
+  optimized: number | null | undefined
+): boolean {
+  return optimized === 0 && original != null && saved > original;
+}
+
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
+  const showPct = pct <= 100;
   const workspace = workspaceBasename(event.workspace);
   const hasExactTokens =
-    event.inputTokensOriginal != null && event.inputTokensOptimized != null;
+    event.inputTokensOriginal != null &&
+    event.inputTokensOptimized != null &&
+    !isClampedTokenPair(saved, event.inputTokensOriginal, event.inputTokensOptimized);
   const hasRequestId = !!event.requestId;
   const hasRawTransforms = event.transformsApplied.length > 0;
   const groups = hasRawTransforms ? groupTransforms(event.transformsApplied) : [];
@@ -536,8 +552,8 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         <CompressionDiff
           requestMessages={event.requestMessages!}
           compressedMessages={event.compressedMessages!}
-          inputTokensOriginal={event.inputTokensOriginal}
-          inputTokensOptimized={event.inputTokensOptimized}
+          inputTokensOriginal={hasExactTokens ? event.inputTokensOriginal : null}
+          inputTokensOptimized={hasExactTokens ? event.inputTokensOptimized : null}
         />
       ) : hasRequestMessages ? (
         // Legacy proxy shape: only `requestMessages` exists. Its content may
@@ -572,7 +588,8 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          Saved {saved.toLocaleString()} tokens ({pct.toFixed(1)}%)
+          Saved {saved.toLocaleString()} tokens
+          {showPct ? ` (${pct.toFixed(1)}%)` : ""}
           {estimatedUsd != null ? (
             <span className="activity-feed__savings-usd">
               {" "}
@@ -850,7 +867,13 @@ function RecordRow({ event }: { event: RecordEvent }) {
   const hasCompressedMessages =
     !!event.compressedMessages && event.compressedMessages.length > 0;
   const hasExactTokens =
-    event.inputTokensOriginal != null && event.inputTokensOptimized != null;
+    event.inputTokensOriginal != null &&
+    event.inputTokensOptimized != null &&
+    !isClampedTokenPair(
+      event.tokensSaved,
+      event.inputTokensOriginal,
+      event.inputTokensOptimized
+    );
   const hasRequestId = !!event.requestId;
   const estimatedUsd = estimateCostSavingsUsd(event.model, event.tokensSaved);
   const hasExtra =
@@ -886,8 +909,8 @@ function RecordRow({ event }: { event: RecordEvent }) {
         <CompressionDiff
           requestMessages={event.requestMessages!}
           compressedMessages={event.compressedMessages!}
-          inputTokensOriginal={event.inputTokensOriginal}
-          inputTokensOptimized={event.inputTokensOptimized}
+          inputTokensOriginal={hasExactTokens ? event.inputTokensOriginal : null}
+          inputTokensOptimized={hasExactTokens ? event.inputTokensOptimized : null}
         />
       ) : hasRequestMessages ? (
         <>
@@ -923,7 +946,7 @@ function RecordRow({ event }: { event: RecordEvent }) {
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
           Saved {event.tokensSaved.toLocaleString()} tokens
-          {pct != null ? ` (${pct.toFixed(1)}%)` : ""}
+          {pct != null && pct <= 100 ? ` (${pct.toFixed(1)}%)` : ""}
         </strong>
         {event.previousRecord != null ? (
           <span className="activity-feed__delta">

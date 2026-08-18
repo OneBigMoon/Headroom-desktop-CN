@@ -202,6 +202,39 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Cache aligned");
   });
 
+  it("suppresses the percent and in/out pair on clamped legacy records", () => {
+    // Backends without the upstream denominator fix (headroom#3106) emit
+    // saved > in with out clamped to 0 and a >100% rate on schema-heavy
+    // responses turns. The saved count is real; the pair and rate are not.
+    const feed = feedWith({
+      transformation: transformation({
+        inputTokensOriginal: 4436,
+        inputTokensOptimized: 0,
+        tokensSaved: 9245,
+        savingsPercent: 208.4
+      })
+    });
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Saved 9,245 tokens");
+    expect(markup).not.toContain("208.4%");
+    expect(markup).not.toContain("4,436");
+    expect(markup).not.toContain("Tokens in → out");
+  });
+
+  it("keeps the in/out pair on a legitimate full wipe (saved == in, out == 0)", () => {
+    const feed = feedWith({
+      transformation: transformation({
+        inputTokensOriginal: 4436,
+        inputTokensOptimized: 0,
+        tokensSaved: 4436,
+        savingsPercent: 100
+      })
+    });
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Saved 4,436 tokens (100.0%)");
+    expect(markup).toContain("4,436");
+  });
+
   it("shows an estimated dollar savings alongside tokens saved", () => {
     const feed = feedWith({
       transformation: transformation({

@@ -881,12 +881,19 @@ impl CodexPlanTier {
 }
 
 /// Price-parity map from an OpenAI plan to the recommended Headroom upgrade
-/// tier, by per-seat spend with a one-tier bump for orgs:
-/// - Go ($8) / Plus ($20) -> Pro ($20): individual, low spend.
+/// tier, by per-seat Codex allowance:
+/// - Go ($8) / Plus ($20) -> Pro: individual, low spend.
+/// - Business / Team -> Pro: a Standard Business seat ($20-25) carries a
+///   Plus-level Codex allowance, so Pro is honest parity. (Team is legacy
+///   Business, folded into Business by OpenAI.) The earlier one-tier "org
+///   budget" bump to Max x5 read as a wrong plan detection to Business users
+///   and was reverted 2026-08-18. Note this is intentionally NOT parity with
+///   Claude Team (-> Max x20): a Claude Team seat grants Max-tier limits.
+///   If/when Business Premium seats ($100, 5x) ship a distinct plan claim,
+///   map that claim to Max x5/x20 -- do not re-bump Standard seats.
+/// - Self-serve usage-based -> Max x5: credit-billed Codex seats with no fixed
+///   seat price; spend is open-ended, so pitch the middle tier.
 /// - Pro ($100/$200) -> Max x20: individual already paying top dollar.
-/// - Business / self-serve usage-based / Team -> Max x5: Plus-level per-seat
-///   ($20-25), bumped one tier for org procurement budget. (Team is legacy
-///   Business, folded into Business by OpenAI.)
 /// - Enterprise / enterprise CBP usage-based -> Max x20: $60+/seat at a 150-seat
 ///   minimum, the genuine high-budget tier.
 /// - Edu -> Max x5: institutional but discounted.
@@ -895,16 +902,13 @@ impl CodexPlanTier {
 /// Free carries no recommendation (already on the no-cost tier).
 pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubscriptionTier> {
     match plan {
-        CodexPlanTier::Go | CodexPlanTier::Plus => Some(HeadroomSubscriptionTier::Pro),
-        // Codex Team/Business -> Max x5 is intentionally NOT parity with Claude
-        // Team (-> Max x20, see `pricing::detect_plan_tier_from_profile`). A
-        // ChatGPT Business seat grants a modest Codex allowance, while a Claude
-        // Team seat grants Claude usage at Max-tier limits. Different products,
-        // different recommendations. Do not "unify" them.
-        CodexPlanTier::Team
-        | CodexPlanTier::Business
-        | CodexPlanTier::SelfServeBusinessUsageBased
-        | CodexPlanTier::Edu => Some(HeadroomSubscriptionTier::Max5x),
+        CodexPlanTier::Go
+        | CodexPlanTier::Plus
+        | CodexPlanTier::Team
+        | CodexPlanTier::Business => Some(HeadroomSubscriptionTier::Pro),
+        CodexPlanTier::SelfServeBusinessUsageBased | CodexPlanTier::Edu => {
+            Some(HeadroomSubscriptionTier::Max5x)
+        }
         CodexPlanTier::Pro
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
@@ -927,6 +931,13 @@ pub struct CodexAccountProfile {
     /// `chatgpt_account_id` from the OAuth JWT (or `tokens.account_id`).
     pub account_uuid: Option<String>,
     pub plan_tier: Option<CodexPlanTier>,
+    /// Sanitized raw `chatgpt_plan_type` claim, kept ONLY when it doesn't
+    /// decode to a known [`CodexPlanTier`]. Rides to headroom-web as the
+    /// `X-Headroom-Codex-Plan` value in place of `"unknown"`, so a new OpenAI
+    /// plan (e.g. Business Premium seats) shows up in the fleet by name the
+    /// day it ships instead of vanishing into the `unknown` bucket.
+    #[serde(default)]
+    pub plan_raw: Option<String>,
     /// Raw org signal: the user's `role` in their default org
     /// (`organizations[0].role`, e.g. owner/admin/member). Present for
     /// Business/Enterprise/Team seats. No Codex analog to Claude's
@@ -1194,7 +1205,9 @@ pub enum TierRecommendationSource {
 /// Set when an active subscriber's paid Headroom tier is lower than the tier
 /// implied by their detected Claude or Codex plan. `clamped` flips true once the
 /// grace window has elapsed, at which point standard paid-plan usage gating
-/// applies.
+/// applies — scoped per product via the `*_undercovered` flags: a Codex-only
+/// mismatch must never pause Claude optimization (and vice versa), since the
+/// other product is exactly what the user is paying for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TierMismatch {
@@ -1203,6 +1216,14 @@ pub struct TierMismatch {
     pub recommended_source: TierRecommendationSource,
     pub grace_ends_at: DateTime<Utc>,
     pub clamped: bool,
+    /// True when the Claude-implied tier alone exceeds the paid tier; only then
+    /// may the clamp gate Claude traffic.
+    #[serde(default)]
+    pub claude_undercovered: bool,
+    /// True when the Codex-implied tier alone exceeds the paid tier; only then
+    /// may the clamp meter Codex traffic.
+    #[serde(default)]
+    pub codex_undercovered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1245,7 +1266,14 @@ mod tests {
     #[test]
     fn codex_plan_maps_to_price_parity_headroom_tier() {
         use HeadroomSubscriptionTier::*;
-        for plan in [CodexPlanTier::Go, CodexPlanTier::Plus] {
+        // Business/Team: Standard seats carry a Plus-level Codex allowance, so
+        // they price-match Pro (reverted from the Max x5 org bump 2026-08-18).
+        for plan in [
+            CodexPlanTier::Go,
+            CodexPlanTier::Plus,
+            CodexPlanTier::Team,
+            CodexPlanTier::Business,
+        ] {
             assert_eq!(headroom_tier_for_codex_plan(&plan), Some(Pro));
         }
         for plan in [
@@ -1256,8 +1284,6 @@ mod tests {
             assert_eq!(headroom_tier_for_codex_plan(&plan), Some(Max20x));
         }
         for plan in [
-            CodexPlanTier::Team,
-            CodexPlanTier::Business,
             CodexPlanTier::SelfServeBusinessUsageBased,
             CodexPlanTier::Edu,
         ] {

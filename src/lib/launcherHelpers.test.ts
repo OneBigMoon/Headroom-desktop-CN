@@ -251,8 +251,9 @@ describe("launcher helpers", () => {
     it("maps Codex tiers per the models.rs table", () => {
       expect(recommendedHeadroomTier(null, "go")).toBe("pro");
       expect(recommendedHeadroomTier(null, "plus")).toBe("pro");
-      expect(recommendedHeadroomTier(null, "team")).toBe("max5x");
-      expect(recommendedHeadroomTier(null, "business")).toBe("max5x");
+      // Standard Business/Team seats carry a Plus-level Codex allowance.
+      expect(recommendedHeadroomTier(null, "team")).toBe("pro");
+      expect(recommendedHeadroomTier(null, "business")).toBe("pro");
       expect(recommendedHeadroomTier(null, "self_serve_business_usage_based")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "edu")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "pro")).toBe("max20x");

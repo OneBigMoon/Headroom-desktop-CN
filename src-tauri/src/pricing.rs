@@ -92,16 +92,23 @@ struct IdentityPayload {
     codex_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_plan_tier: Option<CodexPlanTier>,
+    /// Sanitized raw plan claim, present only when `codex_plan_tier` is
+    /// Unknown; replaces "unknown" as the `X-Headroom-Codex-Plan` value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_plan_raw: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_organization_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_rate_limit_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_billing_type: Option<String>,
-    /// Shape of the live Codex usage windows, `primary=99@43200;secondary=12@10080`
-    /// (used percent @ window minutes). The weekly gate meters against these and
-    /// `secondary` is optional per plan, so without this we cannot tell from the
-    /// fleet whether a clamped subscriber is being metered or silently allowed.
+    /// Shape of the live Codex usage windows plus credits,
+    /// `primary=99@43200;secondary=12@10080;credits=812` (used percent @ window
+    /// minutes; credits balance or `unlimited`). The weekly gate meters against
+    /// the windows and `secondary` is optional per plan, so without this we
+    /// cannot tell from the fleet whether a clamped subscriber is being metered
+    /// or silently allowed; credits identify seats spending beyond their plan
+    /// allowance (the upsell cohort the plan claim can't reveal).
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_usage_windows: Option<String>,
     /// When the local tier-mismatch clock started, if a mismatch is currently
@@ -173,6 +180,7 @@ impl IdentityPayload {
             codex_account_uuid: codex.and_then(|p| p.account_uuid.clone()),
             codex_email: codex.and_then(|p| p.email.clone()),
             codex_plan_tier: codex.and_then(|p| p.plan_tier),
+            codex_plan_raw: codex.and_then(|p| p.plan_raw.clone()),
             codex_organization_type: codex.and_then(|p| p.organization_type.clone()),
             codex_rate_limit_tier: codex.and_then(|p| p.rate_limit_tier.clone()),
             codex_billing_type: codex.and_then(|p| p.billing_type.clone()),
@@ -222,7 +230,13 @@ impl IdentityPayload {
             builder = builder.header("X-Headroom-Codex-Email", value);
         }
         if let Some(tier) = self.codex_plan_tier.as_ref() {
-            builder = builder.header("X-Headroom-Codex-Plan", tier.as_header_str());
+            // An unclassifiable claim ships its sanitized raw value in place of
+            // "unknown" so novel OpenAI plans are visible in the fleet by name.
+            let value = match (tier, self.codex_plan_raw.as_deref()) {
+                (CodexPlanTier::Unknown, Some(raw)) => raw,
+                _ => tier.as_header_str(),
+            };
+            builder = builder.header("X-Headroom-Codex-Plan", value);
         }
         if let Some(value) = self.codex_organization_type.as_deref() {
             builder = builder.header("X-Headroom-Codex-Organization-Type", value);
@@ -728,9 +742,13 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude, codex_plan);
-    // Captured before the mismatch is moved into the Claude evaluator; the Codex
-    // gate meters an under-subscribed account exactly like the Claude side.
-    let subscription_clamped = tier_mismatch.as_ref().is_some_and(|m| m.clamped);
+    // Captured before the mismatch is moved into the Claude evaluator. The clamp
+    // is scoped per product: Codex is metered only when the Codex-implied tier
+    // exceeds the paid one, and the Claude evaluator gates only on
+    // `claude_undercovered` — a mismatch on one product never pauses the other.
+    let subscription_clamped = tier_mismatch
+        .as_ref()
+        .is_some_and(|m| m.clamped && m.codex_undercovered);
 
     let mut status = evaluate_pricing_status_with_mismatch(
         authenticated,
@@ -910,11 +928,14 @@ fn metered_window(snapshot: &CodexRateLimitSnapshot) -> Option<&crate::models::C
         .max_by_key(|w| w.window_minutes.unwrap_or(0))
 }
 
-/// Compact wire summary of the Codex usage windows, as
-/// `primary=99@43200;secondary=12@10080` (used percent @ window minutes), or
-/// `none` when a snapshot carries only a credits balance. Reported to
-/// headroom-web so we can see which ChatGPT plans actually publish a weekly
-/// window — the gate depends on it and we previously had no field visibility.
+/// Compact wire summary of the Codex usage windows and credits, as
+/// `primary=99@43200;secondary=12@10080;credits=812` (used percent @ window
+/// minutes; credits balance or `unlimited`), or `none` for an empty snapshot.
+/// Reported to headroom-web so we can see which ChatGPT plans actually publish
+/// a weekly window — the gate depends on it and we previously had no field
+/// visibility. Credits ride along to spot seats burning workspace credits
+/// beyond their plan allowance (post-April-2026 credit-billed Codex): the
+/// upsell cohort the plan claim alone can't identify.
 fn codex_usage_windows_summary(snapshot: &CodexRateLimitSnapshot) -> String {
     let part = |name: &str, window: Option<&crate::models::CodexUsageWindow>| {
         window.map(|w| match w.window_minutes {
@@ -922,9 +943,24 @@ fn codex_usage_windows_summary(snapshot: &CodexRateLimitSnapshot) -> String {
             None => format!("{name}={:.0}", w.used_percent),
         })
     };
+    let credits = if snapshot.credits_unlimited {
+        Some("credits=unlimited".to_string())
+    } else {
+        // Upstream-controlled string headed into an HTTP header: keep only a
+        // compact numeric-ish charset so a hostile value can't break the send.
+        snapshot.credits_balance.as_deref().map(|balance| {
+            let clean: String = balance
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+                .take(16)
+                .collect();
+            format!("credits={clean}")
+        })
+    };
     let parts: Vec<String> = [
         part("primary", snapshot.primary.as_ref()),
         part("secondary", snapshot.secondary.as_ref()),
+        credits,
     ]
     .into_iter()
     .flatten()
@@ -991,8 +1027,8 @@ struct CodexGate {
 
 /// Codex weekly-usage gate, the Codex-side wrapper around the shared
 /// `evaluate_weekly_gate`. Keyed off `pricing_policy_for_codex_plan` so its
-/// per-tier caps are identical to Claude's: Free ungated (100%), Go/Plus 50%,
-/// Team/Business/Pro/Enterprise and Unknown 25%. Enforcement is scoped to Codex
+/// per-tier caps are identical to Claude's: Free ungated (100%), Go/Plus/
+/// Team/Business 50%, Pro/Enterprise and Unknown 25%. Enforcement is scoped to Codex
 /// traffic via `AppState::codex_bypass`, so it never pauses Claude optimization.
 fn codex_plan_gate(
     weekly_used_percent: Option<f64>,
@@ -1894,7 +1930,15 @@ fn evaluate_pricing_status_with_mismatch(
                 .into();
     } else if let Some(account) = account.as_ref() {
         if account.subscription_active {
-            if tier_mismatch.as_ref().is_some_and(|m| m.clamped) {
+            // Clamp Claude only when the Claude-implied tier itself exceeds the
+            // paid one. A Codex-only mismatch is enforced by the Codex gate
+            // (`fetch_codex_usage`), never here — pausing Claude for a Codex
+            // shortfall would break "unlimited with Claude Pro" for a user
+            // whose Claude plan matches what they pay for.
+            if tier_mismatch
+                .as_ref()
+                .is_some_and(|m| m.clamped && m.claude_undercovered)
+            {
                 let gate = paid_plan_gate(
                     &claude.plan_tier,
                     claude.weekly_utilization_pct,
@@ -2067,12 +2111,23 @@ fn resolve_tier_mismatch(
     };
 
     let grace_ends_at = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+    // Per-product scope for the clamp. `recommended_source` names the higher
+    // recommendation, which is not the same thing: paid Pro with Claude->Max20x
+    // and Codex->Max5x reports source Claude, yet both products are
+    // undercovered. Recompute each product against the paid tier instead.
+    let claude_undercovered = headroom_tier_for_claude_plan(&claude.plan_tier)
+        .is_some_and(|rec| rec.rank() > paid_tier.rank());
+    let codex_undercovered = codex_plan
+        .and_then(|plan| headroom_tier_for_codex_plan(&plan))
+        .is_some_and(|rec| rec.rank() > paid_tier.rank());
     Some(TierMismatch {
         paid_tier,
         recommended_tier,
         recommended_source,
         grace_ends_at,
         clamped: Utc::now() > grace_ends_at,
+        claude_undercovered,
+        codex_undercovered,
     })
 }
 
@@ -2295,6 +2350,20 @@ fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
     }
 }
 
+/// Sanitize an unrecognized `chatgpt_plan_type` claim for the identity header:
+/// lowercase, `[a-z0-9_-]` only, capped at 64 chars. `None` when nothing
+/// survives — a claim that is all junk carries no signal.
+fn sanitize_plan_claim(raw: &str) -> Option<String> {
+    let clean: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(64)
+        .collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
 /// Build a [`CodexAccountProfile`] from `~/.codex/auth.json`. `plan_tier` and
 /// `account_uuid` are also available from live traffic (`state.codex_plan_tier`
 /// + the access-token bearer), so this prefers a live, classified plan tier
@@ -2354,18 +2423,23 @@ pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
         .map(str::to_string);
 
     // Prefer the live, classified tier; fall back to the id_token claim.
+    let raw_claim = auth
+        .and_then(|a| a.get("chatgpt_plan_type"))
+        .and_then(|v| v.as_str());
     let (plan_tier, source) = if !matches!(live_tier, CodexPlanTier::Unknown) {
         (live_tier, "access_token")
     } else {
-        let claim = auth
-            .and_then(|a| a.get("chatgpt_plan_type"))
-            .and_then(|v| v.as_str())
-            .map(CodexPlanTier::from_claim);
-        match claim {
+        match raw_claim.map(CodexPlanTier::from_claim) {
             Some(tier) => (tier, "id_token"),
             None => (CodexPlanTier::Unknown, "none"),
         }
     };
+    // Keep the raw claim only when it exists but decodes to Unknown: that is
+    // a plan value OpenAI ships and we don't know yet (Business Premium seats
+    // are the expected next one). Known tiers carry nothing extra.
+    let plan_raw = matches!(plan_tier, CodexPlanTier::Unknown)
+        .then(|| raw_claim.and_then(sanitize_plan_claim))
+        .flatten();
 
     let billing_type = codex_billing_type(&plan_tier, organization_type.is_some());
 
@@ -2373,6 +2447,7 @@ pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
         email,
         account_uuid,
         plan_tier: Some(plan_tier),
+        plan_raw,
         organization_type,
         rate_limit_tier: None,
         billing_type,
@@ -3544,6 +3619,8 @@ mod tests {
             recommended_source: TierRecommendationSource::Claude,
             grace_ends_at: Utc::now(),
             clamped,
+            claude_undercovered: true,
+            codex_undercovered: false,
         }
     }
 
@@ -3616,6 +3693,55 @@ mod tests {
         assert_eq!(plan_tier_header_value(&ClaudePlanTier::Max5x), "max5x");
         assert_eq!(plan_tier_header_value(&ClaudePlanTier::Max20x), "max20x");
         assert_eq!(plan_tier_header_value(&ClaudePlanTier::Unknown), "unknown");
+    }
+
+    #[test]
+    fn apply_headers_sends_raw_claim_for_unknown_codex_plan_only() {
+        // Unknown + raw -> the raw value replaces "unknown".
+        let unknown = IdentityPayload {
+            device_id: "abc123".into(),
+            codex_plan_tier: Some(CodexPlanTier::Unknown),
+            codex_plan_raw: Some("business_premium".into()),
+            ..Default::default()
+        };
+        let client = reqwest::blocking::Client::new();
+        let req = unknown
+            .apply_headers(client.get("http://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("X-Headroom-Codex-Plan").unwrap(),
+            "business_premium"
+        );
+
+        // A classified tier always wins over a stale raw value.
+        let known = IdentityPayload {
+            device_id: "abc123".into(),
+            codex_plan_tier: Some(CodexPlanTier::Business),
+            codex_plan_raw: Some("stale".into()),
+            ..Default::default()
+        };
+        let req = known
+            .apply_headers(client.get("http://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("X-Headroom-Codex-Plan").unwrap(),
+            "business"
+        );
+    }
+
+    #[test]
+    fn sanitize_plan_claim_lowercases_strips_and_caps() {
+        assert_eq!(
+            super::sanitize_plan_claim("  Business_Premium\r\n"),
+            Some("business_premium".into())
+        );
+        assert_eq!(super::sanitize_plan_claim("!!\r\n  "), None);
+        assert_eq!(
+            super::sanitize_plan_claim(&"x".repeat(100)).map(|s| s.len()),
+            Some(64)
+        );
     }
 
     #[test]
@@ -4986,13 +5112,22 @@ mod tests {
             Some(crate::models::PricingGateReason::CodexWeeklyUsageLimitReached)
         ));
 
-        let team_paused = super::codex_usage_from_snapshot(
+        // Team/Business meter in the Pro (50%) band since the 2026-08-18 remap.
+        let team_ok = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(30.0),
             crate::models::CodexPlanTier::Team,
             super::CodexActivation::Metered,
             0.0,
         );
-        assert!(!team_paused.optimization_allowed, "Team at 30% >= 25%");
+        assert!(team_ok.optimization_allowed, "Team at 30% is below 50%");
+
+        let pro_paused = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(30.0),
+            crate::models::CodexPlanTier::Pro,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(!pro_paused.optimization_allowed, "Pro at 30% >= 25%");
 
         // Free is ungated (100%) even when metered and past any threshold.
         let free = super::codex_usage_from_snapshot(
@@ -5175,7 +5310,30 @@ mod tests {
         assert_eq!(
             super::codex_usage_windows_summary(&codex_snapshot(None, None)),
             "none",
-            "credits-only snapshot still reports that it carried no windows"
+            "an empty snapshot reports that it carried nothing"
+        );
+
+        let with_credits = |balance: Option<&str>, unlimited| super::CodexRateLimitSnapshot {
+            credits_balance: balance.map(str::to_string),
+            credits_unlimited: unlimited,
+            ..codex_snapshot(Some(codex_window(33.0, Some(10_080))), None)
+        };
+        assert_eq!(
+            super::codex_usage_windows_summary(&with_credits(Some("812.5"), false)),
+            "primary=33@10080;credits=812.5"
+        );
+        assert_eq!(
+            super::codex_usage_windows_summary(&with_credits(None, true)),
+            "primary=33@10080;credits=unlimited"
+        );
+        assert_eq!(
+            super::codex_usage_windows_summary(&super::CodexRateLimitSnapshot {
+                credits_balance: Some("100\r\nX-Evil: 1".into()),
+                credits_unlimited: false,
+                ..codex_snapshot(None, None)
+            }),
+            "credits=100X-Evil1",
+            "credits-only snapshot reports credits; CR/LF/space/colon are stripped (`-` stays for negative balances)"
         );
     }
 
@@ -5184,15 +5342,18 @@ mod tests {
         use crate::models::{
             headroom_tier_for_codex_plan, CodexPlanTier, HeadroomSubscriptionTier,
         };
-        for plan in [CodexPlanTier::Go, CodexPlanTier::Plus] {
+        for plan in [
+            CodexPlanTier::Go,
+            CodexPlanTier::Plus,
+            CodexPlanTier::Team,
+            CodexPlanTier::Business,
+        ] {
             assert_eq!(
                 headroom_tier_for_codex_plan(&plan),
                 Some(HeadroomSubscriptionTier::Pro)
             );
         }
         for plan in [
-            CodexPlanTier::Team,
-            CodexPlanTier::Business,
             CodexPlanTier::SelfServeBusinessUsageBased,
             CodexPlanTier::Edu,
         ] {
@@ -6158,6 +6319,39 @@ mod tests {
             status.gate_reason,
             Some(PricingGateReason::WeeklyUsageLimitReached)
         ));
+        assert!(status.tier_mismatch.is_some_and(|m| m.clamped));
+    }
+
+    #[test]
+    fn codex_only_clamped_mismatch_leaves_claude_ungated() {
+        // A ChatGPT Business seat on a Headroom Pro plan (Felix, user 278):
+        // the Codex-implied tier exceeds Pro, but the Claude plan matches it.
+        // The clamp must meter Codex only — Claude stays unlimited even at 99%
+        // weekly usage.
+        let (start, end) = grace();
+        let status = evaluate_pricing_status_with_mismatch(
+            true,
+            start,
+            end,
+            true,
+            None,
+            Some(active_subscriber(HeadroomSubscriptionTier::Pro)),
+            pro_profile_with_weekly(99.0),
+            PricingPromo::default(),
+            None,
+            Some(TierMismatch {
+                paid_tier: HeadroomSubscriptionTier::Pro,
+                recommended_tier: HeadroomSubscriptionTier::Max5x,
+                recommended_source: TierRecommendationSource::Codex,
+                grace_ends_at: Utc::now(),
+                clamped: true,
+                claude_undercovered: false,
+                codex_undercovered: true,
+            }),
+        );
+        assert!(status.optimization_allowed);
+        assert!(status.gate_reason.is_none());
+        // The banner still shows: the mismatch itself is real and upgradeable.
         assert!(status.tier_mismatch.is_some_and(|m| m.clamped));
     }
 }

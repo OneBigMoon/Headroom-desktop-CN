@@ -238,7 +238,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports two fixes owed upstream (remove each once a wheel ships it),
+Also ports three fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -257,6 +257,15 @@ only on status_code == 200, so an empty/unparseable/error body is
 replayed for the whole TTL (1h) and only a proxy restart clears it. The
 guard refuses to store anything that is not a JSON object or that
 carries an error payload. Kill switch: HEADROOM_RESPONSE_CACHE_GUARD=0.
+Responses savings denominator guard (upstream PR #3106): /v1/responses
+HTTP outcomes derive optimized = max(0, original - saved) from a
+messages-only original while tokens_saved includes tool-schema
+compaction measured against the tools array, so schema-heavy turns
+clamp optimized to 0 and record savings rates above 100% ("4,436 -> 0,
+208.4%" in the desktop feed, 2026-08-18). The guard counts the
+request's tools schema once per compressed HTTP request and widens the
+recorded pair at the outcome funnel so original - optimized == saved.
+Kill switch: HEADROOM_RESPONSES_DENOMINATOR_GUARD=0.
 """
 import faulthandler
 import signal
@@ -613,6 +622,99 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 )
 
             _hd_sc.SemanticCache.set = _hd_sc_set
+    except Exception:
+        pass
+
+    # Responses savings denominator guard (upstream PR #3106; remove once a
+    # wheel ships it -- see the module docstring for the failure mode). WS
+    # outcomes already build original as optimized + saved and are excluded
+    # twice over: the stash skips executor calls carrying the WS-only timeout
+    # kwarg (both WS call sites pass it on 0.35.0, the HTTP site does not),
+    # and the repair refuses endpoint=responses_ws. Version-gated below 0.36
+    # so a wheel that ships #3106 natively cannot be widened twice. Kill
+    # switch: HEADROOM_RESPONSES_DENOMINATOR_GUARD=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_RESPONSES_DENOMINATOR_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import asyncio as _hd_rd_asyncio
+            import collections as _hd_rd_collections
+            import dataclasses as _hd_rd_dc
+            import importlib.metadata as _hd_rd_meta
+
+            import headroom.proxy.handlers.openai as _hd_rd_openai
+            import headroom.proxy.server as _hd_rd_server
+
+            _hd_rd_ver = tuple(
+                int(p) for p in _hd_rd_meta.version("headroom-ai").split(".")[:2]
+            )
+            if _hd_rd_ver < (0, 36):
+                # request_id -> pre-compression tools-schema token count.
+                # Entries pop at the outcome funnel; stragglers (upstream
+                # errors, killed requests) age out FIFO.
+                _hd_rd_tools = _hd_rd_collections.OrderedDict()
+                _HD_RD_MAX = 512
+
+                _hd_rd_orig_compress = (
+                    _hd_rd_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
+                )
+
+                async def _hd_rd_compress(self, payload, **kwargs):
+                    result = await _hd_rd_orig_compress(self, payload, **kwargs)
+                    try:
+                        # The pass is copy-on-write, so `payload` still holds
+                        # the pre-compression tools. result[1] = modified.
+                        tools = (
+                            payload.get("tools") if isinstance(payload, dict) else None
+                        )
+                        if tools and "timeout" not in kwargs and result[1]:
+                            counter = self.openai_provider.get_token_counter(
+                                kwargs.get("model")
+                            )
+                            count = await _hd_rd_asyncio.to_thread(
+                                counter.count_text,
+                                _hd_rd_openai._json_debug_dumps(tools),
+                            )
+                            rid = kwargs.get("request_id")
+                            if rid and count > 0:
+                                _hd_rd_tools[rid] = int(count)
+                                while len(_hd_rd_tools) > _HD_RD_MAX:
+                                    _hd_rd_tools.popitem(last=False)
+                    except Exception:
+                        pass
+                    return result
+
+                _hd_rd_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
+                    _hd_rd_compress
+                )
+
+                _hd_rd_orig_record = (
+                    _hd_rd_server.HeadroomProxy._record_request_outcome
+                )
+
+                async def _hd_rd_record(self, outcome):
+                    try:
+                        tools_tokens = _hd_rd_tools.pop(outcome.request_id, None)
+                        # Repair only the old HTTP derivation shape; anything
+                        # else (WS deltas, future wheels) passes untouched.
+                        if (
+                            tools_tokens
+                            and outcome.tokens_saved > 0
+                            and (outcome.tags or {}).get("endpoint") != "responses_ws"
+                            and outcome.optimized_tokens
+                            == max(0, outcome.original_tokens - outcome.tokens_saved)
+                        ):
+                            widened = outcome.original_tokens + tools_tokens
+                            outcome = _hd_rd_dc.replace(
+                                outcome,
+                                original_tokens=widened,
+                                optimized_tokens=max(0, widened - outcome.tokens_saved),
+                            )
+                    except Exception:
+                        pass
+                    return await _hd_rd_orig_record(self, outcome)
+
+                _hd_rd_server.HeadroomProxy._record_request_outcome = _hd_rd_record
     except Exception:
         pass
 "#;
@@ -8802,6 +8904,34 @@ mod tests {
         assert!(py.contains("HEADROOM_RESPONSE_CACHE_GUARD"));
         // Backend process only: it imports the proxy stack.
         assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+    }
+
+    /// Upstream PR #3106: /v1/responses HTTP outcomes derive optimized from
+    /// a messages-only original while tokens_saved includes tool-schema
+    /// compaction, clamping optimized to 0 and recording >100% savings
+    /// rates. Seams verified against the installed 0.35.0 wheel by
+    /// scratchpad verify script on 2026-08-18 (both WS executor call sites
+    /// pass `timeout=`, the HTTP site does not; streaming and buffered HTTP
+    /// both record through HeadroomProxy._record_request_outcome).
+    #[test]
+    fn sitecustomize_ports_responses_denominator_guard() {
+        let py = super::SITECUSTOMIZE_PY;
+        // Both seams patched on the classes the proxy actually uses.
+        assert!(py.contains(
+            "_hd_rd_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = ("
+        ));
+        assert!(py.contains("_hd_rd_server.HeadroomProxy._record_request_outcome = _hd_rd_record"));
+        // WS exclusion, both layers: stash-time kwarg check + repair-time tag.
+        assert!(py.contains(r#""timeout" not in kwargs"#));
+        assert!(py.contains(r#"("endpoint") != "responses_ws""#));
+        // Coherence precondition: only the old derivation shape is repaired,
+        // so a wheel shipping #3106 natively (also version-gated) and WS
+        // delta records pass through untouched.
+        assert!(py.contains("== max(0, outcome.original_tokens - outcome.tokens_saved)"));
+        assert!(py.contains("if _hd_rd_ver < (0, 36):"));
+        assert!(py.contains("HEADROOM_RESPONSES_DENOMINATOR_GUARD"));
+        // The stash must be bounded: entries for failed requests never pop.
+        assert!(py.contains("_HD_RD_MAX"));
     }
 
     #[test]

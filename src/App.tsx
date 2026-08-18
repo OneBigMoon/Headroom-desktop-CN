@@ -5671,6 +5671,16 @@ export default function App() {
           return `Headroom needs attention: ${primaryIssue}.`;
         })();
   const tierMismatch = pricingStatus?.tierMismatch ?? null;
+  // Products the clamp actually limits (per-product scope). Falls back to the
+  // recommendation source for payloads cached by builds without the flags.
+  const clampScopeLabel = tierMismatch
+    ? [
+        tierMismatch.claudeUndercovered ? "Claude" : null,
+        tierMismatch.codexUndercovered ? "Codex" : null,
+      ]
+        .filter(Boolean)
+        .join(" and ") || tierRecommendationSourceLabel(tierMismatch.recommendedSource)
+    : "";
   const sortedClaudeProjects = [...claudeProjects].sort((left, right) => {
     const leftTime = Date.parse(left.lastWorkedAt);
     const rightTime = Date.parse(right.lastWorkedAt);
@@ -6102,8 +6112,8 @@ export default function App() {
                   <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
                   <p className="tier-mismatch-banner__message">
                     {tierMismatch.clamped
-                      ? `Your Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan no longer matches your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage, which needs ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}, so weekly usage limits now apply. Upgrade to restore unlimited optimization.`
-                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}. Upgrade to match.`}
+                      ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan, above your current Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan, so weekly usage limits now apply to ${clampScopeLabel}. Upgrade to restore unlimited optimization.`
+                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan. Upgrade to match.`}
                   </p>
                   {upgradeActionError && upgradeActionBusy === null ? (
                     <p className="tier-mismatch-banner__error" role="status">

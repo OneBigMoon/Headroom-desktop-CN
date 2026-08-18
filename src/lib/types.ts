@@ -681,6 +681,10 @@ export interface TierMismatch {
   recommendedSource: TierRecommendationSource;
   graceEndsAt: string;
   clamped: boolean;
+  /// Which product's implied tier exceeds the paid one; the clamp only limits
+  /// those products. Absent on payloads cached by older builds.
+  claudeUndercovered?: boolean;
+  codexUndercovered?: boolean;
 }
 
 export interface HeadroomAuthCodeRequest {
