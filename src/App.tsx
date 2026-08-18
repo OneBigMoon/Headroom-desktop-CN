@@ -6441,25 +6441,30 @@ export default function App() {
                                       <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
                                     </button>
                                   </span>
-                                  <OptimizePanel
-                                    projectPath={project.projectPath}
-                                    refreshSignal={
-                                      isLatestLearnProject && !headroomLearnStatus.running
-                                        ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
-                                        : 0
-                                    }
-                                    preloadedApplied={
-                                      optimizeAppliedByProject
-                                        ? optimizeAppliedByProject[project.projectPath] ?? {
-                                            claudeMd: [],
-                                            memoryMd: [],
-                                          }
-                                        : undefined
-                                    }
-                                    onAppliedMutated={() =>
-                                      setOptimizeAppliedRefreshTick((tick) => tick + 1)
-                                    }
-                                  />
+                                  {/* Hidden during this project's scan so the status line
+                                      keeps the row to itself; remounts with fresh counts
+                                      when the run finishes. */}
+                                  {!isRunning ? (
+                                    <OptimizePanel
+                                      projectPath={project.projectPath}
+                                      refreshSignal={
+                                        isLatestLearnProject && !headroomLearnStatus.running
+                                          ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
+                                          : 0
+                                      }
+                                      preloadedApplied={
+                                        optimizeAppliedByProject
+                                          ? optimizeAppliedByProject[project.projectPath] ?? {
+                                              claudeMd: [],
+                                              memoryMd: [],
+                                            }
+                                          : undefined
+                                      }
+                                      onAppliedMutated={() =>
+                                        setOptimizeAppliedRefreshTick((tick) => tick + 1)
+                                      }
+                                    />
+                                  ) : null}
                                 </small>
                               </span>
                               <div className="optimize-project-row__actions">
