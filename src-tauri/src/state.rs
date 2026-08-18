@@ -2383,6 +2383,15 @@ impl AppState {
         // Neither merge source carries it: backend rollups have no baseline
         // dimension and tracker buckets predate the sampler. Daily joins on
         // UTC date keys, hourly on local hour keys — matching each list.
+        //
+        // Cache fields overlay from the archive too, and the archive wins:
+        // the history points carry a fresh derivation from the backend's
+        // sliding compacted checkpoint ring, which drifts poll to poll for
+        // settled periods (a settled day's Input % visibly wandered on
+        // 2026-08-18). Ingest ran just above, so settled buckets are frozen
+        // and the live UTC day's archive equals this poll's derivation;
+        // live local-day hours are never ingested, keep None here, and so
+        // fall through to the fresh derivation.
         {
             let tracker = self.savings_tracker.lock();
             for point in daily_savings.iter_mut() {
@@ -2390,11 +2399,19 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
+                if let Some(bucket) = tracker.daily_savings.get(&point.date) {
+                    point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
+                    point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
+                }
             }
             for point in hourly_savings.iter_mut() {
                 if let Some(sample) = tracker.output_hourly_samples.get(&point.hour) {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
+                }
+                if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
+                    point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
+                    point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
                 }
             }
         }
@@ -4444,10 +4461,16 @@ impl SavingsTracker {
                     }
                 }
             }
-            // Once a day's checkpoints age out of the backend's history ring,
-            // the re-derived cache delta comes back None; the value archived
-            // while coverage lasted is the durable copy and must survive.
+            // Cache deltas are re-derived every poll from the backend's
+            // point-capped (and compacted) checkpoint ring, so a settled day's
+            // re-derivation only ever loses coverage relative to what was
+            // archived while the day was live and complete: freeze at the
+            // first archived value. The live UTC day keeps taking the fresh
+            // derivation, which grows with the day.
             let archived = self.daily_savings.get(&point.date).copied();
+            let archived_read = archived.and_then(|b| b.cache_read_tokens);
+            let archived_usd = archived.and_then(|b| b.cache_savings_usd);
+            let live_day = point.date.as_str() == utc_today_key;
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -4455,12 +4478,16 @@ impl SavingsTracker {
                 total_tokens_sent: point.total_tokens_sent,
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
-                cache_read_tokens: point
-                    .cache_read_tokens
-                    .or(archived.and_then(|b| b.cache_read_tokens)),
-                cache_savings_usd: point
-                    .cache_savings_usd
-                    .or(archived.and_then(|b| b.cache_savings_usd)),
+                cache_read_tokens: if live_day {
+                    point.cache_read_tokens.or(archived_read)
+                } else {
+                    archived_read.or(point.cache_read_tokens)
+                },
+                cache_savings_usd: if live_day {
+                    point.cache_savings_usd.or(archived_usd)
+                } else {
+                    archived_usd.or(point.cache_savings_usd)
+                },
             };
             if archived.as_ref() != Some(&bucket) {
                 self.daily_savings.insert(point.date.clone(), bucket);
@@ -4473,7 +4500,8 @@ impl SavingsTracker {
             {
                 continue;
             }
-            // Same cache-coverage preservation as the daily loop above.
+            // Hourly ingest only ever sees settled hours, so freeze cache
+            // coverage at the first archived value (see the daily loop above).
             let archived = self.hourly_savings.get(&point.hour).copied();
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
@@ -4482,12 +4510,12 @@ impl SavingsTracker {
                 total_tokens_sent: point.total_tokens_sent,
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
-                cache_read_tokens: point
-                    .cache_read_tokens
-                    .or(archived.and_then(|b| b.cache_read_tokens)),
-                cache_savings_usd: point
-                    .cache_savings_usd
-                    .or(archived.and_then(|b| b.cache_savings_usd)),
+                cache_read_tokens: archived
+                    .and_then(|b| b.cache_read_tokens)
+                    .or(point.cache_read_tokens),
+                cache_savings_usd: archived
+                    .and_then(|b| b.cache_savings_usd)
+                    .or(point.cache_savings_usd),
             };
             if archived.as_ref() != Some(&bucket) {
                 self.hourly_savings.insert(point.hour.clone(), bucket);
@@ -10653,6 +10681,24 @@ mod tests {
             "2026-06-16"
         ));
 
+        // While trimming eats the day, re-derivations still return Some but
+        // with shrinking coverage. Settled buckets are frozen at the first
+        // archived value, so the worse re-derivation must not overwrite.
+        let mut partial = daily("2026-06-10", 100, 1.0);
+        partial.total_tokens_sent = 10_000;
+        partial.cache_read_tokens = Some(1_000);
+        partial.cache_savings_usd = Some(0.2);
+        let mut partial_hour = hourly("2026-06-10T09:00", 40);
+        partial_hour.cache_read_tokens = Some(500);
+        partial_hour.cache_savings_usd = Some(0.1);
+        assert!(!tracker.ingest_native_rollups(
+            &[partial],
+            &[partial_hour],
+            cutoff,
+            "2026-06-16",
+            "2026-06-16"
+        ));
+
         let day = tracker
             .daily_savings()
             .into_iter()
@@ -10667,6 +10713,32 @@ mod tests {
             .expect("archived hour");
         assert_eq!(hour.cache_read_tokens, Some(2_000));
         assert_eq!(hour.cache_savings_usd, Some(0.4));
+
+        // The live UTC day is the opposite: its derivation grows with the
+        // day, so the fresh value wins over the previously archived one.
+        let mut live = daily("2026-06-16", 10, 0.1);
+        live.total_tokens_sent = 1_000;
+        live.cache_read_tokens = Some(100);
+        live.cache_savings_usd = Some(0.01);
+        assert!(tracker.ingest_native_rollups(&[live], &[], cutoff, "2026-06-16", "2026-06-16"));
+        let mut live_grown = daily("2026-06-16", 20, 0.2);
+        live_grown.total_tokens_sent = 2_000;
+        live_grown.cache_read_tokens = Some(300);
+        live_grown.cache_savings_usd = Some(0.03);
+        assert!(tracker.ingest_native_rollups(
+            &[live_grown],
+            &[],
+            cutoff,
+            "2026-06-16",
+            "2026-06-16"
+        ));
+        let today = tracker
+            .daily_savings()
+            .into_iter()
+            .find(|p| p.date == "2026-06-16")
+            .expect("live day archived");
+        assert_eq!(today.cache_read_tokens, Some(300));
+        assert_eq!(today.cache_savings_usd, Some(0.03));
     }
 
     #[test]
