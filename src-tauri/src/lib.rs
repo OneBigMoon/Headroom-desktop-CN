@@ -65,6 +65,10 @@ const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
+/// Cadence of the background liveness ping. Long enough to be negligible
+/// backend load (4 calls/day/user), short enough that admin can tell a
+/// running-but-idle app from a quit one within half a day.
+const LIVENESS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 const BETA_CHANNEL_ENV: &str = "HEADROOM_BETA_CHANNEL";
 const BETA_CHANNEL_SENTINEL: &str = "beta_channel";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -4109,6 +4113,31 @@ pub fn run() {
                     }
                 })
                 .expect("spawn identity pusher");
+
+            // Liveness ping: an idle app (no agent traffic) otherwise makes
+            // zero backend calls after launch, so the server cannot tell
+            // "running but idle" from "quit" — last_active_at freezes and
+            // check-in emails misfire. get_pricing_status posts grace/start
+            // and, when signed in, GETs desktop/account (which refreshes
+            // last_active_at); it also re-evaluates the server-silent /
+            // auth-silent Sentry alarms on processes that run for days.
+            // Status is read, not applied: gate changes keep flowing through
+            // the existing lifecycle triggers only.
+            let app_handle_for_ping = app.handle().clone();
+            std::thread::Builder::new()
+                .name("liveness-ping".into())
+                .spawn(move || loop {
+                    std::thread::sleep(LIVENESS_PING_INTERVAL);
+                    let app_handle = app_handle_for_ping.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let state: tauri::State<'_, AppState> = app_handle.state();
+                        let _ = pricing::get_pricing_status(&state);
+                    }));
+                    if result.is_err() {
+                        log::error!("liveness ping panicked");
+                    }
+                })
+                .expect("spawn liveness ping");
 
             // Start the intercept layer before anything else touches port 6767.
             proxy_intercept::spawn(

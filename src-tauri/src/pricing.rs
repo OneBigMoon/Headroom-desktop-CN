@@ -45,6 +45,14 @@ struct LocalPricingState {
     /// server flip can't strand a user halfway through the gated flow.
     #[serde(default)]
     paywall_first: Option<bool>,
+    /// Last time any extraheadroom.com call succeeded (grace/start or account
+    /// sync). Baseline for the server-silent Sentry alarm.
+    #[serde(default)]
+    last_server_contact_at: Option<DateTime<Utc>>,
+    /// Last time an authenticated account sync succeeded. Baseline for the
+    /// auth-silent alarm (backend reachable, Bearer channel dead).
+    #[serde(default)]
+    last_account_sync_ok_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -657,14 +665,31 @@ enum RemoteAccountSyncError {
 }
 
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
-    let local_state = reconcile_local_state_with_server(state)?;
+    let mut local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
-    let session_token = read_session_token()?;
     let identity = IdentityPayload::for_state(state);
+    // A keychain read error propagates (callers fail open), but it also kills
+    // every future authenticated call while the app keeps working — exactly
+    // the silence the auth-silent alarm exists for.
+    let session_token = read_session_token().inspect_err(|err| {
+        maybe_report_auth_silent(
+            &local_state,
+            &identity,
+            &format!("keychain read failed: {err}"),
+        );
+    })?;
     let (authenticated, account, account_sync_error, promo) =
         if let Some(token) = session_token.as_deref() {
             let envelope_result = fetch_remote_account(token, &identity);
+            match &envelope_result {
+                Ok(_) => stamp_account_sync_ok(&mut local_state),
+                Err(err) => maybe_report_auth_silent(
+                    &local_state,
+                    &identity,
+                    &format!("account sync failed: {err:?}"),
+                ),
+            }
             let promo = envelope_result
                 .as_ref()
                 .map(|e| {
@@ -2842,6 +2867,128 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
 /// user signed in through server blips, but a *revoked* session answers 401
 /// forever — without an escalation path the app showed "authenticated" with a
 /// permanent confusing banner until reinstall.
+// Alarms for installs that keep running while the backend never hears from
+// them (user 861, Aug 2026: the app worked daily for five days while
+// extraheadroom.com was unreachable from the machine, so last_active_at froze
+// and a check-in email went to a happy customer). Pricing fails open on both
+// failure classes, so nothing is visible to the user; Sentry is the only
+// channel left, and it lives on a different host than the blocked backend.
+const SILENT_ALARM_HOURS: i64 = 24;
+/// How long the current process must have been failing before the
+/// server-silent alarm may fire, so a laptop waking from a weekend sleep
+/// doesn't alarm on the one refresh that runs before Wi-Fi reassociates.
+const SERVER_SILENT_MIN_FAILING_SECS: u64 = 15 * 60;
+/// Successful contacts are persisted at most this often; the pricing poll
+/// would otherwise rewrite the state file on every refresh.
+const CONTACT_STAMP_MIN_INTERVAL_HOURS: i64 = 1;
+
+static SERVER_SILENT_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static AUTH_SILENT_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static GRACE_FAILING_SINCE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Hours the backend has been unreachable, if past the alarm window. Falls
+/// back to first_seen_at so a machine that never reached us still alarms
+/// (install-stall class) without firing on a fresh install.
+fn server_silent_hours(local: &LocalPricingState, now: DateTime<Utc>) -> Option<i64> {
+    let baseline = local.last_server_contact_at.unwrap_or(local.first_seen_at);
+    let hours = (now - baseline).num_hours();
+    (hours >= SILENT_ALARM_HOURS).then_some(hours)
+}
+
+/// Hours the authenticated sync has been failing while the backend itself is
+/// provably reachable, if past the alarm window. None while the backend is
+/// unreachable or was never reached: the server-silent alarm owns that case.
+fn auth_silent_hours(local: &LocalPricingState, now: DateTime<Utc>) -> Option<i64> {
+    let reachable = local
+        .last_server_contact_at
+        .is_some_and(|t| (now - t).num_hours() < SILENT_ALARM_HOURS);
+    if !reachable {
+        return None;
+    }
+    let baseline = local.last_account_sync_ok_at.unwrap_or(local.first_seen_at);
+    let hours = (now - baseline).num_hours();
+    (hours >= SILENT_ALARM_HOURS).then_some(hours)
+}
+
+fn maybe_report_server_silent(local: &LocalPricingState, identity: &IdentityPayload, err: &str) {
+    let failing_long_enough = {
+        let mut since = GRACE_FAILING_SINCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let start = since.get_or_insert_with(std::time::Instant::now);
+        start.elapsed().as_secs() >= SERVER_SILENT_MIN_FAILING_SECS
+    };
+    if !failing_long_enough {
+        return;
+    }
+    let Some(hours) = server_silent_hours(local, Utc::now()) else {
+        return;
+    };
+    if SERVER_SILENT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    report_silent(
+        "desktop running but backend-silent past the alarm window",
+        hours,
+        identity,
+        err,
+    );
+}
+
+fn maybe_report_auth_silent(local: &LocalPricingState, identity: &IdentityPayload, err: &str) {
+    let Some(hours) = auth_silent_hours(local, Utc::now()) else {
+        return;
+    };
+    if AUTH_SILENT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    report_silent(
+        "desktop auth-silent: backend reachable but authenticated sync failing",
+        hours,
+        identity,
+        err,
+    );
+}
+
+/// Fixed message + fingerprint per class so each stays one Sentry issue; the
+/// variable detail rides in extras (same pattern as activation-parse-error).
+/// claude_email is included so support can map the event to a customer — the
+/// usual sentry user tag is absent here, since set_sentry_user needs the very
+/// account fetch that is failing.
+fn report_silent(message: &str, hours: i64, identity: &IdentityPayload, err: &str) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&[message]));
+            scope.set_extra("hours_silent", hours.into());
+            scope.set_extra("error", err.to_string().into());
+            if let Some(email) = identity.claude_email.as_deref() {
+                scope.set_extra("claude_email", email.to_string().into());
+            }
+        },
+        || sentry::capture_message(message, sentry::Level::Warning),
+    );
+}
+
+/// Stamp a successful authenticated sync (which also proves reachability),
+/// persisting at most once per CONTACT_STAMP_MIN_INTERVAL_HOURS.
+fn stamp_account_sync_ok(local: &mut LocalPricingState) {
+    let now = Utc::now();
+    let due = local
+        .last_account_sync_ok_at
+        .is_none_or(|t| now - t > Duration::hours(CONTACT_STAMP_MIN_INTERVAL_HOURS));
+    if !due {
+        return;
+    }
+    local.last_account_sync_ok_at = Some(now);
+    local.last_server_contact_at = Some(now);
+    if let Err(err) = write_local_state(local) {
+        log::warn!("could not persist account sync stamp: {err}");
+    }
+}
+
 static CONSECUTIVE_UNAUTHORIZED_SYNCS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 const MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS: u32 = 3;
@@ -2950,6 +3097,8 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
         reconcile_with_server: true,
         mismatch_since: None,
         paywall_first: None,
+        last_server_contact_at: None,
+        last_account_sync_ok_at: None,
     };
     write_local_state(&state)?;
     Ok(state)
@@ -2987,13 +3136,28 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
             // Record the fingerprint we just successfully posted so the
             // bearer-pusher worker doesn't immediately repost the same data.
             state.record_pushed_identity_fingerprint(IdentityFingerprint::from_payload(&identity));
+            *GRACE_FAILING_SINCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             let server_first_seen = response.first_seen_at;
             let new_first_seen = if local.reconcile_with_server {
                 server_first_seen.min(local.first_seen_at)
             } else {
                 server_first_seen
             };
-            if new_first_seen != local.first_seen_at || local.reconcile_with_server {
+            // Reachability heartbeat for the server-silent alarm, piggybacked
+            // on the write below when first_seen also changed.
+            let now = Utc::now();
+            let contact_stamp_due = local
+                .last_server_contact_at
+                .is_none_or(|t| now - t > Duration::hours(CONTACT_STAMP_MIN_INTERVAL_HOURS));
+            if contact_stamp_due {
+                local.last_server_contact_at = Some(now);
+            }
+            if new_first_seen != local.first_seen_at
+                || local.reconcile_with_server
+                || contact_stamp_due
+            {
                 local.first_seen_at = new_first_seen;
                 local.reconcile_with_server = false;
                 if let Err(err) = write_local_state(&local) {
@@ -3009,9 +3173,10 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
                 }
             }
         }
-        Err(_) => {
+        Err(err) => {
             // Server unreachable; keep whatever we have locally. reconcile_with_server
             // stays set if this is a fresh install so the next successful call wins.
+            maybe_report_server_silent(&local, &identity, &err);
         }
     }
     Ok(local)
@@ -3271,6 +3436,48 @@ mod tests {
         let back: LocalPricingState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.paywall_first, Some(true));
         assert_eq!(back.first_seen_at, state.first_seen_at);
+    }
+
+    #[test]
+    fn silence_alarms_pick_the_right_class() {
+        use super::{auth_silent_hours, server_silent_hours};
+        use chrono::Duration;
+
+        let now = Utc::now();
+        let stale = Some(now - Duration::hours(30));
+        let fresh = Some(now - Duration::hours(1));
+        let mut local = LocalPricingState {
+            first_seen_at: now - Duration::days(30),
+            reconcile_with_server: false,
+            mismatch_since: None,
+            paywall_first: None,
+            last_server_contact_at: stale,
+            last_account_sync_ok_at: stale,
+        };
+
+        // Network class: no backend contact for 30h -> server alarm only.
+        assert_eq!(server_silent_hours(&local, now), Some(30));
+        assert_eq!(auth_silent_hours(&local, now), None);
+
+        // Keychain/401 class: backend reachable, auth stale -> auth alarm only.
+        local.last_server_contact_at = fresh;
+        assert_eq!(server_silent_hours(&local, now), None);
+        assert_eq!(auth_silent_hours(&local, now), Some(30));
+
+        // Healthy: both fresh -> silent.
+        local.last_account_sync_ok_at = fresh;
+        assert_eq!(server_silent_hours(&local, now), None);
+        assert_eq!(auth_silent_hours(&local, now), None);
+
+        // Never-contacted install: baseline falls back to first_seen_at, so a
+        // fresh offline install stays quiet but an install-stall alarms.
+        local.last_server_contact_at = None;
+        local.last_account_sync_ok_at = None;
+        local.first_seen_at = now - Duration::hours(2);
+        assert_eq!(server_silent_hours(&local, now), None);
+        local.first_seen_at = now - Duration::days(3);
+        assert_eq!(server_silent_hours(&local, now), Some(72));
+        assert_eq!(auth_silent_hours(&local, now), None);
     }
 
     #[test]

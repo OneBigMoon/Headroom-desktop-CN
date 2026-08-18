@@ -2808,10 +2808,8 @@ export default function App() {
     learnerProgress && learnerProgress.pendingPatterns > 0
       ? `Learning from live traffic. ${learnerProgress.pendingPatterns} pattern${
           learnerProgress.pendingPatterns === 1 ? "" : "s"
-        } under observation; each is saved once confirmed ${learnerProgress.minEvidence} times.`
-      : `Learns from live traffic in the background. A pattern is saved once it's been confirmed ${
-          learnerProgress?.minEvidence ?? 5
-        } times, so the first learnings can take a few sessions to appear.`;
+        } detected; these are saved once detected ${learnerProgress.minEvidence} times.`
+      : `Learns from live traffic. First learnings may take a few sessions to appear.`;
 
   async function handleAutostartToggle(nextEnabled: boolean) {
     setAutostartBusy(true);
@@ -6804,13 +6802,19 @@ export default function App() {
         </div>
 
         <div className="tray-content" hidden={activeView !== "addons"}>
-          <section className="addons">
-            <header className="addons__header">
-              <h1>Addons</h1>
-              <p className="addons__subtitle">
+          <article className="soft-card addons-card">
+            <header className="addons-card__head">
+              <div className="addons-card__title-row">
+                <span className="addons-card__title-icon" aria-hidden="true">
+                  <PuzzlePiece weight="duotone" />
+                </span>
+                <h1>Addons</h1>
+              </div>
+              <p className="addons-card__blurb">
                 Additional tools that reduce token usage. Install to enable.
               </p>
             </header>
+            <div className="addons-card__body">
             {addonError ? <p className="addons__error">{addonError}</p> : null}
             <ul className="addons__list">
               {dashboard.tools
@@ -6939,7 +6943,8 @@ export default function App() {
                 Request an addon
               </button>
             </div>
-          </section>
+            </div>
+          </article>
         </div>
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>

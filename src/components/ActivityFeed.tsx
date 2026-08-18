@@ -98,8 +98,7 @@ export function ActivityFeed({
             <h1>Activity (beta)</h1>
           </div>
           <p className="activity-card__blurb">
-            Compressions, learnings, RTK saves, and records — everything Headroom is
-            doing.
+            Large Compressions, learnings, and daily records.
           </p>
         </header>
       </article>
