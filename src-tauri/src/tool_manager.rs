@@ -8650,10 +8650,9 @@ mod tests {
     use super::rotate_log_if_large;
     use super::{
         apply_serena_dashboard_interface, apply_serena_gitignore,
-        bootstrap_requirements_lock_for_target,
-        classify_kompress_prefetch_failure, compact_pip_failure, diagnose_proxy_port,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
-        format_already_running_bail, headroom_entrypoint_startup_args,
+        bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
+        compact_pip_failure, diagnose_proxy_port, extract_required_pydantic_core_version,
+        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
@@ -8814,9 +8813,7 @@ mod tests {
 
         // Explicit user choice (or already browser) -> left alone.
         assert!(apply_serena_dashboard_interface("web_dashboard_interface: app\n").is_none());
-        assert!(
-            apply_serena_dashboard_interface("web_dashboard_interface: browser\n").is_none()
-        );
+        assert!(apply_serena_dashboard_interface("web_dashboard_interface: browser\n").is_none());
         // Commented-out template line is not the key.
         assert_eq!(
             apply_serena_dashboard_interface("projects: []\n# web_dashboard_interface:\n")

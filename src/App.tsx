@@ -6231,7 +6231,7 @@ export default function App() {
               >
                 <span className="stat-card__label">
                   <CurrencyCircleDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Total costs saved (estimate)
+                  Total costs saved
                   <button
                     className="stat-card__info-button"
                     onClick={(e) => { e.stopPropagation(); setShowSavingsInfo(true); }}
@@ -7734,25 +7734,24 @@ export default function App() {
                 <p>This will:</p>
                 <ul className="api-key-guide">
                   <li>
-                    Undo the routing config for every agent Headroom set up: Claude Code
-                    (<code>~/.claude/settings.json</code> and <code>settings.local.json</code>),
-                    Codex (<code>~/.codex/config.toml</code>), Grok Build, and OpenCode, plus
-                    the export block in your shell profile. Any base URL you had before
-                    Headroom is restored.
+                    Restore the original routing config for every agent Headroom set
+                    up (Claude Code, Codex, Grok Build, OpenCode) and remove the export
+                    block from your shell profile
                   </li>
-                  <li>Delete <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code></li>
-                  <li>Delete <code>~/Library/Application Support/Headroom</code> (logs, caches, setup state)</li>
-                  <li>Delete <code>~/.headroom</code> (Python runtime)</li>
-                  <li>Remove the LaunchAgent plist from <code>~/Library/LaunchAgents/</code> and disable the login item</li>
-                  <li>Delete <code>~/Library/Preferences/com.extraheadroom.headroom*</code> and <code>~/Library/Caches/com.extraheadroom.headroom</code></li>
-                  <li>Delete Headroom's keychain entries (session token plus any API keys saved by older builds)</li>
-                  <li>Remove Headroom's addons and MCP servers from your coding agents (ponytail, caveman, serena, context7, codebase-memory, MarkItDown)</li>
-                  <li>Move the Headroom app to the Trash</li>
+                  <li>
+                    Remove Headroom's addons and MCP servers (ponytail, caveman, serena,
+                    context7, codebase-memory, MarkItDown)
+                  </li>
+                  <li>
+                    Delete Headroom's data: logs, caches, setup state, the Python runtime,
+                    and saved credentials
+                  </li>
+                  <li>Disable the login item</li>
+                  <li>Remove the app itself</li>
                 </ul>
                 <p className="uninstall-note">
-                  Terminals already open keep <code>ANTHROPIC_BASE_URL</code>{" "}
-                  exported until you restart them. If Claude reports a
-                  connection error after uninstalling, open a new terminal or run{" "}
+                  Terminals you already have open keep{" "}
+                  <code>ANTHROPIC_BASE_URL</code> until you restart them, or run{" "}
                   <code>unset ANTHROPIC_BASE_URL</code>.
                 </p>
                 <p>You can reinstall at any time by launching Headroom again.</p>

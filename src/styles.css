@@ -1,7 +1,7 @@
 :root {
   font-family: var(--font-sans);
   color: #241f1d;
-  background: transparent;
+  background: var(--surface-app);
   color-scheme: light dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -118,6 +118,21 @@
      Move these into the light rule via tokens during Stage 4 migration. */
   .connector-item__reason {
     color: var(--warning) !important;
+  }
+}
+
+/* macOS paints an NSVisualEffectView behind the webview, so --surface-app is
+   transparent and every surface token composites onto that vibrancy. Windows
+   and Linux have no such layer: without an opaque base the translucent tokens
+   composite onto the bare transparent window (black), which makes the whole UI
+   unreadable. main.tsx stamps data-vibrancy="none" on those platforms. */
+html[data-vibrancy="none"] {
+  --surface-app: #f1ece5;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-vibrancy="none"] {
+    --surface-app: #1c1917;
   }
 }
 

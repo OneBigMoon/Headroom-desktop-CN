@@ -305,9 +305,12 @@ mod platform {
     }
 }
 
-// ── Release / Windows: Credential Manager (keyring, windows-native) ─────────
+// ── Release / Windows + Linux: OS credential store (keyring crate) ──────────
+// Windows -> Credential Manager (windows-native); Linux -> DBus Secret
+// Service, i.e. gnome-keyring/kwallet (sync-secret-service). Linux without a
+// running secret-service daemon (headless) surfaces the keyring error here.
 
-#[cfg(all(not(debug_assertions), target_os = "windows"))]
+#[cfg(all(not(debug_assertions), any(target_os = "windows", target_os = "linux")))]
 mod platform {
     use keyring::Entry;
 
@@ -316,7 +319,7 @@ mod platform {
         match entry.get_password() {
             Ok(secret) => Ok(Some(secret)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(format!("Windows credential read failed: {err}")),
+            Err(err) => Err(format!("Credential store read failed: {err}")),
         }
     }
 
@@ -324,7 +327,7 @@ mod platform {
         let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
         entry
             .set_password(secret)
-            .map_err(|err| format!("Windows credential write failed: {err}"))
+            .map_err(|err| format!("Credential store write failed: {err}"))
     }
 
     pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
@@ -332,17 +335,18 @@ mod platform {
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(format!("Windows credential delete failed: {err}")),
+            Err(err) => Err(format!("Credential store delete failed: {err}")),
         }
     }
 }
 
-// ── Release / non-macOS: stub ─────────────────────────────────────────────────
+// ── Release / other platforms: stub ───────────────────────────────────────────
 
 #[cfg(all(
     not(debug_assertions),
     not(target_os = "macos"),
-    not(target_os = "windows")
+    not(target_os = "windows"),
+    not(target_os = "linux")
 ))]
 mod platform {
     pub fn read_secret(_service: &str, _account: &str) -> Result<Option<String>, String> {

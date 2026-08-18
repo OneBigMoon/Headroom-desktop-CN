@@ -902,10 +902,9 @@ impl CodexPlanTier {
 /// Free carries no recommendation (already on the no-cost tier).
 pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubscriptionTier> {
     match plan {
-        CodexPlanTier::Go
-        | CodexPlanTier::Plus
-        | CodexPlanTier::Team
-        | CodexPlanTier::Business => Some(HeadroomSubscriptionTier::Pro),
+        CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::Team | CodexPlanTier::Business => {
+            Some(HeadroomSubscriptionTier::Pro)
+        }
         CodexPlanTier::SelfServeBusinessUsageBased | CodexPlanTier::Edu => {
             Some(HeadroomSubscriptionTier::Max5x)
         }
