@@ -2,8 +2,8 @@ import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LearnScanStatusLine } from "./LearnScanStatusLine";
 
-function visibleText(container: HTMLElement): string {
-  return container.querySelector('[aria-hidden="true"]')?.textContent ?? "";
+function typedText(container: HTMLElement): string {
+  return container.querySelector(".learn-scan-status__text")?.textContent ?? "";
 }
 
 describe("LearnScanStatusLine", () => {
@@ -14,20 +14,40 @@ describe("LearnScanStatusLine", () => {
     vi.useRealTimers();
   });
 
-  it("types the step out character by character with the timer suffix", () => {
+  it("types the step out character by character with the timer pinned throughout", () => {
     const { container } = render(
       <LearnScanStatusLine elapsedSeconds={12} step="Reading sessions" />
     );
 
-    expect(visibleText(container)).toBe(" · 12s");
+    // The timer never rides the typing edge: present from the first frame.
+    expect(container.querySelector(".learn-scan-status__timer")?.textContent).toBe("12s");
+    expect(typedText(container)).toBe("");
     act(() => {
       vi.advanceTimersByTime(18 * 4);
     });
-    expect(visibleText(container)).toBe("Read · 12s");
+    expect(typedText(container)).toBe("Read");
     act(() => {
       vi.advanceTimersByTime(18 * 100);
     });
-    expect(visibleText(container)).toBe("Reading sessions · 12s");
+    expect(typedText(container)).toBe("Reading sessions");
+    expect(container.querySelector(".learn-scan-status__timer")?.textContent).toBe("12s");
+  });
+
+  it("omits the timer when no elapsed time is known", () => {
+    const { container } = render(<LearnScanStatusLine step="Reading sessions" />);
+
+    expect(container.querySelector(".learn-scan-status__timer")).toBeNull();
+  });
+
+  it("reserves the width of the longest phrase so siblings never reflow", () => {
+    const { container } = render(
+      <LearnScanStatusLine elapsedSeconds={12} step="Reading sessions" />
+    );
+
+    const box = container.querySelector<HTMLElement>(".learn-scan-status");
+    expect(box?.style.minWidth).toMatch(/^\d+ch$/);
+    const reserved = parseInt(box?.style.minWidth ?? "0", 10);
+    expect(reserved).toBeGreaterThanOrEqual("Distilling durable patterns".length);
   });
 
   it("rotates through analysis phrases while the analyzing step is active", () => {
@@ -38,7 +58,7 @@ describe("LearnScanStatusLine", () => {
     act(() => {
       vi.advanceTimersByTime(18 * 100);
     });
-    expect(visibleText(container)).toBe("Analyzing with Claude Code");
+    expect(typedText(container)).toBe("Analyzing with Claude Code");
 
     act(() => {
       vi.advanceTimersByTime(7000);
@@ -46,7 +66,7 @@ describe("LearnScanStatusLine", () => {
     act(() => {
       vi.advanceTimersByTime(18 * 100);
     });
-    expect(visibleText(container)).toBe("Reading through your sessions");
+    expect(typedText(container)).toBe("Reading your sessions");
 
     // A full cycle returns to the real step so the backend name resurfaces.
     act(() => {
@@ -55,7 +75,7 @@ describe("LearnScanStatusLine", () => {
     act(() => {
       vi.advanceTimersByTime(18 * 100);
     });
-    expect(visibleText(container)).toBe("Analyzing with Claude Code");
+    expect(typedText(container)).toBe("Analyzing with Claude Code");
   });
 
   it("does not rotate on non-analyzing steps and exposes the full phrase to aria-live", () => {
@@ -64,7 +84,7 @@ describe("LearnScanStatusLine", () => {
     act(() => {
       vi.advanceTimersByTime(7000 + 18 * 100);
     });
-    expect(visibleText(container)).toBe("Found 7 patterns");
+    expect(typedText(container)).toBe("Found 7 patterns");
     expect(container.querySelector(".visually-hidden")?.textContent).toBe(
       "Found 7 patterns"
     );
@@ -76,6 +96,6 @@ describe("LearnScanStatusLine", () => {
     act(() => {
       vi.advanceTimersByTime(18 * 100);
     });
-    expect(visibleText(container)).toBe("Scanning sessions");
+    expect(typedText(container)).toBe("Scanning sessions");
   });
 });

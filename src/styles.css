@@ -2733,6 +2733,17 @@ select {
   gap: 6px;
 }
 
+/* Fixed-width box for the typewriter scan status: min-width is set inline
+ * from the phrase list; the timer sits at the right edge so nothing shifts
+ * while characters type or phrases rotate. */
+.learn-scan-status {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  white-space: nowrap;
+}
+
 .optimize-project-row__refresh {
   display: inline-flex;
   align-items: center;
