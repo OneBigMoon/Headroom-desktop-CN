@@ -2635,10 +2635,46 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, ProfileFetchEr
         return Err(ProfileFetchError { message, transient });
     }
 
-    let body: serde_json::Value = response.json().map_err(|err| {
-        sentry::capture_message(
-            &format!("Could not parse Claude OAuth profile: {err}"),
-            sentry::Level::Error,
+    // Same split as the activation path above (RUST-58): `.json()` collapses a
+    // body-read failure and a serde mismatch into one opaque "error decoding
+    // response body" (RUST-7J). They need opposite handling -- a dropped
+    // connection mid-body is transient and must NOT be a permanent error the
+    // user has to report, while a schema change from Anthropic is exactly the
+    // thing we want to see.
+    let raw = response.text().map_err(|err| {
+        if !is_transient_transport_error(&err) {
+            sentry::capture_message(
+                &format!("Could not read Claude OAuth profile: {err}"),
+                sentry::Level::Error,
+            );
+        }
+        ProfileFetchError {
+            message: "Couldn't finish reading your Claude plan from Anthropic. We'll try again \
+                      shortly."
+                .to_string(),
+            transient: true,
+        }
+    })?;
+    let body: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        sentry::with_scope(
+            |scope| {
+                // Serde errors vary by line/column; one fingerprint keeps them
+                // a single issue.
+                scope.set_fingerprint(Some(&["claude-oauth-profile-parse-error"]));
+                // Snippet only when the body isn't JSON at all (HTML error page,
+                // empty body, captive portal). Valid JSON is described by `err`
+                // and carries the user's account details.
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    let snippet: String = raw.chars().take(300).collect();
+                    scope.set_extra("body_snippet", snippet.into());
+                }
+            },
+            || {
+                sentry::capture_message(
+                    &format!("Could not parse Claude OAuth profile: {err}"),
+                    sentry::Level::Error,
+                )
+            },
         );
         ProfileFetchError {
             message: "We couldn't read the response from Anthropic for your Claude plan. Please \

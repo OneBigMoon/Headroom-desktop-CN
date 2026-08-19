@@ -114,12 +114,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
-    // A foreign squatter on the intercept port reaches Sentry via the explicit
-    // once-per-error capture at the emit site (RUST-62); this warn repeats on
-    // every 15s bind retry and only duplicated it (RUST-5R). Local log only.
+    // A held intercept port reaches Sentry via the explicit once-per-error
+    // capture at the emit site (RUST-62); this warn repeats on every 15s bind
+    // retry and only duplicated it (RUST-5R). Local log only.
+    //
+    // Coupled to the emit site's wording in `proxy_intercept::spawn` -- if that
+    // message changes and this substring is not changed with it, the retry warn
+    // silently starts flooding Sentry again. `skips_foreign_port_bind_retry_warns`
+    // is the guard; keep its fixture a copy of the real message.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
         && msg.starts_with("[proxy_intercept] port")
-        && msg.contains("held by foreign process")
+        && msg.contains("held but not answering")
     {
         return true;
     }
@@ -220,6 +225,27 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::client_adapters")
         && msg.starts_with("codex retag")
         && msg.contains("database disk image is malformed")
+    {
+        return true;
+    }
+    // The backend-port fallback reaches Sentry via the explicit capture at the
+    // emit site (tool_manager), which carries occupant_cmd/occupant_pid tags and
+    // both port numbers. This warn fires at the same instant with none of that
+    // context, so one fallback landed as two issues (RUST-7E and RUST-7F, same
+    // millisecond). Same split as the intercept-port line above.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("[backend_port] ")
+    {
+        return true;
+    }
+    // A host with no usable Secret Service (headless VM, xrdp session with no
+    // login keyring) is the case this fallback exists FOR: the 0600 file is the
+    // designed path, sign-in works, nothing is broken. It fired once per process
+    // as a fresh error-level issue on every Linux box without a desktop keyring
+    // (RUST-7G). Keep the local log so a support thread can see which store was
+    // used; drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib::keychain")
+        && msg.starts_with("OS credential store unusable")
     {
         return true;
     }
@@ -388,7 +414,7 @@ mod tests {
     fn skips_foreign_port_bind_retry_warns() {
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
-            "[proxy_intercept] port 6767 held by foreign process; retrying in 15s (Address already in use (os error 48))"
+            "[proxy_intercept] port 6767 is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s (Address already in use (os error 48))"
         ));
         // Other bind/loop errors from proxy_intercept stay in Sentry.
         assert!(!skip_sentry(
@@ -622,6 +648,35 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::state",
             "some other state warning"
+        ));
+    }
+
+    #[test]
+    fn skips_backend_port_fallback_warn_but_not_siblings() {
+        // The emit-site capture_message is the Sentry path for this event.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "[backend_port] 6768 held by unknown process; falling back to 6770"
+        ));
+        // Other tool_manager warnings still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "managed headroom exited unexpectedly"
+        ));
+    }
+
+    #[test]
+    fn skips_keyring_fallback_but_not_other_keychain_failures() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::keychain",
+            "OS credential store unusable (Couldn't access platform secure storage: \
+             Secret Service: no result found); storing Headroom secrets in a 0600 file \
+             under the app data dir instead"
+        ));
+        // A real keychain failure that is NOT the designed fallback still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::keychain",
+            "failed to write Headroom secret to the file store"
         ));
     }
 

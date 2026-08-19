@@ -28,6 +28,17 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
+    // Python picks its stdio encoding from the locale, and we redirect every
+    // child's stdout/stderr to a log file — so on Windows it resolves to the
+    // ANSI codepage (cp1252), not UTF-8. Upstream's startup banner is not
+    // ASCII, so `print()` raised UnicodeEncodeError and the backend died
+    // before opening its port, with the app reporting only an opaque exit
+    // 0xc000013a (Sentry RUST-7C). Applied to every spawn rather than the one
+    // that crashed: the prefetch and smoke-test children print too, and a
+    // POSIX box running under LC_ALL=C has the identical exposure.
+    // `backslashreplace` over plain `utf-8` because a log stream must never be
+    // the thing that kills the process (a lone surrogate still encodes).
+    command.env("PYTHONIOENCODING", "utf-8:backslashreplace");
     command
 }
 
@@ -45,5 +56,40 @@ mod tests {
         let out = super::command(program).args(args).output().expect("spawn");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "headroom");
+    }
+
+    /// RUST-7C: the backend died printing a non-ASCII banner to a redirected
+    /// stdout because Python fell back to the platform codepage. Deterministic
+    /// half -- the variable must be on every command we hand out.
+    #[test]
+    fn command_forces_utf8_python_stdio() {
+        let cmd = super::command("python3");
+        let set = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PYTHONIOENCODING"))
+            .and_then(|(_, v)| v)
+            .expect("PYTHONIOENCODING is set");
+        assert_eq!(set, std::ffi::OsStr::new("utf-8:backslashreplace"));
+    }
+
+    /// Behavioural half: the exact shape that crashed -- non-ASCII `print()`
+    /// with stdout captured (not a tty), which is how we spawn the backend.
+    /// Skipped where no interpreter is on PATH; the assert above still guards.
+    #[test]
+    fn python_prints_non_ascii_to_piped_stdout_without_dying() {
+        let banner = "\u{250c}\u{2500} Headroom \u{2192} 100% \u{2713}";
+        let script = format!("print('{banner}')");
+        let out = match super::command("python3").args(["-c", &script]).output() {
+            Ok(out) => out,
+            // No python3 on PATH in this environment.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => panic!("spawn failed: {e}"),
+        };
+        assert!(
+            out.status.success(),
+            "non-ASCII print killed the child: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Headroom"));
     }
 }
