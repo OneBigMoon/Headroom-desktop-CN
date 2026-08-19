@@ -228,6 +228,19 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Every one of these lines is the sanitizer WORKING: it found tool_search
+    // references with no matching entry in the tools array and dropped them, so
+    // upstream never 400s and the session survives. Reporting a successful
+    // mitigation as an error-level issue made it un-resolvable (RUST-5W kept
+    // regressing, then escalated) -- any resolve reopens the moment another
+    // client sends a stale reference. The rate is worth watching as a metric,
+    // not as a defect. Keep the local log, which is what support threads read.
+    if target.starts_with("headroom_desktop_lib::proxy_intercept")
+        && msg.starts_with("[proxy_intercept] dropped ")
+        && msg.contains("stale tool_search reference")
+    {
+        return true;
+    }
     // The backend-port fallback reaches Sentry via the explicit capture at the
     // emit site (tool_manager), which carries occupant_cmd/occupant_pid tags and
     // both port numbers. This warn fires at the same instant with none of that
@@ -648,6 +661,21 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::state",
             "some other state warning"
+        ));
+    }
+
+    #[test]
+    fn skips_successful_stale_tool_reference_sanitisation() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] dropped 3 stale tool_search reference(s) [\"TaskCreate\"] from a \
+             direct-forwarded request — absent from the tools array, upstream would 400 the \
+             session permanently"
+        ));
+        // A genuine failure in the same module still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] dropped connection while forwarding"
         ));
     }
 
