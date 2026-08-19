@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -1187,7 +1186,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     {
         // Remove the autostart Run key tauri-plugin-autostart creates
         // (HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Headroom).
-        let _ = std::process::Command::new("reg")
+        let _ = crate::proc::command("reg")
             .args([
                 "delete",
                 "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -1596,7 +1595,7 @@ fn remove_macos_launch_agents() -> Vec<String> {
             continue;
         }
         // Best-effort unload before deletion so launchd forgets the job.
-        let _ = Command::new("launchctl")
+        let _ = crate::proc::command("launchctl")
             .args(["unload", "-w"])
             .arg(&path)
             .output();
@@ -4583,7 +4582,7 @@ fn remove_claude_guard_hook() -> Result<()> {
 /// reasons must not flip `verified`.
 fn codex_doctor_summary() -> Option<String> {
     let codex = find_on_path(&["codex"])?;
-    let output = Command::new(codex).arg("doctor").output().ok()?;
+    let output = crate::proc::command(codex).arg("doctor").output().ok()?;
     if output.status.success() {
         Some("`codex doctor` reports the Codex install is healthy.".into())
     } else {
@@ -4604,7 +4603,7 @@ fn remove_launchctl_env(keys: &[&str]) -> Result<()> {
 }
 
 fn run_launchctl(args: &[&str]) -> Result<std::process::Output> {
-    let output = Command::new("launchctl")
+    let output = crate::proc::command("launchctl")
         .args(args)
         .output()
         .with_context(|| format!("running launchctl {}", args.join(" ")))?;
@@ -6820,7 +6819,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         // Hook expects a JSON object on stdin with tool_input.command.
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -6880,7 +6879,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         for cmd in ["git diff --cached --check", "git diff --check"] {
             let stdin = format!(r#"{{"tool_input":{{"command":"{cmd}"}}}}"#);
-            let output = std::process::Command::new("bash")
+            let output = crate::proc::command("bash")
                 .arg(&hook_path)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -6942,7 +6941,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -7005,7 +7004,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .env("PATH", "/usr/bin:/bin") // ensure bare `rtk` is unresolvable
             .stdin(std::process::Stdio::piped())
@@ -7074,7 +7073,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .env("PATH", "/usr/bin:/bin") // bare `rtk` unresolvable without the prepend
             .stdin(std::process::Stdio::piped())
@@ -7153,7 +7152,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

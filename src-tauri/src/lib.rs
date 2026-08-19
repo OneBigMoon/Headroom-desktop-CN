@@ -13,6 +13,7 @@ mod models;
 mod output_savings;
 mod port_conflict;
 mod pricing;
+mod proc;
 mod proxy_intercept;
 mod state;
 mod storage;
@@ -79,6 +80,11 @@ const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
+/// Extra main-window height for the platforms that render the preview-build
+/// notice (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real
+/// layout width for their scrollbars, which wraps text elsewhere too.
+#[cfg(not(target_os = "macos"))]
+const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
@@ -826,7 +832,7 @@ async fn restart_app(app: AppHandle) {
                     quoted = quoted,
                     log_quoted = log_quoted,
                 );
-                match Command::new("/bin/sh").arg("-c").arg(cmd).spawn() {
+                match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
                     Ok(_) => log::info!("restart_app: relauncher spawned"),
                     Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
                 }
@@ -928,7 +934,7 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
         quoted = quoted,
         log_quoted = log_quoted,
     );
-    match Command::new("/bin/sh").arg("-c").arg(cmd).spawn() {
+    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
         Ok(_) => {
             log::info!("uninstall: scheduled app-bundle trash for {bundle:?}");
             Some(bundle)
@@ -3104,7 +3110,7 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
         return Err("Memory database does not exist.".into());
     }
     let entrypoint = state.tool_manager.headroom_entrypoint();
-    let output = Command::new(&entrypoint)
+    let output = crate::proc::command(&entrypoint)
         .arg("memory")
         .arg("delete")
         .arg(&memory_id)
@@ -3208,7 +3214,7 @@ fn read_applied_block(path: &std::path::Path) -> Vec<crate::models::AppliedSecti
 
 /// Shells `headroom memory export --db-path <db>` and returns raw JSON stdout.
 fn run_memory_export(entrypoint: &Path, db_path: &Path) -> Result<String, String> {
-    let output = Command::new(entrypoint)
+    let output = crate::proc::command(entrypoint)
         .arg("memory")
         .arg("export")
         .arg("--db-path")
@@ -3370,7 +3376,7 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut command = Command::new("open");
+        let mut command = crate::proc::command("open");
         command.arg(trimmed);
         command
     };
@@ -3378,7 +3384,7 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         for opener in ["xdg-open", "gio", "kde-open5", "wslview"] {
-            let mut command = Command::new(opener);
+            let mut command = crate::proc::command(opener);
             if opener == "gio" {
                 command.args(["open", trimmed]);
             } else {
@@ -3402,7 +3408,7 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("cmd");
+        let mut command = crate::proc::command("cmd");
         command.args(["/C", "start", "", trimmed]);
         command
     };
@@ -4033,6 +4039,24 @@ pub fn run() {
                 // popover behavior and fixes both cases.
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_visible_on_all_workspaces(true);
+                }
+            }
+
+            // Windows and Linux render an extra preview-build notice in the
+            // callout banner that macOS never shows, and their scrollbars take
+            // layout width (macOS overlays them), so the same 760x560 frame
+            // clips the bottom of Home. Give those platforms the banner's
+            // height back. Applied here rather than in tauri.conf.json because
+            // Tauri's platform config overlay replaces the whole `windows`
+            // array, which would duplicate every field just to change one.
+            #[cfg(not(target_os = "macos"))]
+            {
+                use tauri::LogicalSize;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_size(LogicalSize::new(
+                        MAIN_WINDOW_WIDTH,
+                        MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
+                    ));
                 }
             }
 
@@ -4933,7 +4957,7 @@ fn execute_headroom_learn_run(
         }
     };
 
-    let mut command = Command::new(&entrypoint);
+    let mut command = crate::proc::command(&entrypoint);
     command.arg("learn").arg("--apply");
     match agent {
         LearnAgent::Claude => {
@@ -5239,6 +5263,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
     let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
     let _ = TRAY_PAUSE_ITEM.set(pause.clone());
+    #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
@@ -5256,6 +5281,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = toggle_main_window(tray.app_handle(), Some(rect));
             }
 
+            // macOS only. With a menu attached, Windows and Linux open it
+            // themselves on right-click; popping a second one here raced the
+            // built-in and left the tray with no usable menu at all, so there
+            // was no way to quit from the tray. macOS does not auto-open on
+            // right-click (only left, which `show_menu_on_left_click(false)`
+            // turns off), so it still needs the manual popup.
+            #[cfg(target_os = "macos")]
             if let TrayIconEvent::Click {
                 button: MouseButton::Right,
                 button_state: MouseButtonState::Up,
@@ -5383,6 +5415,12 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             || client_adapters::any_gate_exempt_client_enabled();
 
         loop {
+            // Quitting stops the backend on purpose, which this loop would
+            // otherwise read as the connector dropping out and announce with a
+            // "Headroom is disconnected" notification on the way out the door.
+            if SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
             // Re-check connectors at most every ~2s, regardless of whether the
             // tick rate is booting-fast (260ms) or idle-slow (1500ms). Time-based
             // instead of tick-count based so the cadence stays correct across the
@@ -8657,7 +8695,7 @@ Some unrelated content.
         let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
         state.mark_headroom_learn_running_for_test();
 
-        let mut command = std::process::Command::new("sh");
+        let mut command = crate::proc::command("sh");
         command.arg("-c").arg(
             "printf '[claude] proj\\n  Analyzing with claude-cli...\\n  Recommendations: 3\\n'; \
              printf 'warn line\\n' >&2; exit 7",

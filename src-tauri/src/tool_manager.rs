@@ -1679,7 +1679,7 @@ impl ToolManager {
     /// With several sessions the tokens above span all of them, so the oldest
     /// is the honest window. `-ww`: unlimited width, argv must not truncate.
     fn serena_oldest_session_age(&self) -> Option<Duration> {
-        let output = Command::new("/bin/ps")
+        let output = crate::proc::command("/bin/ps")
             .args(["-axww", "-o", "etime=,args="])
             .output()
             .ok()?;
@@ -2085,7 +2085,7 @@ impl ToolManager {
                 // (2026-08-17: 34 restarts in one morning at load 55 on 8
                 // cores). The Windows path never niced at all.
                 let mut command = {
-                    let mut c = Command::new(executable);
+                    let mut c = crate::proc::command(executable);
                     c.args(args);
                     c
                 };
@@ -2336,7 +2336,7 @@ impl ToolManager {
                 // so PYTHONFAULTHANDLER=1 dumps all-thread tracebacks to the log file
                 // before the process dies. Skip if the process already exited on its own.
                 if reason.is_none() {
-                    let _ = Command::new("/bin/kill")
+                    let _ = crate::proc::command("/bin/kill")
                         .arg("-ABRT")
                         .arg(child.id().to_string())
                         .status();
@@ -2450,7 +2450,7 @@ impl ToolManager {
             return Ok(vec!["RTK is not installed yet.".into()]);
         }
 
-        let output = Command::new(self.rtk_entrypoint())
+        let output = crate::proc::command(self.rtk_entrypoint())
             .arg("session")
             .current_dir(&self.runtime.root_dir)
             .output()
@@ -2711,7 +2711,7 @@ impl ToolManager {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let status = Command::new(python)
+        let status = crate::proc::command(python)
             .arg("-c")
             .arg(
                 "from headroom.transforms.kompress_compressor import KompressCompressor; \
@@ -2792,7 +2792,7 @@ impl ToolManager {
             .open(&log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let mut child = Command::new(&python)
+        let mut child = crate::proc::command(&python)
             .arg("-c")
             // cl100k_base: the proxy's default/fallback encoding.
             // o200k_base: current OpenAI model family, loaded for codex traffic.
@@ -2923,7 +2923,7 @@ impl ToolManager {
         if !self.rtk_installed() {
             return None;
         }
-        let output = Command::new(self.rtk_entrypoint())
+        let output = crate::proc::command(self.rtk_entrypoint())
             .args(["gain", "--daily", "--format", "json"])
             .current_dir(&self.runtime.root_dir)
             .output()
@@ -3146,7 +3146,17 @@ impl ToolManager {
             eta_seconds: 95,
             percent: 58,
         });
-        self.install_headroom()?;
+        // Forward pip's per-package chatter instead of dropping it. Without
+        // this the whole multi-minute dependency install sits on the single
+        // static frame above, which reads as a hang once its ETA lapses.
+        // Clamped so the sub-step percents (which start at 40 for the
+        // standalone upgrade path) never walk the bar backwards from 58.
+        self.install_headroom(|update| {
+            progress(BootstrapStepUpdate {
+                percent: update.percent.clamp(58, 89),
+                ..update
+            })
+        })?;
 
         // RTK is opt-in: bootstrap no longer installs it. Users add it from the
         // Addons tab, which calls install_addon("rtk").
@@ -3338,7 +3348,7 @@ impl ToolManager {
         // machine for 20-30 seconds).
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("xattr")
+            let _ = crate::proc::command("xattr")
                 .args([
                     "-rd",
                     "com.apple.quarantine",
@@ -3390,11 +3400,14 @@ impl ToolManager {
     }
 
     /// Bootstrap path: installs the pinned headroom release.
-    fn install_headroom(&self) -> Result<()> {
+    fn install_headroom<F>(&self, progress: F) -> Result<()>
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
         // Bootstrap path runs at first launch where there is no boot
         // validation yet — no caller will read the captured pip output, so
         // skip the buffer to avoid allocating it.
-        self.install_headroom_release(&pinned_headroom_release()?, |_| {}, None)
+        self.install_headroom_release(&pinned_headroom_release()?, progress, None)
     }
 
     fn install_headroom_release<F>(
@@ -3790,7 +3803,7 @@ impl ToolManager {
         // One codesign invocation can accept many file arguments; ARG_MAX
         // (~256KB on macOS) is well above what we'd hit even with 1000+
         // long paths, so we avoid the per-file fork-exec overhead.
-        let output = Command::new("codesign")
+        let output = crate::proc::command("codesign")
             .args(["--force", "--sign", "-"])
             .args(&native_paths)
             .output();
@@ -6291,7 +6304,7 @@ const SERENA_GITIGNORE_PATTERN: &str = ".serena/";
 /// when `core.excludesfile` is unset, so the pattern can be added without
 /// rewriting the user's global git config.
 fn global_git_excludes_path() -> Option<PathBuf> {
-    let configured = Command::new("git")
+    let configured = crate::proc::command("git")
         .args(["config", "--global", "--get", "core.excludesfile"])
         .output()
         .ok()
@@ -6625,7 +6638,7 @@ fn diagnose_proxy_port(port: u16) -> PortState {
 /// headroom-branded). Guards port reclaim from killing an unrelated process
 /// that merely answers HTTP on our port.
 fn pid_is_headroom_backend(pid: u32) -> bool {
-    let Ok(output) = Command::new("/bin/ps")
+    let Ok(output) = crate::proc::command("/bin/ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output()
     else {
@@ -6667,7 +6680,7 @@ fn lsof_listener(port: u16) -> Option<String> {
     // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
     // selector (lsof ORs `-i` options) and match every listening socket on
     // the machine, so `nth(1)` would return an unrelated daemon's pid.
-    let output = Command::new("/usr/sbin/lsof")
+    let output = crate::proc::command("/usr/sbin/lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
         .output()
         .ok()?;
@@ -6768,9 +6781,11 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
-    let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
+    let _ = crate::proc::command("/bin/kill")
+        .arg(pid.to_string())
+        .status();
     if !wait_for_port_free(port, Duration::from_secs(3)) {
-        let _ = Command::new("/bin/kill")
+        let _ = crate::proc::command("/bin/kill")
             .arg("-KILL")
             .arg(pid.to_string())
             .status();
@@ -7062,7 +7077,7 @@ fn argv_contains_flag(argv: &str, flag: &str) -> bool {
 }
 
 fn lsof_listener_pid(port: u16) -> Option<u32> {
-    let output = Command::new("/usr/sbin/lsof")
+    let output = crate::proc::command("/usr/sbin/lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
         .output()
         .ok()?;
@@ -7075,7 +7090,7 @@ fn lsof_listener_pid(port: u16) -> Option<u32> {
 }
 
 fn ps_command(pid: u32) -> Option<String> {
-    let output = Command::new("/bin/ps")
+    let output = crate::proc::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
         .ok()?;
@@ -8083,7 +8098,7 @@ fn path_with_binary_dir(binary: &Path) -> String {
 }
 
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
-    let mut command = Command::new(binary);
+    let mut command = crate::proc::command(binary);
     command
         .args(args)
         .current_dir(cwd)
@@ -10036,7 +10051,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         // pid_is_headroom_backend argv identity gate (needs both a "headroom"
         // and a "proxy" token), like a real orphan running as
         // `.../headroom proxy ...` from the app-support venv path would.
-        let mut child = std::process::Command::new("/usr/bin/python3")
+        let mut child = crate::proc::command("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
@@ -10099,7 +10114,7 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 "#;
-        let mut child = std::process::Command::new("/usr/bin/python3")
+        let mut child = crate::proc::command("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
@@ -10844,7 +10859,7 @@ after
         manager.ensure_markitdown_shim().expect("shim");
 
         let run = |arg: &str| {
-            let out = std::process::Command::new(manager.markitdown_shim_path())
+            let out = crate::proc::command(manager.markitdown_shim_path())
                 .arg(arg)
                 .output()
                 .expect("run shim");

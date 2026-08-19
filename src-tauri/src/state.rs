@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
@@ -278,7 +278,7 @@ fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
 /// to call on a 500ms boot-validation tick — fork+exec of a tiny
 /// system binary, no I/O beyond the kernel proc table.
 pub(crate) fn tracked_process_cpu_time_secs(pid: u32) -> Option<u64> {
-    let output = Command::new("ps")
+    let output = crate::proc::command("ps")
         .args(["-p", &pid.to_string(), "-o", "time="])
         .output()
         .ok()?;
@@ -3225,7 +3225,7 @@ impl AppState {
         let Some(pid) = self.headroom_process.lock().as_ref().map(|c| c.id()) else {
             return;
         };
-        let _ = std::process::Command::new("/bin/kill")
+        let _ = crate::proc::command("/bin/kill")
             .arg("-USR1")
             .arg(pid.to_string())
             .status();
@@ -6937,7 +6937,7 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
 /// the process group by negating the pid.
 fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
-        let mut command = std::process::Command::new("taskkill");
+        let mut command = crate::proc::command("taskkill");
         command.args(["/PID", &pid.to_string(), "/T"]);
         if force {
             command.arg("/F");
@@ -6945,7 +6945,7 @@ fn terminate_process_tree(pid: i32, force: bool) {
         let _ = command.status();
     } else {
         let signal = if force { "-KILL" } else { "-TERM" };
-        let _ = std::process::Command::new("/bin/kill")
+        let _ = crate::proc::command("/bin/kill")
             .arg(signal)
             .arg(format!("-{pid}"))
             .status();
@@ -6956,7 +6956,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
     #[cfg(unix)]
     {
         let pattern = format!("{} {args_pattern}", exe.display());
-        let status = Command::new("pkill")
+        let status = crate::proc::command("pkill")
             .args(["-f", &pattern])
             .status()
             .with_context(|| format!("running pkill for pattern '{pattern}'"))?;
@@ -6999,7 +6999,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
         let script = format!(
             "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
         );
-        let status = Command::new("powershell")
+        let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
             .with_context(|| {

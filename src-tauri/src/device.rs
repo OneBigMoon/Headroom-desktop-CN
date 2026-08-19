@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -64,7 +63,7 @@ fn load_or_compute_machine_id_digest() -> String {
 
 #[cfg(target_os = "macos")]
 fn read_hardware_uuid() -> Option<String> {
-    let output = Command::new("/usr/sbin/ioreg")
+    let output = crate::proc::command("/usr/sbin/ioreg")
         .args(["-d2", "-c", "IOPlatformExpertDevice"])
         .output()
         .ok()?;
@@ -94,7 +93,7 @@ fn read_hardware_uuid() -> Option<String> {
         .map(|root| PathBuf::from(root).join("System32").join("reg.exe"))
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("reg"));
-    let output = Command::new(reg)
+    let output = crate::proc::command(reg)
         .args([
             "query",
             "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
@@ -158,7 +157,7 @@ fn fallback_identifier() -> String {
     let hostname = std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| {
-            Command::new("hostname")
+            crate::proc::command("hostname")
                 .output()
                 .ok()
                 .and_then(|out| String::from_utf8(out.stdout).ok())

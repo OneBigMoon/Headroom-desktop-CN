@@ -36,6 +36,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: No child process spawns a console window on Windows
+        # Headroom is a GUI-subsystem binary, so any console-subsystem child
+        # spawned without CREATE_NO_WINDOW gets its own visible (and blank,
+        # since we pipe stdio) console. See src-tauri/src/proc.rs.
+        run: ./scripts/check-no-console.sh
+
       - name: Locks cover every headroom-ai dependency
         # The wheel installs with --no-deps, so a dep absent from a lock is an
         # ImportError at backend start, not something pip resolves later.
