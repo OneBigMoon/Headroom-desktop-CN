@@ -518,12 +518,14 @@ pub fn spawn(
                                     "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
                                 );
                             } else {
-                                // Nothing answered /health, so the port is held
-                                // without being served -- on Windows this is
-                                // what a reserved (Hyper-V/WSL2/Docker) range
-                                // looks like: bind says in-use, connect is
-                                // refused. Surface it; the app is dead to every
-                                // client until it clears.
+                                // Nothing answered /health, so the port is
+                                // held without being served: bind says in-use
+                                // while connect is refused. Observed causes
+                                // include a leftover Headroom whose socket
+                                // outlived it, an unrelated app, and reserved
+                                // ranges -- "foreign" here means "did not
+                                // answer", not "not ours", so do not report a
+                                // cause to the user we have not established.
                                 *bind_error.lock() = Some(e.to_string());
                                 log::warn!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
