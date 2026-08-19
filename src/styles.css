@@ -10,9 +10,9 @@
 
   /* Type families — use these, never a raw font stack. Mono is for numbers,
      code, paths, and log output only; UI labels stay in sans. */
-  --font-sans:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
-  --font-mono:    ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-sans:    -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", Cantarell, "Noto Sans", "Helvetica Neue", sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, "Segoe UI", Cantarell, "Noto Sans", "Helvetica Neue", sans-serif;
+  --font-mono:    ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
 
   /* Type scale */
   --text-xxs:  0.69rem;   /* ~11px — tiny labels, nav text, upgrade pills */
@@ -858,7 +858,7 @@ select {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 18px 8px 14px;
+  padding: 18px 6px 14px;
   background: rgba(0, 0, 0, 0.05);
   border-right: 1px solid var(--border-subtle);
   overflow: visible;
@@ -912,7 +912,11 @@ select {
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.72);
   color: #3f3935;
-  padding: 4px 8px;
+  padding: 4px 6px;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   font-size: 0.6rem;
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -973,6 +977,7 @@ select {
 }
 
 .tray-nav__text strong {
+  display: block;
   font-size: 0.58rem;
   font-weight: 500;
   line-height: 1;

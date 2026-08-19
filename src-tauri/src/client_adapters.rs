@@ -9469,8 +9469,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let err = super::atomic_write(&path, b"x").expect_err("write into a missing dir must fail");
         let shown = format!("{err}");
         assert!(shown.starts_with("writing "), "{shown}");
+        // Match on the "(os error N)" suffix every platform's io::Error Display
+        // carries, not the message text: ENOENT reads "No such file or
+        // directory" on unix but "The system cannot find the path specified."
+        // on Windows, so a unix-worded assertion fails CI on Windows while the
+        // cause it checks for is present.
         assert!(
-            shown.to_ascii_lowercase().contains("no such file"),
+            shown.contains("os error"),
             "io cause missing from `{{err}}`: {shown}"
         );
         std::fs::remove_dir_all(&dir).ok();

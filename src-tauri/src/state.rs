@@ -3690,14 +3690,11 @@ pub(crate) fn support_tier_for_platform(os: &str) -> &'static str {
     }
 }
 
+/// Platform kill switch for Headroom Learn. Linux was gated here through
+/// 0.8.4-rc.4; Learn is the same Python backend on every platform, so nothing
+/// is gated now. Return a message here to disable Learn on a platform again.
 pub(crate) fn headroom_learn_platform_message() -> Option<String> {
-    match current_platform() {
-        "linux" => Some(
-            "Headroom Learn is disabled on Linux preview builds. Core proxy routing works, but Learn and secure API key storage are not production-ready yet."
-                .into(),
-        ),
-        _ => None,
-    }
+    None
 }
 
 impl Drop for AppState {
@@ -6884,21 +6881,22 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 
 /// Explain a failed intercept bind in the terms the user can act on.
 ///
-/// Windows reserves TCP port blocks for Hyper-V, WSL2, Docker and the Windows
-/// container stack at boot. A port inside one of those ranges answers `bind`
-/// with WSAEADDRINUSE (os error 10048) while still refusing connections,
-/// because the range is reserved rather than listened on -- which is why the
-/// app reports the port as taken at the same moment Claude Code reports
-/// "connection refused".
+/// Deliberately does NOT assert a cause. WSAEADDRINUSE (os error 10048) has
+/// several: a leftover Headroom still holding the socket, an unrelated app on
+/// the port, or a reserved range (Hyper-V / WSL2 / Docker). An earlier version
+/// of this text claimed the reserved range outright and told users to run
+/// `net stop winnat`, which fails on any machine where winnat is not even
+/// running -- confidently wrong advice is worse than none. Name the port, hand
+/// over the command that identifies the holder, and let the user look.
 pub(crate) fn intercept_bind_hint(raw: &str) -> String {
     let port = crate::proxy_intercept::INTERCEPT_PORT;
     if raw.contains("os error 10048") {
         return format!(
-            "Port {port} is reserved by Windows (usually a Hyper-V, WSL2, or Docker port \
-             range), so Headroom cannot open it and every client gets \"connection \
-             refused\". In an administrator terminal run `net stop winnat`, then `netsh int \
-             ipv4 add excludedportrange protocol=tcp startport={port} numberofports=2 \
-             store=persistent`, then reboot."
+            "Port {port} is already held by another process, so Headroom cannot open it and \
+             clients get \"connection refused\". In PowerShell, \
+             `Get-NetTCPConnection -LocalPort {port}` names the owning process: if it is a \
+             leftover Headroom, quit it and relaunch. If nothing owns the port, check for a \
+             reserved range with `netsh int ipv4 show excludedportrange protocol=tcp`."
         );
     }
     format!(
@@ -7874,28 +7872,29 @@ mod tests {
         assert!(hint.contains("Reboot"), "got: {hint}");
     }
 
-    /// Regression (Sentry RUST-7D, Windows Server 2022 + RUST-7B/64 in other
-    /// locales): a port inside a Hyper-V / WSL2 / Docker reserved range fails
-    /// `bind` with WSAEADDRINUSE while still refusing connections, so clients
-    /// see "connection refused" at the same moment the app sees "in use". The
-    /// banner must name the port, not the Python runtime -- which in that state
-    /// is running fine on a port of its own.
+    /// Regression (Sentry RUST-7D, RUST-7B, RUST-64): WSAEADDRINUSE on 6767
+    /// leaves the app dead to every client, so the banner must name the port
+    /// rather than blaming the Python runtime -- which in that state is running
+    /// fine on a port of its own. The hint must hand over the command that
+    /// identifies the holder instead of asserting which one it is.
     #[test]
-    fn intercept_bind_hint_names_windows_port_reservation() {
+    fn intercept_bind_hint_names_the_port_and_how_to_find_the_holder() {
         let hint = intercept_bind_hint(
             "Only one usage of each socket address (protocol/network address/port) is \
              normally permitted. (os error 10048)",
         );
         assert!(hint.contains("6767"), "{hint}");
-        assert!(hint.contains("Hyper-V"), "{hint}");
-        assert!(hint.contains("winnat"), "{hint}");
+        assert!(hint.contains("Get-NetTCPConnection"), "{hint}");
+        // Must not assert a single cause: winnat is not running on every
+        // affected machine, and `net stop winnat` fails outright there.
+        assert!(!hint.contains("net stop winnat"), "{hint}");
     }
 
     #[test]
     fn intercept_bind_hint_falls_back_to_the_raw_cause() {
         let hint = intercept_bind_hint("Address already in use (os error 48)");
         assert!(hint.contains("os error 48"), "{hint}");
-        assert!(!hint.contains("winnat"), "{hint}");
+        assert!(!hint.contains("Get-NetTCPConnection"), "{hint}");
     }
 
     #[test]

@@ -6331,10 +6331,6 @@ export default function App() {
                     <p className="optimize-minimal__meta">
                       {headroomLearnDisabledReason}
                     </p>
-                    <p className="optimize-minimal__meta">
-                      Linux preview currently supports the core Headroom proxy,
-                      Claude Code routing, and RTK activity tracking.
-                    </p>
                   </div>
                 ) : !claudeLearnEnabled && !codexLearnEnabled ? (
                   <p className="loading-copy">
