@@ -494,24 +494,42 @@ fn maybe_fire_first_savings_notification(
     if !state.try_mark_first_savings_notified() {
         return;
     }
-    let usd = dashboard.lifetime_estimated_savings_usd;
-    let amount = if usd >= 0.01 {
-        format!("${usd:.2}")
-    } else {
-        "Under a cent".to_string()
-    };
     let _ = show_notification_impl(
         app,
         "First savings recorded",
-        &format!(
-            "{} saved across {} tokens Headroom trimmed for you. \
-             It compounds from here — keep coding.",
-            amount,
-            format_token_count(dashboard.lifetime_estimated_tokens_saved)
+        &first_savings_body(
+            dashboard.lifetime_estimated_savings_usd,
+            dashboard.lifetime_estimated_tokens_saved,
         ),
         None,
     );
     analytics::track_event(app, "first_savings_notification_shown", None);
+}
+
+/// Below this, a dollar figure undersells the moment more than it proves it:
+/// "$0.02 saved" reads as "this does nothing" just like "under a cent" did.
+/// Deliberately well above the rounding floor - the bar is "worth saying out
+/// loud", not "nonzero".
+const FIRST_SAVINGS_USD_WORTH_QUOTING: f64 = 0.33;
+
+/// A small dollar figure is the wrong lead for the first-run payoff moment:
+/// the first prompts' worth of trimming rarely clears a third of a cent's
+/// worth of impressiveness. Under the threshold the token count carries it and
+/// dollars stay out of the sentence entirely.
+fn first_savings_body(usd: f64, tokens: u64) -> String {
+    if usd >= FIRST_SAVINGS_USD_WORTH_QUOTING {
+        format!(
+            "${usd:.2} saved across {} tokens Headroom trimmed for you. \
+             It compounds from here - keep coding.",
+            format_token_count(tokens)
+        )
+    } else {
+        format!(
+            "Headroom just trimmed {} tokens out of your prompts. \
+             That compounds with every session - keep coding.",
+            format_token_count(tokens)
+        )
+    }
 }
 
 /// "1,240" under 100k, then "124k" / "1.2M" — notification-sized precision.
@@ -6625,7 +6643,7 @@ mod tests {
         count_memories_created_today, cpu_rate_indicates_burn, debounced_tray_runtime_visual,
         delete_applied_pattern, empty_live_learnings_for_projects, exe_path_resolvable,
         extract_llm_failure_warnings, fake_override, fetch_transformations_feed_from,
-        format_token_count, install_pending_update, is_disk_full_signal,
+        first_savings_body, format_token_count, install_pending_update, is_disk_full_signal,
         is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
         is_prerelease_version, learn_step_label, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
@@ -7560,6 +7578,22 @@ mod tests {
         assert_eq!(lifetime_token_milestone_kind(5_000_000), "first_5m");
         assert_eq!(lifetime_token_milestone_kind(10_000_000), "first_10m");
         assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
+    }
+
+    #[test]
+    fn first_savings_body_leads_with_tokens_below_the_quotable_threshold() {
+        for usd in [0.004, 0.015, 0.32] {
+            let small = first_savings_body(usd, 2_431);
+            assert!(small.contains("2,431 tokens"), "{small}");
+            assert!(!small.contains('$'), "{small}");
+            assert!(!small.to_lowercase().contains("cent"), "{small}");
+        }
+
+        let real_money = first_savings_body(1.5, 124_500);
+        assert!(
+            real_money.starts_with("$1.50 saved across 124k tokens"),
+            "{real_money}"
+        );
     }
 
     #[test]
