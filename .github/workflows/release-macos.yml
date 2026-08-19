@@ -1,10 +1,21 @@
 name: Release App
 
-# Stable release for every platform. The macOS job releases first (it owns the
-# GitHub release and the updater manifest via tauri-action); the Windows job
-# runs strictly after it, uploads the NSIS installer to the same release, and
-# merges windows-x86_64 into latest.json. A Windows build failure therefore
-# never blocks or breaks the already-published macOS release.
+# Stable release for every platform. The macOS job creates the versioned release
+# via tauri-action as a PRERELEASE, so it is not `releases/latest` and no install
+# can see it; Windows then builds and adds its installer to the same release. The
+# final publish job merges windows-x86_64 into latest.json and only then flips
+# the release to latest.
+#
+# The manifest is published last on purpose. A latest.json that names a new
+# version but carries no entry for the reader's platform is an update *error*
+# there, not a no-op, so shipping the macOS-only manifest first stranded every
+# Windows install for the length of the Windows build. A Windows failure now
+# holds the whole release back instead, and `releases/latest` keeps serving the
+# previous stable until every platform is in.
+#
+# The staging-rolling mirror runs from the same publish job. It carries macOS
+# and Windows only, so a stable release drops linux-x86_64 from that channel
+# until the next rc (see release-macos-staging.yml).
 
 on:
   push:
@@ -296,56 +307,12 @@ jobs:
           releaseBody: ${{ steps.release_notes.outputs.body }}
           generateReleaseNotes: false
           releaseDraft: false
-          prerelease: false
+          # Published but not `releases/latest`, so the stable updater endpoint
+          # keeps serving the previous version until the publish job flips this.
+          prerelease: true
           assetNamePattern: '[name]_[version]_mac[ext]'
           includeUpdaterJson: true
           args: --target universal-apple-darwin
-
-      # Runs before the windows job, so staging-rolling stays macOS-only:
-      # there is no Windows staging channel, only stable.
-      - name: Mirror stable artifacts to rolling staging release
-        if: steps.release_guard.outputs.should_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STABLE_TAG: v${{ steps.release_guard.outputs.package_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          workdir="$(mktemp -d)"
-          gh release download "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
-          # Update in place instead of delete-then-recreate: a mid-step
-          # failure used to leave the release deleted, 404ing the beta
-          # updater endpoint until the next release. Binaries go up first
-          # and the updater manifest (latest.json) last, so the endpoint
-          # never points at assets that aren't there yet.
-          if gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            for f in "$workdir"/*; do
-              [ "$(basename "$f")" = "latest.json" ] && continue
-              gh release upload staging-rolling "$f" --clobber --repo "$GITHUB_REPOSITORY"
-            done
-            if [ -f "$workdir/latest.json" ]; then
-              gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
-            fi
-            gh release edit staging-rolling \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Headroom staging (rolling)" \
-              --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)."
-            # Prune assets left over from previous versions (different
-            # per-version filenames) now that the manifest points elsewhere.
-            for asset in $(gh release view staging-rolling --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
-              if [ ! -e "$workdir/$asset" ]; then
-                gh release delete-asset staging-rolling "$asset" --yes --repo "$GITHUB_REPOSITORY"
-              fi
-            done
-          else
-            gh release create staging-rolling \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Headroom staging (rolling)" \
-              --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)." \
-              --prerelease \
-              --target "$GITHUB_SHA" \
-              "$workdir"/*
-          fi
 
   windows:
     name: Windows x64
@@ -407,24 +374,77 @@ jobs:
           setup="$(ls "$bundle_dir"/*-setup.exe)"
           sig="${setup}.sig"
           [ -f "$sig" ] || { echo "updater signature missing: $sig" >&2; exit 1; }
-          asset_name="$(basename "$setup")"
 
-          # Installer before manifest, so the updater never points at an
-          # asset that isn't there yet (same rule as the staging mirror).
+          # The release is still a prerelease, so nothing polls it yet. The
+          # publish job reads this .sig back out to build the manifest.
           gh release upload "$STABLE_TAG" "$setup" "$sig" --clobber --repo "$GITHUB_REPOSITORY"
 
-          # Merge windows-x86_64 into the manifest tauri-action published in
-          # the macOS job. This job runs strictly after it (needs:), so there
-          # is no write race on latest.json.
+  publish:
+    name: Publish stable manifest
+    # Only after every platform bundle is in the release: this job writes the
+    # complete latest.json, then makes the release `latest` so installs see it.
+    needs: [release, windows]
+    if: needs.release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Complete the manifest and publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STABLE_TAG: v${{ needs.release.outputs.package_version }}
+        run: |
+          set -euo pipefail
           workdir="$(mktemp -d)"
-          gh release download "$STABLE_TAG" --pattern latest.json --dir "$workdir" --repo "$GITHUB_REPOSITORY"
+          gh release download "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
+
+          # tauri-action wrote a darwin-only manifest whose URLs point at this
+          # tag. Merge windows-x86_64 the same way, so the one file is valid on
+          # the stable release and on staging-rolling (whose assets are pruned
+          # by the next rc, and so must never be a manifest target).
+          win_sig="$(ls "$workdir"/*-setup.exe.sig)"
           jq \
-            --arg signature "$(cat "$sig")" \
-            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${STABLE_TAG}/${asset_name}" \
+            --arg signature "$(cat "$win_sig")" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${STABLE_TAG}/$(basename "${win_sig%.sig}")" \
             '.platforms["windows-x86_64"] = {signature: $signature, url: $url}' \
             "$workdir/latest.json" > "$workdir/latest.merged.json"
           mv "$workdir/latest.merged.json" "$workdir/latest.json"
           gh release upload "$STABLE_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+
+          # Manifest complete: hand the release to the stable updater endpoint.
+          gh release edit "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+
+          # Beta installs poll staging-rolling; a newer stable has to reach them
+          # too. Update in place rather than delete-then-recreate: a mid-step
+          # failure used to leave the release deleted, 404ing that endpoint
+          # until the next release. Binaries first, latest.json last.
+          if gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            for f in "$workdir"/*; do
+              [ "$(basename "$f")" = "latest.json" ] && continue
+              gh release upload staging-rolling "$f" --clobber --repo "$GITHUB_REPOSITORY"
+            done
+            gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit staging-rolling \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom staging (rolling)" \
+              --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)."
+            # Prune assets left over from previous versions (different
+            # per-version filenames) now that the manifest points elsewhere.
+            for asset in $(gh release view staging-rolling --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
+              if [ ! -e "$workdir/$asset" ]; then
+                gh release delete-asset staging-rolling "$asset" --yes --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+          else
+            gh release create staging-rolling \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom staging (rolling)" \
+              --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)." \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              "$workdir"/*
+          fi
 
           # The windows-preview channel is retired (its workflow is deleted),
           # but installs from it still poll windows-preview/latest.json. Keep

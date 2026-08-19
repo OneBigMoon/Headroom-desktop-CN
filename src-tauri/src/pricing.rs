@@ -5711,7 +5711,7 @@ mod tests {
             // Pin app_data_dir into the scratch dir: the debug keychain store
             // lives under it, and dirs::data_local_dir() ignores HOME/XDG on
             // macOS/Windows — under nextest (process per test) parallel tests
-            // would otherwise share and race one real dev-secrets store.
+            // would otherwise share and race one real file-backed secret store.
             std::env::set_var(
                 "HEADROOM_DATA_DIR",
                 scratch.path().join(".local").join("share").join("Headroom"),

@@ -6623,13 +6623,15 @@ fn diagnose_proxy_port(port: u16) -> PortState {
         // like our managed backend — an unrelated local HTTP server (dev
         // server, docker forward) squatting the port must route to the
         // foreign fallback-port path instead of being SIGKILLed.
-        let detail = lsof_listener(port).unwrap_or_else(|| "unknown process".into());
-        match parse_pid_from_lsof_detail(&detail) {
-            Some(pid) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
-            _ => PortState::ForeignOccupant(detail),
+        match listener_process(port) {
+            Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
+            Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
+            None => PortState::ForeignOccupant("unknown process".into()),
         }
     } else {
-        PortState::ForeignOccupant(lsof_listener(port).unwrap_or_else(|| "unknown process".into()))
+        PortState::ForeignOccupant(
+            listener_detail(port).unwrap_or_else(|| "unknown process".into()),
+        )
     }
 }
 
@@ -6676,29 +6678,97 @@ fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
     }
 }
 
-fn lsof_listener(port: u16) -> Option<String> {
-    // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
-    // selector (lsof ORs `-i` options) and match every listening socket on
-    // the machine, so `nth(1)` would return an unrelated daemon's pid.
-    let output = crate::proc::command("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
-        .output()
-        .ok()?;
+/// The process listening on `port`, as `(command, pid)`.
+///
+/// lsof lives in /usr/sbin on macOS but /usr/bin on Linux, and Debian-family
+/// images often omit it entirely, so try both paths and then fall back to `ss`
+/// (iproute2, present on every Linux we ship to).
+///
+/// `None` means "could not identify the listener" — never "nothing is
+/// listening" and never "it is not ours". Both the port-reclaim kill path and
+/// the stale-argv check hang off this, so neither may treat None as evidence.
+fn listener_process(port: u16) -> Option<(String, u32)> {
+    for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
+        // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
+        // selector (lsof ORs `-i` options) and match every listening socket on
+        // the machine, so the first row would be an unrelated daemon.
+        let Ok(output) = crate::proc::command(lsof)
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .output()
+        else {
+            continue; // not installed at this path
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Some(found) = parse_lsof_listener(&String::from_utf8_lossy(&output.stdout)) {
+            return Some(found);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    return ss_listener(port);
+    #[cfg(not(target_os = "linux"))]
+    return None;
+}
+
+/// `(command, pid)` from the first data row of `lsof -nP -iTCP -sTCP:LISTEN`,
+/// whose columns start `COMMAND PID`. Row 0 is the header.
+fn parse_lsof_listener(text: &str) -> Option<(String, u32)> {
+    let mut fields = text.lines().nth(1)?.split_whitespace();
+    let command = fields.next()?.to_string();
+    let pid = fields.next()?.parse().ok()?;
+    Some((command, pid))
+}
+
+/// lsof-less fallback. `ss` only fills the `users:` field for processes the
+/// caller owns, which covers the case that matters — our own backend. Someone
+/// else's daemon on our port stays "unknown process", which is the honest
+/// answer and routes to the fallback port instead of the kill path.
+#[cfg(target_os = "linux")]
+fn ss_listener(port: u16) -> Option<(String, u32)> {
+    let output = crate::proc::command("ss").arg("-ltnp").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().nth(1)?;
-    let mut fields = line.split_whitespace();
-    let cmd = fields.next()?;
-    let pid = fields.next()?;
-    Some(format!("{cmd} pid {pid}"))
+    parse_ss_listener(&String::from_utf8_lossy(&output.stdout), port)
+}
+
+/// Pick the LISTEN row whose local address ends in `:{port}` and pull
+/// `(command, pid)` from its `users:(("python",pid=1234,fd=7))` field.
+///
+/// Filtered here rather than with an `ss` filter expression: the column layout
+/// is stable across iproute2 versions, and a filter expression we got subtly
+/// wrong would hand a *different* process's pid to the kill path.
+// Only called on Linux, but compiled everywhere so the parser stays testable.
+#[allow(dead_code)]
+fn parse_ss_listener(text: &str, port: u16) -> Option<(String, u32)> {
+    let suffix = format!(":{port}");
+    let row = text.lines().find(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("LISTEN") && fields.nth(2).is_some_and(|addr| addr.ends_with(&suffix))
+    })?;
+    let users = row.split("users:((").nth(1)?;
+    let command = users.strip_prefix('"')?.split('"').next()?.to_string();
+    let pid = users
+        .split("pid=")
+        .nth(1)?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((command, pid))
+}
+
+/// `listener_process` formatted as the `"cmd pid 1234"` detail string the
+/// port-conflict marker and its bail messages carry.
+fn listener_detail(port: u16) -> Option<String> {
+    listener_process(port).map(|(command, pid)| format!("{command} pid {pid}"))
 }
 
 /// Extract the numeric pid from a `"cmd pid 1234"` string returned by
-/// [`lsof_listener`]. Returns None for the `"unknown process"` placeholder
+/// [`listener_detail`]. Returns None for the `"unknown process"` placeholder
 /// or any unparseable shape. Companion to `port_conflict::parse_occupant`,
-/// which works on the full bail string instead of the lsof detail.
+/// which works on the full bail string instead of the occupant detail.
 fn parse_pid_from_lsof_detail(detail: &str) -> Option<u32> {
     let idx = detail.rfind(" pid ")?;
     detail[idx + " pid ".len()..].trim().parse().ok()
@@ -6767,10 +6837,7 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
         bail!("{}", format_already_running_bail(port));
     }
-    let Some(pid) = lsof_listener(port)
-        .as_deref()
-        .and_then(parse_pid_from_lsof_detail)
-    else {
+    let Some((_, pid)) = listener_process(port) else {
         bail!("{}", format_already_running_bail(port));
     };
     // Belt-and-braces identity gate (diagnose_proxy_port already filters, but
@@ -7046,7 +7113,7 @@ fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
 /// Returns the full command line of whatever process is currently listening on
 /// the proxy port, or `None` if we couldn't determine it.
 pub fn running_proxy_argv() -> Option<String> {
-    let pid = lsof_listener_pid(backend_port::get())?;
+    let (_, pid) = listener_process(backend_port::get())?;
     ps_command(pid)
 }
 
@@ -7054,7 +7121,11 @@ pub fn running_proxy_argv() -> Option<String> {
 /// to pass. Used to detect proxies left over from an older desktop version.
 pub fn running_proxy_matches_expected_args() -> bool {
     let Some(argv) = running_proxy_argv() else {
-        return false;
+        // Fail open. The caller kills the backend when this is false, and
+        // "we could not read the listener's argv" is not evidence that it is
+        // stale. Returning false here meant every ensure-running pass on a
+        // host we cannot introspect killed and respawned a healthy backend.
+        return true;
     };
     proxy_argv_contains_expected_flags(&argv, !crate::client_adapters::is_auto_learn_disabled())
 }
@@ -7074,19 +7145,6 @@ fn proxy_argv_contains_expected_flags(argv: &str, learn_enabled: bool) -> bool {
 /// and `--learn` doesn't match `--no-learn`.
 fn argv_contains_flag(argv: &str, flag: &str) -> bool {
     argv.split_whitespace().any(|tok| tok == flag)
-}
-
-fn lsof_listener_pid(port: u16) -> Option<u32> {
-    let output = crate::proc::command("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .find_map(|line| line.strip_prefix('p').and_then(|n| n.trim().parse().ok()))
 }
 
 fn ps_command(pid: u32) -> Option<String> {
@@ -8714,18 +8772,19 @@ mod tests {
         format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, pending_addon_update, pinned_headroom_release, pip_failure_category,
-        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
-        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
+        parse_pid_from_lsof_detail, parse_ss_listener, path_with_binary_dir, pending_addon_update,
+        pinned_headroom_release, pip_failure_category, plugin_install_failure_category,
+        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
+        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
+        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
+        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -9943,6 +10002,38 @@ mod tests {
             parse_pid_from_lsof_detail("Google Chrome Helper pid 4242"),
             Some(4242)
         );
+    }
+
+    #[test]
+    fn parse_lsof_listener_reads_the_row_below_the_header() {
+        let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+                   python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";
+        assert_eq!(parse_lsof_listener(out), Some(("python".into(), 12345)));
+        // Header only: lsof found nothing, which is not a listener.
+        assert_eq!(
+            parse_lsof_listener("COMMAND   PID USER   FD   TYPE DEVICE\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_ss_listener_picks_the_row_for_the_requested_port() {
+        let out = "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n\
+             LISTEN 0      4096       127.0.0.1:16768      0.0.0.0:*     users:((\"decoy\",pid=1,fd=3))\n\
+             LISTEN 0      4096       127.0.0.1:6768       0.0.0.0:*     users:((\"python\",pid=12345,fd=7))\n";
+        // :16768 must not satisfy a :6768 lookup.
+        assert_eq!(parse_ss_listener(out, 6768), Some(("python".into(), 12345)));
+        assert_eq!(parse_ss_listener(out, 16768), Some(("decoy".into(), 1)));
+        assert_eq!(parse_ss_listener(out, 9999), None);
+    }
+
+    #[test]
+    fn parse_ss_listener_returns_none_without_process_ownership() {
+        // ss omits `users:` for processes the caller does not own. Guessing a
+        // pid here would point the kill path at the wrong process.
+        let out = "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n\
+                   LISTEN 0      4096       0.0.0.0:6768       0.0.0.0:*\n";
+        assert_eq!(parse_ss_listener(out, 6768), None);
     }
 
     #[test]

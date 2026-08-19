@@ -495,6 +495,10 @@ pub struct AppState {
     /// the proxy intercept (`proxy_intercept::decode_codex_plan_tier`). Read by
     /// `pricing::fetch_codex_usage` to pick the recommended upgrade tier.
     pub codex_plan_tier: Arc<Mutex<Option<crate::models::CodexPlanTier>>>,
+    /// Why the always-on intercept is not listening on 6767, written by
+    /// `proxy_intercept::spawn`. Separate from `last_startup_error` (which the
+    /// Python runtime's start path clears) because the two fail independently.
+    pub intercept_bind_error: crate::proxy_intercept::BindErrorSlot,
     /// When true, the Rust intercept on :6767 forwards traffic directly to
     /// api.anthropic.com instead of the Python proxy on :6768. Flipped on by
     /// `enforce_pricing_gate` once a Pro/Max user crosses the disable threshold
@@ -668,6 +672,7 @@ impl AppState {
             claude_bearer_token: Arc::new(Mutex::new(None)),
             codex_rate_limits: Arc::new(Mutex::new(None)),
             codex_plan_tier: Arc::new(Mutex::new(None)),
+            intercept_bind_error: Arc::new(Mutex::new(None)),
             proxy_bypass: Arc::new(AtomicBool::new(false)),
             claude_only_bypass: Arc::new(AtomicBool::new(false)),
             codex_bypass: Arc::new(AtomicBool::new(false)),
@@ -3120,7 +3125,18 @@ impl AppState {
         let effective_running = installed && !paused && proxy_reachable;
 
         let startup_error = self.last_startup_error.lock().clone();
-        let startup_error_hint = startup_error.as_deref().and_then(classify_startup_error);
+        // A failed intercept bind outranks any backend startup error: every
+        // client is hard-configured to 127.0.0.1:6767, so nothing routes no
+        // matter how healthy the Python runtime is, and the backend's own
+        // error (if any) is downstream noise. Without this the banner reports
+        // "runtime offline, proxy unreachable" and points the user at the
+        // runtime, while the actual cause is that the port never opened.
+        let startup_error_hint = self
+            .intercept_bind_error
+            .lock()
+            .as_deref()
+            .map(intercept_bind_hint)
+            .or_else(|| startup_error.as_deref().and_then(classify_startup_error));
 
         RuntimeStatus {
             platform: platform.into(),
@@ -6866,6 +6882,31 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     None
 }
 
+/// Explain a failed intercept bind in the terms the user can act on.
+///
+/// Windows reserves TCP port blocks for Hyper-V, WSL2, Docker and the Windows
+/// container stack at boot. A port inside one of those ranges answers `bind`
+/// with WSAEADDRINUSE (os error 10048) while still refusing connections,
+/// because the range is reserved rather than listened on -- which is why the
+/// app reports the port as taken at the same moment Claude Code reports
+/// "connection refused".
+pub(crate) fn intercept_bind_hint(raw: &str) -> String {
+    let port = crate::proxy_intercept::INTERCEPT_PORT;
+    if raw.contains("os error 10048") {
+        return format!(
+            "Port {port} is reserved by Windows (usually a Hyper-V, WSL2, or Docker port \
+             range), so Headroom cannot open it and every client gets \"connection \
+             refused\". In an administrator terminal run `net stop winnat`, then `netsh int \
+             ipv4 add excludedportrange protocol=tcp startport={port} numberofports=2 \
+             store=persistent`, then reboot."
+        );
+    }
+    format!(
+        "Headroom cannot open port {port}, so no client traffic can reach it ({raw}). \
+         Another app is holding the port -- quit it, or reboot to clear stuck listeners."
+    )
+}
+
 fn is_headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_millis(1500))
 }
@@ -7328,9 +7369,10 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
-        hf_cache_grew, lifetime_output_savings_usd, lifetime_token_milestones_crossed,
-        log_mtime_advanced, merge_daily_savings, merge_hourly_savings, most_recent_monday,
-        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
+        lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
+        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
+        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, support_tier_for_platform,
         tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
@@ -7830,6 +7872,30 @@ mod tests {
             "port 6768 is occupied by a non-headroom process (pid 1234 node); cannot start proxy.";
         let hint = classify_startup_error(raw).expect("foreign port should classify");
         assert!(hint.contains("Reboot"), "got: {hint}");
+    }
+
+    /// Regression (Sentry RUST-7D, Windows Server 2022 + RUST-7B/64 in other
+    /// locales): a port inside a Hyper-V / WSL2 / Docker reserved range fails
+    /// `bind` with WSAEADDRINUSE while still refusing connections, so clients
+    /// see "connection refused" at the same moment the app sees "in use". The
+    /// banner must name the port, not the Python runtime -- which in that state
+    /// is running fine on a port of its own.
+    #[test]
+    fn intercept_bind_hint_names_windows_port_reservation() {
+        let hint = intercept_bind_hint(
+            "Only one usage of each socket address (protocol/network address/port) is \
+             normally permitted. (os error 10048)",
+        );
+        assert!(hint.contains("6767"), "{hint}");
+        assert!(hint.contains("Hyper-V"), "{hint}");
+        assert!(hint.contains("winnat"), "{hint}");
+    }
+
+    #[test]
+    fn intercept_bind_hint_falls_back_to_the_raw_cause() {
+        let hint = intercept_bind_hint("Address already in use (os error 48)");
+        assert!(hint.contains("os error 48"), "{hint}");
+        assert!(!hint.contains("winnat"), "{hint}");
     }
 
     #[test]

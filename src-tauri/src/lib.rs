@@ -712,13 +712,29 @@ async fn check_for_app_update(
         .build()
         .map_err(|err| err.to_string())?;
 
-    let checked_update = updater
-        .check()
-        .await
-        .map(|update| update.map(TauriPendingUpdate))
-        .map_err(|err| err.to_string());
+    let checked_update =
+        classify_update_check(updater.check().await).map(|update| update.map(TauriPendingUpdate));
 
     store_checked_update(checked_update, &pending_update.0)
+}
+
+/// A manifest with no entry for this platform means "nothing for you yet", not a
+/// failure worth showing. Both release workflows now publish latest.json only
+/// once every platform has built, but a channel can still legitimately omit one
+/// (linux-x86_64 ships on the rc channel only), and installs predating that fix
+/// would otherwise surface the raw "None of the fallback platforms ... were
+/// found" error in Tools status.
+fn classify_update_check<U>(
+    checked: Result<Option<U>, tauri_plugin_updater::Error>,
+) -> Result<Option<U>, String> {
+    match checked {
+        Ok(update) => Ok(update),
+        Err(
+            tauri_plugin_updater::Error::TargetNotFound(_)
+            | tauri_plugin_updater::Error::TargetsNotFound(_),
+        ) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -3730,9 +3746,15 @@ fn autolaunch(
     app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
 }
 
+#[cfg(target_os = "macos")]
 const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
      Move Headroom to /Applications and relaunch.";
+
+#[cfg(not(target_os = "macos"))]
+const AUTOSTART_UNAVAILABLE: &str =
+    "Autostart is unavailable: Headroom could not resolve its own application path. \
+     Reinstall Headroom and relaunch.";
 
 #[tauri::command]
 async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
@@ -4173,6 +4195,7 @@ pub fn run() {
                 std::sync::Arc::clone(&state.claude_only_bypass),
                 std::sync::Arc::clone(&state.codex_bypass),
                 fresh_bearer_tx,
+                std::sync::Arc::clone(&state.intercept_bind_error),
             );
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
@@ -6597,15 +6620,16 @@ mod tests {
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
         build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
-        classify_backend_readyz, classify_bootstrap_failure, classify_upgrade_error,
-        client_setup_error_kind, compute_tray_window_position, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, fetch_transformations_feed_from, format_token_count, install_pending_update,
-        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
-        is_port_conflict_failure, is_prerelease_version, learn_step_label,
-        lifetime_token_milestone_kind, noop_app_update_progress_emitter, onboarding_recovery_copy,
-        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
+        classify_upgrade_error, client_setup_error_kind, compute_tray_window_position,
+        count_memories_created_today, cpu_rate_indicates_burn, debounced_tray_runtime_visual,
+        delete_applied_pattern, empty_live_learnings_for_projects, exe_path_resolvable,
+        extract_llm_failure_warnings, fake_override, fetch_transformations_feed_from,
+        format_token_count, install_pending_update, is_disk_full_signal,
+        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -7273,6 +7297,33 @@ mod tests {
             stored.as_ref().expect("pending update").metadata(),
             existing
         );
+    }
+
+    #[test]
+    fn classify_update_check_treats_a_missing_platform_as_no_update() {
+        // What a Windows install saw while a release was mid-flight, before
+        // the workflows moved the manifest publish to the end.
+        let missing =
+            classify_update_check::<()>(Err(tauri_plugin_updater::Error::TargetsNotFound(vec![
+                "windows-x86_64-nsis".into(),
+                "windows-x86_64".into(),
+            ])))
+            .expect("a platform-less manifest is not an error");
+        assert!(missing.is_none());
+
+        assert!(
+            classify_update_check::<()>(Err(tauri_plugin_updater::Error::TargetNotFound(
+                "linux-x86_64".into()
+            )))
+            .expect("single-target miss is not an error")
+            .is_none()
+        );
+
+        let real = classify_update_check::<()>(Err(tauri_plugin_updater::Error::Network(
+            "connection reset".into(),
+        )))
+        .expect_err("other failures still bubble up");
+        assert!(real.contains("connection reset"), "{real}");
     }
 
     #[test]

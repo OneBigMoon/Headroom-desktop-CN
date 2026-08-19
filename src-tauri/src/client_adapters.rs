@@ -1093,10 +1093,13 @@ pub fn revert_external_mutations() -> Vec<String> {
         removed.extend(sweep_managed_backups(&target));
     }
 
-    // The LaunchAgent plist is an install side effect outside Headroom's own
-    // directories, so it belongs here and not with the user-data removal.
+    // The LaunchAgent plist and its Linux counterpart are install side effects
+    // outside Headroom's own directories, so they belong here and not with the
+    // user-data removal.
     #[cfg(target_os = "macos")]
     removed.extend(remove_macos_launch_agents());
+    #[cfg(target_os = "linux")]
+    removed.extend(remove_linux_autostart_entries());
 
     removed
 }
@@ -1601,6 +1604,31 @@ fn remove_macos_launch_agents() -> Vec<String> {
             .output();
         match std::fs::remove_file(&path) {
             Ok(_) => removed.push(path.display().to_string()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
+        }
+    }
+
+    removed
+}
+
+/// tauri-plugin-autostart writes `~/.config/autostart/<product name>.desktop`
+/// on Linux (auto-launch names the file after `package_info().name`). Left
+/// behind, it execs a binary uninstall just deleted, on every login — the same
+/// class of leftover as the macOS LaunchAgent plist.
+#[cfg(target_os = "linux")]
+fn remove_linux_autostart_entries() -> Vec<String> {
+    let mut removed = Vec::new();
+    let autostart_dir = home_dir().join(".config").join("autostart");
+
+    // Current product name, plus the binary name in case a build ever shipped
+    // the plugin's `app_name` override. Either can exist.
+    for name in ["Headroom.desktop", "headroom-desktop.desktop"] {
+        let path = autostart_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path.display().to_string()),
             Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
@@ -2535,6 +2563,11 @@ fn command_contains(command: &Value, fragment: &str) -> bool {
 }
 
 fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
+    // Deliberately the macOS path only. These keys were written into VS Code's
+    // settings.json by macOS-only builds; the connector has since moved to
+    // ~/.claude/settings.json, which is where every platform reads and writes
+    // today. No Linux or Windows build ever wrote a key for this to clean up,
+    // so there is nothing to make platform-aware here.
     let settings_path = home_dir()
         .join("Library")
         .join("Application Support")
@@ -3983,12 +4016,35 @@ fn guard_python_command() -> String {
     }
 }
 
-fn codex_guard_command() -> String {
-    format!(
-        "{} {}",
-        guard_python_command(),
-        codex_guard_hook_path().display()
+/// Join the guard interpreter and its script into a command string the host
+/// shell can actually run. Claude Code and Codex launch hooks through
+/// PowerShell on Windows, where a command that *starts* with a quoted path
+/// parses as a string literal rather than a command ("At line:1 char:81" --
+/// the offset lands on the unquoted script path), so the call operator is
+/// required and the script path needs quoting too because profile directories
+/// contain spaces. Deliberately not `shell_double_quote`: that escapes
+/// backslashes POSIX-style and would mangle every Windows path. PowerShell
+/// escapes with a backtick, and both `"` and backtick are invalid in Windows
+/// filenames, so bare double quotes are already sufficient.
+fn guard_command(script_path: &Path) -> String {
+    join_guard_command(
+        &guard_python_command(),
+        &script_path.to_string_lossy(),
+        cfg!(target_os = "windows"),
     )
+}
+
+/// Pure so the Windows branch is exercised by tests on every platform.
+fn join_guard_command(python: &str, script: &str, windows: bool) -> String {
+    if windows {
+        format!("& {python} \"{script}\"")
+    } else {
+        format!("{python} {script}")
+    }
+}
+
+fn codex_guard_command() -> String {
+    guard_command(&codex_guard_hook_path())
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -4333,6 +4389,15 @@ fn ensure_codex_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         false,
         Some(&["UserPromptSubmit"]),
     )?;
+    // Same stale-command migration as `ensure_claude_guard_hook`; see there.
+    if !codex_guard_registered().unwrap_or(false) {
+        remove_guard_hook_entries(
+            &codex_hooks_json_path(),
+            &script_path.display().to_string(),
+            false,
+            Some(&["SessionStart"]),
+        )?;
+    }
     let (mut changed, mut backups) = register_guard_hook_entries(
         &codex_hooks_json_path(),
         &codex_guard_command(),
@@ -4379,11 +4444,7 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    format!(
-        "{} {}",
-        guard_python_command(),
-        claude_guard_hook_path().display()
-    )
+    guard_command(&claude_guard_hook_path())
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -4541,6 +4602,21 @@ fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         false,
         Some(&["UserPromptSubmit"]),
     )?;
+    // Migration: the Windows command string changed (PowerShell needs the call
+    // operator), and `register_guard_hook_entries` dedupes on the exact command
+    // string, so an upgrading install would keep the old unparseable entry
+    // alongside the fixed one and keep erroring at every session start. Strip
+    // stale forms by script path -- but only when the current command is not
+    // already registered, since an unconditional remove-then-re-add would
+    // rewrite settings.json on every launch.
+    if !claude_guard_registered().unwrap_or(false) {
+        remove_guard_hook_entries(
+            &claude_settings_path(),
+            &script_path.display().to_string(),
+            false,
+            Some(&["SessionStart"]),
+        )?;
+    }
     let (mut changed, mut backups) = register_guard_hook_entries(
         &claude_settings_path(),
         &claude_guard_command(),
@@ -8686,6 +8762,43 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(codex_guard_command().contains("python.exe"));
         assert!(!claude_guard_command().starts_with("/usr/bin/python3"));
         assert!(!codex_guard_command().starts_with("/usr/bin/python3"));
+    }
+
+    /// Regression: Claude Code runs SessionStart hooks through PowerShell on
+    /// Windows. A command that starts with a quoted interpreter path parses as
+    /// a string literal, not a command, so the guard died with
+    /// "SessionStart:startup hook error / Failed with non-blocking status code:
+    /// At line:1 char:81" -- char 81 being the first character of the unquoted
+    /// script path that followed the 79-char quoted python path plus a space.
+    /// The call operator is what makes it a command, and the script path must
+    /// be quoted because profile directories contain spaces.
+    #[test]
+    fn windows_guard_command_is_powershell_callable() {
+        let cmd = super::join_guard_command(
+            "\"C:\\Users\\garm\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe\"",
+            "C:\\Users\\garm space\\.claude\\hooks\\headroom-claude-guard.py",
+            true,
+        );
+        assert!(
+            cmd.starts_with("& \""),
+            "PowerShell needs the call operator before a quoted path, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with("headroom-claude-guard.py\""),
+            "script path must be quoted so spaces survive, got: {cmd}"
+        );
+        // Backslashes stay single: PowerShell escapes with a backtick, so
+        // POSIX-style doubling would break every Windows path.
+        assert!(
+            !cmd.contains("\\\\"),
+            "path must not be POSIX-escaped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn unix_guard_command_is_unquoted() {
+        let cmd = super::join_guard_command("/usr/bin/python3", "/home/g/.claude/guard.py", false);
+        assert_eq!(cmd, "/usr/bin/python3 /home/g/.claude/guard.py");
     }
 
     #[cfg(target_os = "windows")]

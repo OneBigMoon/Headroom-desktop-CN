@@ -441,6 +441,13 @@ pub type BypassFlag = Arc<AtomicBool>;
 /// JWT and read by `pricing::fetch_codex_usage` to pick the recommended tier.
 pub type CodexPlanSlot = Arc<Mutex<Option<crate::models::CodexPlanTier>>>;
 
+/// Why the intercept is not listening on [`INTERCEPT_PORT`], or `None` while it
+/// is serving normally. Shared with `AppState::intercept_bind_error` so the UI
+/// can name the real cause: clients are hard-configured to 127.0.0.1:6767, so a
+/// failed bind refuses every request regardless of the Python backend's state,
+/// and the banner would otherwise blame the runtime.
+pub type BindErrorSlot = Arc<Mutex<Option<String>>>;
+
 /// Channel sender used to notify a background worker that the intercept just
 /// captured a bearer token whose value differs from whatever was previously
 /// in the slot. Empty payload — the worker reads the bearer from `AppState`
@@ -462,6 +469,7 @@ pub fn spawn(
     claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
+    bind_error: BindErrorSlot,
 ) {
     let upstream_base = Arc::new(ANTHROPIC_DIRECT_BASE.to_string());
     std::thread::Builder::new()
@@ -493,6 +501,7 @@ pub fn spawn(
                         codex_bypass.clone(),
                         fresh_bearer_tx.clone(),
                         upstream_base.clone(),
+                        bind_error.clone(),
                     )
                     .await
                     {
@@ -509,6 +518,13 @@ pub fn spawn(
                                     "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
                                 );
                             } else {
+                                // Nothing answered /health, so the port is held
+                                // without being served -- on Windows this is
+                                // what a reserved (Hyper-V/WSL2/Docker) range
+                                // looks like: bind says in-use, connect is
+                                // refused. Surface it; the app is dead to every
+                                // client until it clears.
+                                *bind_error.lock() = Some(e.to_string());
                                 log::warn!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
                                 );
@@ -523,6 +539,7 @@ pub fn spawn(
                             }
                         }
                         Err(e) => {
+                            *bind_error.lock() = Some(e.to_string());
                             log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
                             if reported_errors.insert(e.to_string()) {
                                 sentry::capture_message(
@@ -539,6 +556,7 @@ pub fn spawn(
         .expect("spawn proxy intercept thread");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     bind_addr: SocketAddr,
     token_slot: SharedToken,
@@ -549,8 +567,12 @@ async fn run(
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
+    bind_error: BindErrorSlot,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
+    // Serving again: clear whatever the previous attempt recorded so a
+    // recovered port stops showing a stale cause in the UI.
+    *bind_error.lock() = None;
 
     loop {
         match listener.accept().await {
@@ -2782,6 +2804,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -2886,6 +2909,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -3463,6 +3487,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base_arc,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -3607,6 +3632,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base_arc,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -3703,6 +3729,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -4037,6 +4064,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -4143,6 +4171,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
