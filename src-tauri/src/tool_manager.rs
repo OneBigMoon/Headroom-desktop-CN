@@ -2028,10 +2028,11 @@ impl ToolManager {
                     log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
                 }
 
-                // Holdout is off (HEADROOM_OUTPUT_HOLDOUT=0); clear any control
-                // samples an earlier holdout collected so the proxy reports the
-                // synthetic-control estimate instead of a broken "measured" one.
-                purge_output_savings_control_arm();
+                // Drop control samples left by the abandoned 1% holdout before
+                // the 3% one starts filling the arm. One shot, stamped: from
+                // here on the control arm is live data and clearing it every
+                // spawn would empty it as fast as it fills.
+                purge_legacy_output_savings_control_arm_once();
 
                 // Cross-turn dedup + cold-prefix recompaction (headroom-ai
                 // 0.33.0; older fallback runtimes ignore unknown envs).
@@ -2217,14 +2218,37 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
-                    // No A/B holdout: shape every conversation. A 1% unshaped
-                    // control arm was tried, but a near-empty control produced a
-                    // wildly wrong "measured" reduction (e.g. -1439.9% from a
-                    // handful of stale samples), so we stopped collecting it. With
-                    // holdout 0 the proxy reports the synthetic-control estimate.
-                    // purge_output_savings_control_arm() clears control samples
-                    // collected while the holdout was on.
-                    .env("HEADROOM_OUTPUT_HOLDOUT", "0")
+                    // 3% of conversations run unshaped, as the control arm of a
+                    // standing A/B. This is the only way the output-shaping
+                    // number ever stops being a counterfactual: the seeded
+                    // baseline is frozen at install time and cannot be relearned
+                    // (every transcript written since is already shaped, so a
+                    // re-learn would collapse the baseline onto the treatment
+                    // mean and report ~0 savings). Control conversations are the
+                    // only unshaped replies we will ever see again.
+                    //
+                    // Assignment is per conversation (`assign_arm` hashes the
+                    // conversation key), so a conversation never flips mid-stream
+                    // and the prefix cache stays stable.
+                    //
+                    // 1% was tried first and abandoned, but the fraction was
+                    // never the bug: `best_estimate` prefers the measured number
+                    // as soon as ONE stratum holds a sample in both arms, which
+                    // is how three stale control samples reported -1439.9%. The
+                    // desktop no longer reads that figure -- `output_savings`
+                    // recomputes both estimators from the ledger and only shows
+                    // the measured one once it covers real traffic at a usable
+                    // band -- so collecting the arm is now safe. At 1% a heavy
+                    // user needs ~90 days to reach a +/-13pp band and a light one
+                    // never gets there; 3% reaches the same precision in ~30 days
+                    // and still costs only 3% of conversations.
+                    //
+                    // Invisible to the compression figures: the arm gates the
+                    // `shape_request` call alone, so control conversations are
+                    // compressed, memory-augmented and cache-aligned exactly like
+                    // any other, and the input-savings rate is priced off
+                    // `cost.total_input_cost_usd`, which no output token enters.
+                    .env("HEADROOM_OUTPUT_HOLDOUT", "0.03")
                     // Agent savings persona (new in headroom-ai 0.30.0). The
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
@@ -7889,17 +7913,13 @@ fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_command(python, args, cwd)
 }
 
-/// Path to the output-shaper savings ledger. Mirrors headroom's
-/// `workspace_dir()` default of `~/.headroom` (neither the proxy nor the
-/// seeding run sets `HEADROOM_WORKSPACE_DIR`, so both resolve here).
+/// Path to the output-shaper savings ledger, which `output_savings` also reads
+/// to recompute the estimate the dashboard shows.
 fn output_savings_ledger_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".headroom").join("output_savings.json"))
+    crate::output_savings::ledger_path()
 }
 
-/// Core of [`purge_output_savings_control_arm`]: given the ledger bytes, return
+/// Core of [`purge_legacy_output_savings_control_arm_once`]: given the ledger bytes, return
 /// rewritten bytes when a non-empty `control` arm was cleared, else `None`
 /// (missing/empty control, or unparseable input we must not clobber).
 fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -7917,28 +7937,44 @@ fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&ledger).ok()
 }
 
-/// Drop the output-shaper A/B control arm from the savings ledger.
+/// Drop the output-shaper A/B control arm left over from the abandoned 1%
+/// holdout, exactly once.
 ///
-/// The desktop no longer runs a holdout (HEADROOM_OUTPUT_HOLDOUT=0), but control
-/// samples collected while it was on keep the proxy's `best_estimate` pinned to
-/// the "measured" number — which, on a near-empty control arm, blows up to
-/// nonsense (e.g. -1439.9% from 3 stale samples). Emptying `control` makes the
-/// proxy's `estimate_from_holdout` return None, so /stats falls back to the
-/// synthetic-control estimate. Idempotent one-shot, best-effort: never touch a
-/// missing or unparseable ledger, and only rewrite when there is control data to
-/// drop. Uses atomic_write so a crash mid-write can't truncate the ledger.
-fn purge_output_savings_control_arm() {
+/// Those samples predate the current shaper and were collected under a policy
+/// that never gathered enough of them to mean anything, so folding them into
+/// the 3% arm would poison it from the first request. Clearing them on every
+/// spawn is not an option either: the arm is live data now, and this runs each
+/// time the proxy starts.
+///
+/// The stamp sits beside the ledger on purpose. A reset that removes
+/// `~/.headroom` takes the control samples with it, so the stamp going too is
+/// correct — there is nothing left to purge either way.
+///
+/// Best-effort throughout: never touch a missing or unparseable ledger, and
+/// only rewrite when there is control data to drop. Uses `atomic_write` so a
+/// crash mid-write cannot truncate the ledger.
+fn purge_legacy_output_savings_control_arm_once() {
     let Some(path) = output_savings_ledger_path() else {
         return;
     };
+    let stamp = path.with_file_name(".legacy-control-arm-purged");
+    if stamp.exists() {
+        return;
+    }
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    let Some(out) = ledger_bytes_without_control(&bytes) else {
-        return;
-    };
-    if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
-        log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
+    if let Some(out) = ledger_bytes_without_control(&bytes) {
+        if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
+            log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
+            // Leave the stamp unwritten so the next spawn retries; a failed
+            // purge must not be recorded as a done one.
+            return;
+        }
+        log::info!("[tool_manager] cleared legacy output-shaper control arm");
+    }
+    if let Err(err) = crate::client_adapters::atomic_write(&stamp, b"") {
+        log::warn!("[tool_manager] stamping legacy control-arm purge failed: {err}");
     }
 }
 
@@ -8185,6 +8221,14 @@ fn pip_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
+    } else if lower.contains("no matching distribution found")
+        || lower.contains("could not find a version that satisfies")
+    {
+        // Our lock asked for a version PyPI has no wheel for on that
+        // interpreter/platform (RUST-6S: onnxruntime==1.27.0 on Intel macOS,
+        // where releases stop at 1.23.2). That is a bad pin in *our* lock, not
+        // the user's machine -- it must never sit in the "other" grab-bag.
+        "no-matching-dist"
     } else if lower.contains("no usable temporary directory") {
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
@@ -8658,15 +8702,15 @@ mod tests {
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
         path_with_binary_dir, pending_addon_update, pinned_headroom_release, pip_failure_category,
         plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
-        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
+        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -8837,6 +8881,32 @@ mod tests {
         assert!(ledger_bytes_without_control(br#"{"control":{}}"#).is_none());
         assert!(ledger_bytes_without_control(br#"{"treatment":{"k":{"n":1}}}"#).is_none());
         assert!(ledger_bytes_without_control(b"{not json").is_none());
+    }
+
+    #[test]
+    fn legacy_control_arm_is_purged_once_then_left_to_fill() {
+        let root = std::env::temp_dir().join(format!("headroom-purge-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _guard = HomeGuard::new(&root);
+        let ledger = root.join(".headroom").join("output_savings.json");
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let with_control =
+            br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
+
+        // Samples from the abandoned 1% holdout go.
+        std::fs::write(&ledger, with_control).unwrap();
+        purge_legacy_output_savings_control_arm_once();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(v["control"].as_object().unwrap().len(), 0);
+
+        // The 3% arm now fills on every proxy spawn. Purging again would empty
+        // it as fast as it fills, so the stamp has to hold.
+        std::fs::write(&ledger, with_control).unwrap();
+        purge_legacy_output_savings_control_arm_once();
+        assert_eq!(std::fs::read(&ledger).unwrap(), with_control);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -12228,6 +12298,12 @@ exit 0
                 "disk-full",
             ),
             ("exit=1; stderr tail: Check the permissions.", "permission"),
+            (
+                "exit=1; stderr tail: ERROR: Could not find a version that satisfies the \
+                 requirement onnxruntime==1.27.0 (from versions: 1.23.2)\nERROR: No matching \
+                 distribution found for onnxruntime==1.27.0",
+                "no-matching-dist",
+            ),
             (
                 "exit=1; stderr tail: ERROR: Could not install packages due to an OSError: \
                  [Errno 2] No such file or directory: 'C:\\\\...\\\\INSTALLERvp0i8uew.tmp'",

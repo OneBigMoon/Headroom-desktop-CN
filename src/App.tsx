@@ -7554,7 +7554,7 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex, and shapes the replies that come back.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
@@ -7568,25 +7568,29 @@ export default function App() {
                           <span>Output shaping (Headroom)</span>
                           <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
                         </div>
-                        {/* This row is a lifetime figure from the shaper's own
-                            estimator, which predates per-day tracking of the
-                            layer -- so the daily bars can add up to less. */}
+                        {/* Lifetime figure, recomputed from the shaper's ledger
+                            (see output_savings.rs) and predating per-day
+                            tracking of the layer -- so the daily bars can add
+                            up to less. `requests` counts what the estimate
+                            actually covers, not every shaped request: strata
+                            the baseline never observed are excluded rather
+                            than scored against a global mean. */}
                         <p className="savings-breakdown__note">
-                          Output shaping is a counterfactual: Headroom compares each reply against a
-                          baseline learned from your own past replies
-                          {dashboard.outputReduction
-                            ? `, across ${compactNumber(dashboard.outputReduction.requests)} requests`
-                            : ""}
-                          . It covers every request since that baseline was built, so it can exceed
-                          what the daily bars show.
+                          {dashboard.outputReduction?.method === "measured"
+                            ? `Output savings are measured: a small share of conversations run unshaped as a control group, and Headroom compares your shaped replies against them across ${compactNumber(dashboard.outputReduction.requests)} requests.`
+                            : `Output savings are counterfactual: Headroom compares each reply against a baseline learned from your past replies${
+                                dashboard.outputReduction
+                                  ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
+                                  : ""
+                              }.`}
                         </p>
                       </>
                     ) : null}
-                    {(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0) >= 0.005 ? (
+                    {(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0) > 0 ? (
                       <>
                         <div className="savings-breakdown__row">
                           <span>Tool schemas deferred (Headroom)</span>
-                          <strong>{currency(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
+                          <strong>{currencyExact(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
                         </div>
                         {/* Priced at the cache-read rate, not the input rate --
                             see tool_schema_savings_usd in state.rs. */}
@@ -7594,8 +7598,7 @@ export default function App() {
                           {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
                           of tool definitions Headroom kept out of your requests until they were
                           needed. These sit at the front of the cached prefix, so they are priced at
-                          the provider's cache-read rate rather than the full input rate. Counted from
-                          the day this build started tracking the layer.
+                          the provider's cache-read rate rather than the full input rate.
                         </p>
                       </>
                     ) : null}
@@ -7606,9 +7609,9 @@ export default function App() {
                           <strong>{currency(dashboard.savingsBreakdown.cacheSavingsUsd)}</strong>
                         </div>
                         <p className="savings-breakdown__note">
-                          Cache discounts are earned by your client's own prompt caching, so Headroom
-                          never counts them in its savings. Headroom's compression is cache-aligned:
-                          it only touches content outside the cached prefix, keeping that discount intact.
+                          Cache discounts are earned by your coding agent's own prompt caching. Headroom
+                          never counts them as its savings. Headroom compression is cache-aligned:
+                          it only touches content outside the cache.
                         </p>
                       </>
                     ) : null}
@@ -7642,17 +7645,6 @@ export default function App() {
                     ) : null}
                   </div>
                 ) : null}
-                {/* The cache-discount haircut applies to input compression only.
-                    Output tokens are never served from a prompt cache, and the
-                    tool-schema row already carries the cache-read price, so
-                    halving either would understate the floor. */}
-                <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed input tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(
-                  dashboard.savingsBreakdown
-                    ? dashboard.savingsBreakdown.compressionSavingsUsd * 0.5 +
-                        dashboard.savingsBreakdown.outputSavingsUsd +
-                        (dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)
-                    : dashboard.lifetimeEstimatedSavingsUsd * 0.5
-                )}</strong>.</p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"

@@ -27,7 +27,7 @@ brew install --cask headroom
 
 Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings. Both install paths self-update via the app's built-in updater; the Homebrew cask stays current with each release too.
 
-Linux preview artifacts are published to the rolling [`linux-preview`](https://github.com/gglucass/headroom-desktop/releases/tag/linux-preview) prerelease, not to the stable release page, and are cut on demand rather than with every version. Take the `.AppImage` if you want the built-in updater; the `.deb` installs the same build but updates only by downloading a newer one. Treat this as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. The Linux runtime installs a proxy-only subset of the Python stack, so memory and ML extras that the macOS build ships are absent.
+Linux preview artifacts are published to the rolling [`staging-rolling`](https://github.com/gglucass/headroom-desktop/releases/tag/staging-rolling) prerelease, not to the stable release page, and are cut with every release candidate. Take the `.AppImage` if you want the built-in updater; the `.deb` installs the same build but updates only by downloading a newer one. Treat this as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. The Linux runtime installs a proxy-only subset of the Python stack, so memory and ML extras that the macOS build ships are absent.
 
 ---
 

@@ -2317,15 +2317,32 @@ impl AppState {
 
         let mut savings_breakdown = history.as_ref().and_then(|h| h.lifetime.clone());
 
-        let output_reduction = stats
+        // Recomputed from the shaper's own ledger rather than taken from
+        // `/stats`, which credits strata the baseline never observed against a
+        // global mean and flips to the A/B number on a single sample per arm.
+        // See `output_savings`. Falls back to the backend's figure when the
+        // ledger is missing or mid-write, so a torn read never blanks the tile.
+        let ledger_estimate = crate::output_savings::estimate();
+        let output_reduction = ledger_estimate
             .as_ref()
-            .and_then(|s| s.output_reduction.as_ref())
-            .map(|o| crate::models::OutputReduction {
-                method: o.method.clone(),
-                reduction_percent: o.reduction_percent,
-                ci_low_percent: o.ci_low_percent,
-                ci_high_percent: o.ci_high_percent,
-                requests: o.requests,
+            .map(|e| crate::models::OutputReduction {
+                method: e.method.to_string(),
+                reduction_percent: e.reduction_percent,
+                ci_low_percent: e.ci_low_percent,
+                ci_high_percent: e.ci_high_percent,
+                requests: e.requests,
+            })
+            .or_else(|| {
+                stats
+                    .as_ref()
+                    .and_then(|s| s.output_reduction.as_ref())
+                    .map(|o| crate::models::OutputReduction {
+                        method: o.method.clone(),
+                        reduction_percent: o.reduction_percent,
+                        ci_low_percent: o.ci_low_percent,
+                        ci_high_percent: o.ci_high_percent,
+                        requests: o.requests,
+                    })
             });
 
         let learner_progress = stats.as_ref().and_then(|s| s.learner_progress.clone());
@@ -2443,12 +2460,20 @@ impl AppState {
         // off the last persisted estimator reading instead of the bucket sum,
         // so the headline doesn't dip by hundreds of dollars for the first
         // minutes and then jump back up.
+        // Same ledger recomputation as the tile above: the dollar row and the
+        // percentage have to describe one estimate, or the drill-down stops
+        // explaining the headline.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            stats
+            ledger_estimate
                 .as_ref()
-                .and_then(|s| s.output_reduction.as_ref())
-                .map(|r| r.tokens_saved)
+                .map(|e| e.tokens_saved)
+                .or_else(|| {
+                    stats
+                        .as_ref()
+                        .and_then(|s| s.output_reduction.as_ref())
+                        .map(|r| r.tokens_saved)
+                })
                 .or(cached_output_estimator_tokens),
         );
         let lifetime_tool_schema_savings_usd =
@@ -4562,7 +4587,20 @@ impl SavingsTracker {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
         }
-        self.sample_output_reduction(stats);
+        // Sampled from the locally recomputed estimate, not the backend's, so
+        // the daily bars and the headline describe one number -- and so the
+        // A/B holdout switching `/stats` to its "measured" figure can never
+        // show up as a phantom delta here.
+        self.sample_output_reduction(
+            crate::output_savings::estimate()
+                .map(|e| (e.tokens_saved, e.baseline_tokens))
+                .or_else(|| {
+                    stats
+                        .output_reduction
+                        .as_ref()
+                        .map(|r| (r.tokens_saved, r.baseline_tokens))
+                }),
+        );
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -4998,11 +5036,10 @@ impl SavingsTracker {
     /// regressed reading alone bills the backend's entire catch-up climb to
     /// the launch bucket (2026-08-17: 906k phantom saved tokens, ~2.8x, from
     /// one backend restart 15s after the app started).
-    fn sample_output_reduction(&mut self, stats: &HeadroomDashboardStats) {
-        let Some(reduction) = stats.output_reduction.as_ref() else {
+    fn sample_output_reduction(&mut self, current: Option<(u64, u64)>) {
+        let Some(current) = current else {
             return;
         };
-        let current = (reduction.tokens_saved, reduction.baseline_tokens);
         let previous = self.output_sample_watermark;
         // Read before the writes below clobber them: on the first poll of a
         // launch these still hold the *previous* run's last reading, which is
@@ -5481,16 +5518,53 @@ impl HeadroomSavingsHistoryResponse {
 const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
 static STATS_FETCH_WARNED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Coarse cause class for a `/stats` failure, used as the Sentry fingerprint.
+///
+/// The reason is interpolated into the message and Sentry groups bridged log
+/// lines by message text, so a timeout and an HTTP 404 landed in one
+/// un-resolvable grab-bag (RUST-6V: 53 timeouts + 47 404s under one issue).
+/// They are different bugs -- a timeout is a starved backend, a 404 is a
+/// foreign or ancient server answering on 6767 -- and each needs its own
+/// lifecycle. Statuses stay separate from each other for the same reason.
+fn stats_fetch_failure_category(reason: &str) -> String {
+    if reason.starts_with("timed out") {
+        "timeout".to_string()
+    } else if let Some(rest) = reason.strip_prefix("HTTP ") {
+        match rest.split_whitespace().next() {
+            Some(code) => format!("http-{code}"),
+            None => "http".to_string(),
+        }
+    } else if reason.starts_with("payload had no") {
+        "payload".to_string()
+    } else if reason.starts_with("no local host answered") {
+        "unreachable".to_string()
+    } else {
+        "transport".to_string()
+    }
+}
+
 fn warn_stats_fetch_failed(reason: &str) {
     let mut last = STATS_FETCH_WARNED_AT.lock();
     if last.is_some_and(|at| at.elapsed() < STATS_FETCH_WARN_INTERVAL) {
         return;
     }
     *last = Some(Instant::now());
-    log::warn!(
+    let message = format!(
         "headroom /stats fetch failed ({reason}); dashboard loses the layers only \
          this endpoint reports (output shaping, tool schema)"
     );
+    let category = stats_fetch_failure_category(reason);
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
+        },
+        || {
+            sentry::capture_message(&message, sentry::Level::Warning);
+        },
+    );
+    // Local only: the fingerprinted capture above is the Sentry path, and the
+    // bridged warn would double-report it under the old flat grouping.
+    log::warn!("{message}");
 }
 
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
@@ -7225,6 +7299,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    #[test]
+    fn stats_fetch_failure_category_splits_the_grab_bag() {
+        // RUST-6V held 53 timeouts + 47 404s under one un-resolvable issue.
+        use super::stats_fetch_failure_category as cat;
+        assert_eq!(cat("timed out after 15s"), "timeout");
+        assert_eq!(cat("HTTP 404 Not Found"), "http-404");
+        assert_eq!(cat("HTTP 503 Service Unavailable"), "http-503");
+        assert_eq!(cat("payload had no recognised savings fields"), "payload");
+        assert_eq!(cat("no local host answered"), "unreachable");
+        assert_eq!(
+            cat("error sending request for url (http://127.0.0.1:6767/stats)"),
+            "transport"
+        );
+    }
+
     use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
@@ -7247,7 +7336,7 @@ mod tests {
         tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
         warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
         DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
-        OutputReduction, PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
         STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
     };
 
@@ -8035,30 +8124,10 @@ mod tests {
     #[test]
     fn sample_output_reduction_buckets_deltas_and_reseeds_on_reset() {
         let mut tracker = make_tracker();
-        let stats = |saved, baseline| HeadroomDashboardStats {
-            learner_progress: None,
-            session_requests: None,
-            session_estimated_savings_usd: None,
-            session_estimated_tokens_saved: None,
-            session_savings_pct: None,
-            session_actual_cost_usd: None,
-            session_total_tokens_sent: None,
-            savings_history: Vec::new(),
-            output_reduction: Some(OutputReduction {
-                method: "estimated".into(),
-                reduction_percent: 39.0,
-                ci_low_percent: 36.0,
-                ci_high_percent: 42.0,
-                requests: 1,
-                tokens_saved: saved,
-                baseline_tokens: baseline,
-            }),
-            tool_schema_tokens_saved: None,
-        };
         // First reading seeds the watermark, never a delta.
-        tracker.sample_output_reduction(&stats(1_000, 3_000));
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
         assert!(tracker.output_daily_samples.is_empty());
-        tracker.sample_output_reduction(&stats(1_400, 4_000));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
         let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let day = tracker
             .output_daily_samples
@@ -8072,8 +8141,8 @@ mod tests {
         // live path would.
         assert_eq!(tracker.last_output_estimator_tokens_saved, Some(1_400));
         // A reading below the watermark (estimator rebuilt) reseeds silently.
-        tracker.sample_output_reduction(&stats(100, 200));
-        tracker.sample_output_reduction(&stats(150, 300));
+        tracker.sample_output_reduction(Some((100, 200)));
+        tracker.sample_output_reduction(Some((150, 300)));
         assert_eq!(tracker.last_output_estimator_tokens_saved, Some(150));
         let day = tracker
             .output_daily_samples
@@ -8090,29 +8159,6 @@ mod tests {
         assert_eq!(hourly_total, 450);
     }
 
-    fn output_stats(saved: u64, baseline: u64) -> HeadroomDashboardStats {
-        HeadroomDashboardStats {
-            learner_progress: None,
-            session_requests: None,
-            session_estimated_savings_usd: None,
-            session_estimated_tokens_saved: None,
-            session_savings_pct: None,
-            session_actual_cost_usd: None,
-            session_total_tokens_sent: None,
-            savings_history: Vec::new(),
-            output_reduction: Some(OutputReduction {
-                method: "estimated".into(),
-                reduction_percent: 39.0,
-                ci_low_percent: 36.0,
-                ci_high_percent: 42.0,
-                requests: 1,
-                tokens_saved: saved,
-                baseline_tokens: baseline,
-            }),
-            tool_schema_tokens_saved: None,
-        }
-    }
-
     #[test]
     fn shallow_estimator_dip_is_not_rebilled_when_it_climbs_back() {
         // A backend that restarts onto a lagging durable checkpoint reports
@@ -8126,13 +8172,13 @@ mod tests {
                 .map_or(0, |bucket| bucket.saved_tokens)
         };
 
-        tracker.sample_output_reduction(&output_stats(1_000, 3_000));
-        tracker.sample_output_reduction(&output_stats(1_400, 4_000));
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
         assert_eq!(saved_today(&tracker), 400);
 
         // Shallow dip, then the whole climb back to where it was.
-        tracker.sample_output_reduction(&output_stats(1_200, 3_500));
-        tracker.sample_output_reduction(&output_stats(1_400, 4_000));
+        tracker.sample_output_reduction(Some((1_200, 3_500)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
         assert_eq!(
             saved_today(&tracker),
             400,
@@ -8140,7 +8186,7 @@ mod tests {
         );
 
         // Genuine progress past the old mark still counts.
-        tracker.sample_output_reduction(&output_stats(1_500, 4_200));
+        tracker.sample_output_reduction(Some((1_500, 4_200)));
         assert_eq!(saved_today(&tracker), 500);
     }
 
@@ -8155,14 +8201,14 @@ mod tests {
         tracker.last_output_estimator_baseline_tokens = Some(65_000);
         assert!(tracker.output_sample_watermark.is_none(), "fresh launch");
 
-        tracker.sample_output_reduction(&output_stats(26_000, 63_000));
+        tracker.sample_output_reduction(Some((26_000, 63_000)));
         assert_eq!(
             tracker.output_sample_watermark,
             Some((27_000, 65_000)),
             "seed at the high-water of live and persisted, not the dip"
         );
 
-        tracker.sample_output_reduction(&output_stats(27_100, 65_200));
+        tracker.sample_output_reduction(Some((27_100, 65_200)));
         let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let day = tracker
             .output_daily_samples

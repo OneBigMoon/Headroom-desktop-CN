@@ -153,6 +153,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Same split for the /stats probe: the reason is in the message, so a
+    // 15s timeout and an HTTP 404 grouped as one issue (RUST-6V) that no fix
+    // could ever resolve. The category-fingerprinted capture at the emit site
+    // is the Sentry path.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("headroom /stats fetch failed")
+    {
+        return true;
+    }
     // Boot-validation failure reaches Sentry via the fully-tagged Level::Error
     // capture at the same emit site (capture_runtime_upgrade_failure, RUST-4A:
     // versions, boot diagnostics, pip tail); this bridged warn double-reports
@@ -191,12 +200,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
-    // Uninstall cleanup is best-effort and races a still-exiting backend/proxy
-    // that may re-create a file mid-walk ("Directory not empty"). The removal
-    // is retried; a residual failure during teardown isn't actionable.
-    if target.starts_with("headroom_desktop_lib::client_adapters")
-        && msg.starts_with("cleanup: removing")
-    {
+    // Uninstall/cleanup teardown is best-effort by construction. It races a
+    // still-exiting backend that re-creates a file mid-walk ("Directory not
+    // empty"), a venv Windows still holds open ("Access is denied", RUST-6T),
+    // and settings files we deliberately leave alone when they don't parse
+    // ("refusing to overwrite potentially valid user settings", RUST-6X --
+    // that branch is the correct one, not a failure). The app is being removed
+    // either way, so none of it is actionable in a release. Matched by prefix
+    // across modules: the same teardown runs from client_adapters (files,
+    // settings) and lib (plugins, MCP servers), and every sibling shape landed
+    // as its own un-fixable issue.
+    if msg.starts_with("cleanup: ") || msg.starts_with("uninstall: removing ") {
         return true;
     }
     // Codex thread retag is best-effort over every *.sqlite in the Codex dirs;
@@ -460,6 +474,20 @@ mod tests {
             "headroom_desktop_lib::client_adapters",
             "cleanup: removing /Users/x/Library/Application Support/Headroom failed: Directory not empty (os error 66)"
         ));
+        // RUST-6X: the parse failed, so we left the file alone -- the safe
+        // branch, reported as if it were a defect.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "cleanup: stripping hook from ~/.claude/settings.local.json failed: parsing \
+             ~/.claude/settings.local.json failed (JSON/JSON5); refusing to overwrite \
+             potentially valid user settings"
+        ));
+        // RUST-6T: same teardown, different module -- the venv is still open on
+        // Windows when uninstall_and_quit deletes it.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "uninstall: removing serena failed: removing ~\\AppData\\Local\\Headroom\\headroom\\serena-venv: Access is denied. (os error 5)"
+        ));
     }
 
     #[test]
@@ -541,6 +569,25 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "kompress prefetch download error: [network] Max retries exceeded"
+        ));
+    }
+
+    #[test]
+    fn skips_stats_fetch_failed_warn() {
+        // RUST-6V: timeout and HTTP 404 shared one message shape, so Sentry
+        // grouped two different bugs together. The fingerprinted capture at
+        // the emit site is the Sentry path now.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "headroom /stats fetch failed (HTTP 404 Not Found); dashboard loses the layers"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "headroom /stats fetch failed (timed out after 15s); dashboard loses the layers"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "some other state warning"
         ));
     }
 

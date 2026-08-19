@@ -10,6 +10,7 @@ mod keychain;
 mod logging;
 mod memory_scrubber;
 mod models;
+mod output_savings;
 mod port_conflict;
 mod pricing;
 mod proxy_intercept;

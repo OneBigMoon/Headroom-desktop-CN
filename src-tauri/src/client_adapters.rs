@@ -1858,11 +1858,20 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         s.push(format!(".tmp.{}.{}", std::process::id(), n));
         PathBuf::from(s)
     };
+    // The io error goes in the *message*, not a source: every caller logs this
+    // with `{err}`, which prints only the top context and drops the chain, so
+    // Sentry saw "failed to persist usage-counters.json: writing <path>.tmp.N"
+    // with no reason at all (RUST-77). Baking the cause in fixes all 50-odd
+    // callers at once instead of auditing each log site for `{err:#}`.
     std::fs::write(&tmp_path, contents)
-        .with_context(|| format!("writing {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path).with_context(|| {
+        .map_err(|err| anyhow!("writing {}: {err}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
         let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-        format!("renaming {} -> {}", tmp_path.display(), path.display())
+        anyhow!(
+            "renaming {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
     })
 }
 
@@ -9333,6 +9342,25 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .expect("concurrent atomic_write must not ENOENT");
         }
         assert!(path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_error_names_the_io_cause() {
+        // RUST-77: callers log this with `{err}`, which drops the anyhow
+        // source, so Sentry only ever saw "writing <path>.tmp.N". The cause
+        // must survive plain Display.
+        let dir = std::env::temp_dir().join(format!("aw_cause_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Parent does not exist, so writing the tmp file fails with ENOENT.
+        let path = dir.join("missing").join("state.json");
+        let err = super::atomic_write(&path, b"x").expect_err("write into a missing dir must fail");
+        let shown = format!("{err}");
+        assert!(shown.starts_with("writing "), "{shown}");
+        assert!(
+            shown.to_ascii_lowercase().contains("no such file"),
+            "io cause missing from `{{err}}`: {shown}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
