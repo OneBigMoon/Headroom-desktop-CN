@@ -358,8 +358,9 @@ jobs:
           # which GitHub runners do not provide; extracting instead is the
           # supported workaround.
           APPIMAGE_EXTRACT_AND_RUN: 1
-        # appimage is the only Linux format tauri-plugin-updater can install;
-        # deb covers apt users, who update via a fresh download.
+        # Both are updater targets: the plugin rewrites the AppImage in place,
+        # and installs the deb with `pkexec dpkg -i`. Each needs its own signed
+        # entry in the manifest (see the publish step below).
         run: npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage
 
       - name: Publish Linux bundles to the rc release
@@ -382,7 +383,14 @@ jobs:
           updater_artifact="${sig%.sig}"
           [ -f "$updater_artifact" ] || { echo "signed artifact missing: $updater_artifact" >&2; exit 1; }
 
-          assets=("$appimage" "$sig" "$deb")
+          # The deb is a separate updater target: tauri resolves
+          # `linux-x86_64-deb` before falling back to `linux-x86_64`, so without
+          # its own signed entry a .deb install downloads the AppImage and dies
+          # with "update is not a valid deb package".
+          deb_sig="$(ls "$bundle_dir"/deb/*.deb.sig 2>/dev/null | head -1)"
+          [ -n "$deb_sig" ] || { echo "no updater signature in $bundle_dir/deb" >&2; exit 1; }
+
+          assets=("$appimage" "$sig" "$deb" "$deb_sig")
           [ "$updater_artifact" = "$appimage" ] || assets+=("$updater_artifact")
 
           # rc tag only, same as the windows job: the mirror job composes the
@@ -417,14 +425,19 @@ jobs:
           win_sig="$(ls "$workdir"/*-setup.exe.sig)"
           linux_sig="$(ls "$workdir"/*.AppImage.sig "$workdir"/*.AppImage.tar.gz.sig 2>/dev/null | head -1 || true)"
           [ -n "$linux_sig" ] || { echo "no linux updater signature in $RC_TAG" >&2; exit 1; }
+          deb_sig="$(ls "$workdir"/*.deb.sig 2>/dev/null | head -1 || true)"
+          [ -n "$deb_sig" ] || { echo "no linux deb updater signature in $RC_TAG" >&2; exit 1; }
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RC_TAG}"
           jq \
             --arg win_sig "$(cat "$win_sig")" \
             --arg win_url "${base}/$(basename "${win_sig%.sig}")" \
             --arg linux_sig "$(cat "$linux_sig")" \
             --arg linux_url "${base}/$(basename "${linux_sig%.sig}")" \
+            --arg deb_sig "$(cat "$deb_sig")" \
+            --arg deb_url "${base}/$(basename "${deb_sig%.sig}")" \
             '.platforms["windows-x86_64"] = {signature: $win_sig, url: $win_url}
-             | .platforms["linux-x86_64"] = {signature: $linux_sig, url: $linux_url}' \
+             | .platforms["linux-x86_64"] = {signature: $linux_sig, url: $linux_url}
+             | .platforms["linux-x86_64-deb"] = {signature: $deb_sig, url: $deb_url}' \
             "$workdir/latest.json" > "$workdir/latest.merged.json"
           mv "$workdir/latest.merged.json" "$workdir/latest.json"
           gh release upload "$RC_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"

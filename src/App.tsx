@@ -8059,6 +8059,9 @@ export default function App() {
                     <pre>{appUpdateAvailable.notes.trim()}</pre>
                   </div>
                 ) : null}
+                {appUpdateStatusCopy ? (
+                  <p className="app-update-card__summary">{appUpdateStatusCopy}</p>
+                ) : null}
                 <div className="modal-actions">
                   <button
                     className="secondary-button"
