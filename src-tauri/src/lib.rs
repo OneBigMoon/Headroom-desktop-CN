@@ -817,6 +817,7 @@ async fn restart_app(app: AppHandle) {
         log::info!("restart_app: already in progress, ignoring duplicate invocation");
         return;
     }
+    log::info!("restart_app: tearing down for relaunch");
     SHUTTING_DOWN.store(true, Ordering::Release);
 
     // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
@@ -842,7 +843,6 @@ async fn restart_app(app: AppHandle) {
     {
         match current_app_bundle_path() {
             Some(bundle) => {
-                let pid = std::process::id();
                 let quoted = shell_quote_path(&bundle);
                 // The relauncher runs AFTER this process exits, so the Rust
                 // logger is gone by the time `open` runs. Have the script append
@@ -853,23 +853,10 @@ async fn restart_app(app: AppHandle) {
                 // freshly-installed build crashing on its own startup.
                 let log_quoted = shell_quote_path(&logging::log_path());
                 log::info!("restart_app: relaunching via `open -n` against bundle {bundle:?}");
-                let cmd = format!(
-                    "alive=1; \
-                     for i in $(seq 1 100); do \
-                       if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
-                       sleep 0.1; \
-                     done; \
-                     if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
-                     /usr/bin/open -n {quoted}; rc=$?; \
-                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}",
-                    pid = pid,
-                    quoted = quoted,
-                    log_quoted = log_quoted,
-                );
-                match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
-                    Ok(_) => log::info!("restart_app: relauncher spawned"),
-                    Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
-                }
+                spawn_relauncher(&format!(
+                    "/usr/bin/open -n {quoted}; rc=$?; \
+                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}"
+                ));
             }
             None => {
                 // No enclosing .app bundle (dev build, or an app launched from a
@@ -879,6 +866,34 @@ async fn restart_app(app: AppHandle) {
                     "restart_app: current_app_bundle_path() returned None (current_exe={:?}); cannot relaunch",
                     std::env::current_exe()
                 );
+            }
+        }
+    }
+
+    // Linux: `request_restart()` only relaunches if the process walks all the way
+    // out through the exit handler, and that handler runs our teardown on the GTK
+    // main thread. A step that blocks there leaves the window up forever with no
+    // relaunch - reported after a .deb update as a modal stuck on "Restarting..."
+    // until the app was killed by hand. Arm the same detached relauncher as macOS
+    // so a wedged teardown is force-killed and the app comes back either way.
+    #[cfg(target_os = "linux")]
+    {
+        // `current_binary` is the path tauri cached at startup (and $APPIMAGE when
+        // running from one), so it survives dpkg replacing the binary underneath
+        // us mid-update; `std::env::current_exe()` would readlink to
+        // "/usr/bin/headroom (deleted)" once the old inode is unlinked.
+        match tauri::process::current_binary(&app.env()) {
+            Ok(exe) => {
+                let quoted = shell_quote_path(&exe);
+                let log_quoted = shell_quote_path(&logging::log_path());
+                log::info!("restart_app: relaunching {exe:?}");
+                spawn_relauncher(&format!(
+                    "{quoted} >/dev/null 2>&1 & \
+                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {quoted} pid $! (alive=$alive)\" >> {log_quoted}"
+                ));
+            }
+            Err(err) => {
+                log::error!("restart_app: current_binary failed ({err}); cannot relaunch");
             }
         }
     }
@@ -893,13 +908,16 @@ async fn restart_app(app: AppHandle) {
     }
     analytics::shutdown(&app);
 
-    #[cfg(target_os = "macos")]
+    // macOS and Linux both hand the relaunch to the detached relauncher above, so
+    // exit instead of request_restart(): letting tauri spawn the new process too
+    // would leave two instances running.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         app.exit(0);
         return;
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         app.request_restart();
     }
@@ -914,13 +932,43 @@ fn current_app_bundle_path() -> Option<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn shell_quote_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     // POSIX single-quote escaping: anything inside '...' is literal except
     // ', which we close-escape-open. Safe against spaces / special chars in
     // the bundle path (e.g. `/Applications/Headroom RC.app`).
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Spawns a detached shell that waits for THIS process to die (so the
+/// single-instance lock and the proxy port are released), force-kills it after
+/// ~10s if teardown deadlocks, and only then runs `launch`.
+///
+/// `launch` is a shell snippet and is expected to log its own outcome; `$alive`
+/// is in scope for it (0 = we exited on our own, 1 = we had to be killed). The
+/// force-kill is the whole point: it is what keeps a blocked teardown from
+/// stranding the user on a dead window with no way back to the new build.
+#[cfg(unix)]
+fn spawn_relauncher(launch: &str) {
+    let cmd = relauncher_script(std::process::id(), launch);
+    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
+        Ok(_) => log::info!("restart_app: relauncher spawned"),
+        Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
+    }
+}
+
+#[cfg(unix)]
+fn relauncher_script(pid: u32, launch: &str) -> String {
+    format!(
+        "alive=1; \
+         for i in $(seq 1 100); do \
+           if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
+           sleep 0.1; \
+         done; \
+         if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
+         {launch}"
+    )
 }
 
 /// Best-effort: schedule the running `.app` bundle to be moved to the user's
@@ -4033,6 +4081,7 @@ pub fn run() {
         sentry::ClientOptions {
             release: sentry::release_name!(),
             attach_stacktrace: true,
+            before_send: Some(std::sync::Arc::new(logging::sanitize_event)),
             ..Default::default()
         },
     ));
@@ -4442,6 +4491,11 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 SHUTTING_DOWN.store(true, Ordering::Release);
+                // Step markers: this teardown runs on the UI thread, so a step
+                // that blocks freezes the app mid-quit and emits nothing (Sentry
+                // only receives warn!/error!). The last marker in the log names
+                // the step that hung.
+                log::info!("exit: stop_headroom");
                 let state: tauri::State<'_, AppState> = app.state();
                 state.stop_headroom();
                 // Gracefully reverse every client's base-URL override (and shell
@@ -4453,6 +4507,7 @@ pub fn run() {
                 // exit handler fires for both ExitRequested and Exit, and a
                 // second clear_client_setups wipes the remembered snapshot.
                 if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+                    log::info!("exit: clear_client_setups");
                     if let Err(err) = client_adapters::clear_client_setups() {
                         log::warn!("exit: clear_client_setups failed: {err}");
                     }
@@ -4462,7 +4517,9 @@ pub fn run() {
                 // quit / signals skip exit_headroom -> clear_client_setups, so
                 // this is the only retag they get; the next launch re-applies the
                 // headroom tag via restore_client_setups. Best-effort.
+                log::info!("exit: retag_codex_threads_to_native");
                 client_adapters::retag_codex_threads_to_native();
+                log::info!("exit: teardown complete");
             }
         });
 }
@@ -9037,5 +9094,42 @@ Some unrelated content.
             hint.contains("endpoint protection"),
             "expected EDR hint, got: {hint}"
         );
+    }
+
+    /// The relauncher only ever runs after we are dead, so a quoting slip in it
+    /// is silent until a user updates and never comes back. Syntax-check the
+    /// real snippets (both carry quotes, `$(...)`, and a path with a space).
+    #[cfg(unix)]
+    #[test]
+    fn relauncher_script_is_valid_shell() {
+        use std::path::Path;
+        let app = super::shell_quote_path(Path::new("/Applications/Headroom RC.app"));
+        let log = super::shell_quote_path(Path::new("/Users/a b/Library/Logs/Headroom/d.log"));
+        let launches = [
+            // macOS
+            format!(
+                "/usr/bin/open -n {app}; rc=$?; \
+                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {app} exited rc=$rc (alive=$alive)\" >> {log}"
+            ),
+            // Linux
+            format!(
+                "{app} >/dev/null 2>&1 & \
+                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {app} pid $! (alive=$alive)\" >> {log}"
+            ),
+        ];
+        for launch in launches {
+            let script = super::relauncher_script(4242, &launch);
+            assert!(
+                script.contains("kill -9 4242"),
+                "lost the force-kill backstop: {script}"
+            );
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("run sh -n");
+            assert!(status.success(), "sh rejected the script: {script}");
+        }
     }
 }

@@ -1402,6 +1402,12 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
         "network"
     } else if t.contains("permission denied") {
         "permission denied"
+    // torch's DLLs need the MSVC redistributable, which a fresh Windows box
+    // (notably Server 2022) does not ship. Nothing retriable and nothing the
+    // app can repair, but it must not sit in the "other" grab-bag: that bucket
+    // is what made RUST-3C/RUST-45 unresolvable.
+    } else if t.contains("winerror 126") || t.contains("importerror: dll load failed") {
+        "missing native dep"
     } else {
         "other"
     }
@@ -9191,6 +9197,13 @@ mod tests {
         assert_eq!(
             classify_kompress_prefetch_failure("PermissionError: [Errno 13] Permission denied"),
             "permission denied"
+        );
+        assert_eq!(
+            classify_kompress_prefetch_failure(
+                "OSError: [WinError 126] The specified module could not be found. \
+                 Error loading \"...\\torch\\lib\\c10.dll\" or one of its dependencies"
+            ),
+            "missing native dep"
         );
         assert_eq!(
             classify_kompress_prefetch_failure("ValueError: something unexpected"),

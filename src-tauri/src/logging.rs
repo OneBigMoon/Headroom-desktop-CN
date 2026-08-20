@@ -317,6 +317,73 @@ pub(crate) fn scrub_home(msg: &str) -> String {
     }
 }
 
+/// Last gate before an event leaves the process: drop what is environmental,
+/// scrub what is personal.
+///
+/// `skip_sentry` and `scrub_home` are both reachable only from the `Log` impl,
+/// so the ~40 direct `sentry::capture_message` sites bypassed both. RUST-6R is
+/// what that costs: a disk-full warning that the `log::warn!` twin of the same
+/// failure (RUST-7R) correctly suppresses, carrying an unscrubbed
+/// `/Users/<name>/...` path. Only the target-agnostic rule is applied here -
+/// the target-scoped ones need a `Record` that a direct capture does not have.
+pub(crate) fn sanitize_event(
+    event: sentry::protocol::Event<'static>,
+) -> Option<sentry::protocol::Event<'static>> {
+    let environmental = event.message.as_deref().is_some_and(is_disk_full)
+        || event
+            .logentry
+            .as_ref()
+            .is_some_and(|entry| is_disk_full(&entry.message))
+        || event
+            .exception
+            .values
+            .iter()
+            .filter_map(|exception| exception.value.as_deref())
+            .any(is_disk_full);
+    if environmental {
+        return None;
+    }
+    Some(scrub_event(event))
+}
+
+/// Replace the home directory with `~` in every free-text field, including the
+/// ones `scope.set_extra`/`set_tag` fill in. The username is both a privacy leak
+/// and a grouping key, so leaving it in splits one failure into one Sentry issue
+/// per user.
+pub(crate) fn scrub_event(
+    mut event: sentry::protocol::Event<'static>,
+) -> sentry::protocol::Event<'static> {
+    if let Some(message) = event.message.as_deref() {
+        event.message = Some(scrub_home(message));
+    }
+    if let Some(entry) = event.logentry.as_mut() {
+        entry.message = scrub_home(&entry.message);
+    }
+    for exception in &mut event.exception.values {
+        if let Some(value) = exception.value.as_deref() {
+            exception.value = Some(scrub_home(value));
+        }
+    }
+    // Tags carry paths too: `occupant_cmd` on the port-conflict events is a
+    // process command line.
+    for value in event.tags.values_mut() {
+        *value = scrub_home(value);
+    }
+    for value in event.extra.values_mut() {
+        scrub_json(value);
+    }
+    event
+}
+
+fn scrub_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = scrub_home(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
+        serde_json::Value::Object(map) => map.values_mut().for_each(scrub_json),
+        _ => {}
+    }
+}
+
 impl Log for FileLogger {
     fn enabled(&self, _meta: &Metadata) -> bool {
         true
@@ -782,5 +849,51 @@ mod tests {
             "cleanup: removing ~/Library/Application Support/x"
         );
         assert_eq!(super::scrub_home("no paths here"), "no paths here");
+    }
+
+    #[test]
+    fn scrub_event_covers_message_tags_and_extras() {
+        let home = dirs::home_dir().unwrap();
+        let home = home.display().to_string();
+        let mut event = sentry::protocol::Event::new();
+        event.message = Some(format!("Failed to write {home}/Library/x.json"));
+        event
+            .tags
+            .insert("occupant_cmd".into(), format!("{home}/bin/thing"));
+        event.extra.insert(
+            "error_chain".into(),
+            serde_json::json!({"stderr": [format!("no such file: {home}/y")]}),
+        );
+
+        let scrubbed = super::scrub_event(event);
+
+        assert_eq!(
+            scrubbed.message.as_deref(),
+            Some("Failed to write ~/Library/x.json")
+        );
+        assert_eq!(
+            scrubbed.tags.get("occupant_cmd").map(String::as_str),
+            Some("~/bin/thing")
+        );
+        let chain = serde_json::to_string(&scrubbed.extra["error_chain"]).unwrap();
+        assert!(!chain.contains(&home), "home leaked in extras: {chain}");
+        assert!(chain.contains("no such file: ~/y"), "{chain}");
+    }
+
+    #[test]
+    fn sanitize_event_drops_disk_full_from_direct_captures() {
+        // The shape of RUST-6R: a direct capture_message that never passed
+        // through skip_sentry.
+        let mut full = sentry::protocol::Event::new();
+        full.message = Some(
+            "Could not persist reconciled grace state: Failed to write pricing state \
+             ~/config/headroom-pricing-state.json: No space left on device (os error 28)"
+                .into(),
+        );
+        assert!(super::sanitize_event(full).is_none());
+
+        let mut other = sentry::protocol::Event::new();
+        other.message = Some("Could not persist reconciled grace state: Permission denied".into());
+        assert!(super::sanitize_event(other).is_some());
     }
 }
