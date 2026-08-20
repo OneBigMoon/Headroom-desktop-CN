@@ -3305,6 +3305,14 @@ impl AppState {
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
                             terminate_process_tree(pid, true);
+                            // The group kill only reaches the child if the child
+                            // is actually in that group, and `child.wait()` is
+                            // unbounded when it isn't: rc15 sat here for the
+                            // eight seconds between its logged -KILL and the
+                            // relauncher force-killing the app. Signal the pid we
+                            // hold a handle to as well - the kernel cannot recycle
+                            // it before we reap, so this one always lands.
+                            let _ = child.kill();
                             let _ = child.wait();
                             break;
                         }

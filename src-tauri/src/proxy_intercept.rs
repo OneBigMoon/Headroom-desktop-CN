@@ -526,6 +526,11 @@ pub fn spawn(
                 // neither the clock nor the counter needs a reset.
                 const RELAUNCH_GRACE: std::time::Duration =
                     std::time::Duration::from_secs(90);
+                // ...but the UI banner is on a shorter clock. `run` clears the
+                // slot the instant it binds, so a real overlap never reaches
+                // this; anything still held after it is something the user has
+                // to be told about.
+                const HINT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
                 let launched_at = tokio::time::Instant::now();
                 let mut consecutive_failures = 0usize;
                 loop {
@@ -557,6 +562,15 @@ pub fn spawn(
                                     "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
                                 );
                             } else if launched_at.elapsed() < RELAUNCH_GRACE {
+                                // Sentry stays quiet for the whole grace: a
+                                // bind that heals itself is not an error worth
+                                // a report. The banner must not, or the window
+                                // sits on "runtime offline, proxy unreachable"
+                                // -- which blames the Python runtime for a port
+                                // that never opened -- for the full 90s.
+                                if launched_at.elapsed() >= HINT_GRACE {
+                                    *bind_error.lock() = Some(e.to_string());
+                                }
                                 log::info!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} still held {}s after launch (a restart overlapping the previous instance looks exactly like this); retrying ({e})",
                                     launched_at.elapsed().as_secs()

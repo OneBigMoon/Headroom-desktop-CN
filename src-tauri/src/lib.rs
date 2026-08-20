@@ -6603,6 +6603,9 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 
     if let Some(rect) = anchor_rect {
         position_tray_window(&window, rect)?;
+    } else {
+        #[cfg(target_os = "linux")]
+        position_near_panel(&window)?;
     }
 
     window.show()?;
@@ -6660,6 +6663,55 @@ fn position_tray_window(window: &tauri::WebviewWindow, rect: Rect) -> tauri::Res
     let target = compute_tray_window_position(tray_rect, window_size, monitor_bounds);
 
     window.set_position(Position::Physical(target))
+}
+
+/// Linux tray backends (libappindicator/StatusNotifier) never report click
+/// events or an icon rect, so `show_main_window` gets no anchor there and the
+/// window stays wherever the config's `center: true` put it. Drop it into the
+/// panel corner instead.
+#[cfg(target_os = "linux")]
+fn position_near_panel(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    let Some(monitor) = window
+        .current_monitor()?
+        .or_else(|| window.primary_monitor().ok().flatten())
+    else {
+        return Ok(());
+    };
+    let area = monitor.work_area();
+    let work_area = MonitorBounds {
+        x: area.position.x,
+        y: area.position.y,
+        width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
+        height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
+    };
+    let window_size = window
+        .outer_size()
+        .unwrap_or_else(|_| PhysicalSize::new(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT));
+
+    window.set_position(Position::Physical(compute_panel_corner_position(
+        work_area,
+        window_size,
+    )))
+}
+
+/// Top-right of the work area (which already excludes the panel), inset by the
+/// same gap the tray-anchored path uses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn compute_panel_corner_position(
+    work_area: MonitorBounds,
+    window_size: PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let window_width = i32::try_from(window_size.width).unwrap_or(i32::MAX);
+    let inset_x = work_area
+        .width
+        .saturating_sub(window_width)
+        .saturating_sub(TRAY_WINDOW_VERTICAL_GAP)
+        .max(0);
+
+    PhysicalPosition::new(
+        work_area.x.saturating_add(inset_x),
+        work_area.y.saturating_add(TRAY_WINDOW_VERTICAL_GAP),
+    )
 }
 
 fn physical_rect_from_rect(rect: Rect, scale_factor: f64) -> PhysicalRect {
@@ -6777,24 +6829,25 @@ mod tests {
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
         build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
         classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
-        classify_upgrade_error, client_setup_error_kind, compute_tray_window_position,
-        count_memories_created_today, cpu_rate_indicates_burn, debounced_tray_runtime_visual,
-        delete_applied_pattern, empty_live_learnings_for_projects, exe_path_resolvable,
-        extract_llm_failure_warnings, fake_override, fetch_transformations_feed_from,
-        first_savings_body, format_token_count, install_pending_update, is_disk_full_signal,
-        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, learn_step_label, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
+        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
+        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
+        exe_path_resolvable, extract_llm_failure_warnings, fake_override,
+        fetch_transformations_feed_from, first_savings_body, format_token_count,
+        install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
+        is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
+        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
+        onboarding_recovery_copy, parse_live_learnings, parse_request_count_from_stats_body,
+        parse_request_counts_by_agent, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
+        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -7712,6 +7765,39 @@ mod tests {
 
         assert_eq!(target.x, 680);
         assert_eq!(target.y, 34);
+    }
+
+    #[test]
+    fn panel_corner_position_hugs_the_work_area_top_right() {
+        // Work area starts below a 28px top panel on a second monitor.
+        let target = compute_panel_corner_position(
+            MonitorBounds {
+                x: 1440,
+                y: 28,
+                width: 1440,
+                height: 872,
+            },
+            PhysicalSize::new(760, 560),
+        );
+
+        assert_eq!(target.x, 2110);
+        assert_eq!(target.y, 38);
+    }
+
+    #[test]
+    fn panel_corner_position_stays_on_screen_when_window_is_wider() {
+        let target = compute_panel_corner_position(
+            MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 600,
+                height: 400,
+            },
+            PhysicalSize::new(760, 560),
+        );
+
+        assert_eq!(target.x, 0);
+        assert_eq!(target.y, 10);
     }
 
     #[test]
