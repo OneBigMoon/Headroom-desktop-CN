@@ -9147,7 +9147,7 @@ Some unrelated content.
         let expect = super::relauncher_expect_name();
         assert!(!expect.is_empty(), "no name to gate the force-kill on");
 
-        let out = std::process::Command::new("ps")
+        let out = crate::proc::command("ps")
             .args(["-o", "comm=", "-p", &std::process::id().to_string()])
             .output()
             .expect("run ps");
@@ -9188,9 +9188,7 @@ Some unrelated content.
         let marker = dir.join("launched");
 
         // A pid that is dead for certain: spawn, reap, then reuse its number.
-        let mut done = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn true");
+        let mut done = crate::proc::command("true").spawn().expect("spawn true");
         let dead = done.id();
         done.wait().expect("reap");
 
@@ -9200,7 +9198,7 @@ Some unrelated content.
             &format!("touch {}", super::shell_quote_path(&marker)),
         );
         let started = std::time::Instant::now();
-        let status = std::process::Command::new("/bin/sh")
+        let status = crate::proc::command("/bin/sh")
             .arg("-c")
             .arg(&script)
             .status()
