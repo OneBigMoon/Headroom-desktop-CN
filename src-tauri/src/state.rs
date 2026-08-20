@@ -8589,6 +8589,16 @@ mod tests {
         let base_dir = temp_test_dir("headroom-stop-lifecycle-lock");
         let state = std::sync::Arc::new(AppState::new_in(base_dir.clone()).expect("app state"));
 
+        // Baseline the same call with the lock free. Everything after the lock
+        // is two process sweeps that shell out (`pkill` / `Get-CimInstance`),
+        // and they cost whatever the machine costs: ~1.2s on a warm CI runner,
+        // ~48s on a cold-cache Windows one still scanning freshly built
+        // binaries. Subtracting it makes the ceiling below bound the LOCK WAIT
+        // rather than the runner -- it was failing on the latter.
+        let started = Instant::now();
+        state.stop_headroom();
+        let baseline = started.elapsed();
+
         let holder = std::sync::Arc::clone(&state);
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -8611,9 +8621,11 @@ mod tests {
             waited >= super::STOP_LIFECYCLE_LOCK_TIMEOUT,
             "returned before the lock timeout ({waited:?}), so it never waited for the lock"
         );
+        let lock_wait = waited.saturating_sub(baseline);
         assert!(
-            waited < super::STOP_LIFECYCLE_LOCK_TIMEOUT * 4,
-            "stop_headroom blocked on the held lifecycle lock for {waited:?}"
+            lock_wait < super::STOP_LIFECYCLE_LOCK_TIMEOUT * 4,
+            "stop_headroom blocked on the held lifecycle lock for {lock_wait:?} \
+             (total {waited:?}, sweep baseline {baseline:?})"
         );
     }
 
