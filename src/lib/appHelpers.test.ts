@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  buildInstallFailureMailto,
   buildSetupStallMailto,
   describeInvokeError,
   forgoneSavingsLabel,
@@ -671,5 +672,35 @@ describe("buildSetupStallMailto", () => {
 
     expect(body).toContain("installed=unknown");
     expect(body).toContain("(none reported)");
+  });
+});
+
+describe("buildInstallFailureMailto", () => {
+  it("carries the failure kind and pip's stderr tail, not just our own copy", () => {
+    const url = buildInstallFailureMailto({
+      kind: "unsupported_pin",
+      detail: "exit=1; stderr tail: No matching distribution found for onnxruntime==1.27.0",
+      appVersion: "0.8.1",
+      platform: "macos",
+    });
+    expect(url.startsWith("mailto:support@extraheadroom.com?subject=")).toBe(true);
+    const decoded = decodeURIComponent(url);
+    expect(decoded).toContain("unsupported_pin");
+    expect(decoded).toContain("onnxruntime==1.27.0");
+    expect(decoded).toContain("0.8.1");
+    expect(decoded).toContain("macos");
+  });
+
+  it("stays sendable when no report was captured", () => {
+    const decoded = decodeURIComponent(
+      buildInstallFailureMailto({
+        kind: null,
+        detail: null,
+        appVersion: "0.8.4",
+        platform: "windows",
+      })
+    );
+    expect(decoded).toContain("unknown");
+    expect(decoded).toContain("(none captured)");
   });
 });

@@ -52,8 +52,8 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
-    ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
+    ActivityFeedResponse, BillingPeriod, BootstrapFailureReport, BootstrapProgress,
+    ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest,
     HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
     HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
@@ -1310,6 +1310,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             if let Err(err) = result {
                 let kind = classify_bootstrap_failure(&err);
                 capture_bootstrap_failure(&err, kind);
+                *state.bootstrap_failure_report.lock() = Some(BootstrapFailureReport {
+                    kind: kind.as_str().into(),
+                    detail: tool_manager::compact_pip_failure(&err),
+                });
                 state.mark_bootstrap_failed(user_message_for(kind));
                 emit_bootstrap_progress(&app_handle, &state);
                 analytics::track_event(
@@ -1413,6 +1417,13 @@ enum BootstrapFailureKind {
     /// user's environment — it's self-recoverable, so we frame it softly and
     /// the user just needs to click Try again.
     NetworkDownload,
+    /// Our lock pinned a version that has no wheel for this interpreter or
+    /// platform, so pip resolves nothing and *every* retry fails identically
+    /// (RUST-6S/RUST-1G: `onnxruntime==1.27.0` on Intel macOS, where releases
+    /// stop at 1.23.2). This is a defect in a build we shipped, not a fault of
+    /// the user's machine — the only fix is a newer app, so the message must
+    /// send them to the updater instead of to their network settings.
+    UnsupportedPin,
     Other,
 }
 
@@ -1422,6 +1433,7 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::SslInterception => "ssl_interception",
             BootstrapFailureKind::NoUsableTempDir => "no_usable_tempdir",
             BootstrapFailureKind::NetworkDownload => "network_download",
+            BootstrapFailureKind::UnsupportedPin => "unsupported_pin",
             BootstrapFailureKind::Other => "other",
         }
     }
@@ -1446,11 +1458,23 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslInterception
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
+    } else if is_unsupported_pin_signal(&haystack) {
+        BootstrapFailureKind::UnsupportedPin
     } else if is_network_download_signal(&haystack) {
         BootstrapFailureKind::NetworkDownload
     } else {
         BootstrapFailureKind::Other
     }
+}
+
+/// True when pip could not resolve a pin at all — no wheel exists for this
+/// interpreter/platform. Checked before [`is_network_download_signal`] because
+/// pip echoes every index and find-links URL it consulted, so an unrelated
+/// timeout word in that preamble must not steal the classification.
+fn is_unsupported_pin_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no matching distribution found")
+        || lower.contains("could not find a version that satisfies")
 }
 
 /// True when a bootstrap failure looks like a transient network/download
@@ -1511,6 +1535,14 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              files.pythonhosted.org - try another network or contact \
              support@extraheadroom.com."
         }
+        BootstrapFailureKind::UnsupportedPin => {
+            "Installation failed: this version of Headroom can't build its \
+             runtime on your Mac - one of its components has no release for \
+             your processor. This is a bug in the version you're running, not \
+             a problem with your machine, and retrying will keep failing. \
+             Click Check for updates to get a newer Headroom, which fixes it. \
+             If no update is offered, contact support@extraheadroom.com."
+        }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
              Check your internet connection, then click Try again. \
@@ -1561,6 +1593,8 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     if let Some(failure) = cmd_failure {
         sentry::with_scope(
             |scope| {
+                let fp: &[&str] = &["bootstrap_failed", kind.as_str()];
+                scope.set_fingerprint(Some(fp));
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
@@ -1598,6 +1632,8 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     } else {
         sentry::with_scope(
             |scope| {
+                let fp: &[&str] = &["bootstrap_failed", kind.as_str()];
+                scope.set_fingerprint(Some(fp));
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
@@ -2452,6 +2488,14 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
 #[tauri::command]
 fn get_bootstrap_progress(state: State<'_, AppState>) -> BootstrapProgress {
     state.bootstrap_progress()
+}
+
+/// Cause class + technical detail of the last bootstrap failure, so the
+/// install screen's "Contact support" mail carries something we can act on.
+/// `None` when no bootstrap has failed this session.
+#[tauri::command]
+fn get_bootstrap_failure_report(state: State<'_, AppState>) -> Option<BootstrapFailureReport> {
+    state.bootstrap_failure_report.lock().clone()
 }
 
 #[tauri::command]
@@ -4319,6 +4363,7 @@ pub fn run() {
             prefetch_bootstrap_artifacts,
             start_bootstrap,
             get_bootstrap_progress,
+            get_bootstrap_failure_report,
             get_runtime_upgrade_progress,
             retry_runtime_upgrade,
             retry_runtime_upgrade_with_rebuild,
@@ -5626,10 +5671,17 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 // we just swapped the icon — not only on tooltip text change.
                 let tooltip_changed = last_tooltip.as_deref() != Some(tooltip);
                 if icon_changed || tooltip_changed {
-                    if let Err(err) = tray.set_tooltip(Some(tooltip)) {
-                        log::warn!("tray: set_tooltip failed: {err}");
+                    match tray.set_tooltip(Some(tooltip)) {
+                        Ok(()) => last_tooltip = Some(tooltip.to_string()),
+                        // Windows returns E_FAIL (0x80004005) while the
+                        // notification area is busy -- explorer restarting, or
+                        // a shell extension holding it. Caching the tooltip
+                        // anyway froze the wrong hover text until the text
+                        // happened to change again; leaving `last_tooltip`
+                        // stale keeps `tooltip_changed` true so the next tick
+                        // retries and the failure heals itself (RUST-7P).
+                        Err(err) => log::warn!("tray: set_tooltip failed: {err}"),
                     }
-                    last_tooltip = Some(tooltip.to_string());
                 }
             } else {
                 break;
@@ -6652,7 +6704,7 @@ mod tests {
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, watchdog_should_be_up,
+        select_updater_endpoints, store_checked_update, user_message_for, watchdog_should_be_up,
         zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
         BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
         InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
@@ -7916,6 +7968,47 @@ mod tests {
             exit_code: Some(1),
             signal: None,
         }
+    }
+
+    #[test]
+    fn classify_bootstrap_failure_flags_unresolvable_pin_as_unsupported_pin() {
+        // The exact shape from RUST-1G/RUST-6S: our lock pinned a version with
+        // no Intel-macOS wheel, so every retry failed identically while the
+        // user was told to check their internet connection.
+        let err: anyhow::Error = make_command_failure(
+            "ERROR: Could not find a version that satisfies the requirement \
+             onnxruntime==1.27.0 (from versions: 1.23.0, 1.23.1, 1.23.2)\n\
+             ERROR: No matching distribution found for onnxruntime==1.27.0",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::UnsupportedPin
+        ));
+    }
+
+    #[test]
+    fn unsupported_pin_wins_over_the_network_heuristic() {
+        // pip echoes every index it consulted before reporting the resolution
+        // failure, so a timeout word in that preamble must not steal the
+        // classification and send the user to their network settings.
+        let err: anyhow::Error = make_command_failure(
+            "WARNING: Retrying after connection timed out\n\
+             ERROR: No matching distribution found for onnxruntime==1.27.0",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::UnsupportedPin
+        ));
+    }
+
+    #[test]
+    fn unsupported_pin_message_sends_the_user_to_the_updater_not_the_network() {
+        // The whole point: retrying is futile, so the copy must not imply it.
+        let msg = user_message_for(BootstrapFailureKind::UnsupportedPin);
+        assert!(msg.contains("Check for updates"));
+        assert!(!msg.contains("internet connection"));
     }
 
     #[test]

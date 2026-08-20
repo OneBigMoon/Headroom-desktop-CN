@@ -1890,8 +1890,13 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // Sentry saw "failed to persist usage-counters.json: writing <path>.tmp.N"
     // with no reason at all (RUST-77). Baking the cause in fixes all 50-odd
     // callers at once instead of auditing each log site for `{err:#}`.
-    std::fs::write(&tmp_path, contents)
-        .map_err(|err| anyhow!("writing {}: {err}", tmp_path.display()))?;
+    std::fs::write(&tmp_path, contents).map_err(|err| {
+        // A failed write still leaves the (partial) tmp behind, and the name is
+        // unique per write, so nothing ever reclaims it. On a full disk that is
+        // one orphan per attempt, each holding whatever bytes did land (RUST-6R).
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow!("writing {}: {err}", tmp_path.display())
+    })?;
     std::fs::rename(&tmp_path, path).map_err(|err| {
         let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
         anyhow!(
@@ -2363,6 +2368,50 @@ fn configure_claude_settings_env(
     ))
 }
 
+/// Absolute, quoted `bash.exe` for a Windows hook command. Git for Windows
+/// only adds `Git\cmd` to PATH in its default setup while `bash.exe` lives in
+/// `Git\bin`, so a bare `bash` resolved on a dev box and nowhere else -- the
+/// rtk and markitdown hooks installed fine and then silently never fired.
+/// Install locations are probed before PATH deliberately: `System32\bash.exe`
+/// is WSL, whose filesystem view cannot see the `C:\Users\...` script path.
+/// Bare `bash` remains the last resort -- a hook that needs the user to fix
+/// their PATH still beats no hook at all.
+fn windows_bash_command() -> String {
+    let git_bash = ["ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|root| PathBuf::from(root).join("Git"))
+        .chain(
+            std::env::var_os("LOCALAPPDATA")
+                .map(|root| PathBuf::from(root).join("Programs").join("Git")),
+        )
+        .map(|root| root.join("bin").join("bash.exe"))
+        .find(|candidate| candidate.exists());
+
+    git_bash
+        .or_else(|| find_on_path(&["bash"]))
+        .map(|path| format!("\"{}\"", path.display()))
+        .unwrap_or_else(|| "bash".to_string())
+}
+
+/// The command Claude Code runs for a Headroom PreToolUse hook. The hooks are
+/// bash scripts; on Windows they are launched through PowerShell, which needs
+/// the call operator in front of a quoted interpreter path (see
+/// [`join_guard_command`]).
+fn hook_shell_command(hook_path: &Path) -> Result<String> {
+    if cfg!(target_os = "windows") {
+        return Ok(join_guard_command(
+            &windows_bash_command(),
+            &hook_path.to_string_lossy(),
+            true,
+        ));
+    }
+    hook_path
+        .to_str()
+        .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))
+        .map(str::to_string)
+}
+
 fn ensure_claude_settings_hook(
     hook_path: &Path,
     matcher: &str,
@@ -2381,14 +2430,7 @@ fn ensure_claude_settings_hook(
         content = Value::Object(Default::default());
     }
 
-    let hook_command = if cfg!(target_os = "windows") {
-        format!("bash {}", shell_double_quote(&hook_path.to_string_lossy()))
-    } else {
-        hook_path
-            .to_str()
-            .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))?
-            .to_string()
-    };
+    let hook_command = hook_shell_command(hook_path)?;
     let already_present = claude_hook_present_in_value(&content, &hook_command);
     if already_present {
         return Ok((Vec::new(), Vec::new()));
@@ -5898,7 +5940,7 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
         .ok_or_else(|| anyhow!("{} must contain a top-level JSON object", path.display()))
 }
 
-fn find_on_path(binary_names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn find_on_path(binary_names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     find_on_path_entries(std::env::split_paths(&path_var), binary_names)
 }
@@ -5909,11 +5951,10 @@ where
 {
     for entry in path_entries {
         for binary_name in binary_names {
-            let candidate = entry.join(binary_name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-
+            // PATHEXT variants first on Windows: npm drops an extensionless
+            // shim (`claude`, a bash script) next to `claude.cmd`, and only
+            // the PATHEXT one is executable there. Matching the bare name
+            // first handed callers a path Windows cannot spawn.
             if cfg!(windows) {
                 for ext in windows_path_extensions() {
                     let with_ext = entry.join(format!("{binary_name}{ext}"));
@@ -5921,6 +5962,11 @@ where
                         return Some(with_ext);
                     }
                 }
+            }
+
+            let candidate = entry.join(binary_name);
+            if candidate.exists() {
+                return Some(candidate);
             }
         }
     }
@@ -6367,6 +6413,25 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate == &version_bin.join("claude")));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// npm installs drop an extensionless bash shim next to the `.cmd`, and
+    /// only the `.cmd` is spawnable on Windows. Matching the bare name first
+    /// handed every caller (`claude`, `codex`, `npx`) a dead path.
+    #[test]
+    #[cfg(windows)]
+    fn windows_path_lookup_prefers_the_pathext_variant() {
+        let home = unique_temp_dir("headroom-path-pathext");
+        let bin_dir = home.join("custom-bin");
+        fs::create_dir_all(&bin_dir).expect("create custom bin");
+        fs::write(bin_dir.join("claude"), "").expect("write npm bash shim");
+        fs::write(bin_dir.join("claude.cmd"), "").expect("write npm cmd shim");
+
+        let detected = find_on_path_entries(vec![bin_dir.clone()], &["claude"]);
+
+        assert_eq!(detected, Some(bin_dir.join("claude.cmd")));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -8762,6 +8827,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(codex_guard_command().contains("python.exe"));
         assert!(!claude_guard_command().starts_with("/usr/bin/python3"));
         assert!(!codex_guard_command().starts_with("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn hook_command_is_the_bare_script_path_on_unix() {
+        let path = PathBuf::from("/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
+        let cmd = super::hook_shell_command(&path).expect("hook command");
+        if cfg!(target_os = "windows") {
+            // Same PowerShell contract as the guard: call operator, quoted
+            // interpreter, quoted script.
+            assert!(cmd.starts_with("& "), "{cmd}");
+            assert!(cmd.ends_with("\"/home/g/.claude/hooks/headroom-rtk-rewrite.sh\""));
+            assert!(cmd.contains("bash"), "{cmd}");
+        } else {
+            assert_eq!(cmd, "/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
+        }
     }
 
     /// Regression: Claude Code runs SessionStart hooks through PowerShell on

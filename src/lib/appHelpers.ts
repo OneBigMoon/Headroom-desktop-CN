@@ -685,3 +685,36 @@ export function buildSetupStallMailto(
     subject
   )}&body=${encodeURIComponent(body)}`;
 }
+
+/** Pre-filled support mail for a failed first install.
+ *
+ *  The install screen shows only the friendly message, so an unaided report
+ *  quotes back copy we wrote ("couldn't download a required file") and names
+ *  nothing we can act on — every one of the RUST-1G reports looked identical
+ *  regardless of whether the cause was a bad pin, a proxy, or a full disk.
+ *  `kind` is the same vocabulary as the `failure_kind` Sentry tag, so a mail
+ *  can be matched to its issue; `detail` is pip's stderr tail. */
+export function buildInstallFailureMailto(context: {
+  kind: string | null;
+  detail: string | null;
+  appVersion: string;
+  platform: string;
+}): string {
+  const subject = `Headroom install failed (${context.kind ?? "unknown"})`;
+  const diagnosticLines = [
+    `Failure kind: ${context.kind ?? "unknown"}`,
+    `App version: ${context.appVersion}`,
+    `Platform: ${context.platform}`,
+    "",
+    "Technical detail:",
+    context.detail ?? "(none captured)",
+  ];
+  const body =
+    "What happened, and what have you already tried?\n\n\n" +
+    "---\n" +
+    "Diagnostic info (please keep):\n" +
+    diagnosticLines.join("\n");
+  return `mailto:support@extraheadroom.com?subject=${encodeURIComponent(
+    subject
+  )}&body=${encodeURIComponent(body)}`;
+}

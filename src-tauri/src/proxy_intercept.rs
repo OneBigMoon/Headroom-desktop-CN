@@ -507,6 +507,16 @@ pub fn spawn(
                 // forever; report each distinct error to Sentry once.
                 let mut reported_errors: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                // A restart -- the updater relaunch, or the "Restart now"
+                // button -- starts the new process while the old one still
+                // holds the port, so the first bind after launch routinely
+                // fails through no fault of the machine. Publishing that
+                // immediately paints "Headroom is not hooked up" over a window
+                // that heals itself on the next retry, and files a Sentry error
+                // that fixed itself. Only a failure that survives a retry is
+                // real. `run` never returns once it has bound (accept errors
+                // log and keep serving), so this counter needs no reset.
+                let mut consecutive_failures = 0usize;
                 loop {
                     match run(
                         bind_addr,
@@ -524,6 +534,7 @@ pub fn spawn(
                     {
                         Ok(()) => return,
                         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                            consecutive_failures += 1;
                             // If /health responds over HTTP, an existing
                             // Headroom proxy owns the port (single-instance
                             // plugin should normally prevent this, but a
@@ -533,6 +544,10 @@ pub fn spawn(
                             if probe_existing_intercept().await {
                                 log::info!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
+                                );
+                            } else if consecutive_failures == 1 {
+                                log::info!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} held on the first bind attempt (a restart overlapping the previous instance looks exactly like this); retrying in 15s ({e})"
                                 );
                             } else {
                                 // Nothing answered /health, so the port is
@@ -568,21 +583,28 @@ pub fn spawn(
                             }
                         }
                         Err(e) => {
-                            *bind_error.lock() = Some(e.to_string());
-                            log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
-                            let key = os_error_key(&e);
-                            if reported_errors.insert(key.clone()) {
-                                sentry::with_scope(
-                                    |scope| {
-                                        scope.set_extra("os_error", e.to_string().into());
-                                    },
-                                    || {
-                                        sentry::capture_message(
-                                            &format!("proxy_intercept error: {key} (retrying)"),
-                                            sentry::Level::Error,
-                                        );
-                                    },
+                            consecutive_failures += 1;
+                            if consecutive_failures == 1 {
+                                log::info!(
+                                    "[proxy_intercept] error on the first bind attempt: {e}; retrying in 15s"
                                 );
+                            } else {
+                                *bind_error.lock() = Some(e.to_string());
+                                log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
+                                let key = os_error_key(&e);
+                                if reported_errors.insert(key.clone()) {
+                                    sentry::with_scope(
+                                        |scope| {
+                                            scope.set_extra("os_error", e.to_string().into());
+                                        },
+                                        || {
+                                            sentry::capture_message(
+                                                &format!("proxy_intercept error: {key} (retrying)"),
+                                                sentry::Level::Error,
+                                            );
+                                        },
+                                    );
+                                }
                             }
                         }
                     }

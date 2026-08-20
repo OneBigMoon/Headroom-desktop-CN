@@ -23,6 +23,17 @@ fn detect_cli(name: &str) -> Option<PathBuf> {
     if let Some(path) = probe_known_paths(name) {
         return Some(path);
     }
+    // PATH lookup before the login shell: on Windows none of the POSIX
+    // candidate dirs exist and there is no `/bin/zsh` to probe, so this is the
+    // only branch that can resolve `npx.cmd` / `claude.cmd` -- without it the
+    // Context7 and plugin addons reported "not found on PATH" on every Windows
+    // box regardless of what was installed. On Unix it is a cheap extra hit
+    // ahead of the 2s interactive-shell probe.
+    if let Some(path) = crate::client_adapters::find_on_path(&[name]) {
+        if is_runnable(&path) {
+            return Some(path);
+        }
+    }
     probe_via_login_shell(name)
 }
 

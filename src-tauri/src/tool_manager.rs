@@ -1546,6 +1546,7 @@ impl ToolManager {
                     savings_label: self.tool_savings_label(&manifest.id),
                     update_available,
                     available_version: pending.filter(|version| !version.is_empty()),
+                    unavailable_reason: addon_unavailable_reason(&manifest.id),
                 }
             })
             .collect()
@@ -7504,6 +7505,29 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
     })
 }
 
+/// Why this addon cannot be installed on the current OS/arch, in one sentence
+/// the Addons tab shows in place of an Install button that could only ever
+/// error. Keyed off the same artifact resolvers the installers call, so a newly
+/// published target re-enables the card with no edit here.
+fn addon_unavailable_reason(id: &str) -> Option<String> {
+    let platform = match std::env::consts::OS {
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "macos" => "macOS",
+        other => other,
+    };
+    match id {
+        "rtk" if rtk_distribution_artifact().is_err() => Some(format!(
+            "Not available on {platform} {}: RTK publishes no build for this architecture yet.",
+            std::env::consts::ARCH
+        )),
+        "codebase-memory" if codebase_memory_distribution_artifact().is_err() => Some(format!(
+            "Not available on {platform}: codebase-memory publishes macOS and Linux binaries only."
+        )),
+        _ => None,
+    }
+}
+
 fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
     let (target, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => ("darwin-arm64", CODEBASE_MEMORY_SHA256_MACOS_AARCH64),
@@ -8244,7 +8268,7 @@ fn pip_line_to_progress(
 // 400-char Sentry cap eats before any stderr lines appear. Pip's actual
 // reason lives on stderr, so prefer the tail of stderr (or stdout if stderr
 // is empty) plus exit code.
-fn compact_pip_failure(err: &anyhow::Error) -> String {
+pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     const TAIL_BUDGET: usize = 300;
     let Some(failure) = err.chain().find_map(|c| c.downcast_ref::<CommandFailure>()) else {
         // No CommandFailure means the command never ran (spawn failed).
@@ -8766,10 +8790,11 @@ mod tests {
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::{
-        apply_serena_dashboard_interface, apply_serena_gitignore,
+        addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        compact_pip_failure, diagnose_proxy_port, extract_required_pydantic_core_version,
-        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
+        codebase_memory_distribution_artifact, compact_pip_failure, diagnose_proxy_port,
+        extract_required_pydantic_core_version, format_all_foreign_bail,
+        format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
@@ -10787,6 +10812,49 @@ after
         )
         .expect("receipt");
         assert!(manager.tool_enabled("markitdown"));
+    }
+
+    /// Every addon keeps its card on every platform; the ones with no artifact
+    /// for this target carry a reason instead (codebase-memory ships no Windows
+    /// binary, rtk none for windows-aarch64). A card without an artifact and
+    /// without a reason would offer an Install button that only ever errors.
+    #[test]
+    fn addons_without_an_artifact_for_this_target_carry_a_reason() {
+        let (_root, _runtime, manager) = seed_test_runtime("manifest-artifacts");
+        let tools = manager.list_tools();
+        let reason_for = |id: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.id == id)
+                .unwrap_or_else(|| panic!("{id} card must exist on every platform"))
+                .unavailable_reason
+                .clone()
+        };
+
+        assert_eq!(
+            reason_for("rtk").is_none(),
+            rtk_distribution_artifact().is_ok(),
+            "rtk is installable exactly when its artifact resolves"
+        );
+        assert_eq!(
+            reason_for("codebase-memory").is_none(),
+            codebase_memory_distribution_artifact().is_ok(),
+            "codebase-memory is installable exactly when its artifact resolves"
+        );
+        // Nothing platform-gated about the Python addons: never gray them.
+        assert!(reason_for("markitdown").is_none());
+        assert!(reason_for("serena").is_none());
+    }
+
+    #[test]
+    fn unavailable_reason_names_the_platform_and_the_reason() {
+        // The message is user-facing copy on a grayed card, so it has to say
+        // both which platform is missing and why, without a bare target triple.
+        let Some(reason) = addon_unavailable_reason("codebase-memory") else {
+            return; // this target has a build; nothing to phrase
+        };
+        assert!(reason.starts_with("Not available on "), "{reason}");
+        assert!(reason.contains("codebase-memory"), "{reason}");
     }
 
     fn listed_tool(manager: &ToolManager, id: &str) -> ManagedTool {

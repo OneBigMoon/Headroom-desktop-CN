@@ -680,6 +680,19 @@ select {
   color: #8a3d3d;
 }
 
+/* Recovery actions under a failed install: check for an update (the only fix
+   when the cause is a bad pin in the lock we shipped) and mail support. */
+.install-progress__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.install-progress__update-status {
+  color: var(--text-secondary);
+}
+
 .install-progress__notice {
   color: var(--warning);
   background: var(--warning-tint);
@@ -847,7 +860,8 @@ select {
 
 .tray-shell {
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
+  /* 72px floor, grows if the platform font (Cantarell/Noto on Linux) is wider */
+  grid-template-columns: minmax(72px, max-content) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   background: transparent;
@@ -1885,6 +1899,15 @@ select {
   font-size: 11px;
   color: rgba(0, 0, 0, 0.45);
   line-height: 1.4;
+}
+
+/* Inline support link inside the preview-platform notice: inherit the
+   subtitle's size/colour (which already has a dark-mode override) and drop
+   .link-button's standalone left margin. */
+.callout-banner .callout-banner__subtitle .link-button {
+  font-size: inherit;
+  color: inherit;
+  margin-left: 0;
 }
 
 .callout-banner__action {
@@ -5936,6 +5959,29 @@ html.window-hiding {
   background: var(--surface-sunken);
   font-size: var(--text-xs);
   line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+/* No installable build for this platform: recede the card so it reads as a
+   known limit rather than a broken control, but keep it legible and keep the
+   source link live so the user can check upstream themselves. */
+.addon-card--unavailable {
+  border-color: var(--border-subtle);
+  background: var(--surface-sunken);
+}
+
+.addon-card--unavailable .addon-card__name,
+.addon-card--unavailable .addon-card__description {
+  color: var(--text-muted);
+}
+
+.addon-card__notice {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-subtle);
+  font-size: var(--text-xs);
   color: var(--text-secondary);
 }
 

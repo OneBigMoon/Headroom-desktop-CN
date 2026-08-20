@@ -84,6 +84,16 @@ fn is_transient_transport_error(msg: &str) -> bool {
         || msg.contains("os error 65") // macOS: No route to host
 }
 
+// The user's disk is full. Every persisted file (pricing state, usage counters,
+// activity facts, client configs) fails the same way, from ~50 atomic_write
+// callers, so this fragments into one un-fixable issue per call site. Nothing
+// in the app can free space; the write is retried on the next tick and heals
+// itself once the user clears the disk.
+fn is_disk_full(msg: &str) -> bool {
+    msg.contains("No space left on device") // unix ENOSPC
+        || (cfg!(windows) && msg.contains("os error 112")) // Windows ERROR_DISK_FULL
+}
+
 // Non-2xx response from the update endpoint. Most commonly a transient 5xx
 // from GitHub releases or a 404 during a tag-publish race — not actionable.
 fn is_updater_endpoint_error(msg: &str) -> bool {
@@ -93,6 +103,10 @@ fn is_updater_endpoint_error(msg: &str) -> bool {
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
 // from Sentry. They still hit the local log file via write_record.
 fn skip_sentry(target: &str, msg: &str) -> bool {
+    // Environmental and target-agnostic: keep the local log, drop the event.
+    if is_disk_full(msg) {
+        return true;
+    }
     if target.starts_with("tauri_plugin_updater") {
         return is_transient_transport_error(msg) || is_updater_endpoint_error(msg);
     }
@@ -272,6 +286,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::device")
         && msg.starts_with("Could not persist machine id digest")
     {
+        return true;
+    }
+    // A tray tooltip that would not apply is cosmetic: the icon, the menu and
+    // every action still work, and the updater loop retries on the next tick
+    // (the emit site no longer caches the tooltip on failure, so it heals
+    // itself). Windows reports the busy notification area as a bare E_FAIL
+    // whose text is OS-LOCALIZED -- "Error no especificado" opened RUST-7P as a
+    // separate issue from the English wording, so this would fragment into one
+    // un-fixable issue per language. Keep the local log, drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib") && msg.starts_with("tray: set_tooltip failed") {
         return true;
     }
     false
@@ -694,6 +718,24 @@ mod tests {
     }
 
     #[test]
+    fn skips_tray_tooltip_failures_in_any_locale() {
+        // English and Spanish renderings of the same E_FAIL both drop.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "tray: set_tooltip failed: tray icon error: Unspecified error (os error -2147467259)"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "tray: set_tooltip failed: tray icon error: Error no especificado (os error -2147467259)"
+        ));
+        // Other tray failures are not cosmetic and still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib",
+            "tray: set_icon failed: tray icon error: Unspecified error"
+        ));
+    }
+
+    #[test]
     fn skips_keyring_fallback_but_not_other_keychain_failures() {
         assert!(skip_sentry(
             "headroom_desktop_lib::keychain",
@@ -705,6 +747,25 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::keychain",
             "failed to write Headroom secret to the file store"
+        ));
+    }
+
+    #[test]
+    fn skips_disk_full_from_any_target() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::pricing",
+            "Could not persist reconciled grace state: Failed to write pricing state \
+             ~/config/headroom-pricing-state.json: writing \
+             ~/config/headroom-pricing-state.json.tmp.47276.4810: \
+             No space left on device (os error 28)"
+        ));
+        // Any other write failure from the same path still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::pricing",
+            "Could not persist reconciled grace state: Failed to write pricing state \
+             ~/config/headroom-pricing-state.json: writing \
+             ~/config/headroom-pricing-state.json.tmp.47276.4810: \
+             Permission denied (os error 13)"
         ));
     }
 

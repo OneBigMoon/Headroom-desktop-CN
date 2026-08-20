@@ -22,11 +22,11 @@ use crate::client_adapters::{
 };
 use crate::insights::generate_daily_insights;
 use crate::models::{
-    ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    CodexAccountProfile, CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState,
-    HeadroomLearnPrereqStatus, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
-    RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress,
-    TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
+    ActivityEvent, BootstrapFailureReport, BootstrapProgress, ClaudeAccountProfile,
+    ClaudeCodeProject, ClientStatus, CodexAccountProfile, CodexRateLimitSnapshot, DailyInsight,
+    DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
+    HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
+    RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
@@ -481,6 +481,12 @@ pub struct AppState {
     /// code (Sentry RUST-53). Cleared on each successful spawn.
     pub last_child_natural_exit: Mutex<Option<String>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
+    /// Cause class and technical detail of the most recent bootstrap failure,
+    /// captured at the failure site where pip's stderr tail is still in hand.
+    /// The install screen has no other route to those -- it renders only the
+    /// friendly message -- so a user report would otherwise repeat back copy
+    /// we wrote and name nothing actionable. `None` until a bootstrap fails.
+    pub bootstrap_failure_report: Mutex<Option<BootstrapFailureReport>>,
     pub headroom_learn_state: Mutex<HeadroomLearnRuntimeState>,
     /// Last Claude AI OAuth bearer token seen passing through the proxy intercept.
     /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
@@ -669,6 +675,7 @@ impl AppState {
                 current_step_eta_seconds: 0,
                 overall_percent: 0,
             }),
+            bootstrap_failure_report: Mutex::new(None),
             claude_bearer_token: Arc::new(Mutex::new(None)),
             codex_rate_limits: Arc::new(Mutex::new(None)),
             codex_plan_tier: Arc::new(Mutex::new(None)),

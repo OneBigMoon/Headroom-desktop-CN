@@ -16,6 +16,9 @@ export interface ManagedTool {
   updateAvailable?: boolean;
   /** Version an Update would move to; null when nothing is pending. */
   availableVersion?: string | null;
+  /** Set when this platform has no installable build. The card grays out and
+   *  shows this sentence instead of an Install button that only ever errors. */
+  unavailableReason?: string | null;
 }
 
 export interface PipelineStageMetric {
@@ -192,6 +195,15 @@ export interface BootstrapProgress {
   message: string;
   currentStepEtaSeconds: number;
   overallPercent: number;
+}
+
+/** Why the last bootstrap failed. `kind` matches the `failure_kind` Sentry
+ *  tag, so a support mail can be matched to its issue; `detail` is pip's
+ *  stderr tail. Fetched on demand -- it is only ever needed on the one screen
+ *  where an install has already failed. */
+export interface BootstrapFailureReport {
+  kind: string;
+  detail: string;
 }
 
 export interface ResearchCandidate {
