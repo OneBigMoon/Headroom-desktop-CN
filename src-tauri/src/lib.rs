@@ -9123,7 +9123,7 @@ Some unrelated content.
                 script.contains("kill -9 4242"),
                 "lost the force-kill backstop: {script}"
             );
-            let status = std::process::Command::new("/bin/sh")
+            let status = crate::proc::command("/bin/sh")
                 .arg("-n")
                 .arg("-c")
                 .arg(&script)
