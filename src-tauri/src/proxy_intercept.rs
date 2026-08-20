@@ -513,9 +513,20 @@ pub fn spawn(
                 // fails through no fault of the machine. Publishing that
                 // immediately paints "Headroom is not hooked up" over a window
                 // that heals itself on the next retry, and files a Sentry error
-                // that fixed itself. Only a failure that survives a retry is
-                // real. `run` never returns once it has bound (accept errors
-                // log and keep serving), so this counter needs no reset.
+                // that fixed itself.
+                //
+                // The grace is measured in TIME, not attempts. It used to be
+                // "one attempt", and with a flat 15s retry that gave the old
+                // process exactly 15s to exit -- enough on macOS, not on
+                // Windows, where an exiting process can hold the socket longer
+                // and every update therefore filed one self-healing
+                // `os error 10048` (RUST-7M: one event per release, i.e. one
+                // per update relaunch, not one per launch). `run` never returns
+                // once it has bound (accept errors log and keep serving), so
+                // neither the clock nor the counter needs a reset.
+                const RELAUNCH_GRACE: std::time::Duration =
+                    std::time::Duration::from_secs(90);
+                let launched_at = tokio::time::Instant::now();
                 let mut consecutive_failures = 0usize;
                 loop {
                     match run(
@@ -545,9 +556,10 @@ pub fn spawn(
                                 log::info!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
                                 );
-                            } else if consecutive_failures == 1 {
+                            } else if launched_at.elapsed() < RELAUNCH_GRACE {
                                 log::info!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} held on the first bind attempt (a restart overlapping the previous instance looks exactly like this); retrying in 15s ({e})"
+                                    "[proxy_intercept] port {INTERCEPT_PORT} still held {}s after launch (a restart overlapping the previous instance looks exactly like this); retrying ({e})",
+                                    launched_at.elapsed().as_secs()
                                 );
                             } else {
                                 // Nothing answered /health, so the port is
@@ -586,11 +598,11 @@ pub fn spawn(
                             consecutive_failures += 1;
                             if consecutive_failures == 1 {
                                 log::info!(
-                                    "[proxy_intercept] error on the first bind attempt: {e}; retrying in 15s"
+                                    "[proxy_intercept] error on the first bind attempt: {e}; retrying"
                                 );
                             } else {
                                 *bind_error.lock() = Some(e.to_string());
-                                log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
+                                log::warn!("[proxy_intercept] error: {e}; retrying");
                                 let key = os_error_key(&e);
                                 if reported_errors.insert(key.clone()) {
                                     sentry::with_scope(
@@ -608,7 +620,18 @@ pub fn spawn(
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    // Retry fast at first: a relaunch overlap clears within a
+                    // second or two of the old process finally exiting, and a
+                    // flat 15s kept the app's front door shut for that whole
+                    // window after every single update. Settle back to 15s once
+                    // the holder looks like a genuine squatter rather than the
+                    // instance we just replaced.
+                    let backoff = match consecutive_failures {
+                        0..=3 => 1,
+                        4..=8 => 3,
+                        _ => 15,
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                 }
             });
         })

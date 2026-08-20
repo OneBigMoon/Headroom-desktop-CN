@@ -1375,7 +1375,25 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
         .take(200)
         .collect();
 
-    format!("[{category}] {detail}")
+    // The auto backend tries ONNX first and only then falls back to PyTorch, so
+    // when both are broken the last line is the SECOND failure and the ONNX
+    // cause that actually explains it scrolls past unreported. RUST-75 arrived
+    // as a torch `c10.dll` load error with no hint that onnxruntime -- which
+    // needs the same MSVC redistributable -- had already failed for the same
+    // reason. Carry the first cause too when the loader logged one.
+    let onnx_cause: Option<String> = tail
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| line.contains("ONNX load failed"))
+        .map(|line| line.chars().take(160).collect());
+
+    // The Sentry fingerprint is the bracketed category, so widening the detail
+    // does not regroup the issue.
+    match onnx_cause {
+        Some(onnx) => format!("[{category}] {detail} (after {onnx})"),
+        None => format!("[{category}] {detail}"),
+    }
 }
 
 /// Bucket a prefetch-log tail into a coarse, stable failure category.
@@ -1911,7 +1929,7 @@ impl ToolManager {
             //     6769..=6790. Only bail if every fallback is also taken.
             // The chosen port is stored in `backend_port` so the intercept,
             // health probes, and spawn args all pick it up.
-            let initial_state = diagnose_proxy_port(backend_port::DEFAULT_BACKEND_PORT);
+            let initial_state = diagnose_proxy_port_settled(backend_port::DEFAULT_BACKEND_PORT);
             match initial_state {
                 PortState::Free => {
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
@@ -6614,6 +6632,11 @@ enum PortState {
     ForeignOccupant(String),
 }
 
+/// Occupant string used when the port is held but no owning pid can be found.
+/// `diagnose_proxy_port_settled` keys off this exact shape, so it is a const
+/// rather than three loose copies of the same literal.
+const UNKNOWN_OCCUPANT: &str = "unknown process";
+
 fn diagnose_proxy_port(port: u16) -> PortState {
     // If we can bind the port, nothing is there.
     if TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -6633,13 +6656,46 @@ fn diagnose_proxy_port(port: u16) -> PortState {
         match listener_process(port) {
             Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
             Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
-            None => PortState::ForeignOccupant("unknown process".into()),
+            None => PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into()),
         }
     } else {
-        PortState::ForeignOccupant(
-            listener_detail(port).unwrap_or_else(|| "unknown process".into()),
-        )
+        PortState::ForeignOccupant(listener_detail(port).unwrap_or_else(|| UNKNOWN_OCCUPANT.into()))
     }
+}
+
+/// [`diagnose_proxy_port`], but waits out a socket the process we just replaced
+/// left closing.
+///
+/// An updater relaunch tears down the old backend and starts the new one
+/// immediately. For a few seconds the kernel still holds :6768 while nothing
+/// accepts on it and no pid owns it -- a shape `diagnose_proxy_port` can only
+/// read as a foreign occupant, so the backend abandoned its default port for
+/// 6770 on every update (RUST-7F: one event per release, i.e. one per update,
+/// not one per launch). Only that exact unowned shape is waited on; a named
+/// occupant is a real conflict and falls back immediately.
+fn diagnose_proxy_port_settled(port: u16) -> PortState {
+    settle_unowned_port(|| diagnose_proxy_port(port), 6, Duration::from_millis(500))
+}
+
+/// Re-`diagnose` while the port reads as held-by-nobody, up to `attempts`
+/// times. Split from [`diagnose_proxy_port_settled`] so the retry rule is
+/// testable without binding real sockets.
+fn settle_unowned_port(
+    mut diagnose: impl FnMut() -> PortState,
+    attempts: usize,
+    pause: Duration,
+) -> PortState {
+    let mut last = diagnose();
+    for _ in 1..attempts.max(1) {
+        match last {
+            PortState::ForeignOccupant(ref detail) if detail == UNKNOWN_OCCUPANT => {
+                std::thread::sleep(pause);
+                last = diagnose();
+            }
+            settled => return settled,
+        }
+    }
+    last
 }
 
 /// True when `pid`'s full command line looks like Headroom's managed backend
@@ -8810,12 +8866,13 @@ mod tests {
         purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
-        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
+        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        UNKNOWN_OCCUPANT,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -9238,6 +9295,92 @@ mod tests {
     fn summarize_kompress_prefetch_failure_handles_missing_log() {
         let cause = summarize_kompress_prefetch_failure(&PathBuf::from("/no/such/prefetch.log"));
         assert_eq!(cause, "[no output] (no output in kompress-prefetch.log)");
+    }
+
+    /// RUST-75 arrived as a bare torch DLL error. The ONNX failure that
+    /// preceded it -- same missing MSVC redistributable, and the actual first
+    /// cause -- was dropped, so the report pointed at the wrong library.
+    #[test]
+    fn summarize_kompress_prefetch_failure_carries_the_earlier_onnx_cause() {
+        let dir = std::env::temp_dir().join(format!(
+            "kompress-onnx-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("kompress-prefetch.log");
+        fs::write(
+            &log,
+            "Downloading Kompress ONNX model ...\n             WARNING ONNX load failed for kompress-v2-base, trying PyTorch: DLL load failed while importing onnxruntime_pybind11_state\n             Traceback (most recent call last):\n             OSError: [WinError 126] The specified module could not be found. Error loading \"C:\\venv\\torch\\lib\\c10.dll\"\n",
+        )
+        .unwrap();
+
+        let cause = summarize_kompress_prefetch_failure(&log);
+        // Category still comes from the last line, so the fingerprint is stable.
+        assert!(
+            cause.starts_with("[missing native dep] OSError: [WinError 126]"),
+            "{cause}"
+        );
+        // ...but the ONNX cause that explains it now rides along.
+        assert!(cause.contains("(after WARNING ONNX load failed"), "{cause}");
+        assert!(cause.contains("onnxruntime_pybind11_state"), "{cause}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An updater relaunch leaves :6768 held by nobody for a moment. Treating
+    /// that as a foreign occupant moved the backend to 6770 on every update
+    /// (RUST-7F), so the unowned shape is waited out before falling back.
+    #[test]
+    fn settle_unowned_port_waits_for_a_closing_socket_then_takes_the_port() {
+        let calls = std::cell::Cell::new(0);
+        let state = settle_unowned_port(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into())
+                } else {
+                    PortState::Free
+                }
+            },
+            6,
+            Duration::from_millis(0),
+        );
+        assert!(matches!(state, PortState::Free));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn settle_unowned_port_does_not_wait_on_a_named_occupant() {
+        let calls = std::cell::Cell::new(0);
+        let state = settle_unowned_port(
+            || {
+                calls.set(calls.get() + 1);
+                PortState::ForeignOccupant("rapportd pid 594".into())
+            },
+            6,
+            Duration::from_millis(0),
+        );
+        // A real conflict must fall back immediately, not sit through the wait.
+        assert!(matches!(state, PortState::ForeignOccupant(ref d) if d == "rapportd pid 594"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn settle_unowned_port_gives_up_after_the_attempt_budget() {
+        let calls = std::cell::Cell::new(0);
+        let state = settle_unowned_port(
+            || {
+                calls.set(calls.get() + 1);
+                PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into())
+            },
+            6,
+            Duration::from_millis(0),
+        );
+        assert!(matches!(state, PortState::ForeignOccupant(ref d) if d == UNKNOWN_OCCUPANT));
+        assert_eq!(calls.get(), 6, "budget must be spent, not exceeded");
     }
 
     #[test]
