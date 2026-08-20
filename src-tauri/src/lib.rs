@@ -801,8 +801,20 @@ where
             .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
     };
 
-    update.install(progress).await
+    // The window hides 150ms after losing focus, and a .deb install raises a
+    // polkit password prompt that takes it. The user authenticates, the update
+    // lands, and the window they were just looking at is gone - leaving "Restart
+    // now" behind a tray click nobody would think to make. Hold the window open
+    // for the length of the install.
+    INSTALLING_UPDATE.store(true, Ordering::Release);
+    let result = update.install(progress).await;
+    INSTALLING_UPDATE.store(false, Ordering::Release);
+    result
 }
+
+/// Set while an update install is running, to keep the privilege prompt it
+/// raises from hiding the window behind it. See `handle_window_event`.
+static INSTALLING_UPDATE: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 async fn restart_app(app: AppHandle) {
@@ -6363,6 +6375,11 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
 fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Focused(false) => {
+            // An update install steals focus with a privilege prompt; hiding
+            // underneath it strands the user mid-flow.
+            if INSTALLING_UPDATE.load(Ordering::Acquire) {
+                return;
+            }
             if window.label() == "main" {
                 let window = window.clone();
                 std::thread::spawn(move || {
@@ -7463,6 +7480,52 @@ mod tests {
         )))
         .expect_err("other failures still bubble up");
         assert!(real.contains("connection reset"), "{real}");
+    }
+
+    /// The privilege prompt a .deb install raises steals focus, and the blur
+    /// handler hides the window 150ms later. The flag is what keeps "Restart
+    /// now" on screen instead of behind an unexplained tray click.
+    #[test]
+    fn install_pending_update_holds_the_window_open_while_it_runs() {
+        struct FlagObservingUpdate(Arc<Mutex<Option<bool>>>);
+
+        impl InstallableAppUpdate for FlagObservingUpdate {
+            fn metadata(&self) -> AvailableAppUpdate {
+                unreachable!("metadata is not read on the install path")
+            }
+
+            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+                Box::pin(async move {
+                    *self.0.lock() =
+                        Some(super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire));
+                    Ok(())
+                })
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let pending = Mutex::new(Some(FlagObservingUpdate(Arc::clone(&seen))));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        runtime
+            .block_on(install_pending_update(
+                &pending,
+                noop_app_update_progress_emitter(),
+            ))
+            .expect("install");
+
+        assert_eq!(
+            *seen.lock(),
+            Some(true),
+            "window would hide behind the privilege prompt mid-install"
+        );
+        assert!(
+            !super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire),
+            "flag outlived the install, so the window can never auto-hide again"
+        );
     }
 
     #[test]
