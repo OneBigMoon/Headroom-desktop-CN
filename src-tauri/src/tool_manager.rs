@@ -1221,6 +1221,9 @@ pub struct ToolManager {
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
     serena_live_stats_cache: Arc<Mutex<Option<(Instant, Option<(u64, Option<Instant>)>)>>>,
+    /// False once this app process has tried to start the backend at least
+    /// once. See its use in `start_headroom_background`.
+    first_backend_start: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1538,6 +1541,7 @@ impl ToolManager {
             log_marker_cache: Arc::new(Mutex::new(None)),
             serena_calls_cache: Arc::new(Mutex::new(None)),
             serena_live_stats_cache: Arc::new(Mutex::new(None)),
+            first_backend_start: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -1903,6 +1907,19 @@ impl ToolManager {
     /// upgrade boot validation replaces even a still-healthy old proxy squatting
     /// on 6768. Pass `false` for normal launch (leave a live backend alone).
     pub fn start_headroom_background(&self, reclaim_healthy_orphan: bool) -> Result<Child> {
+        // First backend start of this app process: we hold no Child handle, so
+        // a backend already on 6768 that `pid_is_headroom_backend` vouches for
+        // is an orphan from a previous instance -- classically the one the
+        // Windows updater leaves running when it exits the old app with no
+        // teardown at all. Take the port back even though the orphan answers
+        // /readyz: leaving it alone bails the whole start with "already
+        // running", so the new build serves its traffic through the OLD
+        // version's backend behind a startup error. Blast radius is the same
+        // one the upgrade path already accepts -- one port, one process that
+        // had to pass the identity gate.
+        let first_start = self
+            .first_backend_start
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         let mut allow_repair = true;
         'attempt: loop {
             let python = self.managed_python();
@@ -1937,7 +1954,7 @@ impl ToolManager {
                 PortState::HeadroomRunning => {
                     reclaim_orphan_proxy(
                         backend_port::DEFAULT_BACKEND_PORT,
-                        reclaim_healthy_orphan,
+                        reclaim_healthy_orphan || first_start,
                     )?;
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
                 }
@@ -6735,10 +6752,10 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
         else {
             return false;
         };
-        let path = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        // Both, not either: "headroom" alone matches the app's own exe, and a
-        // bare "venv" matches every unrelated Python project on the machine.
-        return path.contains("headroom") && path.contains("venv");
+        let path = String::from_utf8_lossy(&output.stdout);
+        let runtime_dir =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).runtime_dir;
+        return exe_path_is_under(&path, &runtime_dir);
     }
     #[cfg(not(windows))]
     {
@@ -6758,6 +6775,38 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
         // exact port being reclaimed, so the blast radius is one port either way.
         argv.contains("headroom") && argv.contains("proxy")
     }
+}
+
+/// True when `exe_path` sits inside `runtime_dir`.
+///
+/// The Windows half of [`pid_is_headroom_backend`], split out so the rule is
+/// testable without a live pid. Match the runtime DIRECTORY rather than
+/// substrings: on Windows the backend runs as the base interpreter
+/// (`runtime\python\python.exe`), NOT the venv one
+/// (`runtime\venv\Scripts\python.exe`) that `managed_python()` composes, so a
+/// first cut of this requiring "venv" in the path vouched for neither and the
+/// identity gate could never pass. Both layouts live under `runtime`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_path_is_under(exe_path: &str, runtime_dir: &Path) -> bool {
+    let exe = exe_path.trim();
+    // Empty means the pid was gone by the time PowerShell looked, or it is a
+    // process whose image we may not read. Either way: not provably ours.
+    if exe.is_empty() {
+        return false;
+    }
+    let Some(runtime) = runtime_dir.to_str().filter(|r| !r.is_empty()) else {
+        return false;
+    };
+    // Windows paths are case-insensitive and PowerShell need not echo our
+    // casing back.
+    let exe = exe.to_lowercase();
+    let mut prefix = runtime.to_lowercase();
+    // The prefix has to end on a separator, or `...\runtime-old\python.exe`
+    // would pass for `...\runtime` and the kill would land on a stranger.
+    if !prefix.ends_with('\\') && !prefix.ends_with('/') {
+        prefix.push('\\');
+    }
+    exe.starts_with(&prefix)
 }
 
 fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
@@ -8978,8 +9027,8 @@ mod tests {
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
-        diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
-        format_already_running_bail, headroom_entrypoint_startup_args,
+        diagnose_proxy_port, exe_path_is_under, extract_required_pydantic_core_version,
+        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
@@ -10321,6 +10370,49 @@ mod tests {
     }
 
     #[test]
+    /// The real path observed on a Windows box was
+    /// `...\Headroom\headroom\runtime\python\python.exe` -- the BASE
+    /// interpreter. A first cut of this gate required "venv" in the path, which
+    /// that never matches, so the identity check could never pass and every
+    /// reclaim stayed dead.
+    #[test]
+    fn exe_path_is_under_accepts_both_windows_python_layouts() {
+        let runtime = PathBuf::from(r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime");
+        assert!(exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime\python\python.exe",
+            &runtime
+        ));
+        assert!(exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime\venv\Scripts\headroom.exe",
+            &runtime
+        ));
+        // PowerShell output arrives with a trailing newline and need not match
+        // our casing.
+        assert!(exe_path_is_under(
+            "c:\\users\\garm\\appdata\\local\\headroom\\headroom\\runtime\\python\\python.exe\r\n",
+            &runtime
+        ));
+    }
+
+    /// A prefix match that does not land on a separator would point a kill at a
+    /// stranger.
+    #[test]
+    fn exe_path_is_under_rejects_neighbours_and_strangers() {
+        let runtime = PathBuf::from(r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime");
+        assert!(!exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime-old\python\python.exe",
+            &runtime
+        ));
+        assert!(!exe_path_is_under(r"C:\Python312\python.exe", &runtime));
+        assert!(!exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom-desktop.exe",
+            &runtime
+        ));
+        // Pid already gone: PowerShell prints nothing. Never provably ours.
+        assert!(!exe_path_is_under("", &runtime));
+        assert!(!exe_path_is_under("   \r\n", &runtime));
+    }
+
     /// Windows could not name a port holder at all before this (no lsof, no
     /// ss), so every occupant read as "unknown process" and no reclaim could
     /// pass its identity gate.
