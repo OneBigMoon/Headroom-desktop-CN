@@ -218,9 +218,9 @@ after it, uploads its bundles to the same release, and merges its own entry into
 that `latest.json`. Those jobs are chained rather than parallel because they all
 read-modify-write the one manifest.
 
-Platform coverage differs by channel: staging builds macOS, Windows and Linux;
-stable builds macOS and Windows only. Linux has no job in `release-macos.yml`
-yet, so it ships on the rc channel alone.
+Both channels cover all three platforms: macOS, Windows and Linux. Linux was
+rc-only until `release-macos.yml` gained its own `linux` job, so a stable
+release no longer drops `linux-x86_64` from that channel.
 
 The retired `windows-preview` and `linux-preview` channels had their workflows
 deleted once every platform started building per rc. Their releases stay up
