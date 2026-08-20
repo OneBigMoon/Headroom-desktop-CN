@@ -870,36 +870,6 @@ async fn restart_app(app: AppHandle) {
         }
     }
 
-    // Linux: `request_restart()` only relaunches if the process walks all the way
-    // out through the exit handler, and that handler runs our teardown on the GTK
-    // main thread. A step that blocks there leaves the window up forever with no
-    // relaunch - reported after a .deb update as a modal stuck on "Restarting..."
-    // until the app was killed by hand. Arm the same detached relauncher as macOS
-    // so a wedged teardown is force-killed and the app comes back either way.
-    #[cfg(target_os = "linux")]
-    {
-        // `current_binary` is the path tauri cached at startup (and $APPIMAGE when
-        // running from one), so it survives dpkg replacing the binary underneath
-        // us mid-update; `std::env::current_exe()` would readlink to
-        // "/usr/bin/headroom (deleted)" once the old inode is unlinked.
-        match tauri::process::current_binary(&app.env()) {
-            Ok(exe) => {
-                let quoted = shell_quote_path(&exe);
-                let log_quoted = shell_quote_path(&logging::log_path());
-                log::info!("restart_app: relaunching {exe:?}");
-                spawn_relauncher(&format!(
-                    "{quoted} >/dev/null 2>&1 & \
-                     new=$!; sleep 1; \
-                     if kill -0 $new 2>/dev/null; then st=running; else st=DIED; fi; \
-                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {quoted} pid $new ($st, alive=$alive)\" >> {log_quoted}"
-                ));
-            }
-            Err(err) => {
-                log::error!("restart_app: current_binary failed ({err}); cannot relaunch");
-            }
-        }
-    }
-
     // Stop the proxy before relaunching so the new build starts a fresh proxy
     // with current args (otherwise the orphan keeps serving traffic and the
     // new desktop reuses it via the reachability check). Without this, any
@@ -910,16 +880,17 @@ async fn restart_app(app: AppHandle) {
     }
     analytics::shutdown(&app);
 
-    // macOS and Linux both hand the relaunch to the detached relauncher above, so
-    // exit instead of request_restart(): letting tauri spawn the new process too
-    // would leave two instances running.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    // macOS hands the relaunch to the detached relauncher above, so it exits
+    // rather than request_restart(): letting tauri spawn the new process too
+    // would leave two instances running. Every other platform relaunches through
+    // tauri.
+    #[cfg(target_os = "macos")]
     {
         app.exit(0);
         return;
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     {
         app.request_restart();
     }
@@ -934,7 +905,7 @@ fn current_app_bundle_path() -> Option<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn shell_quote_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     // POSIX single-quote escaping: anything inside '...' is literal except
@@ -951,7 +922,7 @@ fn shell_quote_path(path: &std::path::Path) -> String {
 /// is in scope for it (0 = we exited on our own, 1 = we had to be killed). The
 /// force-kill is the whole point: it is what keeps a blocked teardown from
 /// stranding the user on a dead window with no way back to the new build.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn spawn_relauncher(launch: &str) {
     let cmd = relauncher_script(std::process::id(), &relauncher_expect_name(), launch);
     match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
@@ -968,7 +939,7 @@ fn spawn_relauncher(launch: &str) {
 /// the value the kernel will actually report instead. macOS has no `/proc`, but
 /// its `ps -o comm=` prints the full executable path, so the file name matches as
 /// a substring there.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn relauncher_expect_name() -> String {
     #[cfg(target_os = "linux")]
     {
@@ -991,7 +962,7 @@ fn relauncher_expect_name() -> String {
 /// unguarded `kill -9` lands on an innocent process (and if that process is a
 /// session or group leader, it takes the user's whole desktop session with it).
 /// Same rule as the port-reclaim path: verify identity before signalling.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
     let log_quoted = shell_quote_path(&logging::log_path());
     format!(
@@ -9141,7 +9112,7 @@ Some unrelated content.
     /// the executable's: the Linux .deb ships `/usr/bin/headroom-desktop` while
     /// the kernel reports `headroom`. Check the derivation against what `ps`
     /// actually says about this very process.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn relauncher_expect_name_matches_what_ps_reports() {
         let expect = super::relauncher_expect_name();
@@ -9161,7 +9132,7 @@ Some unrelated content.
 
     /// The force-kill must sit behind the identity check, not beside it: this
     /// script SIGKILLs a pid it resolved up to 10 seconds earlier.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn relauncher_force_kill_is_gated_on_identity() {
         let script = super::relauncher_script(4242, "headroom", "true");
@@ -9180,7 +9151,7 @@ Some unrelated content.
     }
 
     /// An app that exited on its own must be relaunched without any kill at all.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn relauncher_skips_the_kill_when_the_app_already_exited() {
         let dir = std::env::temp_dir().join(format!("hr-relaunch-{}", std::process::id()));
@@ -9216,7 +9187,7 @@ Some unrelated content.
     /// The relauncher only ever runs after we are dead, so a quoting slip in it
     /// is silent until a user updates and never comes back. Syntax-check the
     /// real snippets (both carry quotes, `$(...)`, and a path with a space).
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn relauncher_script_is_valid_shell() {
         use std::path::Path;

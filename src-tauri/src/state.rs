@@ -3327,10 +3327,15 @@ impl AppState {
             (headroom_entrypoint.as_path(), "proxy --port"),
         ];
         for (exe, args_pattern) in command_patterns {
+            log::info!(
+                "stop_headroom: pkill -f {:?}",
+                format!("{} {args_pattern}", exe.display())
+            );
             if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
                 log::warn!("failed to clean detached headroom proxy processes: {err}");
             }
         }
+        log::info!("stop_headroom: done");
     }
 
     /// One-shot, best-effort prefetch of the Kompress ML model on a fresh
@@ -7040,6 +7045,15 @@ fn group_kill_target(pid: i32) -> Option<String> {
 }
 
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
+    // An unresolved runtime path degrades the pattern from "our backend at this
+    // exact path" to a loose substring, and `pkill -f` applies it to every
+    // process the user owns. Refuse rather than guess.
+    if exe.parent().is_none() || exe.as_os_str().is_empty() {
+        return Err(anyhow!(
+            "refusing to pkill with an unresolved executable path {exe:?}"
+        ));
+    }
+
     #[cfg(unix)]
     {
         let pattern = format!("{} {args_pattern}", exe.display());
