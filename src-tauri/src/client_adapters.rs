@@ -6429,9 +6429,23 @@ mod tests {
         fs::write(bin_dir.join("claude"), "").expect("write npm bash shim");
         fs::write(bin_dir.join("claude.cmd"), "").expect("write npm cmd shim");
 
-        let detected = find_on_path_entries(vec![bin_dir.clone()], &["claude"]);
+        let detected = find_on_path_entries(vec![bin_dir.clone()], &["claude"]).expect("detected");
 
-        assert_eq!(detected, Some(bin_dir.join("claude.cmd")));
+        // The extension's CASE comes from PATHEXT, which is uppercase on a real
+        // Windows box (`.COM;.EXE;.BAT;.CMD`), so the returned path is the one
+        // we constructed -- `claude.CMD` -- not the on-disk spelling. It spawns
+        // either way because NTFS is case-insensitive; only a byte-compare in a
+        // test can tell them apart. Assert what actually matters: the .cmd was
+        // picked over the bare shim.
+        assert_eq!(detected.parent(), Some(bin_dir.as_path()));
+        assert!(
+            detected
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("claude.cmd")),
+            "{}",
+            detected.display()
+        );
 
         let _ = fs::remove_dir_all(home);
     }
