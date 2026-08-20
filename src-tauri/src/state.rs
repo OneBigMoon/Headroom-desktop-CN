@@ -1312,6 +1312,9 @@ impl AppState {
             tracked_child: self.headroom_process.lock().is_some(),
             new_proxy_log_written,
             proxy_port_bound: proxy_port_accepts_connection(),
+            port_occupant: crate::tool_manager::describe_proxy_port_occupant(
+                crate::backend_port::get(),
+            ),
             python_installed: post_spawn.python_installed,
             proxy_bypass: post_spawn.proxy_bypass,
             pricing_allows_optimization: post_spawn.pricing_allows_optimization,

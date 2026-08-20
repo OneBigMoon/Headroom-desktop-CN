@@ -3705,20 +3705,30 @@ fn configure_opencode_provider_block(
     let path = opencode_config_path();
     let mut config = read_opencode_config(&path)?;
 
-    // `headroom wrap opencode` (bundled CLI) injects its own provider block
-    // pointing at a wrap-managed proxy. Layering the desktop's routing on top
-    // would fight it; make the user pick one.
-    if config
-        .get("provider")
-        .and_then(|p| p.get("headroom"))
-        .is_some()
-    {
-        return Err(anyhow!(
-            "OpenCode's config contains a provider block from `headroom wrap opencode`. Run `headroom unwrap opencode` first, then retry setup."
-        ));
-    }
-
     let mut changed = false;
+
+    // `headroom wrap opencode` (bundled CLI) injects its own provider block and
+    // repoints the native providers at a wrap-managed proxy, restoring both when
+    // it exits. A SIGKILL, a crash, or a reboot leaves that state behind, and the
+    // user has no `headroom` on PATH to unwrap it with - so do the unwrap here.
+    // The block names the port it hijacked, which is how a wrap-managed base URL
+    // is told apart from one the user actually chose (and so must not be
+    // preserved as the "original" for restore-on-disable).
+    if config.pointer("/provider/headroom").is_some() {
+        let wrap_url = config
+            .pointer("/provider/headroom/options/baseURL")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(providers) = config.get_mut("provider").and_then(|v| v.as_object_mut()) {
+            providers.remove("headroom");
+        }
+        for provider in OPENCODE_MANAGED_PROVIDERS {
+            if wrap_url.is_some() && opencode_provider_base_url(&config, provider) == wrap_url {
+                remove_opencode_provider_base_url(&mut config, provider);
+            }
+        }
+        changed = true;
+    }
     for provider in OPENCODE_MANAGED_PROVIDERS {
         let existing = opencode_provider_base_url(&config, provider);
         if existing.as_deref() == Some(HEADROOM_OPENCODE_BASE_URL) {
@@ -8497,20 +8507,52 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn opencode_apply_refuses_wrap_managed_config() {
+    fn opencode_apply_unwraps_stale_wrap_config() {
         let _home = TestHome::new(); // env guard
         let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("opencode.json");
+        // `headroom wrap opencode` killed before it could restore: its own
+        // provider block, plus a native provider repointed at its proxy port.
         fs::write(
-            config_dir.join("opencode.json"),
-            r#"{"provider":{"headroom":{"npm":"@ai-sdk/openai-compatible"}}}"#,
+            &config_path,
+            r#"{
+  "theme": "tokyonight",
+  "provider": {
+    "headroom": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" }
+    },
+    "anthropic": {
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" }
+    }
+  }
+}"#,
         )
         .unwrap();
 
-        let err = super::apply_client_setup("opencode").expect_err("apply must refuse");
+        super::apply_client_setup("opencode").expect("apply unwraps instead of refusing");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
-            err.to_string().contains("headroom unwrap opencode"),
-            "actionable error, got: {err}"
+            config["provider"].get("headroom").is_none(),
+            "stale wrap provider removed, got:\n{config:#}"
+        );
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            serde_json::json!("http://127.0.0.1:6767/v1")
+        );
+        assert_eq!(config["theme"], serde_json::json!("tokyonight"));
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            after
+                .pointer("/provider/anthropic/options/baseURL")
+                .is_none(),
+            "wrap's dead port must not be restored as the user's own, got:\n{after:#}"
         );
     }
 

@@ -6677,6 +6677,21 @@ fn diagnose_proxy_port_settled(port: u16) -> PortState {
     settle_unowned_port(|| diagnose_proxy_port(port), 6, Duration::from_millis(500))
 }
 
+/// Who holds `port`, as a short label for boot-validation failure diagnostics.
+///
+/// `proxy_port_bound=true` on its own cannot tell "our freshly spawned child
+/// is wedged and never answered /livez" apart from "a foreign process squats
+/// the port so the child never got it": both burn the full boot budget and
+/// look identical in Sentry (RUST-7Y, RUST-4A). Called once, on the failure
+/// path, before `stop_headroom` tears the occupant down.
+pub(crate) fn describe_proxy_port_occupant(port: u16) -> String {
+    match diagnose_proxy_port(port) {
+        PortState::Free => "free".to_string(),
+        PortState::HeadroomRunning => "headroom".to_string(),
+        PortState::ForeignOccupant(detail) => format!("foreign: {detail}"),
+    }
+}
+
 /// Re-`diagnose` while the port reads as held-by-nobody, up to `attempts`
 /// times. Split from [`diagnose_proxy_port_settled`] so the retry rule is
 /// testable without binding real sockets.
@@ -6703,21 +6718,46 @@ fn settle_unowned_port(
 /// headroom-branded). Guards port reclaim from killing an unrelated process
 /// that merely answers HTTP on our port.
 fn pid_is_headroom_backend(pid: u32) -> bool {
-    let Ok(output) = crate::proc::command("/bin/ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-    else {
-        return false;
-    };
-    let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    // A bare "headroom" substring also matches unrelated dev processes whose
-    // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
-    // Require the `proxy` subcommand as well: every version of the managed
-    // backend runs as `... headroom proxy ...` (or `-m headroom.proxy.server`),
-    // so this still recognizes old orphans the upgrade path must reclaim while
-    // excluding a random headroom-pathed process. Only ever consulted for the
-    // exact port being reclaimed, so the blast radius is one port either way.
-    argv.contains("headroom") && argv.contains("proxy")
+    // Windows has no `ps`, and `tasklist` reports only the image name, which is
+    // a bare `python.exe` for every venv on the machine. The executable PATH is
+    // both obtainable and a stricter claim: anything running out of our managed
+    // runtime is ours by construction, whatever its argv says.
+    #[cfg(windows)]
+    {
+        let Ok(output) = crate::proc::command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
+            ])
+            .output()
+        else {
+            return false;
+        };
+        let path = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        // Both, not either: "headroom" alone matches the app's own exe, and a
+        // bare "venv" matches every unrelated Python project on the machine.
+        return path.contains("headroom") && path.contains("venv");
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(output) = crate::proc::command("/bin/ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        // A bare "headroom" substring also matches unrelated dev processes whose
+        // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
+        // Require the `proxy` subcommand as well: every version of the managed
+        // backend runs as `... headroom proxy ...` (or `-m headroom.proxy.server`),
+        // so this still recognizes old orphans the upgrade path must reclaim while
+        // excluding a random headroom-pathed process. Only ever consulted for the
+        // exact port being reclaimed, so the blast radius is one port either way.
+        argv.contains("headroom") && argv.contains("proxy")
+    }
 }
 
 fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
@@ -6770,8 +6810,68 @@ fn listener_process(port: u16) -> Option<(String, u32)> {
     }
     #[cfg(target_os = "linux")]
     return ss_listener(port);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    return windows_listener(port);
+    #[cfg(not(any(target_os = "linux", windows)))]
     return None;
+}
+
+/// Windows has neither `lsof` nor `ss`, so `listener_process` returned `None`
+/// for every port -- which is why `diagnose_proxy_port` could only ever say
+/// "unknown process" there (RUST-7F) and why `reclaim_orphan_proxy` bailed
+/// before it could reclaim anything. `netstat` and `tasklist` ship with every
+/// Windows since XP and need no elevation for our own processes.
+#[cfg(windows)]
+fn windows_listener(port: u16) -> Option<(String, u32)> {
+    let output = crate::proc::command("netstat")
+        .args(["-ano"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let pid = parse_netstat_listener(&String::from_utf8_lossy(&output.stdout), port)?;
+
+    // The image name is cosmetic (it goes into the occupant string); a pid we
+    // could not name is still a pid worth reporting and gating a kill on.
+    let image = crate::proc::command("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_tasklist_image(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_else(|| "unnamed process".to_string());
+    Some((image, pid))
+}
+
+/// The pid LISTENING on `port` in `netstat -ano` output.
+///
+/// Matches the port exactly rather than by suffix: `:16768` ends with `6768`,
+/// and picking that row would point a kill at an unrelated process.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Proto, Local Address, Foreign Address, State, PID
+        if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("TCP") {
+            return None;
+        }
+        if !fields[3].eq_ignore_ascii_case("LISTENING") {
+            return None;
+        }
+        // rsplit: IPv6 rows are `[::1]:6768`, so only the last colon separates
+        // the port.
+        let (_, found) = fields[1].rsplit_once(':')?;
+        (found.parse::<u16>().ok()? == port).then(|| fields[4].parse().ok())?
+    })
+}
+
+/// The image name from one `tasklist /NH /FO CSV` row (`"python.exe","123",...`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tasklist_image(text: &str) -> Option<String> {
+    let row = text.lines().find(|line| line.starts_with('"'))?;
+    let name = row.strip_prefix('"')?.split('"').next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// `(command, pid)` from the first data row of `lsof -nP -iTCP -sTCP:LISTEN`,
@@ -6896,6 +6996,34 @@ fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
 /// `stop_headroom`'s argv pattern-kill missed the real socket holder) must be
 /// killed anyway, or the new venv can't bind and the upgrade rolls back as
 /// `not_started`. When set, skip the readyz health guard and reclaim regardless.
+/// Signal a single pid, gracefully or forcefully.
+///
+/// Deliberately not `state::terminate_process_tree`: that one signals a process
+/// GROUP on unix and refuses any pid we did not spawn, which is exactly what an
+/// orphan from a previous app instance is. Callers must have passed
+/// `pid_is_headroom_backend` first.
+fn kill_pid(pid: u32, force: bool) {
+    #[cfg(windows)]
+    {
+        // `/T` takes the subtree with it: the backend spawns helpers, and a
+        // survivor holds the port just as well as its parent did.
+        let mut command = crate::proc::command("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.status();
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = crate::proc::command("/bin/kill");
+        if force {
+            command.arg("-KILL");
+        }
+        let _ = command.arg(pid.to_string()).status();
+    }
+}
+
 fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
         bail!("{}", format_already_running_bail(port));
@@ -6911,14 +7039,9 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
-    let _ = crate::proc::command("/bin/kill")
-        .arg(pid.to_string())
-        .status();
+    kill_pid(pid, false);
     if !wait_for_port_free(port, Duration::from_secs(3)) {
-        let _ = crate::proc::command("/bin/kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status();
+        kill_pid(pid, true);
         if !wait_for_port_free(port, Duration::from_secs(2)) {
             bail!("{}", format_already_running_bail(port));
         }
@@ -8854,15 +8977,16 @@ mod tests {
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        codebase_memory_distribution_artifact, compact_pip_failure, diagnose_proxy_port,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
+        codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
+        diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
-        parse_pid_from_lsof_detail, parse_ss_listener, path_with_binary_dir, pending_addon_update,
-        pinned_headroom_release, pip_failure_category, plugin_install_failure_category,
-        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
+        parse_tasklist_image, path_with_binary_dir, pending_addon_update, pinned_headroom_release,
+        pip_failure_category, plugin_install_failure_category, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
@@ -9350,6 +9474,17 @@ mod tests {
         );
         assert!(matches!(state, PortState::Free));
         assert_eq!(calls.get(), 3);
+    }
+
+    /// The boot-validation failure path reports the occupant, not just a
+    /// bound/unbound bit. A free port and a held one must not read alike.
+    #[test]
+    fn describe_proxy_port_occupant_separates_free_from_held() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        assert_ne!(describe_proxy_port_occupant(port), "free");
+        drop(listener);
+        assert_eq!(describe_proxy_port_occupant(port), "free");
     }
 
     #[test]
@@ -10186,6 +10321,43 @@ mod tests {
     }
 
     #[test]
+    /// Windows could not name a port holder at all before this (no lsof, no
+    /// ss), so every occupant read as "unknown process" and no reclaim could
+    /// pass its identity gate.
+    #[test]
+    fn parse_netstat_listener_finds_the_listening_pid() {
+        let out = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1044\r\n  TCP    127.0.0.1:6768         0.0.0.0:0              LISTENING       9876\r\n  TCP    [::1]:6767             [::]:0                 LISTENING       4321\r\n";
+        assert_eq!(parse_netstat_listener(out, 6768), Some(9876));
+        // IPv6 rows are `[::1]:6767`; only the LAST colon separates the port.
+        assert_eq!(parse_netstat_listener(out, 6767), Some(4321));
+        assert_eq!(parse_netstat_listener(out, 7000), None);
+    }
+
+    /// Suffix matching would point a kill at whatever holds :16768.
+    #[test]
+    fn parse_netstat_listener_does_not_match_a_port_by_suffix() {
+        let out = "  TCP    127.0.0.1:16768        0.0.0.0:0              LISTENING       5555\r\n";
+        assert_eq!(parse_netstat_listener(out, 6768), None);
+    }
+
+    /// An ESTABLISHED row for the same port is a client, not the holder.
+    #[test]
+    fn parse_netstat_listener_ignores_non_listening_rows() {
+        let out = "  TCP    127.0.0.1:6768         127.0.0.1:52100        ESTABLISHED     7777\r\n";
+        assert_eq!(parse_netstat_listener(out, 6768), None);
+    }
+
+    #[test]
+    fn parse_tasklist_image_reads_the_csv_image_name() {
+        let out = "\"python.exe\",\"9876\",\"Console\",\"1\",\"45,678 K\"\r\n";
+        assert_eq!(parse_tasklist_image(out), Some("python.exe".to_string()));
+        // `/FI` with no match prints an INFO line, not a CSV row.
+        assert_eq!(
+            parse_tasklist_image("INFO: No tasks are running which match the specified criteria."),
+            None
+        );
+    }
+
     fn parse_lsof_listener_reads_the_row_below_the_header() {
         let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
                    python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";

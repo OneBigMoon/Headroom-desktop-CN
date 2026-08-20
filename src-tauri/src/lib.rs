@@ -722,11 +722,32 @@ async fn check_for_app_update(
     let config = release_updater_config(&current_version, beta_channel_enabled())?
         .ok_or_else(|| "Update checks are not configured in this build.".to_string())?;
 
+    // On Windows the plugin installs by calling `ShellExecuteW(installer)` and
+    // then `std::process::exit(0)` -- no Tauri exit event, no destructors, and
+    // no chance for us to stop the Python backend we spawned. That child
+    // outlives the app and keeps :6768, so the freshly installed build finds
+    // its own port "held by unknown process" and falls back to 6769 (RUST-7F)
+    // while an old-version backend squats the real one. One orphaned backend
+    // per update, until the user reboots.
+    //
+    // `on_before_exit` is the only hook ahead of that exit, and it is
+    // Windows-only by construction (the unix `install_inner` never calls it),
+    // so macOS/Linux keep tearing down through `restart_app` exactly as before.
+    // The installer does not launch until this returns, so it must be bounded:
+    // `stop_headroom` caps itself at ~2s on the lifecycle lock plus ~2s on the
+    // child before it force-kills.
+    let teardown = app.clone();
     let updater = app
         .updater_builder()
         .pubkey(config.pubkey)
         .endpoints(config.endpoints)
         .map_err(|err| err.to_string())?
+        .on_before_exit(move || {
+            log::info!("update: stopping the backend before the installer exits the app");
+            SHUTTING_DOWN.store(true, Ordering::Release);
+            let state: tauri::State<'_, AppState> = teardown.state();
+            state.stop_headroom();
+        })
         .build()
         .map_err(|err| err.to_string())?;
 
@@ -2239,6 +2260,10 @@ pub(crate) struct UpgradeBootDiagnostics {
     pub proxy_bypass: bool,
     pub pricing_allows_optimization: bool,
     pub runtime_paused: bool,
+    /// Who actually held the backend port at failure time: `free`,
+    /// `headroom`, or `foreign: <cmd> pid <n>`. `proxy_port_bound` alone
+    /// cannot separate a wedged child of ours from a foreign squatter.
+    pub port_occupant: String,
     pub ensure_error: Option<String>,
     /// Last ~100 lines of pip stdout/stderr from the install pass that
     /// produced the venv we're now booting. Pip can return exit 0 while
@@ -2370,6 +2395,19 @@ pub(crate) fn capture_upgrade_failure(
                     diag.pricing_allows_optimization.into(),
                 );
                 scope.set_extra("runtime_paused", diag.runtime_paused.into());
+                if !diag.port_occupant.is_empty() {
+                    // Tag on the kind only: the detail carries a pid, which
+                    // would explode tag cardinality.
+                    scope.set_tag(
+                        "port_occupant",
+                        diag.port_occupant
+                            .split(':')
+                            .next()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    );
+                    scope.set_extra("port_occupant", diag.port_occupant.clone().into());
+                }
                 if let Some(err) = diag.ensure_error.as_deref() {
                     scope.set_extra("ensure_headroom_running_error", err.into());
                 }
