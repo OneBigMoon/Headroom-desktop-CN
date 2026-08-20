@@ -11,11 +11,6 @@ name: Release App (Staging)
 # there, not a no-op, so publishing macOS entries first stranded every Windows
 # and Linux install for the length of their builds. If any platform fails,
 # staging-rolling keeps serving the previous rc intact.
-#
-# NOTE: Linux ships on this rc channel only. release-macos.yml has no linux job,
-# so a stable X.Y.Z release publishes macOS and Windows and nothing else - and
-# its mirror drops linux-x86_64 from staging-rolling until the next rc. To
-# graduate Linux, add a third job there mirroring this one.
 
 on:
   push:

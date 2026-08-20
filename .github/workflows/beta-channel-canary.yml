@@ -9,9 +9,6 @@ name: Beta channel canary
 # lib.rs), so a manifest that lost windows-x86_64 strands those installs
 # silently. Both release workflows publish latest.json only once every platform
 # has built, so an in-flight release does not red this run.
-#
-# linux-x86_64 is deliberately not asserted: it ships on the rc channel only, so
-# a stable release drops it from staging-rolling until the next rc.
 on:
   schedule:
     - cron: "23 */6 * * *"
@@ -28,7 +25,7 @@ jobs:
           body=$(curl -sfL --max-time 30 "$url")
           echo "$body" | head -c 400
           echo "$body" | grep -q '"version"' || { echo "::error::latest.json has no version field"; exit 1; }
-          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64 linux-x86_64 linux-x86_64-deb; do
             echo "$body" | jq -e --arg p "$platform" '.platforms[$p].url' >/dev/null \
               || { echo "::error::staging latest.json has no $platform entry"; exit 1; }
           done
@@ -38,7 +35,7 @@ jobs:
           set -euo pipefail
           url="https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
           body=$(curl -sfL --max-time 30 "$url")
-          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64 linux-x86_64 linux-x86_64-deb; do
             echo "$body" | jq -e --arg p "$platform" '.platforms[$p].url' >/dev/null \
               || { echo "::error::stable latest.json has no $platform entry"; exit 1; }
           done
