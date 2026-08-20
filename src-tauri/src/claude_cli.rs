@@ -23,6 +23,17 @@ fn detect_cli(name: &str) -> Option<PathBuf> {
     if let Some(path) = probe_known_paths(name) {
         return Some(path);
     }
+    // PATH lookup before the login shell: on Windows none of the POSIX
+    // candidate dirs exist and there is no `/bin/zsh` to probe, so this is the
+    // only branch that can resolve `npx.cmd` / `claude.cmd` -- without it the
+    // Context7 and plugin addons reported "not found on PATH" on every Windows
+    // box regardless of what was installed. On Unix it is a cheap extra hit
+    // ahead of the 2s interactive-shell probe.
+    if let Some(path) = crate::client_adapters::find_on_path(&[name]) {
+        if is_runnable(&path) {
+            return Some(path);
+        }
+    }
     probe_via_login_shell(name)
 }
 
@@ -59,7 +70,7 @@ fn probe_via_login_shell(name: &str) -> Option<PathBuf> {
         _ => "-ilc",
     };
 
-    let mut command = Command::new(&shell);
+    let mut command = crate::proc::command(&shell);
     command.arg(flags).arg(format!("command -v {name}"));
     read_path_from_shell(command, SHELL_LOOKUP_TIMEOUT)
 }
@@ -144,7 +155,7 @@ fn is_runnable(path: &Path) -> bool {
     if !is_executable(path) {
         return false;
     }
-    let mut command = Command::new(path);
+    let mut command = crate::proc::command(path);
     command
         .arg("--version")
         .stdin(Stdio::null())
@@ -438,7 +449,7 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
 
-        let child = Command::new(&path)
+        let child = crate::proc::command(&path)
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -468,7 +479,7 @@ mod tests {
         make_executable(&fake_claude);
         let claude_str = fake_claude.display().to_string();
 
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = crate::proc::command("/bin/sh");
         cmd.arg("-c").arg(format!("echo {claude_str}; sleep 30"));
 
         let start = Instant::now();
@@ -487,7 +498,7 @@ mod tests {
     // and passing both asserts without exercising the timeout at all.
     #[cfg(unix)]
     fn read_path_from_shell_times_out_when_no_output() {
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = crate::proc::command("/bin/sh");
         cmd.arg("-c").arg("sleep 30");
 
         let start = Instant::now();

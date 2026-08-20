@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -1094,10 +1093,13 @@ pub fn revert_external_mutations() -> Vec<String> {
         removed.extend(sweep_managed_backups(&target));
     }
 
-    // The LaunchAgent plist is an install side effect outside Headroom's own
-    // directories, so it belongs here and not with the user-data removal.
+    // The LaunchAgent plist and its Linux counterpart are install side effects
+    // outside Headroom's own directories, so they belong here and not with the
+    // user-data removal.
     #[cfg(target_os = "macos")]
     removed.extend(remove_macos_launch_agents());
+    #[cfg(target_os = "linux")]
+    removed.extend(remove_linux_autostart_entries());
 
     removed
 }
@@ -1187,7 +1189,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     {
         // Remove the autostart Run key tauri-plugin-autostart creates
         // (HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Headroom).
-        let _ = std::process::Command::new("reg")
+        let _ = crate::proc::command("reg")
             .args([
                 "delete",
                 "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -1596,12 +1598,37 @@ fn remove_macos_launch_agents() -> Vec<String> {
             continue;
         }
         // Best-effort unload before deletion so launchd forgets the job.
-        let _ = Command::new("launchctl")
+        let _ = crate::proc::command("launchctl")
             .args(["unload", "-w"])
             .arg(&path)
             .output();
         match std::fs::remove_file(&path) {
             Ok(_) => removed.push(path.display().to_string()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
+        }
+    }
+
+    removed
+}
+
+/// tauri-plugin-autostart writes `~/.config/autostart/<product name>.desktop`
+/// on Linux (auto-launch names the file after `package_info().name`). Left
+/// behind, it execs a binary uninstall just deleted, on every login — the same
+/// class of leftover as the macOS LaunchAgent plist.
+#[cfg(target_os = "linux")]
+fn remove_linux_autostart_entries() -> Vec<String> {
+    let mut removed = Vec::new();
+    let autostart_dir = home_dir().join(".config").join("autostart");
+
+    // Current product name, plus the binary name in case a build ever shipped
+    // the plugin's `app_name` override. Either can exist.
+    for name in ["Headroom.desktop", "headroom-desktop.desktop"] {
+        let path = autostart_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path.display().to_string()),
             Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
@@ -1858,11 +1885,25 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         s.push(format!(".tmp.{}.{}", std::process::id(), n));
         PathBuf::from(s)
     };
-    std::fs::write(&tmp_path, contents)
-        .with_context(|| format!("writing {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path).with_context(|| {
+    // The io error goes in the *message*, not a source: every caller logs this
+    // with `{err}`, which prints only the top context and drops the chain, so
+    // Sentry saw "failed to persist usage-counters.json: writing <path>.tmp.N"
+    // with no reason at all (RUST-77). Baking the cause in fixes all 50-odd
+    // callers at once instead of auditing each log site for `{err:#}`.
+    std::fs::write(&tmp_path, contents).map_err(|err| {
+        // A failed write still leaves the (partial) tmp behind, and the name is
+        // unique per write, so nothing ever reclaims it. On a full disk that is
+        // one orphan per attempt, each holding whatever bytes did land (RUST-6R).
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow!("writing {}: {err}", tmp_path.display())
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
         let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-        format!("renaming {} -> {}", tmp_path.display(), path.display())
+        anyhow!(
+            "renaming {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
     })
 }
 
@@ -2327,6 +2368,50 @@ fn configure_claude_settings_env(
     ))
 }
 
+/// Absolute, quoted `bash.exe` for a Windows hook command. Git for Windows
+/// only adds `Git\cmd` to PATH in its default setup while `bash.exe` lives in
+/// `Git\bin`, so a bare `bash` resolved on a dev box and nowhere else -- the
+/// rtk and markitdown hooks installed fine and then silently never fired.
+/// Install locations are probed before PATH deliberately: `System32\bash.exe`
+/// is WSL, whose filesystem view cannot see the `C:\Users\...` script path.
+/// Bare `bash` remains the last resort -- a hook that needs the user to fix
+/// their PATH still beats no hook at all.
+fn windows_bash_command() -> String {
+    let git_bash = ["ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|root| PathBuf::from(root).join("Git"))
+        .chain(
+            std::env::var_os("LOCALAPPDATA")
+                .map(|root| PathBuf::from(root).join("Programs").join("Git")),
+        )
+        .map(|root| root.join("bin").join("bash.exe"))
+        .find(|candidate| candidate.exists());
+
+    git_bash
+        .or_else(|| find_on_path(&["bash"]))
+        .map(|path| format!("\"{}\"", path.display()))
+        .unwrap_or_else(|| "bash".to_string())
+}
+
+/// The command Claude Code runs for a Headroom PreToolUse hook. The hooks are
+/// bash scripts; on Windows they are launched through PowerShell, which needs
+/// the call operator in front of a quoted interpreter path (see
+/// [`join_guard_command`]).
+fn hook_shell_command(hook_path: &Path) -> Result<String> {
+    if cfg!(target_os = "windows") {
+        return Ok(join_guard_command(
+            &windows_bash_command(),
+            &hook_path.to_string_lossy(),
+            true,
+        ));
+    }
+    hook_path
+        .to_str()
+        .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))
+        .map(str::to_string)
+}
+
 fn ensure_claude_settings_hook(
     hook_path: &Path,
     matcher: &str,
@@ -2345,14 +2430,7 @@ fn ensure_claude_settings_hook(
         content = Value::Object(Default::default());
     }
 
-    let hook_command = if cfg!(target_os = "windows") {
-        format!("bash {}", shell_double_quote(&hook_path.to_string_lossy()))
-    } else {
-        hook_path
-            .to_str()
-            .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))?
-            .to_string()
-    };
+    let hook_command = hook_shell_command(hook_path)?;
     let already_present = claude_hook_present_in_value(&content, &hook_command);
     if already_present {
         return Ok((Vec::new(), Vec::new()));
@@ -2527,6 +2605,11 @@ fn command_contains(command: &Value, fragment: &str) -> bool {
 }
 
 fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
+    // Deliberately the macOS path only. These keys were written into VS Code's
+    // settings.json by macOS-only builds; the connector has since moved to
+    // ~/.claude/settings.json, which is where every platform reads and writes
+    // today. No Linux or Windows build ever wrote a key for this to clean up,
+    // so there is nothing to make platform-aware here.
     let settings_path = home_dir()
         .join("Library")
         .join("Application Support")
@@ -3622,20 +3705,30 @@ fn configure_opencode_provider_block(
     let path = opencode_config_path();
     let mut config = read_opencode_config(&path)?;
 
-    // `headroom wrap opencode` (bundled CLI) injects its own provider block
-    // pointing at a wrap-managed proxy. Layering the desktop's routing on top
-    // would fight it; make the user pick one.
-    if config
-        .get("provider")
-        .and_then(|p| p.get("headroom"))
-        .is_some()
-    {
-        return Err(anyhow!(
-            "OpenCode's config contains a provider block from `headroom wrap opencode`. Run `headroom unwrap opencode` first, then retry setup."
-        ));
-    }
-
     let mut changed = false;
+
+    // `headroom wrap opencode` (bundled CLI) injects its own provider block and
+    // repoints the native providers at a wrap-managed proxy, restoring both when
+    // it exits. A SIGKILL, a crash, or a reboot leaves that state behind, and the
+    // user has no `headroom` on PATH to unwrap it with - so do the unwrap here.
+    // The block names the port it hijacked, which is how a wrap-managed base URL
+    // is told apart from one the user actually chose (and so must not be
+    // preserved as the "original" for restore-on-disable).
+    if config.pointer("/provider/headroom").is_some() {
+        let wrap_url = config
+            .pointer("/provider/headroom/options/baseURL")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(providers) = config.get_mut("provider").and_then(|v| v.as_object_mut()) {
+            providers.remove("headroom");
+        }
+        for provider in OPENCODE_MANAGED_PROVIDERS {
+            if wrap_url.is_some() && opencode_provider_base_url(&config, provider) == wrap_url {
+                remove_opencode_provider_base_url(&mut config, provider);
+            }
+        }
+        changed = true;
+    }
     for provider in OPENCODE_MANAGED_PROVIDERS {
         let existing = opencode_provider_base_url(&config, provider);
         if existing.as_deref() == Some(HEADROOM_OPENCODE_BASE_URL) {
@@ -3975,12 +4068,35 @@ fn guard_python_command() -> String {
     }
 }
 
-fn codex_guard_command() -> String {
-    format!(
-        "{} {}",
-        guard_python_command(),
-        codex_guard_hook_path().display()
+/// Join the guard interpreter and its script into a command string the host
+/// shell can actually run. Claude Code and Codex launch hooks through
+/// PowerShell on Windows, where a command that *starts* with a quoted path
+/// parses as a string literal rather than a command ("At line:1 char:81" --
+/// the offset lands on the unquoted script path), so the call operator is
+/// required and the script path needs quoting too because profile directories
+/// contain spaces. Deliberately not `shell_double_quote`: that escapes
+/// backslashes POSIX-style and would mangle every Windows path. PowerShell
+/// escapes with a backtick, and both `"` and backtick are invalid in Windows
+/// filenames, so bare double quotes are already sufficient.
+fn guard_command(script_path: &Path) -> String {
+    join_guard_command(
+        &guard_python_command(),
+        &script_path.to_string_lossy(),
+        cfg!(target_os = "windows"),
     )
+}
+
+/// Pure so the Windows branch is exercised by tests on every platform.
+fn join_guard_command(python: &str, script: &str, windows: bool) -> String {
+    if windows {
+        format!("& {python} \"{script}\"")
+    } else {
+        format!("{python} {script}")
+    }
+}
+
+fn codex_guard_command() -> String {
+    guard_command(&codex_guard_hook_path())
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -4325,6 +4441,15 @@ fn ensure_codex_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         false,
         Some(&["UserPromptSubmit"]),
     )?;
+    // Same stale-command migration as `ensure_claude_guard_hook`; see there.
+    if !codex_guard_registered().unwrap_or(false) {
+        remove_guard_hook_entries(
+            &codex_hooks_json_path(),
+            &script_path.display().to_string(),
+            false,
+            Some(&["SessionStart"]),
+        )?;
+    }
     let (mut changed, mut backups) = register_guard_hook_entries(
         &codex_hooks_json_path(),
         &codex_guard_command(),
@@ -4371,11 +4496,7 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    format!(
-        "{} {}",
-        guard_python_command(),
-        claude_guard_hook_path().display()
-    )
+    guard_command(&claude_guard_hook_path())
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -4533,6 +4654,21 @@ fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         false,
         Some(&["UserPromptSubmit"]),
     )?;
+    // Migration: the Windows command string changed (PowerShell needs the call
+    // operator), and `register_guard_hook_entries` dedupes on the exact command
+    // string, so an upgrading install would keep the old unparseable entry
+    // alongside the fixed one and keep erroring at every session start. Strip
+    // stale forms by script path -- but only when the current command is not
+    // already registered, since an unconditional remove-then-re-add would
+    // rewrite settings.json on every launch.
+    if !claude_guard_registered().unwrap_or(false) {
+        remove_guard_hook_entries(
+            &claude_settings_path(),
+            &script_path.display().to_string(),
+            false,
+            Some(&["SessionStart"]),
+        )?;
+    }
     let (mut changed, mut backups) = register_guard_hook_entries(
         &claude_settings_path(),
         &claude_guard_command(),
@@ -4574,7 +4710,7 @@ fn remove_claude_guard_hook() -> Result<()> {
 /// reasons must not flip `verified`.
 fn codex_doctor_summary() -> Option<String> {
     let codex = find_on_path(&["codex"])?;
-    let output = Command::new(codex).arg("doctor").output().ok()?;
+    let output = crate::proc::command(codex).arg("doctor").output().ok()?;
     if output.status.success() {
         Some("`codex doctor` reports the Codex install is healthy.".into())
     } else {
@@ -4595,7 +4731,7 @@ fn remove_launchctl_env(keys: &[&str]) -> Result<()> {
 }
 
 fn run_launchctl(args: &[&str]) -> Result<std::process::Output> {
-    let output = Command::new("launchctl")
+    let output = crate::proc::command("launchctl")
         .args(args)
         .output()
         .with_context(|| format!("running launchctl {}", args.join(" ")))?;
@@ -5814,7 +5950,7 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
         .ok_or_else(|| anyhow!("{} must contain a top-level JSON object", path.display()))
 }
 
-fn find_on_path(binary_names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn find_on_path(binary_names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     find_on_path_entries(std::env::split_paths(&path_var), binary_names)
 }
@@ -5825,11 +5961,10 @@ where
 {
     for entry in path_entries {
         for binary_name in binary_names {
-            let candidate = entry.join(binary_name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-
+            // PATHEXT variants first on Windows: npm drops an extensionless
+            // shim (`claude`, a bash script) next to `claude.cmd`, and only
+            // the PATHEXT one is executable there. Matching the bare name
+            // first handed callers a path Windows cannot spawn.
             if cfg!(windows) {
                 for ext in windows_path_extensions() {
                     let with_ext = entry.join(format!("{binary_name}{ext}"));
@@ -5837,6 +5972,11 @@ where
                         return Some(with_ext);
                     }
                 }
+            }
+
+            let candidate = entry.join(binary_name);
+            if candidate.exists() {
+                return Some(candidate);
             }
         }
     }
@@ -6283,6 +6423,39 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate == &version_bin.join("claude")));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// npm installs drop an extensionless bash shim next to the `.cmd`, and
+    /// only the `.cmd` is spawnable on Windows. Matching the bare name first
+    /// handed every caller (`claude`, `codex`, `npx`) a dead path.
+    #[test]
+    #[cfg(windows)]
+    fn windows_path_lookup_prefers_the_pathext_variant() {
+        let home = unique_temp_dir("headroom-path-pathext");
+        let bin_dir = home.join("custom-bin");
+        fs::create_dir_all(&bin_dir).expect("create custom bin");
+        fs::write(bin_dir.join("claude"), "").expect("write npm bash shim");
+        fs::write(bin_dir.join("claude.cmd"), "").expect("write npm cmd shim");
+
+        let detected = find_on_path_entries(vec![bin_dir.clone()], &["claude"]).expect("detected");
+
+        // The extension's CASE comes from PATHEXT, which is uppercase on a real
+        // Windows box (`.COM;.EXE;.BAT;.CMD`), so the returned path is the one
+        // we constructed -- `claude.CMD` -- not the on-disk spelling. It spawns
+        // either way because NTFS is case-insensitive; only a byte-compare in a
+        // test can tell them apart. Assert what actually matters: the .cmd was
+        // picked over the bare shim.
+        assert_eq!(detected.parent(), Some(bin_dir.as_path()));
+        assert!(
+            detected
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("claude.cmd")),
+            "{}",
+            detected.display()
+        );
 
         let _ = fs::remove_dir_all(home);
     }
@@ -6811,7 +6984,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         // Hook expects a JSON object on stdin with tool_input.command.
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -6871,7 +7044,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         for cmd in ["git diff --cached --check", "git diff --check"] {
             let stdin = format!(r#"{{"tool_input":{{"command":"{cmd}"}}}}"#);
-            let output = std::process::Command::new("bash")
+            let output = crate::proc::command("bash")
                 .arg(&hook_path)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -6933,7 +7106,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -6996,7 +7169,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .env("PATH", "/usr/bin:/bin") // ensure bare `rtk` is unresolvable
             .stdin(std::process::Stdio::piped())
@@ -7065,7 +7238,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .env("PATH", "/usr/bin:/bin") // bare `rtk` unresolvable without the prepend
             .stdin(std::process::Stdio::piped())
@@ -7144,7 +7317,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         .expect("chmod hook");
 
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = std::process::Command::new("bash")
+        let output = crate::proc::command("bash")
             .arg(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -8334,20 +8507,52 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn opencode_apply_refuses_wrap_managed_config() {
+    fn opencode_apply_unwraps_stale_wrap_config() {
         let _home = TestHome::new(); // env guard
         let config_dir = super::opencode_config_dir();
         fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("opencode.json");
+        // `headroom wrap opencode` killed before it could restore: its own
+        // provider block, plus a native provider repointed at its proxy port.
         fs::write(
-            config_dir.join("opencode.json"),
-            r#"{"provider":{"headroom":{"npm":"@ai-sdk/openai-compatible"}}}"#,
+            &config_path,
+            r#"{
+  "theme": "tokyonight",
+  "provider": {
+    "headroom": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" }
+    },
+    "anthropic": {
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" }
+    }
+  }
+}"#,
         )
         .unwrap();
 
-        let err = super::apply_client_setup("opencode").expect_err("apply must refuse");
+        super::apply_client_setup("opencode").expect("apply unwraps instead of refusing");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
-            err.to_string().contains("headroom unwrap opencode"),
-            "actionable error, got: {err}"
+            config["provider"].get("headroom").is_none(),
+            "stale wrap provider removed, got:\n{config:#}"
+        );
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            serde_json::json!("http://127.0.0.1:6767/v1")
+        );
+        assert_eq!(config["theme"], serde_json::json!("tokyonight"));
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            after
+                .pointer("/provider/anthropic/options/baseURL")
+                .is_none(),
+            "wrap's dead port must not be restored as the user's own, got:\n{after:#}"
         );
     }
 
@@ -8678,6 +8883,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(codex_guard_command().contains("python.exe"));
         assert!(!claude_guard_command().starts_with("/usr/bin/python3"));
         assert!(!codex_guard_command().starts_with("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn hook_command_is_the_bare_script_path_on_unix() {
+        let path = PathBuf::from("/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
+        let cmd = super::hook_shell_command(&path).expect("hook command");
+        if cfg!(target_os = "windows") {
+            // Same PowerShell contract as the guard: call operator, quoted
+            // interpreter, quoted script.
+            assert!(cmd.starts_with("& "), "{cmd}");
+            assert!(cmd.ends_with("\"/home/g/.claude/hooks/headroom-rtk-rewrite.sh\""));
+            assert!(cmd.contains("bash"), "{cmd}");
+        } else {
+            assert_eq!(cmd, "/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
+        }
+    }
+
+    /// Regression: Claude Code runs SessionStart hooks through PowerShell on
+    /// Windows. A command that starts with a quoted interpreter path parses as
+    /// a string literal, not a command, so the guard died with
+    /// "SessionStart:startup hook error / Failed with non-blocking status code:
+    /// At line:1 char:81" -- char 81 being the first character of the unquoted
+    /// script path that followed the 79-char quoted python path plus a space.
+    /// The call operator is what makes it a command, and the script path must
+    /// be quoted because profile directories contain spaces.
+    #[test]
+    fn windows_guard_command_is_powershell_callable() {
+        let cmd = super::join_guard_command(
+            "\"C:\\Users\\garm\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe\"",
+            "C:\\Users\\garm space\\.claude\\hooks\\headroom-claude-guard.py",
+            true,
+        );
+        assert!(
+            cmd.starts_with("& \""),
+            "PowerShell needs the call operator before a quoted path, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with("headroom-claude-guard.py\""),
+            "script path must be quoted so spaces survive, got: {cmd}"
+        );
+        // Backslashes stay single: PowerShell escapes with a backtick, so
+        // POSIX-style doubling would break every Windows path.
+        assert!(
+            !cmd.contains("\\\\"),
+            "path must not be POSIX-escaped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn unix_guard_command_is_unquoted() {
+        let cmd = super::join_guard_command("/usr/bin/python3", "/home/g/.claude/guard.py", false);
+        assert_eq!(cmd, "/usr/bin/python3 /home/g/.claude/guard.py");
     }
 
     #[cfg(target_os = "windows")]
@@ -9333,6 +9590,30 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .expect("concurrent atomic_write must not ENOENT");
         }
         assert!(path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_error_names_the_io_cause() {
+        // RUST-77: callers log this with `{err}`, which drops the anyhow
+        // source, so Sentry only ever saw "writing <path>.tmp.N". The cause
+        // must survive plain Display.
+        let dir = std::env::temp_dir().join(format!("aw_cause_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Parent does not exist, so writing the tmp file fails with ENOENT.
+        let path = dir.join("missing").join("state.json");
+        let err = super::atomic_write(&path, b"x").expect_err("write into a missing dir must fail");
+        let shown = format!("{err}");
+        assert!(shown.starts_with("writing "), "{shown}");
+        // Match on the "(os error N)" suffix every platform's io::Error Display
+        // carries, not the message text: ENOENT reads "No such file or
+        // directory" on unix but "The system cannot find the path specified."
+        // on Windows, so a unix-worded assertion fails CI on Windows while the
+        // cause it checks for is present.
+        assert!(
+            shown.contains("os error"),
+            "io cause missing from `{{err}}`: {shown}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

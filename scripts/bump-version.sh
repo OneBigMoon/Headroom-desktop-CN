@@ -25,12 +25,10 @@ fi
 # Strip leading 'v'
 VERSION="${VERSION#v}"
 
-# Validate semver format. `-win.N` is the windows-preview channel
-# (windows-preview.yml): it must sort above the last stable so the preview
-# updater offers it, and below the next stable so a promoted release
-# supersedes it.
-if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|win)\.[0-9]+)?$ ]]; then
-  echo "Invalid version: '${VERSION}' (expected x.y.z, x.y.z-rc.N, or x.y.z-win.N)" >&2
+# Validate semver format. `-rc.N` is the staging channel; every platform now
+# builds from it, so the old per-platform `-win.N` preview format is gone.
+if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+  echo "Invalid version: '${VERSION}' (expected x.y.z or x.y.z-rc.N)" >&2
   exit 1
 fi
 

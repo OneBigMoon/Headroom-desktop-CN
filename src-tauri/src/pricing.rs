@@ -2635,10 +2635,46 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, ProfileFetchEr
         return Err(ProfileFetchError { message, transient });
     }
 
-    let body: serde_json::Value = response.json().map_err(|err| {
-        sentry::capture_message(
-            &format!("Could not parse Claude OAuth profile: {err}"),
-            sentry::Level::Error,
+    // Same split as the activation path above (RUST-58): `.json()` collapses a
+    // body-read failure and a serde mismatch into one opaque "error decoding
+    // response body" (RUST-7J). They need opposite handling -- a dropped
+    // connection mid-body is transient and must NOT be a permanent error the
+    // user has to report, while a schema change from Anthropic is exactly the
+    // thing we want to see.
+    let raw = response.text().map_err(|err| {
+        if !is_transient_transport_error(&err) {
+            sentry::capture_message(
+                &format!("Could not read Claude OAuth profile: {err}"),
+                sentry::Level::Error,
+            );
+        }
+        ProfileFetchError {
+            message: "Couldn't finish reading your Claude plan from Anthropic. We'll try again \
+                      shortly."
+                .to_string(),
+            transient: true,
+        }
+    })?;
+    let body: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        sentry::with_scope(
+            |scope| {
+                // Serde errors vary by line/column; one fingerprint keeps them
+                // a single issue.
+                scope.set_fingerprint(Some(&["claude-oauth-profile-parse-error"]));
+                // Snippet only when the body isn't JSON at all (HTML error page,
+                // empty body, captive portal). Valid JSON is described by `err`
+                // and carries the user's account details.
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    let snippet: String = raw.chars().take(300).collect();
+                    scope.set_extra("body_snippet", snippet.into());
+                }
+            },
+            || {
+                sentry::capture_message(
+                    &format!("Could not parse Claude OAuth profile: {err}"),
+                    sentry::Level::Error,
+                )
+            },
         );
         ProfileFetchError {
             message: "We couldn't read the response from Anthropic for your Claude plan. Please \
@@ -3203,8 +3239,50 @@ fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
     .map_err(|err| format!("Failed to write pricing state {}: {err:#}", path.display()))
 }
 
+/// Minimum spacing between grace/start POSTs from one process.
+///
+/// grace/start is a heartbeat whose response (first_seen_at) is effectively
+/// immutable, but the server throttles it at 10/device/hour. The paywall screen
+/// polls get_pricing_status every 3s, which burns that budget in half a minute
+/// and leaves the device 429 for the rest of every hour: last_server_contact_at
+/// then never advances, the account's last_active_at freezes, and the
+/// server-silent alarm fires with hours_silent in the hundreds (RUST-78) on
+/// machines whose network is perfectly fine.
+///
+/// The spacing lives here, not at the callers, because every one of them (UI
+/// poll, pricing gate check, watchdog restart, deep link, liveness ping) routes
+/// through this function.
+const GRACE_START_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Last grace/start attempt, successful or not: a device already inside the 429
+/// window has to stop asking, not retry sooner.
+static LAST_GRACE_START_ATTEMPT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a grace/start attempt is due, given how long ago the last one was.
+fn grace_start_due(since_last: Option<std::time::Duration>) -> bool {
+    since_last.is_none_or(|elapsed| elapsed >= GRACE_START_MIN_INTERVAL)
+}
+
+/// Whether this process may POST grace/start now, stamping the attempt if so.
+fn grace_start_attempt_due() -> bool {
+    let mut last = LAST_GRACE_START_ATTEMPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !grace_start_due(last.map(|at| at.elapsed())) {
+        return false;
+    }
+    *last = Some(std::time::Instant::now());
+    true
+}
+
 fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingState, String> {
     let mut local = load_or_initialize_local_state()?;
+    // Nothing in the response changes between calls, so a skipped POST costs
+    // the caller nothing: local state is already the answer.
+    if !grace_start_attempt_due() {
+        return Ok(local);
+    }
     let identity = IdentityPayload::for_state(state);
     match fetch_grace_start(&identity) {
         Ok(response) => {
@@ -3553,6 +3631,23 @@ mod tests {
         local.first_seen_at = now - Duration::days(3);
         assert_eq!(server_silent_hours(&local, now), Some(72));
         assert_eq!(auth_silent_hours(&local, now), None);
+    }
+
+    #[test]
+    fn grace_start_attempts_are_spaced_within_a_process() {
+        // RUST-78: the paywall screen polls get_pricing_status every 3s, and
+        // every call used to POST grace/start -- 1200 an hour against the
+        // server's 10/device/hour throttle. The devices that reported it had
+        // been 429 for weeks, so last_server_contact_at never advanced and the
+        // silent alarm fired at hours_silent=1342 on a healthy network.
+        assert!(super::grace_start_due(None), "the first attempt must go");
+        assert!(
+            !super::grace_start_due(Some(std::time::Duration::from_secs(3))),
+            "the 3s paywall poll must not reach the server"
+        );
+        assert!(super::grace_start_due(Some(
+            super::GRACE_START_MIN_INTERVAL
+        )));
     }
 
     #[test]
@@ -5652,7 +5747,7 @@ mod tests {
             // Pin app_data_dir into the scratch dir: the debug keychain store
             // lives under it, and dirs::data_local_dir() ignores HOME/XDG on
             // macOS/Windows — under nextest (process per test) parallel tests
-            // would otherwise share and race one real dev-secrets store.
+            // would otherwise share and race one real file-backed secret store.
             std::env::set_var(
                 "HEADROOM_DATA_DIR",
                 scratch.path().join(".local").join("share").join("Headroom"),

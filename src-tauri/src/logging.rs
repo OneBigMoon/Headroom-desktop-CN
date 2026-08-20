@@ -84,6 +84,16 @@ fn is_transient_transport_error(msg: &str) -> bool {
         || msg.contains("os error 65") // macOS: No route to host
 }
 
+// The user's disk is full. Every persisted file (pricing state, usage counters,
+// activity facts, client configs) fails the same way, from ~50 atomic_write
+// callers, so this fragments into one un-fixable issue per call site. Nothing
+// in the app can free space; the write is retried on the next tick and heals
+// itself once the user clears the disk.
+fn is_disk_full(msg: &str) -> bool {
+    msg.contains("No space left on device") // unix ENOSPC
+        || (cfg!(windows) && msg.contains("os error 112")) // Windows ERROR_DISK_FULL
+}
+
 // Non-2xx response from the update endpoint. Most commonly a transient 5xx
 // from GitHub releases or a 404 during a tag-publish race — not actionable.
 fn is_updater_endpoint_error(msg: &str) -> bool {
@@ -93,6 +103,10 @@ fn is_updater_endpoint_error(msg: &str) -> bool {
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
 // from Sentry. They still hit the local log file via write_record.
 fn skip_sentry(target: &str, msg: &str) -> bool {
+    // Environmental and target-agnostic: keep the local log, drop the event.
+    if is_disk_full(msg) {
+        return true;
+    }
     if target.starts_with("tauri_plugin_updater") {
         return is_transient_transport_error(msg) || is_updater_endpoint_error(msg);
     }
@@ -114,12 +128,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
-    // A foreign squatter on the intercept port reaches Sentry via the explicit
-    // once-per-error capture at the emit site (RUST-62); this warn repeats on
-    // every 15s bind retry and only duplicated it (RUST-5R). Local log only.
+    // A held intercept port reaches Sentry via the explicit once-per-error
+    // capture at the emit site (RUST-62); this warn repeats on every 15s bind
+    // retry and only duplicated it (RUST-5R). Local log only.
+    //
+    // Coupled to the emit site's wording in `proxy_intercept::spawn` -- if that
+    // message changes and this substring is not changed with it, the retry warn
+    // silently starts flooding Sentry again. `skips_foreign_port_bind_retry_warns`
+    // is the guard; keep its fixture a copy of the real message.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
         && msg.starts_with("[proxy_intercept] port")
-        && msg.contains("held by foreign process")
+        && msg.contains("held but not answering")
     {
         return true;
     }
@@ -150,6 +169,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // grab-bag split); the accompanying log::warn is local-only.
     if target.starts_with("headroom_desktop_lib::state")
         && msg.starts_with("kompress prefetch download error")
+    {
+        return true;
+    }
+    // Same split for the /stats probe: the reason is in the message, so a
+    // 15s timeout and an HTTP 404 grouped as one issue (RUST-6V) that no fix
+    // could ever resolve. The category-fingerprinted capture at the emit site
+    // is the Sentry path.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("headroom /stats fetch failed")
     {
         return true;
     }
@@ -191,12 +219,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
-    // Uninstall cleanup is best-effort and races a still-exiting backend/proxy
-    // that may re-create a file mid-walk ("Directory not empty"). The removal
-    // is retried; a residual failure during teardown isn't actionable.
-    if target.starts_with("headroom_desktop_lib::client_adapters")
-        && msg.starts_with("cleanup: removing")
-    {
+    // Uninstall/cleanup teardown is best-effort by construction. It races a
+    // still-exiting backend that re-creates a file mid-walk ("Directory not
+    // empty"), a venv Windows still holds open ("Access is denied", RUST-6T),
+    // and settings files we deliberately leave alone when they don't parse
+    // ("refusing to overwrite potentially valid user settings", RUST-6X --
+    // that branch is the correct one, not a failure). The app is being removed
+    // either way, so none of it is actionable in a release. Matched by prefix
+    // across modules: the same teardown runs from client_adapters (files,
+    // settings) and lib (plugins, MCP servers), and every sibling shape landed
+    // as its own un-fixable issue.
+    if msg.starts_with("cleanup: ") || msg.starts_with("uninstall: removing ") {
         return true;
     }
     // Codex thread retag is best-effort over every *.sqlite in the Codex dirs;
@@ -206,6 +239,40 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::client_adapters")
         && msg.starts_with("codex retag")
         && msg.contains("database disk image is malformed")
+    {
+        return true;
+    }
+    // Every one of these lines is the sanitizer WORKING: it found tool_search
+    // references with no matching entry in the tools array and dropped them, so
+    // upstream never 400s and the session survives. Reporting a successful
+    // mitigation as an error-level issue made it un-resolvable (RUST-5W kept
+    // regressing, then escalated) -- any resolve reopens the moment another
+    // client sends a stale reference. The rate is worth watching as a metric,
+    // not as a defect. Keep the local log, which is what support threads read.
+    if target.starts_with("headroom_desktop_lib::proxy_intercept")
+        && msg.starts_with("[proxy_intercept] dropped ")
+        && msg.contains("stale tool_search reference")
+    {
+        return true;
+    }
+    // The backend-port fallback reaches Sentry via the explicit capture at the
+    // emit site (tool_manager), which carries occupant_cmd/occupant_pid tags and
+    // both port numbers. This warn fires at the same instant with none of that
+    // context, so one fallback landed as two issues (RUST-7E and RUST-7F, same
+    // millisecond). Same split as the intercept-port line above.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("[backend_port] ")
+    {
+        return true;
+    }
+    // A host with no usable Secret Service (headless VM, xrdp session with no
+    // login keyring) is the case this fallback exists FOR: the 0600 file is the
+    // designed path, sign-in works, nothing is broken. It fired once per process
+    // as a fresh error-level issue on every Linux box without a desktop keyring
+    // (RUST-7G). Keep the local log so a support thread can see which store was
+    // used; drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib::keychain")
+        && msg.starts_with("OS credential store unusable")
     {
         return true;
     }
@@ -219,6 +286,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::device")
         && msg.starts_with("Could not persist machine id digest")
     {
+        return true;
+    }
+    // A tray tooltip that would not apply is cosmetic: the icon, the menu and
+    // every action still work, and the updater loop retries on the next tick
+    // (the emit site no longer caches the tooltip on failure, so it heals
+    // itself). Windows reports the busy notification area as a bare E_FAIL
+    // whose text is OS-LOCALIZED -- "Error no especificado" opened RUST-7P as a
+    // separate issue from the English wording, so this would fragment into one
+    // un-fixable issue per language. Keep the local log, drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib") && msg.starts_with("tray: set_tooltip failed") {
         return true;
     }
     false
@@ -237,6 +314,73 @@ pub(crate) fn scrub_home(msg: &str) -> String {
             }
         }
         None => msg.to_string(),
+    }
+}
+
+/// Last gate before an event leaves the process: drop what is environmental,
+/// scrub what is personal.
+///
+/// `skip_sentry` and `scrub_home` are both reachable only from the `Log` impl,
+/// so the ~40 direct `sentry::capture_message` sites bypassed both. RUST-6R is
+/// what that costs: a disk-full warning that the `log::warn!` twin of the same
+/// failure (RUST-7R) correctly suppresses, carrying an unscrubbed
+/// `/Users/<name>/...` path. Only the target-agnostic rule is applied here -
+/// the target-scoped ones need a `Record` that a direct capture does not have.
+pub(crate) fn sanitize_event(
+    event: sentry::protocol::Event<'static>,
+) -> Option<sentry::protocol::Event<'static>> {
+    let environmental = event.message.as_deref().is_some_and(is_disk_full)
+        || event
+            .logentry
+            .as_ref()
+            .is_some_and(|entry| is_disk_full(&entry.message))
+        || event
+            .exception
+            .values
+            .iter()
+            .filter_map(|exception| exception.value.as_deref())
+            .any(is_disk_full);
+    if environmental {
+        return None;
+    }
+    Some(scrub_event(event))
+}
+
+/// Replace the home directory with `~` in every free-text field, including the
+/// ones `scope.set_extra`/`set_tag` fill in. The username is both a privacy leak
+/// and a grouping key, so leaving it in splits one failure into one Sentry issue
+/// per user.
+pub(crate) fn scrub_event(
+    mut event: sentry::protocol::Event<'static>,
+) -> sentry::protocol::Event<'static> {
+    if let Some(message) = event.message.as_deref() {
+        event.message = Some(scrub_home(message));
+    }
+    if let Some(entry) = event.logentry.as_mut() {
+        entry.message = scrub_home(&entry.message);
+    }
+    for exception in &mut event.exception.values {
+        if let Some(value) = exception.value.as_deref() {
+            exception.value = Some(scrub_home(value));
+        }
+    }
+    // Tags carry paths too: `occupant_cmd` on the port-conflict events is a
+    // process command line.
+    for value in event.tags.values_mut() {
+        *value = scrub_home(value);
+    }
+    for value in event.extra.values_mut() {
+        scrub_json(value);
+    }
+    event
+}
+
+fn scrub_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = scrub_home(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
+        serde_json::Value::Object(map) => map.values_mut().for_each(scrub_json),
+        _ => {}
     }
 }
 
@@ -374,7 +518,7 @@ mod tests {
     fn skips_foreign_port_bind_retry_warns() {
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
-            "[proxy_intercept] port 6767 held by foreign process; retrying in 15s (Address already in use (os error 48))"
+            "[proxy_intercept] port 6767 is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s (Address already in use (os error 48))"
         ));
         // Other bind/loop errors from proxy_intercept stay in Sentry.
         assert!(!skip_sentry(
@@ -459,6 +603,20 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "cleanup: removing /Users/x/Library/Application Support/Headroom failed: Directory not empty (os error 66)"
+        ));
+        // RUST-6X: the parse failed, so we left the file alone -- the safe
+        // branch, reported as if it were a defect.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "cleanup: stripping hook from ~/.claude/settings.local.json failed: parsing \
+             ~/.claude/settings.local.json failed (JSON/JSON5); refusing to overwrite \
+             potentially valid user settings"
+        ));
+        // RUST-6T: same teardown, different module -- the venv is still open on
+        // Windows when uninstall_and_quit deletes it.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "uninstall: removing serena failed: removing ~\\AppData\\Local\\Headroom\\headroom\\serena-venv: Access is denied. (os error 5)"
         ));
     }
 
@@ -545,6 +703,25 @@ mod tests {
     }
 
     #[test]
+    fn skips_stats_fetch_failed_warn() {
+        // RUST-6V: timeout and HTTP 404 shared one message shape, so Sentry
+        // grouped two different bugs together. The fingerprinted capture at
+        // the emit site is the Sentry path now.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "headroom /stats fetch failed (HTTP 404 Not Found); dashboard loses the layers"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "headroom /stats fetch failed (timed out after 15s); dashboard loses the layers"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "some other state warning"
+        ));
+    }
+
+    #[test]
     fn skips_bypass_upgrade_forward_transport_errors() {
         // The websocket-upgrade forwarder variant (RUST-2R) gets the same
         // transient-transport treatment as the plain bypass forwarder.
@@ -579,6 +756,87 @@ mod tests {
     }
 
     #[test]
+    fn skips_successful_stale_tool_reference_sanitisation() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] dropped 3 stale tool_search reference(s) [\"TaskCreate\"] from a \
+             direct-forwarded request — absent from the tools array, upstream would 400 the \
+             session permanently"
+        ));
+        // A genuine failure in the same module still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] dropped connection while forwarding"
+        ));
+    }
+
+    #[test]
+    fn skips_backend_port_fallback_warn_but_not_siblings() {
+        // The emit-site capture_message is the Sentry path for this event.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "[backend_port] 6768 held by unknown process; falling back to 6770"
+        ));
+        // Other tool_manager warnings still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "managed headroom exited unexpectedly"
+        ));
+    }
+
+    #[test]
+    fn skips_tray_tooltip_failures_in_any_locale() {
+        // English and Spanish renderings of the same E_FAIL both drop.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "tray: set_tooltip failed: tray icon error: Unspecified error (os error -2147467259)"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "tray: set_tooltip failed: tray icon error: Error no especificado (os error -2147467259)"
+        ));
+        // Other tray failures are not cosmetic and still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib",
+            "tray: set_icon failed: tray icon error: Unspecified error"
+        ));
+    }
+
+    #[test]
+    fn skips_keyring_fallback_but_not_other_keychain_failures() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::keychain",
+            "OS credential store unusable (Couldn't access platform secure storage: \
+             Secret Service: no result found); storing Headroom secrets in a 0600 file \
+             under the app data dir instead"
+        ));
+        // A real keychain failure that is NOT the designed fallback still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::keychain",
+            "failed to write Headroom secret to the file store"
+        ));
+    }
+
+    #[test]
+    fn skips_disk_full_from_any_target() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::pricing",
+            "Could not persist reconciled grace state: Failed to write pricing state \
+             ~/config/headroom-pricing-state.json: writing \
+             ~/config/headroom-pricing-state.json.tmp.47276.4810: \
+             No space left on device (os error 28)"
+        ));
+        // Any other write failure from the same path still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::pricing",
+            "Could not persist reconciled grace state: Failed to write pricing state \
+             ~/config/headroom-pricing-state.json: writing \
+             ~/config/headroom-pricing-state.json.tmp.47276.4810: \
+             Permission denied (os error 13)"
+        ));
+    }
+
+    #[test]
     fn scrub_home_replaces_home_dir_with_tilde() {
         let home = dirs::home_dir().unwrap();
         let msg = format!(
@@ -591,5 +849,51 @@ mod tests {
             "cleanup: removing ~/Library/Application Support/x"
         );
         assert_eq!(super::scrub_home("no paths here"), "no paths here");
+    }
+
+    #[test]
+    fn scrub_event_covers_message_tags_and_extras() {
+        let home = dirs::home_dir().unwrap();
+        let home = home.display().to_string();
+        let mut event = sentry::protocol::Event::new();
+        event.message = Some(format!("Failed to write {home}/Library/x.json"));
+        event
+            .tags
+            .insert("occupant_cmd".into(), format!("{home}/bin/thing"));
+        event.extra.insert(
+            "error_chain".into(),
+            serde_json::json!({"stderr": [format!("no such file: {home}/y")]}),
+        );
+
+        let scrubbed = super::scrub_event(event);
+
+        assert_eq!(
+            scrubbed.message.as_deref(),
+            Some("Failed to write ~/Library/x.json")
+        );
+        assert_eq!(
+            scrubbed.tags.get("occupant_cmd").map(String::as_str),
+            Some("~/bin/thing")
+        );
+        let chain = serde_json::to_string(&scrubbed.extra["error_chain"]).unwrap();
+        assert!(!chain.contains(&home), "home leaked in extras: {chain}");
+        assert!(chain.contains("no such file: ~/y"), "{chain}");
+    }
+
+    #[test]
+    fn sanitize_event_drops_disk_full_from_direct_captures() {
+        // The shape of RUST-6R: a direct capture_message that never passed
+        // through skip_sentry.
+        let mut full = sentry::protocol::Event::new();
+        full.message = Some(
+            "Could not persist reconciled grace state: Failed to write pricing state \
+             ~/config/headroom-pricing-state.json: No space left on device (os error 28)"
+                .into(),
+        );
+        assert!(super::sanitize_event(full).is_none());
+
+        let mut other = sentry::protocol::Event::new();
+        other.message = Some("Could not persist reconciled grace state: Permission denied".into());
+        assert!(super::sanitize_event(other).is_some());
     }
 }

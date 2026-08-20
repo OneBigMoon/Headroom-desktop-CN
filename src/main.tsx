@@ -4,6 +4,13 @@ import * as Sentry from "@sentry/react";
 import App from "./App";
 import "./styles.css";
 
+// Only macOS puts a vibrancy layer behind the webview. Elsewhere the window is
+// transparent with nothing behind it, so the translucent --surface-* tokens need
+// an opaque base to composite onto (see html[data-vibrancy="none"] in styles.css).
+if (!navigator.userAgent.includes("Mac")) {
+  document.documentElement.dataset.vibrancy = "none";
+}
+
 Sentry.init({
   dsn: import.meta.env.VITE_SENTRY_DSN,
   integrations: [Sentry.browserTracingIntegration()],

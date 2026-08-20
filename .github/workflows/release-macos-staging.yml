@@ -1,4 +1,16 @@
-name: Release macOS App (Staging)
+name: Release App (Staging)
+
+# Release candidate build for every platform, on each -rc.N version bump pushed
+# to staging. The macOS job creates the versioned rc release, then Windows and
+# Linux build in parallel and add their bundles to it. Nothing polls that
+# release. Only the final mirror job touches staging-rolling (the endpoint rc
+# installs poll), and it writes the complete manifest in one go.
+#
+# The manifest is published last on purpose. A latest.json that names a new
+# version but carries no entry for the reader's platform is an update *error*
+# there, not a no-op, so publishing macOS entries first stranded every Windows
+# and Linux install for the length of their builds. If any platform fails,
+# staging-rolling keeps serving the previous rc intact.
 
 on:
   push:
@@ -21,6 +33,9 @@ jobs:
     name: macOS Universal (Staging)
     runs-on: macos-latest
     timeout-minutes: 45
+    outputs:
+      should_release: ${{ steps.release_guard.outputs.should_release }}
+      package_version: ${{ steps.release_guard.outputs.package_version }}
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
@@ -199,16 +214,228 @@ jobs:
           includeUpdaterJson: true
           args: --target universal-apple-darwin
 
-      - name: Mirror artifacts to rolling staging release
-        if: steps.release_guard.outputs.should_release == 'true'
+  windows:
+    name: Windows x64 (Staging)
+    needs: release
+    if: needs.release.outputs.should_release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      # Same endpoint pair the macOS staging job bakes in, so an rc install
+      # follows whichever channel the app is set to.
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build NSIS installer
+        shell: bash
+        # NSIS only: bundle.targets is "all", which also builds an MSI this
+        # workflow never publishes. No Authenticode cert yet, so SmartScreen
+        # warns on install.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Publish Windows installer to the rc release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RC_TAG: v${{ steps.release_guard.outputs.package_version }}
+          RC_TAG: v${{ needs.release.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          setup="$(ls "$bundle_dir"/*-setup.exe)"
+          sig="${setup}.sig"
+          [ -f "$sig" ] || { echo "updater signature missing: $sig" >&2; exit 1; }
+
+          # rc tag only: nothing polls it, so a half-built release is invisible.
+          # The mirror job reads this .sig back out to build the manifest.
+          gh release upload "$RC_TAG" "$setup" "$sig" --clobber --repo "$GITHUB_REPOSITORY"
+
+  linux:
+    name: Linux x86_64 (Staging)
+    needs: release
+    if: needs.release.outputs.should_release == 'true'
+    # ubuntu-22.04 would give a lower glibc floor, but it enters brownout
+    # deprecation on 2026-09-17 (actions/runner-images#14254), so builds would
+    # start failing within weeks. 24.04 sets the floor at glibc 2.39: this
+    # AppImage will not start on Ubuntu 22.04 or Debian 12. To widen support
+    # later, build inside an older container (`container: ubuntu:22.04`)
+    # rather than pinning the runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build AppImage and deb
         shell: bash
+        env:
+          # linuxdeploy ships as an AppImage and needs FUSE to mount itself,
+          # which GitHub runners do not provide; extracting instead is the
+          # supported workaround.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        # Both are updater targets: the plugin rewrites the AppImage in place,
+        # and installs the deb with `pkexec dpkg -i`. Each needs its own signed
+        # entry in the manifest (see the publish step below).
+        run: npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage
+
+      - name: Publish Linux bundles to the rc release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_TAG: v${{ needs.release.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+          appimage="$(ls "$bundle_dir"/appimage/*.AppImage)"
+          deb="$(ls "$bundle_dir"/deb/*.deb)"
+
+          # Derive the updater artifact from the .sig rather than assuming it is
+          # the bare .AppImage: Linux has historically shipped as
+          # .AppImage.tar.gz. A bundler change then surfaces as a missing file
+          # here instead of a manifest whose signature does not match the bytes.
+          sig="$(ls "$bundle_dir"/appimage/*.sig 2>/dev/null | head -1)"
+          [ -n "$sig" ] || { echo "no updater signature in $bundle_dir/appimage" >&2; exit 1; }
+          updater_artifact="${sig%.sig}"
+          [ -f "$updater_artifact" ] || { echo "signed artifact missing: $updater_artifact" >&2; exit 1; }
+
+          # The deb is a separate updater target: tauri resolves
+          # `linux-x86_64-deb` before falling back to `linux-x86_64`, so without
+          # its own signed entry a .deb install downloads the AppImage and dies
+          # with "update is not a valid deb package".
+          deb_sig="$(ls "$bundle_dir"/deb/*.deb.sig 2>/dev/null | head -1)"
+          [ -n "$deb_sig" ] || { echo "no updater signature in $bundle_dir/deb" >&2; exit 1; }
+
+          assets=("$appimage" "$sig" "$deb" "$deb_sig")
+          [ "$updater_artifact" = "$appimage" ] || assets+=("$updater_artifact")
+
+          # rc tag only, same as the windows job: the mirror job composes the
+          # manifest once every platform has landed here.
+          gh release upload "$RC_TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+
+  mirror:
+    name: Publish staging manifest
+    # Only after every platform bundle is in the rc release. staging-rolling is
+    # the endpoint rc installs poll, and this job is its only writer, so a
+    # partial build is never visible to any platform.
+    needs: [release, windows, linux]
+    if: needs.release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Mirror the rc release to staging-rolling
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_TAG: v${{ needs.release.outputs.package_version }}
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
           gh release download "$RC_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
+
+          # tauri-action wrote a darwin-only manifest whose URLs point at the rc
+          # tag. Merge the other two the same way rather than at staging-rolling:
+          # rc tag assets are permanent, staging-rolling's are pruned by the next
+          # rc, so one manifest is valid on both releases.
+          win_sig="$(ls "$workdir"/*-setup.exe.sig)"
+          linux_sig="$(ls "$workdir"/*.AppImage.sig "$workdir"/*.AppImage.tar.gz.sig 2>/dev/null | head -1 || true)"
+          [ -n "$linux_sig" ] || { echo "no linux updater signature in $RC_TAG" >&2; exit 1; }
+          deb_sig="$(ls "$workdir"/*.deb.sig 2>/dev/null | head -1 || true)"
+          [ -n "$deb_sig" ] || { echo "no linux deb updater signature in $RC_TAG" >&2; exit 1; }
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RC_TAG}"
+          jq \
+            --arg win_sig "$(cat "$win_sig")" \
+            --arg win_url "${base}/$(basename "${win_sig%.sig}")" \
+            --arg linux_sig "$(cat "$linux_sig")" \
+            --arg linux_url "${base}/$(basename "${linux_sig%.sig}")" \
+            --arg deb_sig "$(cat "$deb_sig")" \
+            --arg deb_url "${base}/$(basename "${deb_sig%.sig}")" \
+            '.platforms["windows-x86_64"] = {signature: $win_sig, url: $win_url}
+             | .platforms["linux-x86_64"] = {signature: $linux_sig, url: $linux_url}
+             | .platforms["linux-x86_64-deb"] = {signature: $deb_sig, url: $deb_url}' \
+            "$workdir/latest.json" > "$workdir/latest.merged.json"
+          mv "$workdir/latest.merged.json" "$workdir/latest.json"
+          gh release upload "$RC_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
 
           # Point the staging-rolling tag at this build's commit (create or force-move).
           if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/staging-rolling" >/dev/null 2>&1; then
@@ -219,7 +446,9 @@ jobs:
               -f ref="refs/tags/staging-rolling" -f sha="${GITHUB_SHA}" >/dev/null
           fi
 
-          # Ensure the rolling release exists and refresh its notes.
+          # Ensure the rolling release exists and refresh its notes. Update in
+          # place rather than delete-then-recreate: a mid-step failure used to
+          # leave the release deleted, 404ing the endpoint until the next rc.
           if gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             existing_assets="$(gh release view staging-rolling --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
             gh release edit staging-rolling \
@@ -234,19 +463,14 @@ jobs:
               --prerelease
           fi
 
-          # Upload fresh artifacts. latest.json goes last so updaters never see
-          # a pointer referencing an asset that hasn't finished uploading.
+          # Bundles first, latest.json last, so the endpoint never names an
+          # asset that has not finished uploading.
           shopt -s nullglob
           for asset in "$workdir"/*; do
-            name="$(basename "$asset")"
-            if [[ "$name" == "latest.json" ]]; then
-              continue
-            fi
+            [[ "$(basename "$asset")" == "latest.json" ]] && continue
             gh release upload staging-rolling "$asset" --clobber --repo "$GITHUB_REPOSITORY"
           done
-          if [[ -f "$workdir/latest.json" ]]; then
-            gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
-          fi
+          gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
 
           # Prune assets left over from previous rc versions.
           new_assets="$(cd "$workdir" && ls)"

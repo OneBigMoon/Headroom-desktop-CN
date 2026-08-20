@@ -38,6 +38,11 @@ pub struct ManagedTool {
     /// The version an Update would move to. None when no update is pending.
     #[serde(default)]
     pub available_version: Option<String>,
+    /// Why this addon cannot be installed on the current OS/arch, shown in
+    /// place of an Install button that could only ever error. None when it is
+    /// installable here.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +328,17 @@ pub struct DashboardState {
     pub accepted_terms_version: u32,
     /// Canonical Terms-of-Service URL the acceptance gate links to.
     pub terms_url: String,
+}
+
+/// Why the last bootstrap failed, in the two forms a support report needs:
+/// the stable cause class (same vocabulary as the `failure_kind` Sentry tag,
+/// so a mail can be matched to its issue) and the compact technical detail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapFailureReport {
+    pub kind: String,
+    /// Pip's stderr tail, or the whole error chain when the command never ran.
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,10 +918,9 @@ impl CodexPlanTier {
 /// Free carries no recommendation (already on the no-cost tier).
 pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubscriptionTier> {
     match plan {
-        CodexPlanTier::Go
-        | CodexPlanTier::Plus
-        | CodexPlanTier::Team
-        | CodexPlanTier::Business => Some(HeadroomSubscriptionTier::Pro),
+        CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::Team | CodexPlanTier::Business => {
+            Some(HeadroomSubscriptionTier::Pro)
+        }
         CodexPlanTier::SelfServeBusinessUsageBased | CodexPlanTier::Edu => {
             Some(HeadroomSubscriptionTier::Max5x)
         }

@@ -1221,6 +1221,9 @@ pub struct ToolManager {
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
     serena_live_stats_cache: Arc<Mutex<Option<(Instant, Option<(u64, Option<Instant>)>)>>>,
+    /// False once this app process has tried to start the backend at least
+    /// once. See its use in `start_headroom_background`.
+    first_backend_start: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1375,7 +1378,25 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
         .take(200)
         .collect();
 
-    format!("[{category}] {detail}")
+    // The auto backend tries ONNX first and only then falls back to PyTorch, so
+    // when both are broken the last line is the SECOND failure and the ONNX
+    // cause that actually explains it scrolls past unreported. RUST-75 arrived
+    // as a torch `c10.dll` load error with no hint that onnxruntime -- which
+    // needs the same MSVC redistributable -- had already failed for the same
+    // reason. Carry the first cause too when the loader logged one.
+    let onnx_cause: Option<String> = tail
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| line.contains("ONNX load failed"))
+        .map(|line| line.chars().take(160).collect());
+
+    // The Sentry fingerprint is the bracketed category, so widening the detail
+    // does not regroup the issue.
+    match onnx_cause {
+        Some(onnx) => format!("[{category}] {detail} (after {onnx})"),
+        None => format!("[{category}] {detail}"),
+    }
 }
 
 /// Bucket a prefetch-log tail into a coarse, stable failure category.
@@ -1402,6 +1423,12 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
         "network"
     } else if t.contains("permission denied") {
         "permission denied"
+    // torch's DLLs need the MSVC redistributable, which a fresh Windows box
+    // (notably Server 2022) does not ship. Nothing retriable and nothing the
+    // app can repair, but it must not sit in the "other" grab-bag: that bucket
+    // is what made RUST-3C/RUST-45 unresolvable.
+    } else if t.contains("winerror 126") || t.contains("importerror: dll load failed") {
+        "missing native dep"
     } else {
         "other"
     }
@@ -1514,6 +1541,7 @@ impl ToolManager {
             log_marker_cache: Arc::new(Mutex::new(None)),
             serena_calls_cache: Arc::new(Mutex::new(None)),
             serena_live_stats_cache: Arc::new(Mutex::new(None)),
+            first_backend_start: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -1546,6 +1574,7 @@ impl ToolManager {
                     savings_label: self.tool_savings_label(&manifest.id),
                     update_available,
                     available_version: pending.filter(|version| !version.is_empty()),
+                    unavailable_reason: addon_unavailable_reason(&manifest.id),
                 }
             })
             .collect()
@@ -1679,7 +1708,7 @@ impl ToolManager {
     /// With several sessions the tokens above span all of them, so the oldest
     /// is the honest window. `-ww`: unlimited width, argv must not truncate.
     fn serena_oldest_session_age(&self) -> Option<Duration> {
-        let output = Command::new("/bin/ps")
+        let output = crate::proc::command("/bin/ps")
             .args(["-axww", "-o", "etime=,args="])
             .output()
             .ok()?;
@@ -1878,6 +1907,19 @@ impl ToolManager {
     /// upgrade boot validation replaces even a still-healthy old proxy squatting
     /// on 6768. Pass `false` for normal launch (leave a live backend alone).
     pub fn start_headroom_background(&self, reclaim_healthy_orphan: bool) -> Result<Child> {
+        // First backend start of this app process: we hold no Child handle, so
+        // a backend already on 6768 that `pid_is_headroom_backend` vouches for
+        // is an orphan from a previous instance -- classically the one the
+        // Windows updater leaves running when it exits the old app with no
+        // teardown at all. Take the port back even though the orphan answers
+        // /readyz: leaving it alone bails the whole start with "already
+        // running", so the new build serves its traffic through the OLD
+        // version's backend behind a startup error. Blast radius is the same
+        // one the upgrade path already accepts -- one port, one process that
+        // had to pass the identity gate.
+        let first_start = self
+            .first_backend_start
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         let mut allow_repair = true;
         'attempt: loop {
             let python = self.managed_python();
@@ -1904,7 +1946,7 @@ impl ToolManager {
             //     6769..=6790. Only bail if every fallback is also taken.
             // The chosen port is stored in `backend_port` so the intercept,
             // health probes, and spawn args all pick it up.
-            let initial_state = diagnose_proxy_port(backend_port::DEFAULT_BACKEND_PORT);
+            let initial_state = diagnose_proxy_port_settled(backend_port::DEFAULT_BACKEND_PORT);
             match initial_state {
                 PortState::Free => {
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
@@ -1912,7 +1954,7 @@ impl ToolManager {
                 PortState::HeadroomRunning => {
                     reclaim_orphan_proxy(
                         backend_port::DEFAULT_BACKEND_PORT,
-                        reclaim_healthy_orphan,
+                        reclaim_healthy_orphan || first_start,
                     )?;
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
                 }
@@ -2028,10 +2070,11 @@ impl ToolManager {
                     log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
                 }
 
-                // Holdout is off (HEADROOM_OUTPUT_HOLDOUT=0); clear any control
-                // samples an earlier holdout collected so the proxy reports the
-                // synthetic-control estimate instead of a broken "measured" one.
-                purge_output_savings_control_arm();
+                // Drop control samples left by the abandoned 1% holdout before
+                // the 3% one starts filling the arm. One shot, stamped: from
+                // here on the control arm is live data and clearing it every
+                // spawn would empty it as fast as it fills.
+                purge_legacy_output_savings_control_arm_once();
 
                 // Cross-turn dedup + cold-prefix recompaction (headroom-ai
                 // 0.33.0; older fallback runtimes ignore unknown envs).
@@ -2084,7 +2127,7 @@ impl ToolManager {
                 // (2026-08-17: 34 restarts in one morning at load 55 on 8
                 // cores). The Windows path never niced at all.
                 let mut command = {
-                    let mut c = Command::new(executable);
+                    let mut c = crate::proc::command(executable);
                     c.args(args);
                     c
                 };
@@ -2217,14 +2260,37 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
-                    // No A/B holdout: shape every conversation. A 1% unshaped
-                    // control arm was tried, but a near-empty control produced a
-                    // wildly wrong "measured" reduction (e.g. -1439.9% from a
-                    // handful of stale samples), so we stopped collecting it. With
-                    // holdout 0 the proxy reports the synthetic-control estimate.
-                    // purge_output_savings_control_arm() clears control samples
-                    // collected while the holdout was on.
-                    .env("HEADROOM_OUTPUT_HOLDOUT", "0")
+                    // 3% of conversations run unshaped, as the control arm of a
+                    // standing A/B. This is the only way the output-shaping
+                    // number ever stops being a counterfactual: the seeded
+                    // baseline is frozen at install time and cannot be relearned
+                    // (every transcript written since is already shaped, so a
+                    // re-learn would collapse the baseline onto the treatment
+                    // mean and report ~0 savings). Control conversations are the
+                    // only unshaped replies we will ever see again.
+                    //
+                    // Assignment is per conversation (`assign_arm` hashes the
+                    // conversation key), so a conversation never flips mid-stream
+                    // and the prefix cache stays stable.
+                    //
+                    // 1% was tried first and abandoned, but the fraction was
+                    // never the bug: `best_estimate` prefers the measured number
+                    // as soon as ONE stratum holds a sample in both arms, which
+                    // is how three stale control samples reported -1439.9%. The
+                    // desktop no longer reads that figure -- `output_savings`
+                    // recomputes both estimators from the ledger and only shows
+                    // the measured one once it covers real traffic at a usable
+                    // band -- so collecting the arm is now safe. At 1% a heavy
+                    // user needs ~90 days to reach a +/-13pp band and a light one
+                    // never gets there; 3% reaches the same precision in ~30 days
+                    // and still costs only 3% of conversations.
+                    //
+                    // Invisible to the compression figures: the arm gates the
+                    // `shape_request` call alone, so control conversations are
+                    // compressed, memory-augmented and cache-aligned exactly like
+                    // any other, and the input-savings rate is priced off
+                    // `cost.total_input_cost_usd`, which no output token enters.
+                    .env("HEADROOM_OUTPUT_HOLDOUT", "0.03")
                     // Agent savings persona (new in headroom-ai 0.30.0). The
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
@@ -2312,7 +2378,7 @@ impl ToolManager {
                 // so PYTHONFAULTHANDLER=1 dumps all-thread tracebacks to the log file
                 // before the process dies. Skip if the process already exited on its own.
                 if reason.is_none() {
-                    let _ = Command::new("/bin/kill")
+                    let _ = crate::proc::command("/bin/kill")
                         .arg("-ABRT")
                         .arg(child.id().to_string())
                         .status();
@@ -2426,7 +2492,7 @@ impl ToolManager {
             return Ok(vec!["RTK is not installed yet.".into()]);
         }
 
-        let output = Command::new(self.rtk_entrypoint())
+        let output = crate::proc::command(self.rtk_entrypoint())
             .arg("session")
             .current_dir(&self.runtime.root_dir)
             .output()
@@ -2687,7 +2753,7 @@ impl ToolManager {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let status = Command::new(python)
+        let status = crate::proc::command(python)
             .arg("-c")
             .arg(
                 "from headroom.transforms.kompress_compressor import KompressCompressor; \
@@ -2768,7 +2834,7 @@ impl ToolManager {
             .open(&log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let mut child = Command::new(&python)
+        let mut child = crate::proc::command(&python)
             .arg("-c")
             // cl100k_base: the proxy's default/fallback encoding.
             // o200k_base: current OpenAI model family, loaded for codex traffic.
@@ -2899,7 +2965,7 @@ impl ToolManager {
         if !self.rtk_installed() {
             return None;
         }
-        let output = Command::new(self.rtk_entrypoint())
+        let output = crate::proc::command(self.rtk_entrypoint())
             .args(["gain", "--daily", "--format", "json"])
             .current_dir(&self.runtime.root_dir)
             .output()
@@ -3122,7 +3188,17 @@ impl ToolManager {
             eta_seconds: 95,
             percent: 58,
         });
-        self.install_headroom()?;
+        // Forward pip's per-package chatter instead of dropping it. Without
+        // this the whole multi-minute dependency install sits on the single
+        // static frame above, which reads as a hang once its ETA lapses.
+        // Clamped so the sub-step percents (which start at 40 for the
+        // standalone upgrade path) never walk the bar backwards from 58.
+        self.install_headroom(|update| {
+            progress(BootstrapStepUpdate {
+                percent: update.percent.clamp(58, 89),
+                ..update
+            })
+        })?;
 
         // RTK is opt-in: bootstrap no longer installs it. Users add it from the
         // Addons tab, which calls install_addon("rtk").
@@ -3314,7 +3390,7 @@ impl ToolManager {
         // machine for 20-30 seconds).
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("xattr")
+            let _ = crate::proc::command("xattr")
                 .args([
                     "-rd",
                     "com.apple.quarantine",
@@ -3366,11 +3442,14 @@ impl ToolManager {
     }
 
     /// Bootstrap path: installs the pinned headroom release.
-    fn install_headroom(&self) -> Result<()> {
+    fn install_headroom<F>(&self, progress: F) -> Result<()>
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
         // Bootstrap path runs at first launch where there is no boot
         // validation yet — no caller will read the captured pip output, so
         // skip the buffer to avoid allocating it.
-        self.install_headroom_release(&pinned_headroom_release()?, |_| {}, None)
+        self.install_headroom_release(&pinned_headroom_release()?, progress, None)
     }
 
     fn install_headroom_release<F>(
@@ -3766,7 +3845,7 @@ impl ToolManager {
         // One codesign invocation can accept many file arguments; ARG_MAX
         // (~256KB on macOS) is well above what we'd hit even with 1000+
         // long paths, so we avoid the per-file fork-exec overhead.
-        let output = Command::new("codesign")
+        let output = crate::proc::command("codesign")
             .args(["--force", "--sign", "-"])
             .args(&native_paths)
             .output();
@@ -6267,7 +6346,7 @@ const SERENA_GITIGNORE_PATTERN: &str = ".serena/";
 /// when `core.excludesfile` is unset, so the pattern can be added without
 /// rewriting the user's global git config.
 fn global_git_excludes_path() -> Option<PathBuf> {
-    let configured = Command::new("git")
+    let configured = crate::proc::command("git")
         .args(["config", "--global", "--get", "core.excludesfile"])
         .output()
         .ok()
@@ -6570,6 +6649,11 @@ enum PortState {
     ForeignOccupant(String),
 }
 
+/// Occupant string used when the port is held but no owning pid can be found.
+/// `diagnose_proxy_port_settled` keys off this exact shape, so it is a const
+/// rather than three loose copies of the same literal.
+const UNKNOWN_OCCUPANT: &str = "unknown process";
+
 fn diagnose_proxy_port(port: u16) -> PortState {
     // If we can bind the port, nothing is there.
     if TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -6586,14 +6670,64 @@ fn diagnose_proxy_port(port: u16) -> PortState {
         // like our managed backend — an unrelated local HTTP server (dev
         // server, docker forward) squatting the port must route to the
         // foreign fallback-port path instead of being SIGKILLed.
-        let detail = lsof_listener(port).unwrap_or_else(|| "unknown process".into());
-        match parse_pid_from_lsof_detail(&detail) {
-            Some(pid) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
-            _ => PortState::ForeignOccupant(detail),
+        match listener_process(port) {
+            Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
+            Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
+            None => PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into()),
         }
     } else {
-        PortState::ForeignOccupant(lsof_listener(port).unwrap_or_else(|| "unknown process".into()))
+        PortState::ForeignOccupant(listener_detail(port).unwrap_or_else(|| UNKNOWN_OCCUPANT.into()))
     }
+}
+
+/// [`diagnose_proxy_port`], but waits out a socket the process we just replaced
+/// left closing.
+///
+/// An updater relaunch tears down the old backend and starts the new one
+/// immediately. For a few seconds the kernel still holds :6768 while nothing
+/// accepts on it and no pid owns it -- a shape `diagnose_proxy_port` can only
+/// read as a foreign occupant, so the backend abandoned its default port for
+/// 6770 on every update (RUST-7F: one event per release, i.e. one per update,
+/// not one per launch). Only that exact unowned shape is waited on; a named
+/// occupant is a real conflict and falls back immediately.
+fn diagnose_proxy_port_settled(port: u16) -> PortState {
+    settle_unowned_port(|| diagnose_proxy_port(port), 6, Duration::from_millis(500))
+}
+
+/// Who holds `port`, as a short label for boot-validation failure diagnostics.
+///
+/// `proxy_port_bound=true` on its own cannot tell "our freshly spawned child
+/// is wedged and never answered /livez" apart from "a foreign process squats
+/// the port so the child never got it": both burn the full boot budget and
+/// look identical in Sentry (RUST-7Y, RUST-4A). Called once, on the failure
+/// path, before `stop_headroom` tears the occupant down.
+pub(crate) fn describe_proxy_port_occupant(port: u16) -> String {
+    match diagnose_proxy_port(port) {
+        PortState::Free => "free".to_string(),
+        PortState::HeadroomRunning => "headroom".to_string(),
+        PortState::ForeignOccupant(detail) => format!("foreign: {detail}"),
+    }
+}
+
+/// Re-`diagnose` while the port reads as held-by-nobody, up to `attempts`
+/// times. Split from [`diagnose_proxy_port_settled`] so the retry rule is
+/// testable without binding real sockets.
+fn settle_unowned_port(
+    mut diagnose: impl FnMut() -> PortState,
+    attempts: usize,
+    pause: Duration,
+) -> PortState {
+    let mut last = diagnose();
+    for _ in 1..attempts.max(1) {
+        match last {
+            PortState::ForeignOccupant(ref detail) if detail == UNKNOWN_OCCUPANT => {
+                std::thread::sleep(pause);
+                last = diagnose();
+            }
+            settled => return settled,
+        }
+    }
+    last
 }
 
 /// True when `pid`'s full command line looks like Headroom's managed backend
@@ -6601,21 +6735,78 @@ fn diagnose_proxy_port(port: u16) -> PortState {
 /// headroom-branded). Guards port reclaim from killing an unrelated process
 /// that merely answers HTTP on our port.
 fn pid_is_headroom_backend(pid: u32) -> bool {
-    let Ok(output) = Command::new("/bin/ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-    else {
+    // Windows has no `ps`, and `tasklist` reports only the image name, which is
+    // a bare `python.exe` for every venv on the machine. The executable PATH is
+    // both obtainable and a stricter claim: anything running out of our managed
+    // runtime is ours by construction, whatever its argv says.
+    #[cfg(windows)]
+    {
+        let Ok(output) = crate::proc::command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
+            ])
+            .output()
+        else {
+            return false;
+        };
+        let path = String::from_utf8_lossy(&output.stdout);
+        let runtime_dir =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).runtime_dir;
+        return exe_path_is_under(&path, &runtime_dir);
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(output) = crate::proc::command("/bin/ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        // A bare "headroom" substring also matches unrelated dev processes whose
+        // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
+        // Require the `proxy` subcommand as well: every version of the managed
+        // backend runs as `... headroom proxy ...` (or `-m headroom.proxy.server`),
+        // so this still recognizes old orphans the upgrade path must reclaim while
+        // excluding a random headroom-pathed process. Only ever consulted for the
+        // exact port being reclaimed, so the blast radius is one port either way.
+        argv.contains("headroom") && argv.contains("proxy")
+    }
+}
+
+/// True when `exe_path` sits inside `runtime_dir`.
+///
+/// The Windows half of [`pid_is_headroom_backend`], split out so the rule is
+/// testable without a live pid. Match the runtime DIRECTORY rather than
+/// substrings: on Windows the backend runs as the base interpreter
+/// (`runtime\python\python.exe`), NOT the venv one
+/// (`runtime\venv\Scripts\python.exe`) that `managed_python()` composes, so a
+/// first cut of this requiring "venv" in the path vouched for neither and the
+/// identity gate could never pass. Both layouts live under `runtime`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_path_is_under(exe_path: &str, runtime_dir: &Path) -> bool {
+    let exe = exe_path.trim();
+    // Empty means the pid was gone by the time PowerShell looked, or it is a
+    // process whose image we may not read. Either way: not provably ours.
+    if exe.is_empty() {
+        return false;
+    }
+    let Some(runtime) = runtime_dir.to_str().filter(|r| !r.is_empty()) else {
         return false;
     };
-    let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    // A bare "headroom" substring also matches unrelated dev processes whose
-    // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
-    // Require the `proxy` subcommand as well: every version of the managed
-    // backend runs as `... headroom proxy ...` (or `-m headroom.proxy.server`),
-    // so this still recognizes old orphans the upgrade path must reclaim while
-    // excluding a random headroom-pathed process. Only ever consulted for the
-    // exact port being reclaimed, so the blast radius is one port either way.
-    argv.contains("headroom") && argv.contains("proxy")
+    // Windows paths are case-insensitive and PowerShell need not echo our
+    // casing back.
+    let exe = exe.to_lowercase();
+    let mut prefix = runtime.to_lowercase();
+    // The prefix has to end on a separator, or `...\runtime-old\python.exe`
+    // would pass for `...\runtime` and the kill would land on a stranger.
+    if !prefix.ends_with('\\') && !prefix.ends_with('/') {
+        prefix.push('\\');
+    }
+    exe.starts_with(&prefix)
 }
 
 fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
@@ -6639,29 +6830,157 @@ fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
     }
 }
 
-fn lsof_listener(port: u16) -> Option<String> {
-    // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
-    // selector (lsof ORs `-i` options) and match every listening socket on
-    // the machine, so `nth(1)` would return an unrelated daemon's pid.
-    let output = Command::new("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+/// The process listening on `port`, as `(command, pid)`.
+///
+/// lsof lives in /usr/sbin on macOS but /usr/bin on Linux, and Debian-family
+/// images often omit it entirely, so try both paths and then fall back to `ss`
+/// (iproute2, present on every Linux we ship to).
+///
+/// `None` means "could not identify the listener" — never "nothing is
+/// listening" and never "it is not ours". Both the port-reclaim kill path and
+/// the stale-argv check hang off this, so neither may treat None as evidence.
+fn listener_process(port: u16) -> Option<(String, u32)> {
+    for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
+        // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
+        // selector (lsof ORs `-i` options) and match every listening socket on
+        // the machine, so the first row would be an unrelated daemon.
+        let Ok(output) = crate::proc::command(lsof)
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .output()
+        else {
+            continue; // not installed at this path
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Some(found) = parse_lsof_listener(&String::from_utf8_lossy(&output.stdout)) {
+            return Some(found);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    return ss_listener(port);
+    #[cfg(windows)]
+    return windows_listener(port);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    return None;
+}
+
+/// Windows has neither `lsof` nor `ss`, so `listener_process` returned `None`
+/// for every port -- which is why `diagnose_proxy_port` could only ever say
+/// "unknown process" there (RUST-7F) and why `reclaim_orphan_proxy` bailed
+/// before it could reclaim anything. `netstat` and `tasklist` ship with every
+/// Windows since XP and need no elevation for our own processes.
+#[cfg(windows)]
+fn windows_listener(port: u16) -> Option<(String, u32)> {
+    let output = crate::proc::command("netstat")
+        .args(["-ano"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().nth(1)?;
-    let mut fields = line.split_whitespace();
-    let cmd = fields.next()?;
-    let pid = fields.next()?;
-    Some(format!("{cmd} pid {pid}"))
+    let pid = parse_netstat_listener(&String::from_utf8_lossy(&output.stdout), port)?;
+
+    // The image name is cosmetic (it goes into the occupant string); a pid we
+    // could not name is still a pid worth reporting and gating a kill on.
+    let image = crate::proc::command("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_tasklist_image(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_else(|| "unnamed process".to_string());
+    Some((image, pid))
+}
+
+/// The pid LISTENING on `port` in `netstat -ano` output.
+///
+/// Matches the port exactly rather than by suffix: `:16768` ends with `6768`,
+/// and picking that row would point a kill at an unrelated process.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Proto, Local Address, Foreign Address, State, PID
+        if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("TCP") {
+            return None;
+        }
+        if !fields[3].eq_ignore_ascii_case("LISTENING") {
+            return None;
+        }
+        // rsplit: IPv6 rows are `[::1]:6768`, so only the last colon separates
+        // the port.
+        let (_, found) = fields[1].rsplit_once(':')?;
+        (found.parse::<u16>().ok()? == port).then(|| fields[4].parse().ok())?
+    })
+}
+
+/// The image name from one `tasklist /NH /FO CSV` row (`"python.exe","123",...`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tasklist_image(text: &str) -> Option<String> {
+    let row = text.lines().find(|line| line.starts_with('"'))?;
+    let name = row.strip_prefix('"')?.split('"').next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `(command, pid)` from the first data row of `lsof -nP -iTCP -sTCP:LISTEN`,
+/// whose columns start `COMMAND PID`. Row 0 is the header.
+fn parse_lsof_listener(text: &str) -> Option<(String, u32)> {
+    let mut fields = text.lines().nth(1)?.split_whitespace();
+    let command = fields.next()?.to_string();
+    let pid = fields.next()?.parse().ok()?;
+    Some((command, pid))
+}
+
+/// lsof-less fallback. `ss` only fills the `users:` field for processes the
+/// caller owns, which covers the case that matters — our own backend. Someone
+/// else's daemon on our port stays "unknown process", which is the honest
+/// answer and routes to the fallback port instead of the kill path.
+#[cfg(target_os = "linux")]
+fn ss_listener(port: u16) -> Option<(String, u32)> {
+    let output = crate::proc::command("ss").arg("-ltnp").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ss_listener(&String::from_utf8_lossy(&output.stdout), port)
+}
+
+/// Pick the LISTEN row whose local address ends in `:{port}` and pull
+/// `(command, pid)` from its `users:(("python",pid=1234,fd=7))` field.
+///
+/// Filtered here rather than with an `ss` filter expression: the column layout
+/// is stable across iproute2 versions, and a filter expression we got subtly
+/// wrong would hand a *different* process's pid to the kill path.
+// Only called on Linux, but compiled everywhere so the parser stays testable.
+#[allow(dead_code)]
+fn parse_ss_listener(text: &str, port: u16) -> Option<(String, u32)> {
+    let suffix = format!(":{port}");
+    let row = text.lines().find(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("LISTEN") && fields.nth(2).is_some_and(|addr| addr.ends_with(&suffix))
+    })?;
+    let users = row.split("users:((").nth(1)?;
+    let command = users.strip_prefix('"')?.split('"').next()?.to_string();
+    let pid = users
+        .split("pid=")
+        .nth(1)?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((command, pid))
+}
+
+/// `listener_process` formatted as the `"cmd pid 1234"` detail string the
+/// port-conflict marker and its bail messages carry.
+fn listener_detail(port: u16) -> Option<String> {
+    listener_process(port).map(|(command, pid)| format!("{command} pid {pid}"))
 }
 
 /// Extract the numeric pid from a `"cmd pid 1234"` string returned by
-/// [`lsof_listener`]. Returns None for the `"unknown process"` placeholder
+/// [`listener_detail`]. Returns None for the `"unknown process"` placeholder
 /// or any unparseable shape. Companion to `port_conflict::parse_occupant`,
-/// which works on the full bail string instead of the lsof detail.
+/// which works on the full bail string instead of the occupant detail.
 fn parse_pid_from_lsof_detail(detail: &str) -> Option<u32> {
     let idx = detail.rfind(" pid ")?;
     detail[idx + " pid ".len()..].trim().parse().ok()
@@ -6726,14 +7045,39 @@ fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
 /// `stop_headroom`'s argv pattern-kill missed the real socket holder) must be
 /// killed anyway, or the new venv can't bind and the upgrade rolls back as
 /// `not_started`. When set, skip the readyz health guard and reclaim regardless.
+/// Signal a single pid, gracefully or forcefully.
+///
+/// Deliberately not `state::terminate_process_tree`: that one signals a process
+/// GROUP on unix and refuses any pid we did not spawn, which is exactly what an
+/// orphan from a previous app instance is. Callers must have passed
+/// `pid_is_headroom_backend` first.
+fn kill_pid(pid: u32, force: bool) {
+    #[cfg(windows)]
+    {
+        // `/T` takes the subtree with it: the backend spawns helpers, and a
+        // survivor holds the port just as well as its parent did.
+        let mut command = crate::proc::command("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.status();
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = crate::proc::command("/bin/kill");
+        if force {
+            command.arg("-KILL");
+        }
+        let _ = command.arg(pid.to_string()).status();
+    }
+}
+
 fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
         bail!("{}", format_already_running_bail(port));
     }
-    let Some(pid) = lsof_listener(port)
-        .as_deref()
-        .and_then(parse_pid_from_lsof_detail)
-    else {
+    let Some((_, pid)) = listener_process(port) else {
         bail!("{}", format_already_running_bail(port));
     };
     // Belt-and-braces identity gate (diagnose_proxy_port already filters, but
@@ -6744,12 +7088,9 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
-    let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
+    kill_pid(pid, false);
     if !wait_for_port_free(port, Duration::from_secs(3)) {
-        let _ = Command::new("/bin/kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status();
+        kill_pid(pid, true);
         if !wait_for_port_free(port, Duration::from_secs(2)) {
             bail!("{}", format_already_running_bail(port));
         }
@@ -7007,7 +7348,7 @@ fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
 /// Returns the full command line of whatever process is currently listening on
 /// the proxy port, or `None` if we couldn't determine it.
 pub fn running_proxy_argv() -> Option<String> {
-    let pid = lsof_listener_pid(backend_port::get())?;
+    let (_, pid) = listener_process(backend_port::get())?;
     ps_command(pid)
 }
 
@@ -7015,7 +7356,11 @@ pub fn running_proxy_argv() -> Option<String> {
 /// to pass. Used to detect proxies left over from an older desktop version.
 pub fn running_proxy_matches_expected_args() -> bool {
     let Some(argv) = running_proxy_argv() else {
-        return false;
+        // Fail open. The caller kills the backend when this is false, and
+        // "we could not read the listener's argv" is not evidence that it is
+        // stale. Returning false here meant every ensure-running pass on a
+        // host we cannot introspect killed and respawned a healthy backend.
+        return true;
     };
     proxy_argv_contains_expected_flags(&argv, !crate::client_adapters::is_auto_learn_disabled())
 }
@@ -7037,21 +7382,8 @@ fn argv_contains_flag(argv: &str, flag: &str) -> bool {
     argv.split_whitespace().any(|tok| tok == flag)
 }
 
-fn lsof_listener_pid(port: u16) -> Option<u32> {
-    let output = Command::new("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .find_map(|line| line.strip_prefix('p').and_then(|n| n.trim().parse().ok()))
-}
-
 fn ps_command(pid: u32) -> Option<String> {
-    let output = Command::new("/bin/ps")
+    let output = crate::proc::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
         .ok()?;
@@ -7405,6 +7737,29 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
         ),
         sha256: Some(sha256),
     })
+}
+
+/// Why this addon cannot be installed on the current OS/arch, in one sentence
+/// the Addons tab shows in place of an Install button that could only ever
+/// error. Keyed off the same artifact resolvers the installers call, so a newly
+/// published target re-enables the card with no edit here.
+fn addon_unavailable_reason(id: &str) -> Option<String> {
+    let platform = match std::env::consts::OS {
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "macos" => "macOS",
+        other => other,
+    };
+    match id {
+        "rtk" if rtk_distribution_artifact().is_err() => Some(format!(
+            "Not available on {platform} {}: RTK publishes no build for this architecture yet.",
+            std::env::consts::ARCH
+        )),
+        "codebase-memory" if codebase_memory_distribution_artifact().is_err() => Some(format!(
+            "Not available on {platform}: codebase-memory publishes macOS and Linux binaries only."
+        )),
+        _ => None,
+    }
 }
 
 fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
@@ -7889,17 +8244,13 @@ fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_command(python, args, cwd)
 }
 
-/// Path to the output-shaper savings ledger. Mirrors headroom's
-/// `workspace_dir()` default of `~/.headroom` (neither the proxy nor the
-/// seeding run sets `HEADROOM_WORKSPACE_DIR`, so both resolve here).
+/// Path to the output-shaper savings ledger, which `output_savings` also reads
+/// to recompute the estimate the dashboard shows.
 fn output_savings_ledger_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".headroom").join("output_savings.json"))
+    crate::output_savings::ledger_path()
 }
 
-/// Core of [`purge_output_savings_control_arm`]: given the ledger bytes, return
+/// Core of [`purge_legacy_output_savings_control_arm_once`]: given the ledger bytes, return
 /// rewritten bytes when a non-empty `control` arm was cleared, else `None`
 /// (missing/empty control, or unparseable input we must not clobber).
 fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -7917,28 +8268,44 @@ fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&ledger).ok()
 }
 
-/// Drop the output-shaper A/B control arm from the savings ledger.
+/// Drop the output-shaper A/B control arm left over from the abandoned 1%
+/// holdout, exactly once.
 ///
-/// The desktop no longer runs a holdout (HEADROOM_OUTPUT_HOLDOUT=0), but control
-/// samples collected while it was on keep the proxy's `best_estimate` pinned to
-/// the "measured" number — which, on a near-empty control arm, blows up to
-/// nonsense (e.g. -1439.9% from 3 stale samples). Emptying `control` makes the
-/// proxy's `estimate_from_holdout` return None, so /stats falls back to the
-/// synthetic-control estimate. Idempotent one-shot, best-effort: never touch a
-/// missing or unparseable ledger, and only rewrite when there is control data to
-/// drop. Uses atomic_write so a crash mid-write can't truncate the ledger.
-fn purge_output_savings_control_arm() {
+/// Those samples predate the current shaper and were collected under a policy
+/// that never gathered enough of them to mean anything, so folding them into
+/// the 3% arm would poison it from the first request. Clearing them on every
+/// spawn is not an option either: the arm is live data now, and this runs each
+/// time the proxy starts.
+///
+/// The stamp sits beside the ledger on purpose. A reset that removes
+/// `~/.headroom` takes the control samples with it, so the stamp going too is
+/// correct — there is nothing left to purge either way.
+///
+/// Best-effort throughout: never touch a missing or unparseable ledger, and
+/// only rewrite when there is control data to drop. Uses `atomic_write` so a
+/// crash mid-write cannot truncate the ledger.
+fn purge_legacy_output_savings_control_arm_once() {
     let Some(path) = output_savings_ledger_path() else {
         return;
     };
+    let stamp = path.with_file_name(".legacy-control-arm-purged");
+    if stamp.exists() {
+        return;
+    }
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    let Some(out) = ledger_bytes_without_control(&bytes) else {
-        return;
-    };
-    if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
-        log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
+    if let Some(out) = ledger_bytes_without_control(&bytes) {
+        if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
+            log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
+            // Leave the stamp unwritten so the next spawn retries; a failed
+            // purge must not be recorded as a done one.
+            return;
+        }
+        log::info!("[tool_manager] cleared legacy output-shaper control arm");
+    }
+    if let Err(err) = crate::client_adapters::atomic_write(&stamp, b"") {
+        log::warn!("[tool_manager] stamping legacy control-arm purge failed: {err}");
     }
 }
 
@@ -8047,7 +8414,7 @@ fn path_with_binary_dir(binary: &Path) -> String {
 }
 
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
-    let mut command = Command::new(binary);
+    let mut command = crate::proc::command(binary);
     command
         .args(args)
         .current_dir(cwd)
@@ -8135,7 +8502,7 @@ fn pip_line_to_progress(
 // 400-char Sentry cap eats before any stderr lines appear. Pip's actual
 // reason lives on stderr, so prefer the tail of stderr (or stdout if stderr
 // is empty) plus exit code.
-fn compact_pip_failure(err: &anyhow::Error) -> String {
+pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     const TAIL_BUDGET: usize = 300;
     let Some(failure) = err.chain().find_map(|c| c.downcast_ref::<CommandFailure>()) else {
         // No CommandFailure means the command never ran (spawn failed).
@@ -8185,6 +8552,14 @@ fn pip_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
+    } else if lower.contains("no matching distribution found")
+        || lower.contains("could not find a version that satisfies")
+    {
+        // Our lock asked for a version PyPI has no wheel for on that
+        // interpreter/platform (RUST-6S: onnxruntime==1.27.0 on Intel macOS,
+        // where releases stop at 1.23.2). That is a bad pin in *our* lock, not
+        // the user's machine -- it must never sit in the "other" grab-bag.
+        "no-matching-dist"
     } else if lower.contains("no usable temporary directory") {
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
@@ -8649,25 +9024,28 @@ mod tests {
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::{
-        apply_serena_dashboard_interface, apply_serena_gitignore,
-        bootstrap_requirements_lock_for_target,
-        classify_kompress_prefetch_failure, compact_pip_failure, diagnose_proxy_port,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
-        format_already_running_bail, headroom_entrypoint_startup_args,
+        addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
+        bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
+        codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
+        diagnose_proxy_port, exe_path_is_under, extract_required_pydantic_core_version,
+        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, pending_addon_update, pinned_headroom_release, pip_failure_category,
-        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
+        parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
+        parse_tasklist_image, path_with_binary_dir, pending_addon_update, pinned_headroom_release,
+        pip_failure_category, plugin_install_failure_category, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, sha256_bytes, summarize_kompress_prefetch_failure,
-        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
+        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        UNKNOWN_OCCUPANT,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -8814,9 +9192,7 @@ mod tests {
 
         // Explicit user choice (or already browser) -> left alone.
         assert!(apply_serena_dashboard_interface("web_dashboard_interface: app\n").is_none());
-        assert!(
-            apply_serena_dashboard_interface("web_dashboard_interface: browser\n").is_none()
-        );
+        assert!(apply_serena_dashboard_interface("web_dashboard_interface: browser\n").is_none());
         // Commented-out template line is not the key.
         assert_eq!(
             apply_serena_dashboard_interface("projects: []\n# web_dashboard_interface:\n")
@@ -8840,6 +9216,32 @@ mod tests {
         assert!(ledger_bytes_without_control(br#"{"control":{}}"#).is_none());
         assert!(ledger_bytes_without_control(br#"{"treatment":{"k":{"n":1}}}"#).is_none());
         assert!(ledger_bytes_without_control(b"{not json").is_none());
+    }
+
+    #[test]
+    fn legacy_control_arm_is_purged_once_then_left_to_fill() {
+        let root = std::env::temp_dir().join(format!("headroom-purge-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _guard = HomeGuard::new(&root);
+        let ledger = root.join(".headroom").join("output_savings.json");
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let with_control =
+            br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
+
+        // Samples from the abandoned 1% holdout go.
+        std::fs::write(&ledger, with_control).unwrap();
+        purge_legacy_output_savings_control_arm_once();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(v["control"].as_object().unwrap().len(), 0);
+
+        // The 3% arm now fills on every proxy spawn. Purging again would empty
+        // it as fast as it fills, so the stamp has to hold.
+        std::fs::write(&ledger, with_control).unwrap();
+        purge_legacy_output_savings_control_arm_once();
+        assert_eq!(std::fs::read(&ledger).unwrap(), with_control);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -9027,6 +9429,13 @@ mod tests {
             "permission denied"
         );
         assert_eq!(
+            classify_kompress_prefetch_failure(
+                "OSError: [WinError 126] The specified module could not be found. \
+                 Error loading \"...\\torch\\lib\\c10.dll\" or one of its dependencies"
+            ),
+            "missing native dep"
+        );
+        assert_eq!(
             classify_kompress_prefetch_failure("ValueError: something unexpected"),
             "other"
         );
@@ -9059,6 +9468,103 @@ mod tests {
     fn summarize_kompress_prefetch_failure_handles_missing_log() {
         let cause = summarize_kompress_prefetch_failure(&PathBuf::from("/no/such/prefetch.log"));
         assert_eq!(cause, "[no output] (no output in kompress-prefetch.log)");
+    }
+
+    /// RUST-75 arrived as a bare torch DLL error. The ONNX failure that
+    /// preceded it -- same missing MSVC redistributable, and the actual first
+    /// cause -- was dropped, so the report pointed at the wrong library.
+    #[test]
+    fn summarize_kompress_prefetch_failure_carries_the_earlier_onnx_cause() {
+        let dir = std::env::temp_dir().join(format!(
+            "kompress-onnx-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("kompress-prefetch.log");
+        fs::write(
+            &log,
+            "Downloading Kompress ONNX model ...\n             WARNING ONNX load failed for kompress-v2-base, trying PyTorch: DLL load failed while importing onnxruntime_pybind11_state\n             Traceback (most recent call last):\n             OSError: [WinError 126] The specified module could not be found. Error loading \"C:\\venv\\torch\\lib\\c10.dll\"\n",
+        )
+        .unwrap();
+
+        let cause = summarize_kompress_prefetch_failure(&log);
+        // Category still comes from the last line, so the fingerprint is stable.
+        assert!(
+            cause.starts_with("[missing native dep] OSError: [WinError 126]"),
+            "{cause}"
+        );
+        // ...but the ONNX cause that explains it now rides along.
+        assert!(cause.contains("(after WARNING ONNX load failed"), "{cause}");
+        assert!(cause.contains("onnxruntime_pybind11_state"), "{cause}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An updater relaunch leaves :6768 held by nobody for a moment. Treating
+    /// that as a foreign occupant moved the backend to 6770 on every update
+    /// (RUST-7F), so the unowned shape is waited out before falling back.
+    #[test]
+    fn settle_unowned_port_waits_for_a_closing_socket_then_takes_the_port() {
+        let calls = std::cell::Cell::new(0);
+        let state = settle_unowned_port(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into())
+                } else {
+                    PortState::Free
+                }
+            },
+            6,
+            Duration::from_millis(0),
+        );
+        assert!(matches!(state, PortState::Free));
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// The boot-validation failure path reports the occupant, not just a
+    /// bound/unbound bit. A free port and a held one must not read alike.
+    #[test]
+    fn describe_proxy_port_occupant_separates_free_from_held() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        assert_ne!(describe_proxy_port_occupant(port), "free");
+        drop(listener);
+        assert_eq!(describe_proxy_port_occupant(port), "free");
+    }
+
+    #[test]
+    fn settle_unowned_port_does_not_wait_on_a_named_occupant() {
+        let calls = std::cell::Cell::new(0);
+        let state = settle_unowned_port(
+            || {
+                calls.set(calls.get() + 1);
+                PortState::ForeignOccupant("rapportd pid 594".into())
+            },
+            6,
+            Duration::from_millis(0),
+        );
+        // A real conflict must fall back immediately, not sit through the wait.
+        assert!(matches!(state, PortState::ForeignOccupant(ref d) if d == "rapportd pid 594"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn settle_unowned_port_gives_up_after_the_attempt_budget() {
+        let calls = std::cell::Cell::new(0);
+        let state = settle_unowned_port(
+            || {
+                calls.set(calls.get() + 1);
+                PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into())
+            },
+            6,
+            Duration::from_millis(0),
+        );
+        assert!(matches!(state, PortState::ForeignOccupant(ref d) if d == UNKNOWN_OCCUPANT));
+        assert_eq!(calls.get(), 6, "budget must be spent, not exceeded");
     }
 
     #[test]
@@ -9864,6 +10370,118 @@ mod tests {
     }
 
     #[test]
+    /// The real path observed on a Windows box was
+    /// `...\Headroom\headroom\runtime\python\python.exe` -- the BASE
+    /// interpreter. A first cut of this gate required "venv" in the path, which
+    /// that never matches, so the identity check could never pass and every
+    /// reclaim stayed dead.
+    #[test]
+    fn exe_path_is_under_accepts_both_windows_python_layouts() {
+        let runtime = PathBuf::from(r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime");
+        assert!(exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime\python\python.exe",
+            &runtime
+        ));
+        assert!(exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime\venv\Scripts\headroom.exe",
+            &runtime
+        ));
+        // PowerShell output arrives with a trailing newline and need not match
+        // our casing.
+        assert!(exe_path_is_under(
+            "c:\\users\\garm\\appdata\\local\\headroom\\headroom\\runtime\\python\\python.exe\r\n",
+            &runtime
+        ));
+    }
+
+    /// A prefix match that does not land on a separator would point a kill at a
+    /// stranger.
+    #[test]
+    fn exe_path_is_under_rejects_neighbours_and_strangers() {
+        let runtime = PathBuf::from(r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime");
+        assert!(!exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime-old\python\python.exe",
+            &runtime
+        ));
+        assert!(!exe_path_is_under(r"C:\Python312\python.exe", &runtime));
+        assert!(!exe_path_is_under(
+            r"C:\Users\garm\AppData\Local\Headroom\headroom-desktop.exe",
+            &runtime
+        ));
+        // Pid already gone: PowerShell prints nothing. Never provably ours.
+        assert!(!exe_path_is_under("", &runtime));
+        assert!(!exe_path_is_under("   \r\n", &runtime));
+    }
+
+    /// Windows could not name a port holder at all before this (no lsof, no
+    /// ss), so every occupant read as "unknown process" and no reclaim could
+    /// pass its identity gate.
+    #[test]
+    fn parse_netstat_listener_finds_the_listening_pid() {
+        let out = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1044\r\n  TCP    127.0.0.1:6768         0.0.0.0:0              LISTENING       9876\r\n  TCP    [::1]:6767             [::]:0                 LISTENING       4321\r\n";
+        assert_eq!(parse_netstat_listener(out, 6768), Some(9876));
+        // IPv6 rows are `[::1]:6767`; only the LAST colon separates the port.
+        assert_eq!(parse_netstat_listener(out, 6767), Some(4321));
+        assert_eq!(parse_netstat_listener(out, 7000), None);
+    }
+
+    /// Suffix matching would point a kill at whatever holds :16768.
+    #[test]
+    fn parse_netstat_listener_does_not_match_a_port_by_suffix() {
+        let out = "  TCP    127.0.0.1:16768        0.0.0.0:0              LISTENING       5555\r\n";
+        assert_eq!(parse_netstat_listener(out, 6768), None);
+    }
+
+    /// An ESTABLISHED row for the same port is a client, not the holder.
+    #[test]
+    fn parse_netstat_listener_ignores_non_listening_rows() {
+        let out = "  TCP    127.0.0.1:6768         127.0.0.1:52100        ESTABLISHED     7777\r\n";
+        assert_eq!(parse_netstat_listener(out, 6768), None);
+    }
+
+    #[test]
+    fn parse_tasklist_image_reads_the_csv_image_name() {
+        let out = "\"python.exe\",\"9876\",\"Console\",\"1\",\"45,678 K\"\r\n";
+        assert_eq!(parse_tasklist_image(out), Some("python.exe".to_string()));
+        // `/FI` with no match prints an INFO line, not a CSV row.
+        assert_eq!(
+            parse_tasklist_image("INFO: No tasks are running which match the specified criteria."),
+            None
+        );
+    }
+
+    fn parse_lsof_listener_reads_the_row_below_the_header() {
+        let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+                   python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";
+        assert_eq!(parse_lsof_listener(out), Some(("python".into(), 12345)));
+        // Header only: lsof found nothing, which is not a listener.
+        assert_eq!(
+            parse_lsof_listener("COMMAND   PID USER   FD   TYPE DEVICE\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_ss_listener_picks_the_row_for_the_requested_port() {
+        let out = "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n\
+             LISTEN 0      4096       127.0.0.1:16768      0.0.0.0:*     users:((\"decoy\",pid=1,fd=3))\n\
+             LISTEN 0      4096       127.0.0.1:6768       0.0.0.0:*     users:((\"python\",pid=12345,fd=7))\n";
+        // :16768 must not satisfy a :6768 lookup.
+        assert_eq!(parse_ss_listener(out, 6768), Some(("python".into(), 12345)));
+        assert_eq!(parse_ss_listener(out, 16768), Some(("decoy".into(), 1)));
+        assert_eq!(parse_ss_listener(out, 9999), None);
+    }
+
+    #[test]
+    fn parse_ss_listener_returns_none_without_process_ownership() {
+        // ss omits `users:` for processes the caller does not own. Guessing a
+        // pid here would point the kill path at the wrong process.
+        let out = "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n\
+                   LISTEN 0      4096       0.0.0.0:6768       0.0.0.0:*\n";
+        assert_eq!(parse_ss_listener(out, 6768), None);
+    }
+
+    #[test]
     fn parse_pid_from_lsof_detail_returns_none_for_unknown_or_malformed() {
         assert_eq!(parse_pid_from_lsof_detail("unknown process"), None);
         assert_eq!(parse_pid_from_lsof_detail(""), None);
@@ -9969,7 +10587,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         // pid_is_headroom_backend argv identity gate (needs both a "headroom"
         // and a "proxy" token), like a real orphan running as
         // `.../headroom proxy ...` from the app-support venv path would.
-        let mut child = std::process::Command::new("/usr/bin/python3")
+        let mut child = crate::proc::command("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
@@ -10032,7 +10650,7 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 "#;
-        let mut child = std::process::Command::new("/usr/bin/python3")
+        let mut child = crate::proc::command("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
@@ -10100,6 +10718,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     }
 
     #[test]
+    #[serial_test::serial(backend_port)]
     fn managed_headroom_startup_uses_supported_proxy_args() {
         backend_port::reset_for_tests();
         let default_port = backend_port::DEFAULT_BACKEND_PORT.to_string();
@@ -10143,6 +10762,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// validation attempt exit 2 and the upgrade time out. The flag must be
     /// gated on runtime >= 0.28.0; unknown versions assume the pinned runtime.
     #[test]
+    #[serial_test::serial(backend_port)]
     fn entrypoint_args_gate_no_http2_on_runtime_version() {
         backend_port::reset_for_tests();
 
@@ -10172,6 +10792,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
     /// click would exit 2 and boot validation would fail like RUST-4A.
     #[test]
+    #[serial_test::serial(backend_port)]
     fn entrypoint_args_gate_no_ccr_on_runtime_version() {
         backend_port::reset_for_tests();
 
@@ -10205,6 +10826,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// the proxy raise on startup and exit before opening the port. Must gate on
     /// runtime >= 0.30.0; unknown versions assume the pinned (current) runtime.
     #[test]
+    #[serial_test::serial(backend_port)]
     fn savings_profile_gated_on_runtime_version() {
         assert_eq!(savings_profile_for_runtime(Some("0.28.0")), "agent-90");
         assert_eq!(savings_profile_for_runtime(Some("0.29.9")), "agent-90");
@@ -10222,6 +10844,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// the helpers are invoked AFTER fallback has updated the atomic, the
     /// chosen fallback port flows through.
     #[test]
+    #[serial_test::serial(backend_port)]
     fn startup_args_reflect_fallback_port_set_after_default() {
         backend_port::reset_for_tests();
         backend_port::set(6770);
@@ -10611,6 +11234,49 @@ after
         assert!(manager.tool_enabled("markitdown"));
     }
 
+    /// Every addon keeps its card on every platform; the ones with no artifact
+    /// for this target carry a reason instead (codebase-memory ships no Windows
+    /// binary, rtk none for windows-aarch64). A card without an artifact and
+    /// without a reason would offer an Install button that only ever errors.
+    #[test]
+    fn addons_without_an_artifact_for_this_target_carry_a_reason() {
+        let (_root, _runtime, manager) = seed_test_runtime("manifest-artifacts");
+        let tools = manager.list_tools();
+        let reason_for = |id: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.id == id)
+                .unwrap_or_else(|| panic!("{id} card must exist on every platform"))
+                .unavailable_reason
+                .clone()
+        };
+
+        assert_eq!(
+            reason_for("rtk").is_none(),
+            rtk_distribution_artifact().is_ok(),
+            "rtk is installable exactly when its artifact resolves"
+        );
+        assert_eq!(
+            reason_for("codebase-memory").is_none(),
+            codebase_memory_distribution_artifact().is_ok(),
+            "codebase-memory is installable exactly when its artifact resolves"
+        );
+        // Nothing platform-gated about the Python addons: never gray them.
+        assert!(reason_for("markitdown").is_none());
+        assert!(reason_for("serena").is_none());
+    }
+
+    #[test]
+    fn unavailable_reason_names_the_platform_and_the_reason() {
+        // The message is user-facing copy on a grayed card, so it has to say
+        // both which platform is missing and why, without a bare target triple.
+        let Some(reason) = addon_unavailable_reason("codebase-memory") else {
+            return; // this target has a build; nothing to phrase
+        };
+        assert!(reason.starts_with("Not available on "), "{reason}");
+        assert!(reason.contains("codebase-memory"), "{reason}");
+    }
+
     fn listed_tool(manager: &ToolManager, id: &str) -> ManagedTool {
         manager
             .list_tools()
@@ -10777,7 +11443,7 @@ after
         manager.ensure_markitdown_shim().expect("shim");
 
         let run = |arg: &str| {
-            let out = std::process::Command::new(manager.markitdown_shim_path())
+            let out = crate::proc::command(manager.markitdown_shim_path())
                 .arg(arg)
                 .output()
                 .expect("run shim");
@@ -12231,6 +12897,12 @@ exit 0
                 "disk-full",
             ),
             ("exit=1; stderr tail: Check the permissions.", "permission"),
+            (
+                "exit=1; stderr tail: ERROR: Could not find a version that satisfies the \
+                 requirement onnxruntime==1.27.0 (from versions: 1.23.2)\nERROR: No matching \
+                 distribution found for onnxruntime==1.27.0",
+                "no-matching-dist",
+            ),
             (
                 "exit=1; stderr tail: ERROR: Could not install packages due to an OSError: \
                  [Errno 2] No such file or directory: 'C:\\\\...\\\\INSTALLERvp0i8uew.tmp'",

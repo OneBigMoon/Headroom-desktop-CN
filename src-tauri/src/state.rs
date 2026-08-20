@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
@@ -22,11 +22,11 @@ use crate::client_adapters::{
 };
 use crate::insights::generate_daily_insights;
 use crate::models::{
-    ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    CodexAccountProfile, CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState,
-    HeadroomLearnPrereqStatus, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
-    RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress,
-    TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
+    ActivityEvent, BootstrapFailureReport, BootstrapProgress, ClaudeAccountProfile,
+    ClaudeCodeProject, ClientStatus, CodexAccountProfile, CodexRateLimitSnapshot, DailyInsight,
+    DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
+    HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
+    RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
@@ -278,7 +278,7 @@ fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
 /// to call on a 500ms boot-validation tick — fork+exec of a tiny
 /// system binary, no I/O beyond the kernel proc table.
 pub(crate) fn tracked_process_cpu_time_secs(pid: u32) -> Option<u64> {
-    let output = Command::new("ps")
+    let output = crate::proc::command("ps")
         .args(["-p", &pid.to_string(), "-o", "time="])
         .output()
         .ok()?;
@@ -481,6 +481,12 @@ pub struct AppState {
     /// code (Sentry RUST-53). Cleared on each successful spawn.
     pub last_child_natural_exit: Mutex<Option<String>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
+    /// Cause class and technical detail of the most recent bootstrap failure,
+    /// captured at the failure site where pip's stderr tail is still in hand.
+    /// The install screen has no other route to those -- it renders only the
+    /// friendly message -- so a user report would otherwise repeat back copy
+    /// we wrote and name nothing actionable. `None` until a bootstrap fails.
+    pub bootstrap_failure_report: Mutex<Option<BootstrapFailureReport>>,
     pub headroom_learn_state: Mutex<HeadroomLearnRuntimeState>,
     /// Last Claude AI OAuth bearer token seen passing through the proxy intercept.
     /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
@@ -495,6 +501,10 @@ pub struct AppState {
     /// the proxy intercept (`proxy_intercept::decode_codex_plan_tier`). Read by
     /// `pricing::fetch_codex_usage` to pick the recommended upgrade tier.
     pub codex_plan_tier: Arc<Mutex<Option<crate::models::CodexPlanTier>>>,
+    /// Why the always-on intercept is not listening on 6767, written by
+    /// `proxy_intercept::spawn`. Separate from `last_startup_error` (which the
+    /// Python runtime's start path clears) because the two fail independently.
+    pub intercept_bind_error: crate::proxy_intercept::BindErrorSlot,
     /// When true, the Rust intercept on :6767 forwards traffic directly to
     /// api.anthropic.com instead of the Python proxy on :6768. Flipped on by
     /// `enforce_pricing_gate` once a Pro/Max user crosses the disable threshold
@@ -665,9 +675,11 @@ impl AppState {
                 current_step_eta_seconds: 0,
                 overall_percent: 0,
             }),
+            bootstrap_failure_report: Mutex::new(None),
             claude_bearer_token: Arc::new(Mutex::new(None)),
             codex_rate_limits: Arc::new(Mutex::new(None)),
             codex_plan_tier: Arc::new(Mutex::new(None)),
+            intercept_bind_error: Arc::new(Mutex::new(None)),
             proxy_bypass: Arc::new(AtomicBool::new(false)),
             claude_only_bypass: Arc::new(AtomicBool::new(false)),
             codex_bypass: Arc::new(AtomicBool::new(false)),
@@ -1300,6 +1312,9 @@ impl AppState {
             tracked_child: self.headroom_process.lock().is_some(),
             new_proxy_log_written,
             proxy_port_bound: proxy_port_accepts_connection(),
+            port_occupant: crate::tool_manager::describe_proxy_port_occupant(
+                crate::backend_port::get(),
+            ),
             python_installed: post_spawn.python_installed,
             proxy_bypass: post_spawn.proxy_bypass,
             pricing_allows_optimization: post_spawn.pricing_allows_optimization,
@@ -2317,15 +2332,32 @@ impl AppState {
 
         let mut savings_breakdown = history.as_ref().and_then(|h| h.lifetime.clone());
 
-        let output_reduction = stats
+        // Recomputed from the shaper's own ledger rather than taken from
+        // `/stats`, which credits strata the baseline never observed against a
+        // global mean and flips to the A/B number on a single sample per arm.
+        // See `output_savings`. Falls back to the backend's figure when the
+        // ledger is missing or mid-write, so a torn read never blanks the tile.
+        let ledger_estimate = crate::output_savings::estimate();
+        let output_reduction = ledger_estimate
             .as_ref()
-            .and_then(|s| s.output_reduction.as_ref())
-            .map(|o| crate::models::OutputReduction {
-                method: o.method.clone(),
-                reduction_percent: o.reduction_percent,
-                ci_low_percent: o.ci_low_percent,
-                ci_high_percent: o.ci_high_percent,
-                requests: o.requests,
+            .map(|e| crate::models::OutputReduction {
+                method: e.method.to_string(),
+                reduction_percent: e.reduction_percent,
+                ci_low_percent: e.ci_low_percent,
+                ci_high_percent: e.ci_high_percent,
+                requests: e.requests,
+            })
+            .or_else(|| {
+                stats
+                    .as_ref()
+                    .and_then(|s| s.output_reduction.as_ref())
+                    .map(|o| crate::models::OutputReduction {
+                        method: o.method.clone(),
+                        reduction_percent: o.reduction_percent,
+                        ci_low_percent: o.ci_low_percent,
+                        ci_high_percent: o.ci_high_percent,
+                        requests: o.requests,
+                    })
             });
 
         let learner_progress = stats.as_ref().and_then(|s| s.learner_progress.clone());
@@ -2443,12 +2475,20 @@ impl AppState {
         // off the last persisted estimator reading instead of the bucket sum,
         // so the headline doesn't dip by hundreds of dollars for the first
         // minutes and then jump back up.
+        // Same ledger recomputation as the tile above: the dollar row and the
+        // percentage have to describe one estimate, or the drill-down stops
+        // explaining the headline.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            stats
+            ledger_estimate
                 .as_ref()
-                .and_then(|s| s.output_reduction.as_ref())
-                .map(|r| r.tokens_saved)
+                .map(|e| e.tokens_saved)
+                .or_else(|| {
+                    stats
+                        .as_ref()
+                        .and_then(|s| s.output_reduction.as_ref())
+                        .map(|r| r.tokens_saved)
+                })
                 .or(cached_output_estimator_tokens),
         );
         let lifetime_tool_schema_savings_usd =
@@ -3095,7 +3135,18 @@ impl AppState {
         let effective_running = installed && !paused && proxy_reachable;
 
         let startup_error = self.last_startup_error.lock().clone();
-        let startup_error_hint = startup_error.as_deref().and_then(classify_startup_error);
+        // A failed intercept bind outranks any backend startup error: every
+        // client is hard-configured to 127.0.0.1:6767, so nothing routes no
+        // matter how healthy the Python runtime is, and the backend's own
+        // error (if any) is downstream noise. Without this the banner reports
+        // "runtime offline, proxy unreachable" and points the user at the
+        // runtime, while the actual cause is that the port never opened.
+        let startup_error_hint = self
+            .intercept_bind_error
+            .lock()
+            .as_deref()
+            .map(intercept_bind_hint)
+            .or_else(|| startup_error.as_deref().and_then(classify_startup_error));
 
         RuntimeStatus {
             platform: platform.into(),
@@ -3200,7 +3251,7 @@ impl AppState {
         let Some(pid) = self.headroom_process.lock().as_ref().map(|c| c.id()) else {
             return;
         };
-        let _ = std::process::Command::new("/bin/kill")
+        let _ = crate::proc::command("/bin/kill")
             .arg("-USR1")
             .arg(pid.to_string())
             .status();
@@ -3208,7 +3259,25 @@ impl AppState {
     }
 
     pub fn stop_headroom(&self) {
-        let _lifecycle_guard = self.lifecycle_lock.lock();
+        // `ensure_headroom_running` holds this lock across a blocking backend
+        // start, so a launch racing this stop can hold it for the length of that
+        // spawn. Quit must not wait on it: `restart_app` calls us before it can
+        // post the exit request, so a lock held here leaves the app alive with
+        // its window stuck on "Restarting..." and no relaunch - and it is the
+        // only unbounded wait on that path (the child wait below is capped at
+        // 2s, the analytics flush at 3s). Stop unguarded rather than never: the
+        // caller has already set SHUTTING_DOWN, and the pkill sweep at the end
+        // reaps whatever a racing spawn manages to leave behind.
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .try_lock_for(STOP_LIFECYCLE_LOCK_TIMEOUT)
+            .or_else(|| {
+                log::warn!(
+                    "stop_headroom: lifecycle lock still held after {}s; stopping without it",
+                    STOP_LIFECYCLE_LOCK_TIMEOUT.as_secs()
+                );
+                None
+            });
         // Every app-initiated stop is a down window we caused: a watchdog
         // restart, a pricing-gate pause, a port rebind, quit. The down->up
         // transition that follows is not an outage worth paging, and when the
@@ -3239,6 +3308,14 @@ impl AppState {
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
                             terminate_process_tree(pid, true);
+                            // The group kill only reaches the child if the child
+                            // is actually in that group, and `child.wait()` is
+                            // unbounded when it isn't: rc15 sat here for the
+                            // eight seconds between its logged -KILL and the
+                            // relauncher force-killing the app. Signal the pid we
+                            // hold a handle to as well - the kernel cannot recycle
+                            // it before we reap, so this one always lands.
+                            let _ = child.kill();
                             let _ = child.wait();
                             break;
                         }
@@ -3261,10 +3338,15 @@ impl AppState {
             (headroom_entrypoint.as_path(), "proxy --port"),
         ];
         for (exe, args_pattern) in command_patterns {
+            log::info!(
+                "stop_headroom: pkill -f {:?}",
+                format!("{} {args_pattern}", exe.display())
+            );
             if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
                 log::warn!("failed to clean detached headroom proxy processes: {err}");
             }
         }
+        log::info!("stop_headroom: done");
     }
 
     /// One-shot, best-effort prefetch of the Kompress ML model on a fresh
@@ -3649,14 +3731,11 @@ pub(crate) fn support_tier_for_platform(os: &str) -> &'static str {
     }
 }
 
+/// Platform kill switch for Headroom Learn. Linux was gated here through
+/// 0.8.4-rc.4; Learn is the same Python backend on every platform, so nothing
+/// is gated now. Return a message here to disable Learn on a platform again.
 pub(crate) fn headroom_learn_platform_message() -> Option<String> {
-    match current_platform() {
-        "linux" => Some(
-            "Headroom Learn is disabled on Linux preview builds. Core proxy routing works, but Learn and secure API key storage are not production-ready yet."
-                .into(),
-        ),
-        _ => None,
-    }
+    None
 }
 
 impl Drop for AppState {
@@ -4562,7 +4641,20 @@ impl SavingsTracker {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
         }
-        self.sample_output_reduction(stats);
+        // Sampled from the locally recomputed estimate, not the backend's, so
+        // the daily bars and the headline describe one number -- and so the
+        // A/B holdout switching `/stats` to its "measured" figure can never
+        // show up as a phantom delta here.
+        self.sample_output_reduction(
+            crate::output_savings::estimate()
+                .map(|e| (e.tokens_saved, e.baseline_tokens))
+                .or_else(|| {
+                    stats
+                        .output_reduction
+                        .as_ref()
+                        .map(|r| (r.tokens_saved, r.baseline_tokens))
+                }),
+        );
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -4998,11 +5090,10 @@ impl SavingsTracker {
     /// regressed reading alone bills the backend's entire catch-up climb to
     /// the launch bucket (2026-08-17: 906k phantom saved tokens, ~2.8x, from
     /// one backend restart 15s after the app started).
-    fn sample_output_reduction(&mut self, stats: &HeadroomDashboardStats) {
-        let Some(reduction) = stats.output_reduction.as_ref() else {
+    fn sample_output_reduction(&mut self, current: Option<(u64, u64)>) {
+        let Some(current) = current else {
             return;
         };
-        let current = (reduction.tokens_saved, reduction.baseline_tokens);
         let previous = self.output_sample_watermark;
         // Read before the writes below clobber them: on the first poll of a
         // launch these still hold the *previous* run's last reading, which is
@@ -5481,16 +5572,53 @@ impl HeadroomSavingsHistoryResponse {
 const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
 static STATS_FETCH_WARNED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Coarse cause class for a `/stats` failure, used as the Sentry fingerprint.
+///
+/// The reason is interpolated into the message and Sentry groups bridged log
+/// lines by message text, so a timeout and an HTTP 404 landed in one
+/// un-resolvable grab-bag (RUST-6V: 53 timeouts + 47 404s under one issue).
+/// They are different bugs -- a timeout is a starved backend, a 404 is a
+/// foreign or ancient server answering on 6767 -- and each needs its own
+/// lifecycle. Statuses stay separate from each other for the same reason.
+fn stats_fetch_failure_category(reason: &str) -> String {
+    if reason.starts_with("timed out") {
+        "timeout".to_string()
+    } else if let Some(rest) = reason.strip_prefix("HTTP ") {
+        match rest.split_whitespace().next() {
+            Some(code) => format!("http-{code}"),
+            None => "http".to_string(),
+        }
+    } else if reason.starts_with("payload had no") {
+        "payload".to_string()
+    } else if reason.starts_with("no local host answered") {
+        "unreachable".to_string()
+    } else {
+        "transport".to_string()
+    }
+}
+
 fn warn_stats_fetch_failed(reason: &str) {
     let mut last = STATS_FETCH_WARNED_AT.lock();
     if last.is_some_and(|at| at.elapsed() < STATS_FETCH_WARN_INTERVAL) {
         return;
     }
     *last = Some(Instant::now());
-    log::warn!(
+    let message = format!(
         "headroom /stats fetch failed ({reason}); dashboard loses the layers only \
          this endpoint reports (output shaping, tool schema)"
     );
+    let category = stats_fetch_failure_category(reason);
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
+        },
+        || {
+            sentry::capture_message(&message, sentry::Level::Warning);
+        },
+    );
+    // Local only: the fingerprinted capture above is the Sentry path, and the
+    // bridged warn would double-report it under the old flat grouping.
+    log::warn!("{message}");
 }
 
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
@@ -6792,6 +6920,32 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     None
 }
 
+/// Explain a failed intercept bind in the terms the user can act on.
+///
+/// Deliberately does NOT assert a cause. WSAEADDRINUSE (os error 10048) has
+/// several: a leftover Headroom still holding the socket, an unrelated app on
+/// the port, or a reserved range (Hyper-V / WSL2 / Docker). An earlier version
+/// of this text claimed the reserved range outright and told users to run
+/// `net stop winnat`, which fails on any machine where winnat is not even
+/// running -- confidently wrong advice is worse than none. Name the port, hand
+/// over the command that identifies the holder, and let the user look.
+pub(crate) fn intercept_bind_hint(raw: &str) -> String {
+    let port = crate::proxy_intercept::INTERCEPT_PORT;
+    if raw.contains("os error 10048") {
+        return format!(
+            "Port {port} is already held by another process, so Headroom cannot open it and \
+             clients get \"connection refused\". In PowerShell, \
+             `Get-NetTCPConnection -LocalPort {port}` names the owning process: if it is a \
+             leftover Headroom, quit it and relaunch. If nothing owns the port, check for a \
+             reserved range with `netsh int ipv4 show excludedportrange protocol=tcp`."
+        );
+    }
+    format!(
+        "Headroom cannot open port {port}, so no client traffic can reach it ({raw}). \
+         Another app is holding the port -- quit it, or reboot to clear stuck listeners."
+    )
+}
+
 fn is_headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_millis(1500))
 }
@@ -6861,28 +7015,60 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
 
 /// Terminate a process tree. Windows uses taskkill /T (subtree); Unix signals
 /// the process group by negating the pid.
+/// How long `stop_headroom` waits for a concurrent lifecycle transition before
+/// stopping the backend anyway.
+const STOP_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
-        let mut command = std::process::Command::new("taskkill");
+        let mut command = crate::proc::command("taskkill");
         command.args(["/PID", &pid.to_string(), "/T"]);
         if force {
             command.arg("/F");
         }
         let _ = command.status();
     } else {
+        let Some(target) = group_kill_target(pid) else {
+            log::error!("refusing to signal process group for pid {pid}: not a pid we spawned");
+            return;
+        };
         let signal = if force { "-KILL" } else { "-TERM" };
-        let _ = std::process::Command::new("/bin/kill")
+        // Attribution: this is the only signal we send that reaches processes we
+        // did not spawn, so the group has to be in the log to be provable later.
+        log::info!("terminate_process_tree: {signal} to process group {target}");
+        let _ = crate::proc::command("/bin/kill")
             .arg(signal)
-            .arg(format!("-{pid}"))
+            .arg(target)
             .status();
     }
 }
 
+/// The `kill` argument for signalling `pid`'s process group, or `None` when
+/// `pid` must never be used as a group target.
+///
+/// `kill -TERM -0` does not mean "no process", it means "every process in MY
+/// group" - and on a Linux desktop this app can share its group with the login
+/// session, so a 0 here SIGTERMs xfce4-session, the window manager and the rest
+/// of the session out from under the user. Pid 1 is init. Neither is ever a
+/// backend we spawned, so neither is worth the blast radius.
+fn group_kill_target(pid: i32) -> Option<String> {
+    (pid > 1).then(|| format!("-{pid}"))
+}
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
+    // An unresolved runtime path degrades the pattern from "our backend at this
+    // exact path" to a loose substring, and `pkill -f` applies it to every
+    // process the user owns. Refuse rather than guess.
+    if exe.parent().is_none() || exe.as_os_str().is_empty() {
+        return Err(anyhow!(
+            "refusing to pkill with an unresolved executable path {exe:?}"
+        ));
+    }
+
     #[cfg(unix)]
     {
         let pattern = format!("{} {args_pattern}", exe.display());
-        let status = Command::new("pkill")
+        let status = crate::proc::command("pkill")
             .args(["-f", &pattern])
             .status()
             .with_context(|| format!("running pkill for pattern '{pattern}'"))?;
@@ -6925,7 +7111,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
         let script = format!(
             "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
         );
-        let status = Command::new("powershell")
+        let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
             .with_context(|| {
@@ -7225,6 +7411,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    #[test]
+    fn stats_fetch_failure_category_splits_the_grab_bag() {
+        // RUST-6V held 53 timeouts + 47 404s under one un-resolvable issue.
+        use super::stats_fetch_failure_category as cat;
+        assert_eq!(cat("timed out after 15s"), "timeout");
+        assert_eq!(cat("HTTP 404 Not Found"), "http-404");
+        assert_eq!(cat("HTTP 503 Service Unavailable"), "http-503");
+        assert_eq!(cat("payload had no recognised savings fields"), "payload");
+        assert_eq!(cat("no local host answered"), "unreachable");
+        assert_eq!(
+            cat("error sending request for url (http://127.0.0.1:6767/stats)"),
+            "transport"
+        );
+    }
+
     use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
@@ -7239,15 +7440,16 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
-        hf_cache_grew, lifetime_output_savings_usd, lifetime_token_milestones_crossed,
-        log_mtime_advanced, merge_daily_savings, merge_hourly_savings, most_recent_monday,
-        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
+        lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
+        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
+        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, support_tier_for_platform,
         tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
         warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
         DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
-        OutputReduction, PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
         STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
     };
 
@@ -7743,6 +7945,31 @@ mod tests {
         assert!(hint.contains("Reboot"), "got: {hint}");
     }
 
+    /// Regression (Sentry RUST-7D, RUST-7B, RUST-64): WSAEADDRINUSE on 6767
+    /// leaves the app dead to every client, so the banner must name the port
+    /// rather than blaming the Python runtime -- which in that state is running
+    /// fine on a port of its own. The hint must hand over the command that
+    /// identifies the holder instead of asserting which one it is.
+    #[test]
+    fn intercept_bind_hint_names_the_port_and_how_to_find_the_holder() {
+        let hint = intercept_bind_hint(
+            "Only one usage of each socket address (protocol/network address/port) is \
+             normally permitted. (os error 10048)",
+        );
+        assert!(hint.contains("6767"), "{hint}");
+        assert!(hint.contains("Get-NetTCPConnection"), "{hint}");
+        // Must not assert a single cause: winnat is not running on every
+        // affected machine, and `net stop winnat` fails outright there.
+        assert!(!hint.contains("net stop winnat"), "{hint}");
+    }
+
+    #[test]
+    fn intercept_bind_hint_falls_back_to_the_raw_cause() {
+        let hint = intercept_bind_hint("Address already in use (os error 48)");
+        assert!(hint.contains("os error 48"), "{hint}");
+        assert!(!hint.contains("Get-NetTCPConnection"), "{hint}");
+    }
+
     #[test]
     fn classify_startup_error_foreign_port_with_fallback_exhausted() {
         let raw =
@@ -8035,30 +8262,10 @@ mod tests {
     #[test]
     fn sample_output_reduction_buckets_deltas_and_reseeds_on_reset() {
         let mut tracker = make_tracker();
-        let stats = |saved, baseline| HeadroomDashboardStats {
-            learner_progress: None,
-            session_requests: None,
-            session_estimated_savings_usd: None,
-            session_estimated_tokens_saved: None,
-            session_savings_pct: None,
-            session_actual_cost_usd: None,
-            session_total_tokens_sent: None,
-            savings_history: Vec::new(),
-            output_reduction: Some(OutputReduction {
-                method: "estimated".into(),
-                reduction_percent: 39.0,
-                ci_low_percent: 36.0,
-                ci_high_percent: 42.0,
-                requests: 1,
-                tokens_saved: saved,
-                baseline_tokens: baseline,
-            }),
-            tool_schema_tokens_saved: None,
-        };
         // First reading seeds the watermark, never a delta.
-        tracker.sample_output_reduction(&stats(1_000, 3_000));
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
         assert!(tracker.output_daily_samples.is_empty());
-        tracker.sample_output_reduction(&stats(1_400, 4_000));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
         let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let day = tracker
             .output_daily_samples
@@ -8072,8 +8279,8 @@ mod tests {
         // live path would.
         assert_eq!(tracker.last_output_estimator_tokens_saved, Some(1_400));
         // A reading below the watermark (estimator rebuilt) reseeds silently.
-        tracker.sample_output_reduction(&stats(100, 200));
-        tracker.sample_output_reduction(&stats(150, 300));
+        tracker.sample_output_reduction(Some((100, 200)));
+        tracker.sample_output_reduction(Some((150, 300)));
         assert_eq!(tracker.last_output_estimator_tokens_saved, Some(150));
         let day = tracker
             .output_daily_samples
@@ -8090,29 +8297,6 @@ mod tests {
         assert_eq!(hourly_total, 450);
     }
 
-    fn output_stats(saved: u64, baseline: u64) -> HeadroomDashboardStats {
-        HeadroomDashboardStats {
-            learner_progress: None,
-            session_requests: None,
-            session_estimated_savings_usd: None,
-            session_estimated_tokens_saved: None,
-            session_savings_pct: None,
-            session_actual_cost_usd: None,
-            session_total_tokens_sent: None,
-            savings_history: Vec::new(),
-            output_reduction: Some(OutputReduction {
-                method: "estimated".into(),
-                reduction_percent: 39.0,
-                ci_low_percent: 36.0,
-                ci_high_percent: 42.0,
-                requests: 1,
-                tokens_saved: saved,
-                baseline_tokens: baseline,
-            }),
-            tool_schema_tokens_saved: None,
-        }
-    }
-
     #[test]
     fn shallow_estimator_dip_is_not_rebilled_when_it_climbs_back() {
         // A backend that restarts onto a lagging durable checkpoint reports
@@ -8126,13 +8310,13 @@ mod tests {
                 .map_or(0, |bucket| bucket.saved_tokens)
         };
 
-        tracker.sample_output_reduction(&output_stats(1_000, 3_000));
-        tracker.sample_output_reduction(&output_stats(1_400, 4_000));
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
         assert_eq!(saved_today(&tracker), 400);
 
         // Shallow dip, then the whole climb back to where it was.
-        tracker.sample_output_reduction(&output_stats(1_200, 3_500));
-        tracker.sample_output_reduction(&output_stats(1_400, 4_000));
+        tracker.sample_output_reduction(Some((1_200, 3_500)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
         assert_eq!(
             saved_today(&tracker),
             400,
@@ -8140,7 +8324,7 @@ mod tests {
         );
 
         // Genuine progress past the old mark still counts.
-        tracker.sample_output_reduction(&output_stats(1_500, 4_200));
+        tracker.sample_output_reduction(Some((1_500, 4_200)));
         assert_eq!(saved_today(&tracker), 500);
     }
 
@@ -8155,14 +8339,14 @@ mod tests {
         tracker.last_output_estimator_baseline_tokens = Some(65_000);
         assert!(tracker.output_sample_watermark.is_none(), "fresh launch");
 
-        tracker.sample_output_reduction(&output_stats(26_000, 63_000));
+        tracker.sample_output_reduction(Some((26_000, 63_000)));
         assert_eq!(
             tracker.output_sample_watermark,
             Some((27_000, 65_000)),
             "seed at the high-water of live and persisted, not the dip"
         );
 
-        tracker.sample_output_reduction(&output_stats(27_100, 65_200));
+        tracker.sample_output_reduction(Some((27_100, 65_200)));
         let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let day = tracker
             .output_daily_samples
@@ -8372,6 +8556,76 @@ mod tests {
         assert_eq!(
             most_recent_monday(NaiveDate::from_ymd_opt(2026, 5, 3).unwrap()),
             NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
+    }
+
+    /// The whole-session blast radius, in one test: 0 means "my own group", and
+    /// on a Linux desktop that group can be the login session.
+    #[test]
+    fn group_kill_refuses_targets_that_are_not_a_child_of_ours() {
+        assert_eq!(
+            super::group_kill_target(0),
+            None,
+            "0 is our own process group"
+        );
+        assert_eq!(super::group_kill_target(1), None, "1 is init");
+        assert_eq!(
+            super::group_kill_target(-1),
+            None,
+            "-1 is everything we can signal"
+        );
+        assert_eq!(
+            super::group_kill_target(4242).as_deref(),
+            Some("-4242"),
+            "a real child's group must still be signalled"
+        );
+    }
+
+    /// A launch racing a quit used to strand the app: `stop_headroom` waited on
+    /// `lifecycle_lock` forever, so `restart_app` never reached the exit request
+    /// and the window sat on "Restarting..." until it was killed by hand.
+    #[test]
+    fn stop_headroom_gives_up_on_a_held_lifecycle_lock() {
+        let base_dir = temp_test_dir("headroom-stop-lifecycle-lock");
+        let state = std::sync::Arc::new(AppState::new_in(base_dir.clone()).expect("app state"));
+
+        // Baseline the same call with the lock free. Everything after the lock
+        // is two process sweeps that shell out (`pkill` / `Get-CimInstance`),
+        // and they cost whatever the machine costs: ~1.2s on a warm CI runner,
+        // ~48s on a cold-cache Windows one still scanning freshly built
+        // binaries. Subtracting it makes the ceiling below bound the LOCK WAIT
+        // rather than the runner -- it was failing on the latter.
+        let started = Instant::now();
+        state.stop_headroom();
+        let baseline = started.elapsed();
+
+        let holder = std::sync::Arc::clone(&state);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = holder.lifecycle_lock.lock();
+            locked_tx.send(()).expect("signal locked");
+            // Outlive the timeout, then let the guard drop.
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().expect("lock taken");
+
+        let started = Instant::now();
+        state.stop_headroom();
+        let waited = started.elapsed();
+
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread");
+
+        assert!(
+            waited >= super::STOP_LIFECYCLE_LOCK_TIMEOUT,
+            "returned before the lock timeout ({waited:?}), so it never waited for the lock"
+        );
+        let lock_wait = waited.saturating_sub(baseline);
+        assert!(
+            lock_wait < super::STOP_LIFECYCLE_LOCK_TIMEOUT * 4,
+            "stop_headroom blocked on the held lifecycle lock for {lock_wait:?} \
+             (total {waited:?}, sweep baseline {baseline:?})"
         );
     }
 

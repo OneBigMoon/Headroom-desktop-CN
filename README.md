@@ -8,7 +8,7 @@
 
 > **Stable:** macOS 14 (Sonoma) or later on Apple Silicon (M1 or later)
 >
-> **Preview:** Linux x86_64 builds are experimental and currently support the core proxy flow only.
+> **Preview:** Linux x86_64 builds are experimental and currently support the core proxy flow only. They need glibc 2.39 or newer (Ubuntu 24.04, Debian 13) and a running secret-service keyring provider (gnome-keyring or kwallet) for sign-in.
 
 ### Install
 
@@ -27,7 +27,7 @@ brew install --cask headroom
 
 Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings. Both install paths self-update via the app's built-in updater; the Homebrew cask stays current with each release too.
 
-Linux preview artifacts are published on the same release page. Today they are best treated as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. `Headroom Learn` is not supported yet on Linux preview builds.
+Linux preview artifacts are published to the rolling [`staging-rolling`](https://github.com/gglucass/headroom-desktop/releases/tag/staging-rolling) prerelease, not to the stable release page, and are cut with every release candidate. Take the `.AppImage` if you want the built-in updater; the `.deb` installs the same build but updates only by downloading a newer one. Treat this as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. The Linux runtime installs a proxy-only subset of the Python stack, so memory and ML extras that the macOS build ships are absent.
 
 ---
 

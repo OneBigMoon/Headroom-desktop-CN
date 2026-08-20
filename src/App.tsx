@@ -31,7 +31,11 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { platformPreviewNoticeFor } from "./lib/platform";
+import {
+  PREVIEW_SUPPORT_EMAIL,
+  platformPreviewNoticeFor,
+  platformPreviewSupportMailto,
+} from "./lib/platform";
 import {
   Bar,
   BarChart,
@@ -71,6 +75,7 @@ import {
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
 import {
+  buildInstallFailureMailto,
   buildSetupStallMailto,
   describeInvokeError,
   formatCents,
@@ -171,6 +176,7 @@ import { TermsGate } from "./components/TermsGate";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
+  BootstrapFailureReport,
   BootstrapProgress,
   ClaudePlanTier,
   HeadroomAuthCodeRequest,
@@ -1368,6 +1374,7 @@ function AddonCard({
   updateAvailable,
   onUpdate,
   availableVersion,
+  unavailableReason,
   children
 }: {
   name: string;
@@ -1394,10 +1401,12 @@ function AddonCard({
   updateAvailable?: boolean;
   onUpdate?: () => void;
   availableVersion?: string | null;
+  /** Platform has no installable build: gray the card, drop the actions. */
+  unavailableReason?: string | null;
   children?: ReactNode;
 }) {
   return (
-    <li className="addon-card">
+    <li className={`addon-card${unavailableReason ? " addon-card--unavailable" : ""}`}>
       <div className="addon-card__body">
         <div className="addon-card__heading">
           <span className="addon-card__name">{name}</span>
@@ -1433,6 +1442,9 @@ function AddonCard({
         <button type="button" className="addon-card__link" onClick={onOpenSource}>
           {sourceUrl}
         </button>
+        {unavailableReason ? (
+          <p className="addon-card__notice">{unavailableReason}</p>
+        ) : null}
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
         ) : resultMessage ? (
@@ -1451,7 +1463,11 @@ function AddonCard({
         {children}
       </div>
       <div className="addon-card__actions">
-        {!installed ? (
+        {unavailableReason ? (
+          <button type="button" className="addon-card__action" disabled>
+            Unavailable
+          </button>
+        ) : !installed ? (
           <button
             type="button"
             className="addon-card__action addon-card__action--primary"
@@ -1796,6 +1812,7 @@ export default function App() {
   // Mirrors runtimeStatus.installed for closures (background update check) that
   // must not fire notifications while first-install bootstrap is still running.
   const runtimeInstalledRef = useRef(false);
+  const bootstrapFailedRef = useRef(false);
   const claudeProjectsSignatureRef = useRef(serializeState([] as ClaudeCodeProject[]));
   // Mirror the server's price table into the pricing helpers before anything
   // reads a price this render. Idempotent and derived purely from state, so a
@@ -1876,6 +1893,10 @@ export default function App() {
     runtimeStatusSignatureRef.current = serializeState(runtimeStatus);
     runtimeInstalledRef.current = runtimeStatus?.installed === true;
   }, [runtimeStatus]);
+
+  useEffect(() => {
+    bootstrapFailedRef.current = bootstrapProgress.failed === true;
+  }, [bootstrapProgress.failed]);
 
   useEffect(() => {
     claudeProjectsSignatureRef.current = serializeState(claudeProjects);
@@ -2718,7 +2739,14 @@ export default function App() {
         // Don't fire an "update available" notification while first-install
         // bootstrap is still building the runtime — it piles onto the install
         // window. Resume once the runtime is installed.
-        !runtimeInstalledRef.current
+        //
+        // A *failed* bootstrap is the exception, and suppressing it there was
+        // a trap: when the cause is a bad pin in the lock we shipped, every
+        // retry fails identically and a newer build is the only fix, so the
+        // one screen that needed the updater most was the one screen that
+        // never checked (Sentry RUST-1G — users on 0.8.1 retried for hours
+        // while 0.8.2 sat in the manifest with the fix).
+        (!runtimeInstalledRef.current && !bootstrapFailedRef.current)
       ) {
         return;
       }
@@ -3627,6 +3655,38 @@ export default function App() {
     } finally {
       setAppUpdateInstallBusy(false);
     }
+  }
+
+  /// One progressive button on the failed-install screen: check -> install ->
+  /// restart. That screen has no other route to a newer build, and when the
+  /// cause is a bad pin in the lock we shipped (RUST-1G: onnxruntime on Intel
+  /// macOS) a newer build is the *only* fix -- Try again re-resolves the same
+  /// impossible pin forever.
+  async function handleFailedInstallUpdateAction() {
+    if (appUpdateReadyToRestart) {
+      restartIntoInstalledUpdate();
+      return;
+    }
+    if (appUpdateAvailable) {
+      await installAvailableUpdate();
+      return;
+    }
+    // Foreground check, so a "Up to date."/error line always answers the click.
+    await checkForAppUpdate();
+  }
+
+  async function handleFailedInstallSupportMail() {
+    const report = await invoke<BootstrapFailureReport | null>(
+      "get_bootstrap_failure_report"
+    ).catch(() => null);
+    await invoke("open_external_link", {
+      url: buildInstallFailureMailto({
+        kind: report?.kind ?? null,
+        detail: report?.detail ?? null,
+        appVersion: appSemver,
+        platform: runtimeStatus?.platform ?? "unknown",
+      }),
+    });
   }
 
   function restartIntoInstalledUpdate() {
@@ -4859,13 +4919,29 @@ export default function App() {
     const stepProgress = Math.round(getStepProgress(bootstrapProgress) * 100);
     const renderPercent = animatedOverallPercent(bootstrapProgress);
     const installComplete = bootstrapProgress.complete || dashboard.bootstrapComplete;
-    const statusCopy = showInstallProgress
-      ? `${bootstrapProgress.message} ${
-          bootstrapProgress.running && !bootstrapProgress.complete
-            ? `(${stepProgress}% of this step)`
-            : ""
-        }`.trim()
-      : "";
+    const failedInstallUpdateLabel = appUpdateRestartBusy
+      ? "Restarting…"
+      : appUpdateInstallBusy
+        ? "Installing…"
+        : appUpdateBusy
+          ? "Checking…"
+          : appUpdateReadyToRestart
+            ? "Restart now"
+            : appUpdateAvailable
+              ? `Install ${appUpdateAvailable.version}`
+              : "Check for updates";
+
+    const statusCopy = !showInstallProgress
+      ? ""
+      : bootstrapProgress.failed
+        ? // The message renders in full in the error paragraph below; repeating
+          // it here printed the same three sentences twice.
+          bootstrapProgress.currentStep
+        : `${bootstrapProgress.message} ${
+            bootstrapProgress.running && !bootstrapProgress.complete
+              ? `(${stepProgress}% of this step)`
+              : ""
+          }`.trim();
 
     return (
       <LauncherShell
@@ -4986,6 +5062,30 @@ export default function App() {
               </div>
               {bootstrapError ? (
                 <p className="install-progress__error">{bootstrapError}</p>
+              ) : null}
+              {bootstrapProgress.failed ? (
+                <div className="install-progress__actions">
+                  <button
+                    className="secondary-button secondary-button--small"
+                    disabled={
+                      appUpdateBusy || appUpdateInstallBusy || appUpdateRestartBusy
+                    }
+                    onClick={() => void handleFailedInstallUpdateAction()}
+                    type="button"
+                  >
+                    {failedInstallUpdateLabel}
+                  </button>
+                  <button
+                    className="secondary-button secondary-button--small"
+                    onClick={() => void handleFailedInstallSupportMail()}
+                    type="button"
+                  >
+                    Contact support
+                  </button>
+                </div>
+              ) : null}
+              {appUpdateStatusCopy && bootstrapProgress.failed ? (
+                <p className="install-progress__update-status">{appUpdateStatusCopy}</p>
               ) : null}
             </div>
           ) : null}
@@ -6155,7 +6255,25 @@ export default function App() {
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
                 {platformPreviewNotice ? (
-                  <p className="callout-banner__subtitle">{platformPreviewNotice}</p>
+                  <p className="callout-banner__subtitle">
+                    {platformPreviewNotice} Please report any issues to{" "}
+                    <button
+                      type="button"
+                      className="link-button"
+                      onClick={() =>
+                        void invoke("open_external_link", {
+                          url: platformPreviewSupportMailto({
+                            platform: runtimeStatus?.platform,
+                            appVersion: appSemver,
+                            headroomVersion,
+                          }),
+                        }).catch(() => {})
+                      }
+                    >
+                      {PREVIEW_SUPPORT_EMAIL}
+                    </button>
+                    .
+                  </p>
                 ) : null}
                 {showUpgradeSavingsLine ? (
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
@@ -6231,7 +6349,7 @@ export default function App() {
               >
                 <span className="stat-card__label">
                   <CurrencyCircleDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Total costs saved (estimate)
+                  Total costs saved
                   <button
                     className="stat-card__info-button"
                     onClick={(e) => { e.stopPropagation(); setShowSavingsInfo(true); }}
@@ -6330,10 +6448,6 @@ export default function App() {
                   <div className="optimize-minimal">
                     <p className="optimize-minimal__meta">
                       {headroomLearnDisabledReason}
-                    </p>
-                    <p className="optimize-minimal__meta">
-                      Linux preview currently supports the core Headroom proxy,
-                      Claude Code routing, and RTK activity tracking.
                     </p>
                   </div>
                 ) : !claudeLearnEnabled && !codexLearnEnabled ? (
@@ -6813,6 +6927,7 @@ export default function App() {
                       actionsDisabled={addonBusyId === tool.id}
                       updateAvailable={tool.updateAvailable ?? false}
                       availableVersion={tool.availableVersion ?? null}
+                      unavailableReason={tool.unavailableReason ?? null}
                       onUpdate={() =>
                         void runAddonAction("install_addon", tool.id, undefined, {
                           busy: `Updating ${tool.name}...`,
@@ -6864,6 +6979,10 @@ export default function App() {
                 }
                 savings={rtkSavingsChip}
                 actionsDisabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                unavailableReason={
+                  dashboard.tools.find((tool) => tool.id === "rtk")?.unavailableReason ??
+                  null
+                }
                 onInstall={() => void runAddonAction("install_addon", "rtk")}
                 onToggleEnabled={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
                 onUninstall={() => void runAddonAction("uninstall_addon", "rtk")}
@@ -7554,7 +7673,7 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex, and shapes the replies that come back.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
@@ -7568,25 +7687,29 @@ export default function App() {
                           <span>Output shaping (Headroom)</span>
                           <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
                         </div>
-                        {/* This row is a lifetime figure from the shaper's own
-                            estimator, which predates per-day tracking of the
-                            layer -- so the daily bars can add up to less. */}
+                        {/* Lifetime figure, recomputed from the shaper's ledger
+                            (see output_savings.rs) and predating per-day
+                            tracking of the layer -- so the daily bars can add
+                            up to less. `requests` counts what the estimate
+                            actually covers, not every shaped request: strata
+                            the baseline never observed are excluded rather
+                            than scored against a global mean. */}
                         <p className="savings-breakdown__note">
-                          Output shaping is a counterfactual: Headroom compares each reply against a
-                          baseline learned from your own past replies
-                          {dashboard.outputReduction
-                            ? `, across ${compactNumber(dashboard.outputReduction.requests)} requests`
-                            : ""}
-                          . It covers every request since that baseline was built, so it can exceed
-                          what the daily bars show.
+                          {dashboard.outputReduction?.method === "measured"
+                            ? `Output savings are measured: a small share of conversations run unshaped as a control group, and Headroom compares your shaped replies against them across ${compactNumber(dashboard.outputReduction.requests)} requests.`
+                            : `Output savings are counterfactual: Headroom compares each reply against a baseline learned from your past replies${
+                                dashboard.outputReduction
+                                  ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
+                                  : ""
+                              }.`}
                         </p>
                       </>
                     ) : null}
-                    {(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0) >= 0.005 ? (
+                    {(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0) > 0 ? (
                       <>
                         <div className="savings-breakdown__row">
                           <span>Tool schemas deferred (Headroom)</span>
-                          <strong>{currency(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
+                          <strong>{currencyExact(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
                         </div>
                         {/* Priced at the cache-read rate, not the input rate --
                             see tool_schema_savings_usd in state.rs. */}
@@ -7594,8 +7717,7 @@ export default function App() {
                           {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
                           of tool definitions Headroom kept out of your requests until they were
                           needed. These sit at the front of the cached prefix, so they are priced at
-                          the provider's cache-read rate rather than the full input rate. Counted from
-                          the day this build started tracking the layer.
+                          the provider's cache-read rate rather than the full input rate.
                         </p>
                       </>
                     ) : null}
@@ -7606,9 +7728,9 @@ export default function App() {
                           <strong>{currency(dashboard.savingsBreakdown.cacheSavingsUsd)}</strong>
                         </div>
                         <p className="savings-breakdown__note">
-                          Cache discounts are earned by your client's own prompt caching, so Headroom
-                          never counts them in its savings. Headroom's compression is cache-aligned:
-                          it only touches content outside the cached prefix, keeping that discount intact.
+                          Cache discounts are earned by your coding agent's own prompt caching. Headroom
+                          never counts them as its savings. Headroom compression is cache-aligned:
+                          it only touches content outside the cache.
                         </p>
                       </>
                     ) : null}
@@ -7642,17 +7764,6 @@ export default function App() {
                     ) : null}
                   </div>
                 ) : null}
-                {/* The cache-discount haircut applies to input compression only.
-                    Output tokens are never served from a prompt cache, and the
-                    tool-schema row already carries the cache-read price, so
-                    halving either would understate the floor. */}
-                <p>The Headroom figure is an optimistic estimate: without Headroom, some of the removed input tokens would have been re-sent at the provider's ~90% cache discount instead of full price. In our testing that reduces real savings by at most 50% — so you've likely saved at least <strong>{currency(
-                  dashboard.savingsBreakdown
-                    ? dashboard.savingsBreakdown.compressionSavingsUsd * 0.5 +
-                        dashboard.savingsBreakdown.outputSavingsUsd +
-                        (dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)
-                    : dashboard.lifetimeEstimatedSavingsUsd * 0.5
-                )}</strong>.</p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"
@@ -7734,25 +7845,24 @@ export default function App() {
                 <p>This will:</p>
                 <ul className="api-key-guide">
                   <li>
-                    Undo the routing config for every agent Headroom set up: Claude Code
-                    (<code>~/.claude/settings.json</code> and <code>settings.local.json</code>),
-                    Codex (<code>~/.codex/config.toml</code>), Grok Build, and OpenCode, plus
-                    the export block in your shell profile. Any base URL you had before
-                    Headroom is restored.
+                    Restore the original routing config for every agent Headroom set
+                    up (Claude Code, Codex, Grok Build, OpenCode) and remove the export
+                    block from your shell profile
                   </li>
-                  <li>Delete <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code></li>
-                  <li>Delete <code>~/Library/Application Support/Headroom</code> (logs, caches, setup state)</li>
-                  <li>Delete <code>~/.headroom</code> (Python runtime)</li>
-                  <li>Remove the LaunchAgent plist from <code>~/Library/LaunchAgents/</code> and disable the login item</li>
-                  <li>Delete <code>~/Library/Preferences/com.extraheadroom.headroom*</code> and <code>~/Library/Caches/com.extraheadroom.headroom</code></li>
-                  <li>Delete Headroom's keychain entries (session token plus any API keys saved by older builds)</li>
-                  <li>Remove Headroom's addons and MCP servers from your coding agents (ponytail, caveman, serena, context7, codebase-memory, MarkItDown)</li>
-                  <li>Move the Headroom app to the Trash</li>
+                  <li>
+                    Remove Headroom's addons and MCP servers (ponytail, caveman, serena,
+                    context7, codebase-memory, MarkItDown)
+                  </li>
+                  <li>
+                    Delete Headroom's data: logs, caches, setup state, the Python runtime,
+                    and saved credentials
+                  </li>
+                  <li>Disable the login item</li>
+                  <li>Remove the app itself</li>
                 </ul>
                 <p className="uninstall-note">
-                  Terminals already open keep <code>ANTHROPIC_BASE_URL</code>{" "}
-                  exported until you restart them. If Claude reports a
-                  connection error after uninstalling, open a new terminal or run{" "}
+                  Terminals you already have open keep{" "}
+                  <code>ANTHROPIC_BASE_URL</code> until you restart them, or run{" "}
                   <code>unset ANTHROPIC_BASE_URL</code>.
                 </p>
                 <p>You can reinstall at any time by launching Headroom again.</p>
@@ -8071,6 +8181,9 @@ export default function App() {
                     <h4>What&apos;s new</h4>
                     <pre>{appUpdateAvailable.notes.trim()}</pre>
                   </div>
+                ) : null}
+                {appUpdateStatusCopy ? (
+                  <p className="app-update-card__summary">{appUpdateStatusCopy}</p>
                 ) : null}
                 <div className="modal-actions">
                   <button

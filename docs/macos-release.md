@@ -211,13 +211,21 @@ There are two channels with separate GitHub Actions workflows:
 |---------|--------|----------|----------------|----------|
 | Stable | `main` | `release-macos.yml` | `X.Y.Z` | `releases/latest/download/latest.json` |
 | Staging | `staging` | `release-macos-staging.yml` | `X.Y.Z-rc.N` | `releases/download/staging-rolling/latest.json` |
-| Windows preview | ad-hoc branch | `windows-preview.yml` (manual) | `X.Y.Z-win.N` | `releases/download/windows-preview/latest.json` |
 
-Stable is cross-platform: the `windows` job in `release-macos.yml` runs after the
-macOS job, uploads the NSIS installer to the same `vX.Y.Z` release, and merges
-`windows-x86_64` into its `latest.json`. Staging stays macOS-only. Each stable
-release also rewrites the windows-preview channel manifest so lingering preview
-installs migrate to stable.
+Both channels are cross-platform, and both build the same way: the macOS job
+publishes the release and its `latest.json`, then each other platform's job runs
+after it, uploads its bundles to the same release, and merges its own entry into
+that `latest.json`. Those jobs are chained rather than parallel because they all
+read-modify-write the one manifest.
+
+Platform coverage differs by channel: staging builds macOS, Windows and Linux;
+stable builds macOS and Windows only. Linux has no job in `release-macos.yml`
+yet, so it ships on the rc channel alone.
+
+The retired `windows-preview` and `linux-preview` channels had their workflows
+deleted once every platform started building per rc. Their releases stay up
+because installs in the wild still poll those manifests; the stable Windows job
+keeps rewriting `windows-preview/latest.json` to pull those installs forward.
 
 ### Branching model
 

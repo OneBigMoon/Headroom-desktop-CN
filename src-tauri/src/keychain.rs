@@ -5,49 +5,68 @@
 // no kSecUseDataProtectionKeychain, which would additionally require the
 // keychain-access-groups entitlement that Entitlements.plist does not carry).
 
-// ── Debug: file-based store ──────────────────────────────────────────────────
+// ── File-backed store ────────────────────────────────────────────────────────
+// Used by every debug build, and as the release fallback on Windows/Linux when
+// the OS credential store is unusable (see the keyring module below).
 
-#[cfg(debug_assertions)]
-mod platform {
-    use std::path::PathBuf;
+#[cfg(any(debug_assertions, target_os = "windows", target_os = "linux"))]
+mod file_store {
+    use std::path::{Path, PathBuf};
 
     fn secret_path(service: &str, account: &str) -> PathBuf {
         crate::storage::app_data_dir()
             .join("config")
-            .join("dev-secrets")
+            .join("secrets")
             .join(service)
             .join(account)
     }
 
+    // Best effort: the dir goes 0700 before the file is written, so the brief
+    // window where the tmp file still carries the umask mode is not readable
+    // by other users anyway.
+    #[cfg(unix)]
+    fn restrict(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+
+    #[cfg(not(unix))]
+    fn restrict(_path: &Path, _mode: u32) {}
+
     pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
         let path = secret_path(service, account);
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::read_to_string(&path) {
+            Ok(secret) => Ok(Some(secret)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("Failed to read secret {}: {err}", path.display())),
         }
-        std::fs::read_to_string(&path)
-            .map(Some)
-            .map_err(|err| format!("Failed to read dev secret {}: {err}", path.display()))
     }
 
     pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
         let path = secret_path(service, account);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|err| format!("Failed to create dev-secrets dir: {err}"))?;
+                .map_err(|err| format!("Failed to create secrets dir: {err}"))?;
+            restrict(parent, 0o700);
         }
-        std::fs::write(&path, secret)
-            .map_err(|err| format!("Failed to write dev secret {}: {err}", path.display()))
+        crate::client_adapters::atomic_write(&path, secret.as_bytes())
+            .map_err(|err| format!("Failed to write secret {}: {err}", path.display()))?;
+        restrict(&path, 0o600);
+        Ok(())
     }
 
     pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
         let path = secret_path(service, account);
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|err| format!("Failed to delete dev secret {}: {err}", path.display()))?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("Failed to delete secret {}: {err}", path.display())),
         }
-        Ok(())
     }
 }
+
+#[cfg(debug_assertions)]
+use file_store as platform;
 
 // ── Release / macOS: login keychain (Security framework) ────────────────────
 
@@ -305,44 +324,82 @@ mod platform {
     }
 }
 
-// ── Release / Windows: Credential Manager (keyring, windows-native) ─────────
+// ── Release / Windows + Linux: OS credential store (keyring crate) ──────────
+// Windows -> Credential Manager (windows-native); Linux -> DBus Secret
+// Service, i.e. gnome-keyring/kwallet (sync-secret-service). Either store can
+// be missing or unusable on a given host, so both fall back to file_store.
 
-#[cfg(all(not(debug_assertions), target_os = "windows"))]
+#[cfg(all(not(debug_assertions), any(target_os = "windows", target_os = "linux")))]
 mod platform {
+    use super::file_store;
     use keyring::Entry;
 
+    // The Secret Service can be reachable and still have nowhere to put a
+    // secret: keyring resolves everything through the `default` collection
+    // alias, and on a box where that alias was never created (headless VM,
+    // XFCE/xrdp session with no login keyring) both its lookup and its create
+    // path call get_default_collection() and fail with "no result found". That
+    // is not recoverable from our side, and it blocked sign-in entirely, so
+    // fall back to a 0600 file rather than refuse to store the token.
+    fn warn_fallback(err: &str) {
+        // Once per process: read_secret runs on every pricing poll, so warning
+        // per call would flood Sentry the way the grace/start retries did.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::warn!(
+                "OS credential store unusable ({err}); storing Headroom secrets \
+                 in a 0600 file under the app data dir instead"
+            );
+        });
+    }
+
     pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
-        let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
-        match entry.get_password() {
+        match Entry::new(service, account).and_then(|entry| entry.get_password()) {
             Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(format!("Windows credential read failed: {err}")),
+            // NoEntry is not a store failure, but the secret may still be in
+            // the fallback file from a run where the store was unusable.
+            Err(keyring::Error::NoEntry) => file_store::read_secret(service, account),
+            Err(err) => {
+                warn_fallback(&err.to_string());
+                file_store::read_secret(service, account)
+            }
         }
     }
 
     pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
-        let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
-        entry
-            .set_password(secret)
-            .map_err(|err| format!("Windows credential write failed: {err}"))
+        match Entry::new(service, account).and_then(|entry| entry.set_password(secret)) {
+            Ok(()) => {
+                // Don't leave a stale plaintext copy shadowed by the store.
+                let _ = file_store::delete_secret(service, account);
+                Ok(())
+            }
+            Err(err) => {
+                warn_fallback(&err.to_string());
+                file_store::write_secret(service, account, secret)
+            }
+        }
     }
 
     pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
-        let entry = Entry::new(service, account).map_err(|err| err.to_string())?;
-        match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(format!("Windows credential delete failed: {err}")),
+        // Both stores: sign-out must not leave a token behind in whichever one
+        // happened to be writable when it was saved.
+        if let Ok(entry) = Entry::new(service, account) {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(err) => warn_fallback(&err.to_string()),
+            }
         }
+        file_store::delete_secret(service, account)
     }
 }
 
-// ── Release / non-macOS: stub ─────────────────────────────────────────────────
+// ── Release / other platforms: stub ───────────────────────────────────────────
 
 #[cfg(all(
     not(debug_assertions),
     not(target_os = "macos"),
-    not(target_os = "windows")
+    not(target_os = "windows"),
+    not(target_os = "linux")
 ))]
 mod platform {
     pub fn read_secret(_service: &str, _account: &str) -> Result<Option<String>, String> {

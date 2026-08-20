@@ -10,8 +10,10 @@ mod keychain;
 mod logging;
 mod memory_scrubber;
 mod models;
+mod output_savings;
 mod port_conflict;
 mod pricing;
+mod proc;
 mod proxy_intercept;
 mod state;
 mod storage;
@@ -50,8 +52,8 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
-    ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
+    ActivityFeedResponse, BillingPeriod, BootstrapFailureReport, BootstrapProgress,
+    ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest,
     HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
     HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
@@ -78,6 +80,11 @@ const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
+/// Extra main-window height for the platforms that render the preview-build
+/// notice (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real
+/// layout width for their scrollbars, which wraps text elsewhere too.
+#[cfg(not(target_os = "macos"))]
+const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
@@ -487,24 +494,42 @@ fn maybe_fire_first_savings_notification(
     if !state.try_mark_first_savings_notified() {
         return;
     }
-    let usd = dashboard.lifetime_estimated_savings_usd;
-    let amount = if usd >= 0.01 {
-        format!("${usd:.2}")
-    } else {
-        "Under a cent".to_string()
-    };
     let _ = show_notification_impl(
         app,
         "First savings recorded",
-        &format!(
-            "{} saved across {} tokens Headroom trimmed for you. \
-             It compounds from here — keep coding.",
-            amount,
-            format_token_count(dashboard.lifetime_estimated_tokens_saved)
+        &first_savings_body(
+            dashboard.lifetime_estimated_savings_usd,
+            dashboard.lifetime_estimated_tokens_saved,
         ),
         None,
     );
     analytics::track_event(app, "first_savings_notification_shown", None);
+}
+
+/// Below this, a dollar figure undersells the moment more than it proves it:
+/// "$0.02 saved" reads as "this does nothing" just like "under a cent" did.
+/// Deliberately well above the rounding floor - the bar is "worth saying out
+/// loud", not "nonzero".
+const FIRST_SAVINGS_USD_WORTH_QUOTING: f64 = 0.33;
+
+/// A small dollar figure is the wrong lead for the first-run payoff moment:
+/// the first prompts' worth of trimming rarely clears a third of a cent's
+/// worth of impressiveness. Under the threshold the token count carries it and
+/// dollars stay out of the sentence entirely.
+fn first_savings_body(usd: f64, tokens: u64) -> String {
+    if usd >= FIRST_SAVINGS_USD_WORTH_QUOTING {
+        format!(
+            "${usd:.2} saved across {} tokens Headroom trimmed for you. \
+             It compounds from here - keep coding.",
+            format_token_count(tokens)
+        )
+    } else {
+        format!(
+            "Headroom just trimmed {} tokens out of your prompts. \
+             That compounds with every session - keep coding.",
+            format_token_count(tokens)
+        )
+    }
 }
 
 /// "1,240" under 100k, then "124k" / "1.2M" — notification-sized precision.
@@ -697,21 +722,58 @@ async fn check_for_app_update(
     let config = release_updater_config(&current_version, beta_channel_enabled())?
         .ok_or_else(|| "Update checks are not configured in this build.".to_string())?;
 
+    // On Windows the plugin installs by calling `ShellExecuteW(installer)` and
+    // then `std::process::exit(0)` -- no Tauri exit event, no destructors, and
+    // no chance for us to stop the Python backend we spawned. That child
+    // outlives the app and keeps :6768, so the freshly installed build finds
+    // its own port "held by unknown process" and falls back to 6769 (RUST-7F)
+    // while an old-version backend squats the real one. One orphaned backend
+    // per update, until the user reboots.
+    //
+    // `on_before_exit` is the only hook ahead of that exit, and it is
+    // Windows-only by construction (the unix `install_inner` never calls it),
+    // so macOS/Linux keep tearing down through `restart_app` exactly as before.
+    // The installer does not launch until this returns, so it must be bounded:
+    // `stop_headroom` caps itself at ~2s on the lifecycle lock plus ~2s on the
+    // child before it force-kills.
+    let teardown = app.clone();
     let updater = app
         .updater_builder()
         .pubkey(config.pubkey)
         .endpoints(config.endpoints)
         .map_err(|err| err.to_string())?
+        .on_before_exit(move || {
+            log::info!("update: stopping the backend before the installer exits the app");
+            SHUTTING_DOWN.store(true, Ordering::Release);
+            let state: tauri::State<'_, AppState> = teardown.state();
+            state.stop_headroom();
+        })
         .build()
         .map_err(|err| err.to_string())?;
 
-    let checked_update = updater
-        .check()
-        .await
-        .map(|update| update.map(TauriPendingUpdate))
-        .map_err(|err| err.to_string());
+    let checked_update =
+        classify_update_check(updater.check().await).map(|update| update.map(TauriPendingUpdate));
 
     store_checked_update(checked_update, &pending_update.0)
+}
+
+/// A manifest with no entry for this platform means "nothing for you yet", not a
+/// failure worth showing. Both release workflows now publish latest.json only
+/// once every platform has built, but a channel can still legitimately omit one
+/// (linux-x86_64 ships on the rc channel only), and installs predating that fix
+/// would otherwise surface the raw "None of the fallback platforms ... were
+/// found" error in Tools status.
+fn classify_update_check<U>(
+    checked: Result<Option<U>, tauri_plugin_updater::Error>,
+) -> Result<Option<U>, String> {
+    match checked {
+        Ok(update) => Ok(update),
+        Err(
+            tauri_plugin_updater::Error::TargetNotFound(_)
+            | tauri_plugin_updater::Error::TargetsNotFound(_),
+        ) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -760,8 +822,20 @@ where
             .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
     };
 
-    update.install(progress).await
+    // The window hides 150ms after losing focus, and a .deb install raises a
+    // polkit password prompt that takes it. The user authenticates, the update
+    // lands, and the window they were just looking at is gone - leaving "Restart
+    // now" behind a tray click nobody would think to make. Hold the window open
+    // for the length of the install.
+    INSTALLING_UPDATE.store(true, Ordering::Release);
+    let result = update.install(progress).await;
+    INSTALLING_UPDATE.store(false, Ordering::Release);
+    result
 }
+
+/// Set while an update install is running, to keep the privilege prompt it
+/// raises from hiding the window behind it. See `handle_window_event`.
+static INSTALLING_UPDATE: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 async fn restart_app(app: AppHandle) {
@@ -776,6 +850,7 @@ async fn restart_app(app: AppHandle) {
         log::info!("restart_app: already in progress, ignoring duplicate invocation");
         return;
     }
+    log::info!("restart_app: tearing down for relaunch");
     SHUTTING_DOWN.store(true, Ordering::Release);
 
     // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
@@ -801,7 +876,6 @@ async fn restart_app(app: AppHandle) {
     {
         match current_app_bundle_path() {
             Some(bundle) => {
-                let pid = std::process::id();
                 let quoted = shell_quote_path(&bundle);
                 // The relauncher runs AFTER this process exits, so the Rust
                 // logger is gone by the time `open` runs. Have the script append
@@ -812,23 +886,10 @@ async fn restart_app(app: AppHandle) {
                 // freshly-installed build crashing on its own startup.
                 let log_quoted = shell_quote_path(&logging::log_path());
                 log::info!("restart_app: relaunching via `open -n` against bundle {bundle:?}");
-                let cmd = format!(
-                    "alive=1; \
-                     for i in $(seq 1 100); do \
-                       if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
-                       sleep 0.1; \
-                     done; \
-                     if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
-                     /usr/bin/open -n {quoted}; rc=$?; \
-                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}",
-                    pid = pid,
-                    quoted = quoted,
-                    log_quoted = log_quoted,
-                );
-                match Command::new("/bin/sh").arg("-c").arg(cmd).spawn() {
-                    Ok(_) => log::info!("restart_app: relauncher spawned"),
-                    Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
-                }
+                spawn_relauncher(&format!(
+                    "/usr/bin/open -n {quoted}; rc=$?; \
+                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}"
+                ));
             }
             None => {
                 // No enclosing .app bundle (dev build, or an app launched from a
@@ -852,6 +913,10 @@ async fn restart_app(app: AppHandle) {
     }
     analytics::shutdown(&app);
 
+    // macOS hands the relaunch to the detached relauncher above, so it exits
+    // rather than request_restart(): letting tauri spawn the new process too
+    // would leave two instances running. Every other platform relaunches through
+    // tauri.
     #[cfg(target_os = "macos")]
     {
         app.exit(0);
@@ -880,6 +945,75 @@ fn shell_quote_path(path: &std::path::Path) -> String {
     // ', which we close-escape-open. Safe against spaces / special chars in
     // the bundle path (e.g. `/Applications/Headroom RC.app`).
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Spawns a detached shell that waits for THIS process to die (so the
+/// single-instance lock and the proxy port are released), force-kills it after
+/// ~10s if teardown deadlocks, and only then runs `launch`.
+///
+/// `launch` is a shell snippet and is expected to log its own outcome; `$alive`
+/// is in scope for it (0 = we exited on our own, 1 = we had to be killed). The
+/// force-kill is the whole point: it is what keeps a blocked teardown from
+/// stranding the user on a dead window with no way back to the new build.
+#[cfg(target_os = "macos")]
+fn spawn_relauncher(launch: &str) {
+    let cmd = relauncher_script(std::process::id(), &relauncher_expect_name(), launch);
+    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
+        Ok(_) => log::info!("restart_app: relauncher spawned"),
+        Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
+    }
+}
+
+/// What `ps -o comm=` reports for THIS process, for the identity gate below.
+///
+/// Not derivable from the executable name: the Linux .deb installs the binary as
+/// `/usr/bin/headroom-desktop` but the kernel reports `headroom`, so matching on
+/// the file name never fires and the gate silently blocks every force-kill. Read
+/// the value the kernel will actually report instead. macOS has no `/proc`, but
+/// its `ps -o comm=` prints the full executable path, so the file name matches as
+/// a substring there.
+#[cfg(target_os = "macos")]
+fn relauncher_expect_name() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/comm")
+            .map(|comm| comm.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default()
+    }
+}
+
+/// `expect`: what `ps -o comm=` should still report for `pid` at force-kill
+/// time. The pid is resolved now but signalled up to 10s later, and by then it
+/// may belong to something else entirely - on a box that recycles pids fast, an
+/// unguarded `kill -9` lands on an innocent process (and if that process is a
+/// session or group leader, it takes the user's whole desktop session with it).
+/// Same rule as the port-reclaim path: verify identity before signalling.
+#[cfg(target_os = "macos")]
+fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
+    let log_quoted = shell_quote_path(&logging::log_path());
+    format!(
+        "alive=1; \
+         for i in $(seq 1 100); do \
+           if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
+           sleep 0.1; \
+         done; \
+         if [ \"$alive\" = 1 ] && [ -n \"{expect}\" ]; then \
+           now=$(ps -o comm= -p {pid} 2>/dev/null); \
+           case \"$now\" in \
+             *{expect}*) kill -9 {pid} 2>/dev/null; sleep 0.5;; \
+             *) alive=stale; \
+                echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: pid {pid} is now '$now', not ours; not killing\" >> {log_quoted};; \
+           esac; \
+         fi; \
+         {launch}"
+    )
 }
 
 /// Best-effort: schedule the running `.app` bundle to be moved to the user's
@@ -927,7 +1061,7 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
         quoted = quoted,
         log_quoted = log_quoted,
     );
-    match Command::new("/bin/sh").arg("-c").arg(cmd).spawn() {
+    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
         Ok(_) => {
             log::info!("uninstall: scheduled app-bundle trash for {bundle:?}");
             Some(bundle)
@@ -1269,6 +1403,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             if let Err(err) = result {
                 let kind = classify_bootstrap_failure(&err);
                 capture_bootstrap_failure(&err, kind);
+                *state.bootstrap_failure_report.lock() = Some(BootstrapFailureReport {
+                    kind: kind.as_str().into(),
+                    detail: tool_manager::compact_pip_failure(&err),
+                });
                 state.mark_bootstrap_failed(user_message_for(kind));
                 emit_bootstrap_progress(&app_handle, &state);
                 analytics::track_event(
@@ -1372,6 +1510,13 @@ enum BootstrapFailureKind {
     /// user's environment — it's self-recoverable, so we frame it softly and
     /// the user just needs to click Try again.
     NetworkDownload,
+    /// Our lock pinned a version that has no wheel for this interpreter or
+    /// platform, so pip resolves nothing and *every* retry fails identically
+    /// (RUST-6S/RUST-1G: `onnxruntime==1.27.0` on Intel macOS, where releases
+    /// stop at 1.23.2). This is a defect in a build we shipped, not a fault of
+    /// the user's machine — the only fix is a newer app, so the message must
+    /// send them to the updater instead of to their network settings.
+    UnsupportedPin,
     Other,
 }
 
@@ -1381,6 +1526,7 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::SslInterception => "ssl_interception",
             BootstrapFailureKind::NoUsableTempDir => "no_usable_tempdir",
             BootstrapFailureKind::NetworkDownload => "network_download",
+            BootstrapFailureKind::UnsupportedPin => "unsupported_pin",
             BootstrapFailureKind::Other => "other",
         }
     }
@@ -1405,11 +1551,23 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslInterception
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
+    } else if is_unsupported_pin_signal(&haystack) {
+        BootstrapFailureKind::UnsupportedPin
     } else if is_network_download_signal(&haystack) {
         BootstrapFailureKind::NetworkDownload
     } else {
         BootstrapFailureKind::Other
     }
+}
+
+/// True when pip could not resolve a pin at all — no wheel exists for this
+/// interpreter/platform. Checked before [`is_network_download_signal`] because
+/// pip echoes every index and find-links URL it consulted, so an unrelated
+/// timeout word in that preamble must not steal the classification.
+fn is_unsupported_pin_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no matching distribution found")
+        || lower.contains("could not find a version that satisfies")
 }
 
 /// True when a bootstrap failure looks like a transient network/download
@@ -1470,6 +1628,14 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              files.pythonhosted.org - try another network or contact \
              support@extraheadroom.com."
         }
+        BootstrapFailureKind::UnsupportedPin => {
+            "Installation failed: this version of Headroom can't build its \
+             runtime on your Mac - one of its components has no release for \
+             your processor. This is a bug in the version you're running, not \
+             a problem with your machine, and retrying will keep failing. \
+             Click Check for updates to get a newer Headroom, which fixes it. \
+             If no update is offered, contact support@extraheadroom.com."
+        }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
              Check your internet connection, then click Try again. \
@@ -1520,6 +1686,8 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     if let Some(failure) = cmd_failure {
         sentry::with_scope(
             |scope| {
+                let fp: &[&str] = &["bootstrap_failed", kind.as_str()];
+                scope.set_fingerprint(Some(fp));
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
@@ -1557,6 +1725,8 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     } else {
         sentry::with_scope(
             |scope| {
+                let fp: &[&str] = &["bootstrap_failed", kind.as_str()];
+                scope.set_fingerprint(Some(fp));
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
@@ -2090,6 +2260,10 @@ pub(crate) struct UpgradeBootDiagnostics {
     pub proxy_bypass: bool,
     pub pricing_allows_optimization: bool,
     pub runtime_paused: bool,
+    /// Who actually held the backend port at failure time: `free`,
+    /// `headroom`, or `foreign: <cmd> pid <n>`. `proxy_port_bound` alone
+    /// cannot separate a wedged child of ours from a foreign squatter.
+    pub port_occupant: String,
     pub ensure_error: Option<String>,
     /// Last ~100 lines of pip stdout/stderr from the install pass that
     /// produced the venv we're now booting. Pip can return exit 0 while
@@ -2221,6 +2395,19 @@ pub(crate) fn capture_upgrade_failure(
                     diag.pricing_allows_optimization.into(),
                 );
                 scope.set_extra("runtime_paused", diag.runtime_paused.into());
+                if !diag.port_occupant.is_empty() {
+                    // Tag on the kind only: the detail carries a pid, which
+                    // would explode tag cardinality.
+                    scope.set_tag(
+                        "port_occupant",
+                        diag.port_occupant
+                            .split(':')
+                            .next()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    );
+                    scope.set_extra("port_occupant", diag.port_occupant.clone().into());
+                }
                 if let Some(err) = diag.ensure_error.as_deref() {
                     scope.set_extra("ensure_headroom_running_error", err.into());
                 }
@@ -2411,6 +2598,14 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
 #[tauri::command]
 fn get_bootstrap_progress(state: State<'_, AppState>) -> BootstrapProgress {
     state.bootstrap_progress()
+}
+
+/// Cause class + technical detail of the last bootstrap failure, so the
+/// install screen's "Contact support" mail carries something we can act on.
+/// `None` when no bootstrap has failed this session.
+#[tauri::command]
+fn get_bootstrap_failure_report(state: State<'_, AppState>) -> Option<BootstrapFailureReport> {
+    state.bootstrap_failure_report.lock().clone()
 }
 
 #[tauri::command]
@@ -3103,7 +3298,7 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
         return Err("Memory database does not exist.".into());
     }
     let entrypoint = state.tool_manager.headroom_entrypoint();
-    let output = Command::new(&entrypoint)
+    let output = crate::proc::command(&entrypoint)
         .arg("memory")
         .arg("delete")
         .arg(&memory_id)
@@ -3207,7 +3402,7 @@ fn read_applied_block(path: &std::path::Path) -> Vec<crate::models::AppliedSecti
 
 /// Shells `headroom memory export --db-path <db>` and returns raw JSON stdout.
 fn run_memory_export(entrypoint: &Path, db_path: &Path) -> Result<String, String> {
-    let output = Command::new(entrypoint)
+    let output = crate::proc::command(entrypoint)
         .arg("memory")
         .arg("export")
         .arg("--db-path")
@@ -3369,7 +3564,7 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut command = Command::new("open");
+        let mut command = crate::proc::command("open");
         command.arg(trimmed);
         command
     };
@@ -3377,7 +3572,7 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         for opener in ["xdg-open", "gio", "kde-open5", "wslview"] {
-            let mut command = Command::new(opener);
+            let mut command = crate::proc::command(opener);
             if opener == "gio" {
                 command.args(["open", trimmed]);
             } else {
@@ -3401,7 +3596,7 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("cmd");
+        let mut command = crate::proc::command("cmd");
         command.args(["/C", "start", "", trimmed]);
         command
     };
@@ -3723,9 +3918,15 @@ fn autolaunch(
     app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
 }
 
+#[cfg(target_os = "macos")]
 const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
      Move Headroom to /Applications and relaunch.";
+
+#[cfg(not(target_os = "macos"))]
+const AUTOSTART_UNAVAILABLE: &str =
+    "Autostart is unavailable: Headroom could not resolve its own application path. \
+     Reinstall Headroom and relaunch.";
 
 #[tauri::command]
 async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
@@ -3942,6 +4143,7 @@ pub fn run() {
         sentry::ClientOptions {
             release: sentry::release_name!(),
             attach_stacktrace: true,
+            before_send: Some(std::sync::Arc::new(logging::sanitize_event)),
             ..Default::default()
         },
     ));
@@ -4032,6 +4234,24 @@ pub fn run() {
                 // popover behavior and fixes both cases.
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_visible_on_all_workspaces(true);
+                }
+            }
+
+            // Windows and Linux render an extra preview-build notice in the
+            // callout banner that macOS never shows, and their scrollbars take
+            // layout width (macOS overlays them), so the same 760x560 frame
+            // clips the bottom of Home. Give those platforms the banner's
+            // height back. Applied here rather than in tauri.conf.json because
+            // Tauri's platform config overlay replaces the whole `windows`
+            // array, which would duplicate every field just to change one.
+            #[cfg(not(target_os = "macos"))]
+            {
+                use tauri::LogicalSize;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_size(LogicalSize::new(
+                        MAIN_WINDOW_WIDTH,
+                        MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
+                    ));
                 }
             }
 
@@ -4148,6 +4368,7 @@ pub fn run() {
                 std::sync::Arc::clone(&state.claude_only_bypass),
                 std::sync::Arc::clone(&state.codex_bypass),
                 fresh_bearer_tx,
+                std::sync::Arc::clone(&state.intercept_bind_error),
             );
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
@@ -4253,6 +4474,7 @@ pub fn run() {
             prefetch_bootstrap_artifacts,
             start_bootstrap,
             get_bootstrap_progress,
+            get_bootstrap_failure_report,
             get_runtime_upgrade_progress,
             retry_runtime_upgrade,
             retry_runtime_upgrade_with_rebuild,
@@ -4331,6 +4553,11 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 SHUTTING_DOWN.store(true, Ordering::Release);
+                // Step markers: this teardown runs on the UI thread, so a step
+                // that blocks freezes the app mid-quit and emits nothing (Sentry
+                // only receives warn!/error!). The last marker in the log names
+                // the step that hung.
+                log::info!("exit: stop_headroom");
                 let state: tauri::State<'_, AppState> = app.state();
                 state.stop_headroom();
                 // Gracefully reverse every client's base-URL override (and shell
@@ -4342,6 +4569,7 @@ pub fn run() {
                 // exit handler fires for both ExitRequested and Exit, and a
                 // second clear_client_setups wipes the remembered snapshot.
                 if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+                    log::info!("exit: clear_client_setups");
                     if let Err(err) = client_adapters::clear_client_setups() {
                         log::warn!("exit: clear_client_setups failed: {err}");
                     }
@@ -4351,7 +4579,9 @@ pub fn run() {
                 // quit / signals skip exit_headroom -> clear_client_setups, so
                 // this is the only retag they get; the next launch re-applies the
                 // headroom tag via restore_client_setups. Best-effort.
+                log::info!("exit: retag_codex_threads_to_native");
                 client_adapters::retag_codex_threads_to_native();
+                log::info!("exit: teardown complete");
             }
         });
 }
@@ -4932,7 +5162,7 @@ fn execute_headroom_learn_run(
         }
     };
 
-    let mut command = Command::new(&entrypoint);
+    let mut command = crate::proc::command(&entrypoint);
     command.arg("learn").arg("--apply");
     match agent {
         LearnAgent::Claude => {
@@ -5238,6 +5468,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
     let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
     let _ = TRAY_PAUSE_ITEM.set(pause.clone());
+    #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
@@ -5255,6 +5486,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = toggle_main_window(tray.app_handle(), Some(rect));
             }
 
+            // macOS only. With a menu attached, Windows and Linux open it
+            // themselves on right-click; popping a second one here raced the
+            // built-in and left the tray with no usable menu at all, so there
+            // was no way to quit from the tray. macOS does not auto-open on
+            // right-click (only left, which `show_menu_on_left_click(false)`
+            // turns off), so it still needs the manual popup.
+            #[cfg(target_os = "macos")]
             if let TrayIconEvent::Click {
                 button: MouseButton::Right,
                 button_state: MouseButtonState::Up,
@@ -5382,6 +5620,12 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             || client_adapters::any_gate_exempt_client_enabled();
 
         loop {
+            // Quitting stops the backend on purpose, which this loop would
+            // otherwise read as the connector dropping out and announce with a
+            // "Headroom is disconnected" notification on the way out the door.
+            if SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
             // Re-check connectors at most every ~2s, regardless of whether the
             // tick rate is booting-fast (260ms) or idle-slow (1500ms). Time-based
             // instead of tick-count based so the cadence stays correct across the
@@ -5546,10 +5790,17 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 // we just swapped the icon — not only on tooltip text change.
                 let tooltip_changed = last_tooltip.as_deref() != Some(tooltip);
                 if icon_changed || tooltip_changed {
-                    if let Err(err) = tray.set_tooltip(Some(tooltip)) {
-                        log::warn!("tray: set_tooltip failed: {err}");
+                    match tray.set_tooltip(Some(tooltip)) {
+                        Ok(()) => last_tooltip = Some(tooltip.to_string()),
+                        // Windows returns E_FAIL (0x80004005) while the
+                        // notification area is busy -- explorer restarting, or
+                        // a shell extension holding it. Caching the tooltip
+                        // anyway froze the wrong hover text until the text
+                        // happened to change again; leaving `last_tooltip`
+                        // stale keeps `tooltip_changed` true so the next tick
+                        // retries and the failure heals itself (RUST-7P).
+                        Err(err) => log::warn!("tray: set_tooltip failed: {err}"),
                     }
-                    last_tooltip = Some(tooltip.to_string());
                 }
             } else {
                 break;
@@ -6162,6 +6413,11 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
 fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Focused(false) => {
+            // An update install steals focus with a privilege prompt; hiding
+            // underneath it strands the user mid-flow.
+            if INSTALLING_UPDATE.load(Ordering::Acquire) {
+                return;
+            }
             if window.label() == "main" {
                 let window = window.clone();
                 std::thread::spawn(move || {
@@ -6385,6 +6641,9 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 
     if let Some(rect) = anchor_rect {
         position_tray_window(&window, rect)?;
+    } else {
+        #[cfg(target_os = "linux")]
+        position_near_panel(&window)?;
     }
 
     window.show()?;
@@ -6442,6 +6701,55 @@ fn position_tray_window(window: &tauri::WebviewWindow, rect: Rect) -> tauri::Res
     let target = compute_tray_window_position(tray_rect, window_size, monitor_bounds);
 
     window.set_position(Position::Physical(target))
+}
+
+/// Linux tray backends (libappindicator/StatusNotifier) never report click
+/// events or an icon rect, so `show_main_window` gets no anchor there and the
+/// window stays wherever the config's `center: true` put it. Drop it into the
+/// panel corner instead.
+#[cfg(target_os = "linux")]
+fn position_near_panel(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    let Some(monitor) = window
+        .current_monitor()?
+        .or_else(|| window.primary_monitor().ok().flatten())
+    else {
+        return Ok(());
+    };
+    let area = monitor.work_area();
+    let work_area = MonitorBounds {
+        x: area.position.x,
+        y: area.position.y,
+        width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
+        height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
+    };
+    let window_size = window
+        .outer_size()
+        .unwrap_or_else(|_| PhysicalSize::new(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT));
+
+    window.set_position(Position::Physical(compute_panel_corner_position(
+        work_area,
+        window_size,
+    )))
+}
+
+/// Top-right of the work area (which already excludes the panel), inset by the
+/// same gap the tray-anchored path uses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn compute_panel_corner_position(
+    work_area: MonitorBounds,
+    window_size: PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let window_width = i32::try_from(window_size.width).unwrap_or(i32::MAX);
+    let inset_x = work_area
+        .width
+        .saturating_sub(window_width)
+        .saturating_sub(TRAY_WINDOW_VERTICAL_GAP)
+        .max(0);
+
+    PhysicalPosition::new(
+        work_area.x.saturating_add(inset_x),
+        work_area.y.saturating_add(TRAY_WINDOW_VERTICAL_GAP),
+    )
 }
 
 fn physical_rect_from_rect(rect: Rect, scale_factor: f64) -> PhysicalRect {
@@ -6558,24 +6866,26 @@ mod tests {
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
         build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
-        classify_backend_readyz, classify_bootstrap_failure, classify_upgrade_error,
-        client_setup_error_kind, compute_tray_window_position, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, fetch_transformations_feed_from, format_token_count, install_pending_update,
-        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
-        is_port_conflict_failure, is_prerelease_version, learn_step_label,
-        lifetime_token_milestone_kind, noop_app_update_progress_emitter, onboarding_recovery_copy,
-        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
+        classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
+        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
+        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
+        exe_path_resolvable, extract_llm_failure_warnings, fake_override,
+        fetch_transformations_feed_from, first_savings_body, format_token_count,
+        install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
+        is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
+        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
+        onboarding_recovery_copy, parse_live_learnings, parse_request_count_from_stats_body,
+        parse_request_counts_by_agent, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
+        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -7237,6 +7547,79 @@ mod tests {
     }
 
     #[test]
+    fn classify_update_check_treats_a_missing_platform_as_no_update() {
+        // What a Windows install saw while a release was mid-flight, before
+        // the workflows moved the manifest publish to the end.
+        let missing =
+            classify_update_check::<()>(Err(tauri_plugin_updater::Error::TargetsNotFound(vec![
+                "windows-x86_64-nsis".into(),
+                "windows-x86_64".into(),
+            ])))
+            .expect("a platform-less manifest is not an error");
+        assert!(missing.is_none());
+
+        assert!(
+            classify_update_check::<()>(Err(tauri_plugin_updater::Error::TargetNotFound(
+                "linux-x86_64".into()
+            )))
+            .expect("single-target miss is not an error")
+            .is_none()
+        );
+
+        let real = classify_update_check::<()>(Err(tauri_plugin_updater::Error::Network(
+            "connection reset".into(),
+        )))
+        .expect_err("other failures still bubble up");
+        assert!(real.contains("connection reset"), "{real}");
+    }
+
+    /// The privilege prompt a .deb install raises steals focus, and the blur
+    /// handler hides the window 150ms later. The flag is what keeps "Restart
+    /// now" on screen instead of behind an unexplained tray click.
+    #[test]
+    fn install_pending_update_holds_the_window_open_while_it_runs() {
+        struct FlagObservingUpdate(Arc<Mutex<Option<bool>>>);
+
+        impl InstallableAppUpdate for FlagObservingUpdate {
+            fn metadata(&self) -> AvailableAppUpdate {
+                unreachable!("metadata is not read on the install path")
+            }
+
+            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+                Box::pin(async move {
+                    *self.0.lock() =
+                        Some(super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire));
+                    Ok(())
+                })
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let pending = Mutex::new(Some(FlagObservingUpdate(Arc::clone(&seen))));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        runtime
+            .block_on(install_pending_update(
+                &pending,
+                noop_app_update_progress_emitter(),
+            ))
+            .expect("install");
+
+        assert_eq!(
+            *seen.lock(),
+            Some(true),
+            "window would hide behind the privilege prompt mid-install"
+        );
+        assert!(
+            !super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire),
+            "flag outlived the install, so the window can never auto-hide again"
+        );
+    }
+
+    #[test]
     fn install_pending_update_requires_a_checked_update() {
         let pending = Mutex::new(None::<FakePendingUpdate>);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -7423,6 +7806,39 @@ mod tests {
     }
 
     #[test]
+    fn panel_corner_position_hugs_the_work_area_top_right() {
+        // Work area starts below a 28px top panel on a second monitor.
+        let target = compute_panel_corner_position(
+            MonitorBounds {
+                x: 1440,
+                y: 28,
+                width: 1440,
+                height: 872,
+            },
+            PhysicalSize::new(760, 560),
+        );
+
+        assert_eq!(target.x, 2110);
+        assert_eq!(target.y, 38);
+    }
+
+    #[test]
+    fn panel_corner_position_stays_on_screen_when_window_is_wider() {
+        let target = compute_panel_corner_position(
+            MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 600,
+                height: 400,
+            },
+            PhysicalSize::new(760, 560),
+        );
+
+        assert_eq!(target.x, 0);
+        assert_eq!(target.y, 10);
+    }
+
+    #[test]
     fn tray_window_position_moves_above_when_bottom_would_overflow() {
         let target = compute_tray_window_position(
             PhysicalRect {
@@ -7470,6 +7886,22 @@ mod tests {
         assert_eq!(lifetime_token_milestone_kind(5_000_000), "first_5m");
         assert_eq!(lifetime_token_milestone_kind(10_000_000), "first_10m");
         assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
+    }
+
+    #[test]
+    fn first_savings_body_leads_with_tokens_below_the_quotable_threshold() {
+        for usd in [0.004, 0.015, 0.32] {
+            let small = first_savings_body(usd, 2_431);
+            assert!(small.contains("2,431 tokens"), "{small}");
+            assert!(!small.contains('$'), "{small}");
+            assert!(!small.to_lowercase().contains("cent"), "{small}");
+        }
+
+        let real_money = first_savings_body(1.5, 124_500);
+        assert!(
+            real_money.starts_with("$1.50 saved across 124k tokens"),
+            "{real_money}"
+        );
     }
 
     #[test]
@@ -7792,6 +8224,47 @@ mod tests {
             exit_code: Some(1),
             signal: None,
         }
+    }
+
+    #[test]
+    fn classify_bootstrap_failure_flags_unresolvable_pin_as_unsupported_pin() {
+        // The exact shape from RUST-1G/RUST-6S: our lock pinned a version with
+        // no Intel-macOS wheel, so every retry failed identically while the
+        // user was told to check their internet connection.
+        let err: anyhow::Error = make_command_failure(
+            "ERROR: Could not find a version that satisfies the requirement \
+             onnxruntime==1.27.0 (from versions: 1.23.0, 1.23.1, 1.23.2)\n\
+             ERROR: No matching distribution found for onnxruntime==1.27.0",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::UnsupportedPin
+        ));
+    }
+
+    #[test]
+    fn unsupported_pin_wins_over_the_network_heuristic() {
+        // pip echoes every index it consulted before reporting the resolution
+        // failure, so a timeout word in that preamble must not steal the
+        // classification and send the user to their network settings.
+        let err: anyhow::Error = make_command_failure(
+            "WARNING: Retrying after connection timed out\n\
+             ERROR: No matching distribution found for onnxruntime==1.27.0",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::UnsupportedPin
+        ));
+    }
+
+    #[test]
+    fn unsupported_pin_message_sends_the_user_to_the_updater_not_the_network() {
+        // The whole point: retrying is futile, so the copy must not imply it.
+        let msg = user_message_for(BootstrapFailureKind::UnsupportedPin);
+        assert!(msg.contains("Check for updates"));
+        assert!(!msg.contains("internet connection"));
     }
 
     #[test]
@@ -8656,7 +9129,7 @@ Some unrelated content.
         let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
         state.mark_headroom_learn_running_for_test();
 
-        let mut command = std::process::Command::new("sh");
+        let mut command = crate::proc::command("sh");
         command.arg("-c").arg(
             "printf '[claude] proj\\n  Analyzing with claude-cli...\\n  Recommendations: 3\\n'; \
              printf 'warn line\\n' >&2; exit 7",
@@ -8820,5 +9293,120 @@ Some unrelated content.
             hint.contains("endpoint protection"),
             "expected EDR hint, got: {hint}"
         );
+    }
+
+    /// The gate is only as good as the name it matches on, and that name is not
+    /// the executable's: the Linux .deb ships `/usr/bin/headroom-desktop` while
+    /// the kernel reports `headroom`. Check the derivation against what `ps`
+    /// actually says about this very process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relauncher_expect_name_matches_what_ps_reports() {
+        let expect = super::relauncher_expect_name();
+        assert!(!expect.is_empty(), "no name to gate the force-kill on");
+
+        let out = crate::proc::command("ps")
+            .args(["-o", "comm=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("run ps");
+        let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        assert!(
+            reported.contains(&expect),
+            "gate would never fire: ps reports {reported:?}, gate matches on {expect:?}"
+        );
+    }
+
+    /// The force-kill must sit behind the identity check, not beside it: this
+    /// script SIGKILLs a pid it resolved up to 10 seconds earlier.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relauncher_force_kill_is_gated_on_identity() {
+        let script = super::relauncher_script(4242, "headroom", "true");
+        let gate = script
+            .find("ps -o comm= -p 4242")
+            .expect("no identity check");
+        let kill = script.find("kill -9 4242").expect("no force-kill");
+        assert!(
+            gate < kill,
+            "force-kill runs before the identity check: {script}"
+        );
+        assert!(
+            script[gate..kill].contains("*headroom*)"),
+            "force-kill is not inside the matching case arm: {script}"
+        );
+    }
+
+    /// An app that exited on its own must be relaunched without any kill at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relauncher_skips_the_kill_when_the_app_already_exited() {
+        let dir = std::env::temp_dir().join(format!("hr-relaunch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let marker = dir.join("launched");
+
+        // A pid that is dead for certain: spawn, reap, then reuse its number.
+        let mut done = crate::proc::command("true").spawn().expect("spawn true");
+        let dead = done.id();
+        done.wait().expect("reap");
+
+        let script = super::relauncher_script(
+            dead,
+            "headroom",
+            &format!("touch {}", super::shell_quote_path(&marker)),
+        );
+        let started = std::time::Instant::now();
+        let status = crate::proc::command("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run relauncher");
+
+        assert!(status.success(), "relauncher failed: {script}");
+        assert!(marker.exists(), "launch never ran: {script}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited on a pid that was already gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The relauncher only ever runs after we are dead, so a quoting slip in it
+    /// is silent until a user updates and never comes back. Syntax-check the
+    /// real snippets (both carry quotes, `$(...)`, and a path with a space).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relauncher_script_is_valid_shell() {
+        use std::path::Path;
+        let app = super::shell_quote_path(Path::new("/Applications/Headroom RC.app"));
+        let log = super::shell_quote_path(Path::new("/Users/a b/Library/Logs/Headroom/d.log"));
+        let launches = [
+            // macOS
+            format!(
+                "/usr/bin/open -n {app}; rc=$?; \
+                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {app} exited rc=$rc (alive=$alive)\" >> {log}"
+            ),
+            // Linux
+            format!(
+                "{app} >/dev/null 2>&1 & \
+                 new=$!; sleep 1; \
+                 if kill -0 $new 2>/dev/null; then st=running; else st=DIED; fi; \
+                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {app} pid $new ($st, alive=$alive)\" >> {log}"
+            ),
+        ];
+        for launch in launches {
+            let script = super::relauncher_script(4242, "headroom", &launch);
+            assert!(
+                script.contains("kill -9 4242"),
+                "lost the force-kill backstop: {script}"
+            );
+            let status = crate::proc::command("/bin/sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("run sh -n");
+            assert!(status.success(), "sh rejected the script: {script}");
+        }
     }
 }

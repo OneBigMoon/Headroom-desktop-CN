@@ -441,6 +441,13 @@ pub type BypassFlag = Arc<AtomicBool>;
 /// JWT and read by `pricing::fetch_codex_usage` to pick the recommended tier.
 pub type CodexPlanSlot = Arc<Mutex<Option<crate::models::CodexPlanTier>>>;
 
+/// Why the intercept is not listening on [`INTERCEPT_PORT`], or `None` while it
+/// is serving normally. Shared with `AppState::intercept_bind_error` so the UI
+/// can name the real cause: clients are hard-configured to 127.0.0.1:6767, so a
+/// failed bind refuses every request regardless of the Python backend's state,
+/// and the banner would otherwise blame the runtime.
+pub type BindErrorSlot = Arc<Mutex<Option<String>>>;
+
 /// Channel sender used to notify a background worker that the intercept just
 /// captured a bearer token whose value differs from whatever was previously
 /// in the slot. Empty payload — the worker reads the bearer from `AppState`
@@ -450,10 +457,27 @@ pub type FreshBearerNotifier = mpsc::Sender<()>;
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
 
+/// Locale-invariant identity for an OS error.
+///
+/// `io::Error`'s `Display` is the *localized* platform string, so keying a
+/// Sentry message on it fingerprints one bug once per OS language: the held
+/// intercept port arrived as RUST-7D (English) and RUST-7B (Spanish), which
+/// can never be resolved together. The numeric code is the same everywhere;
+/// the localized text still ships as an extra for the human reading it.
+fn os_error_key(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("os error {code}"),
+        // Not all io::Errors come from the OS (e.g. synthesized by a wrapper).
+        // Nothing locale-dependent to strip, so the text is the best key.
+        None => e.to_string(),
+    }
+}
+
 /// Spawn the intercept proxy as a background Tokio task.
 /// Returns immediately; the server runs until the process exits.
 /// Uses a dedicated OS thread with its own Tokio runtime so it's safe to call
 /// from Tauri's `.setup()` before the main async runtime has started.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     token_slot: SharedToken,
     codex_slot: CodexRateLimitSlot,
@@ -462,6 +486,7 @@ pub fn spawn(
     claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
+    bind_error: BindErrorSlot,
 ) {
     let upstream_base = Arc::new(ANTHROPIC_DIRECT_BASE.to_string());
     std::thread::Builder::new()
@@ -482,6 +507,32 @@ pub fn spawn(
                 // forever; report each distinct error to Sentry once.
                 let mut reported_errors: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                // A restart -- the updater relaunch, or the "Restart now"
+                // button -- starts the new process while the old one still
+                // holds the port, so the first bind after launch routinely
+                // fails through no fault of the machine. Publishing that
+                // immediately paints "Headroom is not hooked up" over a window
+                // that heals itself on the next retry, and files a Sentry error
+                // that fixed itself.
+                //
+                // The grace is measured in TIME, not attempts. It used to be
+                // "one attempt", and with a flat 15s retry that gave the old
+                // process exactly 15s to exit -- enough on macOS, not on
+                // Windows, where an exiting process can hold the socket longer
+                // and every update therefore filed one self-healing
+                // `os error 10048` (RUST-7M: one event per release, i.e. one
+                // per update relaunch, not one per launch). `run` never returns
+                // once it has bound (accept errors log and keep serving), so
+                // neither the clock nor the counter needs a reset.
+                const RELAUNCH_GRACE: std::time::Duration =
+                    std::time::Duration::from_secs(90);
+                // ...but the UI banner is on a shorter clock. `run` clears the
+                // slot the instant it binds, so a real overlap never reaches
+                // this; anything still held after it is something the user has
+                // to be told about.
+                const HINT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+                let launched_at = tokio::time::Instant::now();
+                let mut consecutive_failures = 0usize;
                 loop {
                     match run(
                         bind_addr,
@@ -493,11 +544,13 @@ pub fn spawn(
                         codex_bypass.clone(),
                         fresh_bearer_tx.clone(),
                         upstream_base.clone(),
+                        bind_error.clone(),
                     )
                     .await
                     {
                         Ok(()) => return,
                         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                            consecutive_failures += 1;
                             // If /health responds over HTTP, an existing
                             // Headroom proxy owns the port (single-instance
                             // plugin should normally prevent this, but a
@@ -508,37 +561,98 @@ pub fn spawn(
                                 log::info!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
                                 );
-                            } else {
-                                log::warn!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
+                            } else if launched_at.elapsed() < RELAUNCH_GRACE {
+                                // Sentry stays quiet for the whole grace: a
+                                // bind that heals itself is not an error worth
+                                // a report. The banner must not, or the window
+                                // sits on "runtime offline, proxy unreachable"
+                                // -- which blames the Python runtime for a port
+                                // that never opened -- for the full 90s.
+                                if launched_at.elapsed() >= HINT_GRACE {
+                                    *bind_error.lock() = Some(e.to_string());
+                                }
+                                log::info!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} still held {}s after launch (a restart overlapping the previous instance looks exactly like this); retrying ({e})",
+                                    launched_at.elapsed().as_secs()
                                 );
-                                if reported_errors.insert(format!("foreign:{e}")) {
-                                    sentry::capture_message(
-                                        &format!(
-                                            "proxy_intercept bind failed: {e} (port {INTERCEPT_PORT} held by foreign process; retrying)"
-                                        ),
-                                        sentry::Level::Error,
+                            } else {
+                                // Nothing answered /health, so the port is
+                                // held without being served: bind says in-use
+                                // while connect is refused. Observed causes
+                                // include a leftover Headroom whose socket
+                                // outlived it, an unrelated app, and reserved
+                                // ranges. Say only what was measured -- an
+                                // earlier "held by foreign process" wording
+                                // asserted the holder was not ours and sent a
+                                // whole investigation down the wrong path.
+                                *bind_error.lock() = Some(e.to_string());
+                                log::warn!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s ({e})"
+                                );
+                                let key = os_error_key(&e);
+                                if reported_errors.insert(format!("foreign:{key}")) {
+                                    sentry::with_scope(
+                                        |scope| {
+                                            scope.set_extra(
+                                                "os_error", e.to_string().into());
+                                        },
+                                        || {
+                                            sentry::capture_message(
+                                                &format!(
+                                                    "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held but not answering /health; retrying)"
+                                                ),
+                                                sentry::Level::Error,
+                                            );
+                                        },
                                     );
                                 }
                             }
                         }
                         Err(e) => {
-                            log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
-                            if reported_errors.insert(e.to_string()) {
-                                sentry::capture_message(
-                                    &format!("proxy_intercept error: {e} (retrying)"),
-                                    sentry::Level::Error,
+                            consecutive_failures += 1;
+                            if consecutive_failures == 1 {
+                                log::info!(
+                                    "[proxy_intercept] error on the first bind attempt: {e}; retrying"
                                 );
+                            } else {
+                                *bind_error.lock() = Some(e.to_string());
+                                log::warn!("[proxy_intercept] error: {e}; retrying");
+                                let key = os_error_key(&e);
+                                if reported_errors.insert(key.clone()) {
+                                    sentry::with_scope(
+                                        |scope| {
+                                            scope.set_extra("os_error", e.to_string().into());
+                                        },
+                                        || {
+                                            sentry::capture_message(
+                                                &format!("proxy_intercept error: {key} (retrying)"),
+                                                sentry::Level::Error,
+                                            );
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    // Retry fast at first: a relaunch overlap clears within a
+                    // second or two of the old process finally exiting, and a
+                    // flat 15s kept the app's front door shut for that whole
+                    // window after every single update. Settle back to 15s once
+                    // the holder looks like a genuine squatter rather than the
+                    // instance we just replaced.
+                    let backoff = match consecutive_failures {
+                        0..=3 => 1,
+                        4..=8 => 3,
+                        _ => 15,
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                 }
             });
         })
         .expect("spawn proxy intercept thread");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     bind_addr: SocketAddr,
     token_slot: SharedToken,
@@ -549,8 +663,12 @@ async fn run(
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
+    bind_error: BindErrorSlot,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
+    // Serving again: clear whatever the previous attempt recorded so a
+    // recovered port stops showing a stale cause in the UI.
+    *bind_error.lock() = None;
 
     loop {
         match listener.accept().await {
@@ -2481,7 +2599,7 @@ mod tests {
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
         find_header_end, intercept_request_counts, is_codex_request_head, is_codex_sse_response,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_prompt_request_head, is_reportable_codex_error,
+        is_openai_path, is_prompt_request_head, is_reportable_codex_error, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
         rewrite_use_responses_lite, run, sanitize_stale_tool_references,
@@ -2501,6 +2619,28 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// The whole point of the fix: the SAME bug on two differently-localized
+    /// machines must produce one Sentry fingerprint, not two (RUST-7B Spanish
+    /// vs RUST-7D English, both WSAEADDRINUSE).
+    #[test]
+    fn os_error_key_is_locale_invariant() {
+        // Win32 10048 (WSAEADDRINUSE) as the OS reports it in two languages.
+        let english = std::io::Error::from_raw_os_error(10048);
+        let spanish = std::io::Error::from_raw_os_error(10048);
+        assert_eq!(os_error_key(&english), os_error_key(&spanish));
+        assert_eq!(os_error_key(&english), "os error 10048");
+
+        // A different code must still be a different key.
+        assert_ne!(
+            os_error_key(&std::io::Error::from_raw_os_error(10048)),
+            os_error_key(&std::io::Error::from_raw_os_error(10061))
+        );
+
+        // Non-OS errors have no code; fall back to the text so they stay distinct.
+        let synthetic = std::io::Error::other("synthesized by a wrapper");
+        assert_eq!(os_error_key(&synthetic), "synthesized by a wrapper");
+    }
     use tokio::time::{timeout, Duration};
 
     #[test]
@@ -2768,7 +2908,13 @@ mod tests {
         drop(intercept_listener); // free the port; run() rebinds the same one
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        // Unroutable on purpose. These tests assert on a local fake backend and
+        // must never reach the real API: when a stale backend_port sent them down
+        // the direct-to-provider fallback, they silently made live calls to
+        // api.anthropic.com and failed on the resulting 401 body instead of saying
+        // so. Port 1 on loopback refuses instantly, so a stray fallback is a fast,
+        // legible failure rather than a network round trip.
+        let upstream_base = Arc::new("http://127.0.0.1:1".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             // run() loops forever; the test cancels it via abort below.
@@ -2782,6 +2928,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -2886,6 +3033,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -3463,6 +3611,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base_arc,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -3607,6 +3756,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base_arc,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -3689,7 +3839,13 @@ mod tests {
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener);
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        // Unroutable on purpose. These tests assert on a local fake backend and
+        // must never reach the real API: when a stale backend_port sent them down
+        // the direct-to-provider fallback, they silently made live calls to
+        // api.anthropic.com and failed on the resulting 401 body instead of saying
+        // so. Port 1 on loopback refuses instantly, so a stray fallback is a fast,
+        // legible failure rather than a network round trip.
+        let upstream_base = Arc::new("http://127.0.0.1:1".to_string());
         let token_for_run = token_slot.clone();
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
@@ -3703,6 +3859,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -4024,7 +4181,13 @@ mod tests {
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        // Unroutable on purpose. These tests assert on a local fake backend and
+        // must never reach the real API: when a stale backend_port sent them down
+        // the direct-to-provider fallback, they silently made live calls to
+        // api.anthropic.com and failed on the resulting 401 body instead of saying
+        // so. Port 1 on loopback refuses instantly, so a stray fallback is a fast,
+        // legible failure rather than a network round trip.
+        let upstream_base = Arc::new("http://127.0.0.1:1".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -4037,6 +4200,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -4130,7 +4294,13 @@ mod tests {
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        // Unroutable on purpose. These tests assert on a local fake backend and
+        // must never reach the real API: when a stale backend_port sent them down
+        // the direct-to-provider fallback, they silently made live calls to
+        // api.anthropic.com and failed on the resulting 401 body instead of saying
+        // so. Port 1 on loopback refuses instantly, so a stray fallback is a fast,
+        // legible failure rather than a network round trip.
+        let upstream_base = Arc::new("http://127.0.0.1:1".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -4143,6 +4313,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
+                Arc::new(Mutex::new(None)),
             )
             .await;
         });
@@ -4168,7 +4339,7 @@ mod tests {
 
         let mut response = Vec::new();
         let mut tmp = [0u8; 4096];
-        let _ = timeout(Duration::from_secs(2), async {
+        let read_completed = timeout(Duration::from_secs(2), async {
             loop {
                 match client.read(&mut tmp).await {
                     Ok(0) | Err(_) => break,
@@ -4188,8 +4359,21 @@ mod tests {
         .await;
 
         let end = find_header_end(&response).expect("response head complete");
-        let body: serde_json::Value =
-            serde_json::from_slice(&response[end + 4..]).expect("json body");
+        let raw = &response[end + 4..];
+        // Self-diagnosing on failure: this test is flaky under parallel load
+        // and "json body: trailing characters" alone cannot distinguish a
+        // read that ran out of time from a body whose framing is wrong.
+        // Truncation would report "EOF while parsing"; "trailing characters"
+        // means the slice did not start where we think it did.
+        let body: serde_json::Value = serde_json::from_slice(raw).unwrap_or_else(|e| {
+            panic!(
+                "json body: {e}\n  read loop finished within budget: {}\n  {} body bytes, \
+                 first 80: {:?}",
+                read_completed.is_ok(),
+                raw.len(),
+                String::from_utf8_lossy(&raw[..raw.len().min(80)])
+            )
+        });
         assert_eq!(
             body["models"][0]["use_responses_lite"],
             serde_json::Value::Bool(true),
