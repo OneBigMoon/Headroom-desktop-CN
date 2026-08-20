@@ -7012,12 +7012,31 @@ fn terminate_process_tree(pid: i32, force: bool) {
         }
         let _ = command.status();
     } else {
+        let Some(target) = group_kill_target(pid) else {
+            log::error!("refusing to signal process group for pid {pid}: not a pid we spawned");
+            return;
+        };
         let signal = if force { "-KILL" } else { "-TERM" };
+        // Attribution: this is the only signal we send that reaches processes we
+        // did not spawn, so the group has to be in the log to be provable later.
+        log::info!("terminate_process_tree: {signal} to process group {target}");
         let _ = crate::proc::command("/bin/kill")
             .arg(signal)
-            .arg(format!("-{pid}"))
+            .arg(target)
             .status();
     }
+}
+
+/// The `kill` argument for signalling `pid`'s process group, or `None` when
+/// `pid` must never be used as a group target.
+///
+/// `kill -TERM -0` does not mean "no process", it means "every process in MY
+/// group" - and on a Linux desktop this app can share its group with the login
+/// session, so a 0 here SIGTERMs xfce4-session, the window manager and the rest
+/// of the session out from under the user. Pid 1 is init. Neither is ever a
+/// backend we spawned, so neither is worth the blast radius.
+fn group_kill_target(pid: i32) -> Option<String> {
+    (pid > 1).then(|| format!("-{pid}"))
 }
 
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
@@ -8512,6 +8531,28 @@ mod tests {
         assert_eq!(
             most_recent_monday(NaiveDate::from_ymd_opt(2026, 5, 3).unwrap()),
             NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
+    }
+
+    /// The whole-session blast radius, in one test: 0 means "my own group", and
+    /// on a Linux desktop that group can be the login session.
+    #[test]
+    fn group_kill_refuses_targets_that_are_not_a_child_of_ours() {
+        assert_eq!(
+            super::group_kill_target(0),
+            None,
+            "0 is our own process group"
+        );
+        assert_eq!(super::group_kill_target(1), None, "1 is init");
+        assert_eq!(
+            super::group_kill_target(-1),
+            None,
+            "-1 is everything we can signal"
+        );
+        assert_eq!(
+            super::group_kill_target(4242).as_deref(),
+            Some("-4242"),
+            "a real child's group must still be signalled"
         );
     }
 

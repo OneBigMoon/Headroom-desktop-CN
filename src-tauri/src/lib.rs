@@ -889,7 +889,9 @@ async fn restart_app(app: AppHandle) {
                 log::info!("restart_app: relaunching {exe:?}");
                 spawn_relauncher(&format!(
                     "{quoted} >/dev/null 2>&1 & \
-                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {quoted} pid $! (alive=$alive)\" >> {log_quoted}"
+                     new=$!; sleep 1; \
+                     if kill -0 $new 2>/dev/null; then st=running; else st=DIED; fi; \
+                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {quoted} pid $new ($st, alive=$alive)\" >> {log_quoted}"
                 ));
             }
             Err(err) => {
@@ -951,22 +953,61 @@ fn shell_quote_path(path: &std::path::Path) -> String {
 /// stranding the user on a dead window with no way back to the new build.
 #[cfg(unix)]
 fn spawn_relauncher(launch: &str) {
-    let cmd = relauncher_script(std::process::id(), launch);
+    let cmd = relauncher_script(std::process::id(), &relauncher_expect_name(), launch);
     match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
         Ok(_) => log::info!("restart_app: relauncher spawned"),
         Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
     }
 }
 
+/// What `ps -o comm=` reports for THIS process, for the identity gate below.
+///
+/// Not derivable from the executable name: the Linux .deb installs the binary as
+/// `/usr/bin/headroom-desktop` but the kernel reports `headroom`, so matching on
+/// the file name never fires and the gate silently blocks every force-kill. Read
+/// the value the kernel will actually report instead. macOS has no `/proc`, but
+/// its `ps -o comm=` prints the full executable path, so the file name matches as
+/// a substring there.
 #[cfg(unix)]
-fn relauncher_script(pid: u32, launch: &str) -> String {
+fn relauncher_expect_name() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/comm")
+            .map(|comm| comm.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default()
+    }
+}
+
+/// `expect`: what `ps -o comm=` should still report for `pid` at force-kill
+/// time. The pid is resolved now but signalled up to 10s later, and by then it
+/// may belong to something else entirely - on a box that recycles pids fast, an
+/// unguarded `kill -9` lands on an innocent process (and if that process is a
+/// session or group leader, it takes the user's whole desktop session with it).
+/// Same rule as the port-reclaim path: verify identity before signalling.
+#[cfg(unix)]
+fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
+    let log_quoted = shell_quote_path(&logging::log_path());
     format!(
         "alive=1; \
          for i in $(seq 1 100); do \
            if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
            sleep 0.1; \
          done; \
-         if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
+         if [ \"$alive\" = 1 ] && [ -n \"{expect}\" ]; then \
+           now=$(ps -o comm= -p {pid} 2>/dev/null); \
+           case \"$now\" in \
+             *{expect}*) kill -9 {pid} 2>/dev/null; sleep 0.5;; \
+             *) alive=stale; \
+                echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: pid {pid} is now '$now', not ours; not killing\" >> {log_quoted};; \
+           esac; \
+         fi; \
          {launch}"
     )
 }
@@ -9096,6 +9137,84 @@ Some unrelated content.
         );
     }
 
+    /// The gate is only as good as the name it matches on, and that name is not
+    /// the executable's: the Linux .deb ships `/usr/bin/headroom-desktop` while
+    /// the kernel reports `headroom`. Check the derivation against what `ps`
+    /// actually says about this very process.
+    #[cfg(unix)]
+    #[test]
+    fn relauncher_expect_name_matches_what_ps_reports() {
+        let expect = super::relauncher_expect_name();
+        assert!(!expect.is_empty(), "no name to gate the force-kill on");
+
+        let out = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("run ps");
+        let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        assert!(
+            reported.contains(&expect),
+            "gate would never fire: ps reports {reported:?}, gate matches on {expect:?}"
+        );
+    }
+
+    /// The force-kill must sit behind the identity check, not beside it: this
+    /// script SIGKILLs a pid it resolved up to 10 seconds earlier.
+    #[cfg(unix)]
+    #[test]
+    fn relauncher_force_kill_is_gated_on_identity() {
+        let script = super::relauncher_script(4242, "headroom", "true");
+        let gate = script
+            .find("ps -o comm= -p 4242")
+            .expect("no identity check");
+        let kill = script.find("kill -9 4242").expect("no force-kill");
+        assert!(
+            gate < kill,
+            "force-kill runs before the identity check: {script}"
+        );
+        assert!(
+            script[gate..kill].contains("*headroom*)"),
+            "force-kill is not inside the matching case arm: {script}"
+        );
+    }
+
+    /// An app that exited on its own must be relaunched without any kill at all.
+    #[cfg(unix)]
+    #[test]
+    fn relauncher_skips_the_kill_when_the_app_already_exited() {
+        let dir = std::env::temp_dir().join(format!("hr-relaunch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let marker = dir.join("launched");
+
+        // A pid that is dead for certain: spawn, reap, then reuse its number.
+        let mut done = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let dead = done.id();
+        done.wait().expect("reap");
+
+        let script = super::relauncher_script(
+            dead,
+            "headroom",
+            &format!("touch {}", super::shell_quote_path(&marker)),
+        );
+        let started = std::time::Instant::now();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run relauncher");
+
+        assert!(status.success(), "relauncher failed: {script}");
+        assert!(marker.exists(), "launch never ran: {script}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited on a pid that was already gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The relauncher only ever runs after we are dead, so a quoting slip in it
     /// is silent until a user updates and never comes back. Syntax-check the
     /// real snippets (both carry quotes, `$(...)`, and a path with a space).
@@ -9114,11 +9233,13 @@ Some unrelated content.
             // Linux
             format!(
                 "{app} >/dev/null 2>&1 & \
-                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {app} pid $! (alive=$alive)\" >> {log}"
+                 new=$!; sleep 1; \
+                 if kill -0 $new 2>/dev/null; then st=running; else st=DIED; fi; \
+                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {app} pid $new ($st, alive=$alive)\" >> {log}"
             ),
         ];
         for launch in launches {
-            let script = super::relauncher_script(4242, &launch);
+            let script = super::relauncher_script(4242, "headroom", &launch);
             assert!(
                 script.contains("kill -9 4242"),
                 "lost the force-kill backstop: {script}"

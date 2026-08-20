@@ -6256,7 +6256,7 @@ export default function App() {
                 <h1>{calloutTitle}</h1>
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">
-                    {platformPreviewNotice} Please report any issues you encounter to{" "}
+                    {platformPreviewNotice} Please report any issues to{" "}
                     <button
                       type="button"
                       className="link-button"
