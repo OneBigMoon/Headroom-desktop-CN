@@ -3256,7 +3256,25 @@ impl AppState {
     }
 
     pub fn stop_headroom(&self) {
-        let _lifecycle_guard = self.lifecycle_lock.lock();
+        // `ensure_headroom_running` holds this lock across a blocking backend
+        // start, so a launch racing this stop can hold it for the length of that
+        // spawn. Quit must not wait on it: `restart_app` calls us before it can
+        // post the exit request, so a lock held here leaves the app alive with
+        // its window stuck on "Restarting..." and no relaunch - and it is the
+        // only unbounded wait on that path (the child wait below is capped at
+        // 2s, the analytics flush at 3s). Stop unguarded rather than never: the
+        // caller has already set SHUTTING_DOWN, and the pkill sweep at the end
+        // reaps whatever a racing spawn manages to leave behind.
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .try_lock_for(STOP_LIFECYCLE_LOCK_TIMEOUT)
+            .or_else(|| {
+                log::warn!(
+                    "stop_headroom: lifecycle lock still held after {}s; stopping without it",
+                    STOP_LIFECYCLE_LOCK_TIMEOUT.as_secs()
+                );
+                None
+            });
         // Every app-initiated stop is a down window we caused: a watchdog
         // restart, a pricing-gate pause, a port rebind, quit. The down->up
         // transition that follows is not an outage worth paging, and when the
@@ -6981,6 +6999,10 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
 
 /// Terminate a process tree. Windows uses taskkill /T (subtree); Unix signals
 /// the process group by negating the pid.
+/// How long `stop_headroom` waits for a concurrent lifecycle transition before
+/// stopping the backend anyway.
+const STOP_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
         let mut command = crate::proc::command("taskkill");
@@ -8490,6 +8512,42 @@ mod tests {
         assert_eq!(
             most_recent_monday(NaiveDate::from_ymd_opt(2026, 5, 3).unwrap()),
             NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
+    }
+
+    /// A launch racing a quit used to strand the app: `stop_headroom` waited on
+    /// `lifecycle_lock` forever, so `restart_app` never reached the exit request
+    /// and the window sat on "Restarting..." until it was killed by hand.
+    #[test]
+    fn stop_headroom_gives_up_on_a_held_lifecycle_lock() {
+        let base_dir = temp_test_dir("headroom-stop-lifecycle-lock");
+        let state = std::sync::Arc::new(AppState::new_in(base_dir.clone()).expect("app state"));
+
+        let holder = std::sync::Arc::clone(&state);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = holder.lifecycle_lock.lock();
+            locked_tx.send(()).expect("signal locked");
+            // Outlive the timeout, then let the guard drop.
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().expect("lock taken");
+
+        let started = Instant::now();
+        state.stop_headroom();
+        let waited = started.elapsed();
+
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread");
+
+        assert!(
+            waited >= super::STOP_LIFECYCLE_LOCK_TIMEOUT,
+            "returned before the lock timeout ({waited:?}), so it never waited for the lock"
+        );
+        assert!(
+            waited < super::STOP_LIFECYCLE_LOCK_TIMEOUT * 4,
+            "stop_headroom blocked on the held lifecycle lock for {waited:?}"
         );
     }
 
