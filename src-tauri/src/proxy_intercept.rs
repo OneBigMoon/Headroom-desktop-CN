@@ -763,6 +763,9 @@ async fn handle(
     let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
     let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
     let is_chatgpt_codex = is_codex && request_uses_chatgpt_auth(&buf);
+    let is_local_backend_path = parsed_head
+        .as_ref()
+        .is_some_and(|head| is_local_proxy_path(&head.path));
     // OpenCode is classified by User-Agent, not path: it speaks both API
     // shapes (`/v1/messages` and `/v1/responses`), so path-based
     // classification would split it between the Claude and Codex buckets.
@@ -921,7 +924,16 @@ async fn handle(
     // !is_grok: a grok request on a non-OpenAI path must not be direct-
     // forwarded to api.anthropic.com with its xAI bearer; the backend stays
     // alive whenever grok is enabled, so falling through is always routable.
-    if !is_codex && !is_opencode && !is_grok && claude_only_bypass.load(Ordering::Acquire) {
+    // Local backend paths (/stats, /readyz, ...) also fall through: the backend
+    // is alive here (it is serving Codex), but the direct forwarder dead-ends
+    // them in its local-path 503 guard, so the dashboard lost the layers a
+    // live backend was ready to serve for the whole claude-only window.
+    if !is_codex
+        && !is_opencode
+        && !is_grok
+        && !is_local_backend_path
+        && claude_only_bypass.load(Ordering::Acquire)
+    {
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }

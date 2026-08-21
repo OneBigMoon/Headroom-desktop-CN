@@ -11,6 +11,10 @@ it unprompted and the harness enforces the rest. Do not re-add it.
 - Frontend changes: `npx tsc --noEmit` and any relevant Vitest suite. For visual changes, see Styling Rules.
 - If a test cannot be run in this environment, say so explicitly rather than skipping silently.
 
+## Wheel Bump Rules
+- Before changing `HEADROOM_PINNED_VERSION`: diff upstream `savings_tracker.py`, `prometheus_metrics.py`, and `server.py` between the old and new pins, and check every consumed field against `stats_contract_pins_every_consumed_path` in state.rs. Upstream has silently redefined persisted savings fields before (0.36.0 widened `compression_savings_usd`); the savings-rate canary in state.rs is the runtime tripwire, this diff is the compile-time one.
+- Re-pick every platform's wheel URL/sha256 when bumping (see the pin comment in tool_manager.rs).
+
 ## Persistence Rules
 Most stability bugs in this codebase's history were violations of one of these five. Follow them for any new code; treat violations found in existing code as bugs.
 - Anything persisted uses `client_adapters::atomic_write` (tmp+rename), never plain `fs::write`. Crash mid-write must not truncate state.

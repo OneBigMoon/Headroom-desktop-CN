@@ -169,10 +169,12 @@ grep -c 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log
 grep 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log \
   | sed -n 's/.*mutation_reasons=\([^ ]*\).*/\1/p' | tr ',' '\n' | sort | uniq -c
 ```
-Expect *today*: non-zero, listing only `output_shaper` and/or `image_compression`. That is upstream #2990 - on any turn whose history carries a signed `thinking` block, `select_outbound_body` forwards client bytes and discards every mutation, while PERF still counts them as delivered. Baseline observed on 0.8.1-rc.1 / headroom-ai 0.35.0: ~2,900 `output_shaper` and ~765 `image_compression` discards across ~6,400 outbound requests.
+Expect *today*: non-zero, listing only `output_shaper`, `image_compression`, and/or `structural_diff_vs_original`. That is upstream #2990 - on any turn whose history carries a signed `thinking` block, `select_outbound_body` forwards client bytes and discards every mutation, while PERF still counts them as delivered. Baseline observed on 0.8.1-rc.1 / headroom-ai 0.35.0: ~2,900 `output_shaper` and ~765 `image_compression` discards across ~6,400 outbound requests.
+
+`structural_diff_vs_original` is the one to read first, not last. The core compression pipeline never calls `mark_mutated` - grep the package and the reason vocabulary has no entry for it - so compression is only ever noticed by the structural safety net at the end of `handle_anthropic_messages`, which fires when no transform reported a mutation but the final body differs from the parsed original bytes. That makes this reason the label core compression lands under by omission, and a discard under it is the pipeline's own work being thrown away, which costs more than losing a shaping pass. It also means the share is not fixed: measured 7.6%-60% of mutated requests across six logs on 0.8.5-rc.1, tracking how much real compression happened. Do not read a ~3% reading as the `HEADROOM_OUTPUT_HOLDOUT=0.03` control arm - the arm gate and this one are unrelated, and the resemblance is a coincidence of whichever subset you counted.
 
 Two things make this a FAIL rather than a known-issue note:
-- any reason appearing that is **not** `output_shaper` / `image_compression` - a new transform just joined the silent-discard set;
+- any reason appearing that is **not** `output_shaper` / `image_compression` / `structural_diff_vs_original` - a new transform just joined the silent-discard set;
 - a **non-zero count at all**, once a wheel bump lands upstream PR #3015. Delete this paragraph and promote 11b to "expect `0`" at that bump.
 
 Do not try to derive this from PERF `transforms=` instead. That field includes detector-only and no-op entries (`router:noop`, `router:protected:error_output`), so joining it against `source=` reports ~1,100 false positives per log file. `mutation_reasons` is only written when the body actually changed.
@@ -236,12 +238,15 @@ cat /tmp/hr-preupgrade/*.json /tmp/hr-preupgrade/claude-md.txt
 **After installing and launching the rc**, re-run the same three `jq` expressions and diff:
 ```bash
 S=~/Library/Application\ Support/Headroom
+stat -f '%Sm %N' /tmp/hr-preupgrade/*   # must predate THIS install, not an older one
 diff <(jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json") /tmp/hr-preupgrade/pricing.json
 diff <(jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json") /tmp/hr-preupgrade/setup.json
 jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json"
 ls "$S/config/" | grep -c '\.corrupt$'
 ```
 Expect: `first_seen_at` byte-identical (`paywall_first` may legitimately change - the server owns it), the configured-client and shell-file key sets unchanged, and `0` quarantine files. (Use `grep -c`, not `ls *.corrupt`: zsh aborts the whole line with `no matches found` when the glob is empty, which is the healthy case.)
+
+Check the snapshot's mtime before trusting a clean diff. `/tmp/hr-preupgrade` survives across rcs, so a run that forgot the pre-install step silently diffs against a snapshot from two builds ago - which passes, but tests the wrong upgrade. If the mtime predates the build you just replaced, say so in the report rather than claiming this rc preserved state.
 
 `activity-facts.json` is the deliberate exception: a `schemaVersion` bump intentionally drops the tile slots, so it needs its own comparison rather than a `diff`. What must survive a bump is `allTimeRecordTokens` and `lastWeeklyRecapWeekKey` - wiping those re-fires the weekly recap and resets all-time records for every user, which has happened on four bumps so far.
 

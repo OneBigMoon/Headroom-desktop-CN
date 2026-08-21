@@ -51,6 +51,20 @@ const HEADROOM_BASELINE_SEED_TIMEOUT: Duration = Duration::from_secs(30);
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
 const VENDOR_WHEELS_INDEX_URL: &str =
     "https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1";
+/// Never let pip build a dependency from source. A user's machine is not
+/// guaranteed to have Xcode Command Line Tools (nor the Rust toolchain
+/// pydantic-core's sdist needs), and requiring either to install a desktop app
+/// is not a bargain we get to make. Every pin we install has a wheel for every
+/// platform we ship -- the one sdist-only dependency, hnswlib, is served as a
+/// prebuilt wheel from `VENDOR_WHEELS_INDEX_URL` -- so in the healthy case this
+/// flag changes nothing. It only bites when a wheel is *missing*: without it
+/// pip silently falls back to the sdist and spends minutes compiling before
+/// dying on a clang/cargo error no user can act on; with it pip fails at once
+/// with "no matching distribution found", which `classify_bootstrap_failure`
+/// already recognises and explains. Deliberately NOT applied to the optional
+/// markitdown/serena addons: their transitive sets are unpinned and unaudited,
+/// and a failed addon leaves a working Headroom behind.
+const PIP_ONLY_BINARY: &str = "--only-binary=:all:";
 // headroom binds on the backend port chosen at spawn time (default 6768);
 // the intercept layer on 6767 forwards to it. The backend port is dynamic
 // because something else on the machine (e.g. rapportd) can claim 6768 at
@@ -238,7 +252,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports three fixes owed upstream (remove each once a wheel ships it),
+Also ports four fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -266,6 +280,21 @@ clamp optimized to 0 and record savings rates above 100% ("4,436 -> 0,
 request's tools schema once per compressed HTTP request and widens the
 recorded pair at the outcome funnel so original - optimized == saved.
 Kill switch: HEADROOM_RESPONSES_DENOMINATOR_GUARD=0.
+Codex additional_tools guard (upstream issue #3185): Codex CLI 0.149.0
+stopped sending a top-level tools array on /v1/responses for models its
+capability cache flags (gpt-5.6-sol, its default) -- tool definitions
+ride inside input as items of type "additional_tools". Every tools
+consumer in the proxy (tool_schema_compaction, the output-shaper
+stratum, the tools token counts, the denominator guard above) reads
+only payload["tools"], so those requests classify "notools" and record
+zero savings (2026-08-21: 0/13 afternoon signups and 42/54 active
+codex users with frozen savings). The guard lifts the items' tools into
+a top-level array and drops the items from input before compression;
+the classic encoding is verified accepted by the ChatGPT Codex backend
+(live tool calls execute; Codex 0.142.4 sends it for the same model).
+No version gate: it self-neutralizes when payload["tools"] is already
+present, and 0.36.2 has no additional_tools support either. Kill
+switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
 """
 import faulthandler
 import signal
@@ -715,6 +744,78 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return await _hd_rd_orig_record(self, outcome)
 
                 _hd_rd_server.HeadroomProxy._record_request_outcome = _hd_rd_record
+    except Exception:
+        pass
+
+    # Codex additional_tools guard (upstream issue #3185; remove once a wheel
+    # ships support -- see the module docstring for the failure mode). Applied
+    # AFTER the denominator guard so this wrapper is outermost: the lift runs
+    # first at runtime and every inner layer (denominator widening included)
+    # sees the classic top-level tools shape. In-place on the caller's payload,
+    # so the outbound canonical serialization carries the lifted form too --
+    # deliberate: the ChatGPT Codex backend accepts the classic encoding for
+    # these models (Codex 0.142.4 still sends it), verified with live tool
+    # calls. Kill switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_ADDITIONAL_TOOLS_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import logging as _hd_at_logging
+
+            import headroom.proxy.handlers.openai as _hd_at_openai
+
+            _hd_at_log = _hd_at_logging.getLogger("headroom.proxy")
+            _hd_at_announced = False
+
+            def _hd_at_lift(payload):
+                # Lift additional_tools input items into a top-level tools
+                # array, in place. No-op (0) unless the request uses the
+                # Codex >= 0.149.0 encoding and has no top-level tools.
+                global _hd_at_announced
+                if not isinstance(payload, dict) or payload.get("tools"):
+                    return 0
+                items = payload.get("input")
+                if not isinstance(items, list):
+                    return 0
+                lifted = []
+                kept = []
+                for item in items:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "additional_tools"
+                        and isinstance(item.get("tools"), list)
+                        and item["tools"]
+                    ):
+                        lifted.extend(item["tools"])
+                    else:
+                        kept.append(item)
+                if not lifted:
+                    return 0
+                payload["tools"] = lifted
+                payload["input"] = kept
+                if not _hd_at_announced:
+                    _hd_at_announced = True
+                    _hd_at_log.info(
+                        "event=codex_additional_tools_lifted tools=%d "
+                        "(codex >= 0.149.0 encoding; desktop guard active)",
+                        len(lifted),
+                    )
+                return len(lifted)
+
+            _hd_at_orig_compress = (
+                _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
+            )
+
+            async def _hd_at_compress(self, payload, **kwargs):
+                try:
+                    _hd_at_lift(payload)
+                except Exception:
+                    pass
+                return await _hd_at_orig_compress(self, payload, **kwargs)
+
+            _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
+                _hd_at_compress
+            )
     except Exception:
         pass
 "#;
@@ -2314,6 +2415,22 @@ impl ToolManager {
                         "HEADROOM_SAVINGS_PROFILE",
                         savings_profile_for_runtime(self.installed_headroom_version().as_deref()),
                     )
+                    // cc-switch reconciler. Off upstream by default; the desktop
+                    // opts in so a user who points Claude Code at a third-party
+                    // Anthropic-compatible endpoint (Kimi, DeepSeek, GLM) keeps
+                    // Headroom in the path instead of dropping out of it. The
+                    // reconciler captures that endpoint as the proxy upstream and
+                    // rewrites env.ANTHROPIC_BASE_URL back to us, leaving the
+                    // user's token untouched -- so their traffic is still
+                    // compressed, and token-priced providers are exactly where
+                    // compression is worth the most. Version-gated: see
+                    // cc_switch_reconcile_for_runtime.
+                    .env(
+                        "HEADROOM_CC_SWITCH_RECONCILE",
+                        cc_switch_reconcile_for_runtime(
+                            self.installed_headroom_version().as_deref(),
+                        ),
+                    )
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
                     // event loop from CPU-bound compression. The desktop runs with
@@ -3069,6 +3186,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--find-links",
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
@@ -3419,17 +3537,44 @@ impl ToolManager {
             .is_ok()
     }
 
+    /// Creates the venv, then installs pip into it as a separate step.
+    ///
+    /// `python -m venv` runs ensurepip through `subprocess.check_output` and
+    /// re-raises only the exit status, so the child's own stderr is captured
+    /// into an exception venv never prints. A failure there reached us as the
+    /// bare string "Command '[... -m ensurepip ...]' returned non-zero exit
+    /// status 1" -- no cause, no keyword for `pip_failure_category` to match,
+    /// so it landed in the `other` grab-bag (Sentry RUST-82, an install-blocking
+    /// dead end on 0.8.4 with nothing in it to act on).
+    ///
+    /// Running the two steps ourselves is what venv does internally, but now
+    /// ensurepip's stderr comes back as a first-class `CommandFailure` that the
+    /// categoriser can bucket. `build_command` already clears
+    /// PYTHONHOME/PYTHONPATH and sets PYTHONNOUSERSITE, which is the isolation
+    /// venv applies to this call, so the explicit invocation is equivalent.
+    ///
+    /// A venv left pip-less by a failure here is not a dead end: it fails
+    /// `managed_venv_has_pip`, so the next launch treats it as absent and
+    /// re-runs this whole function.
     fn create_managed_venv(&self) -> Result<()> {
         run_python_command(
             &self.runtime.standalone_python(),
             &[
                 "-m",
                 "venv",
+                "--without-pip",
                 self.runtime.venv_dir.to_string_lossy().as_ref(),
             ],
             &self.runtime.root_dir,
         )
         .context("creating Headroom-managed virtualenv")?;
+
+        run_python_command(
+            &self.runtime.managed_python(),
+            &["-m", "ensurepip", "--upgrade", "--default-pip"],
+            &self.runtime.root_dir,
+        )
+        .context("installing pip into the Headroom-managed virtualenv")?;
 
         run_python_command(
             &self.runtime.managed_python(),
@@ -3518,6 +3663,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--find-links",
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
@@ -3565,6 +3711,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -4446,6 +4593,7 @@ impl ToolManager {
                     "180",
                     "--retries",
                     "10",
+                    PIP_ONLY_BINARY,
                     "--find-links",
                     VENDOR_WHEELS_INDEX_URL,
                     "--extra-index-url",
@@ -4530,6 +4678,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -4640,6 +4789,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -4673,6 +4823,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -4694,6 +4845,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -4720,6 +4872,7 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
+                PIP_ONLY_BINARY,
                 "--find-links",
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
@@ -7281,6 +7434,44 @@ fn savings_profile_for_runtime(installed_version: Option<&str>) -> &'static str 
     }
 }
 
+/// First bundled runtime carrying the cc-switch reconciler's Official-branch
+/// upstream reset (upstream PR #3166). The reconciler itself has shipped since
+/// 0.29.0, but before the reset a switch back to Claude Official left the
+/// previously captured third-party endpoint live on
+/// `HeadroomProxy.ANTHROPIC_API_URL` -- a process-wide class attr -- so every
+/// Anthropic client on this proxy kept reaching e.g. api.deepseek.com while
+/// sending Anthropic OAuth credentials. Bump this the release the fix lands in;
+/// until then the gate below keeps the flag off.
+const CC_SWITCH_RESET_MIN_VERSION: (u64, u64, u64) = (0, 36, 3);
+
+/// Whether to opt this runtime into the cc-switch reconciler.
+///
+/// Defaults to off for an unreadable version and for the 0.28.0 fallback the
+/// app drops to when boot validation times out: enabling the reconciler on a
+/// runtime without the reset is worse than leaving it off, because it only
+/// misroutes AFTER the user has already switched providers once.
+fn cc_switch_reconcile_for_runtime(installed_version: Option<&str>) -> &'static str {
+    let Some(version) = installed_version else {
+        return "0";
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    let parsed = (
+        parts.next().flatten(),
+        parts.next().flatten(),
+        parts.next().flatten(),
+    );
+    match parsed {
+        (Some(major), Some(minor), Some(patch)) => {
+            if (major, minor, patch) >= CC_SWITCH_RESET_MIN_VERSION {
+                "1"
+            } else {
+                "0"
+            }
+        }
+        _ => "0",
+    }
+}
+
 fn headroom_entrypoint_startup_args(
     installed_version: Option<&str>,
     learn_enabled: bool,
@@ -7350,6 +7541,39 @@ fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
 pub fn running_proxy_argv() -> Option<String> {
     let (_, pid) = listener_process(backend_port::get())?;
     ps_command(pid)
+}
+
+/// Identity of whatever is listening on `port`, for diagnostics that need to
+/// tell a foreign squatter from an orphaned old Headroom: a port that answers
+/// HTTP without the backend's routes is invisible to the readyz gate (a 404
+/// there deliberately counts as reachable), so the listener's name is the one
+/// fact that resolves the ambiguity. Best-effort: `None` where lsof is
+/// unavailable (Windows), and the caller's message must read fine without it.
+pub(crate) fn listener_identity(port: u16) -> Option<String> {
+    let (cmd, pid) = listener_process(port)?;
+    Some(format_listener_identity(
+        &cmd,
+        pid,
+        ps_command(pid).as_deref(),
+    ))
+}
+
+fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {
+    const MAX_ARGV: usize = 160;
+    let argv = argv.map(str::trim).unwrap_or_default();
+    if argv.is_empty() {
+        return format!("{cmd} (pid {pid})");
+    }
+    let mut argv = argv.to_string();
+    if argv.len() > MAX_ARGV {
+        let cut = (0..=MAX_ARGV)
+            .rev()
+            .find(|i| argv.is_char_boundary(*i))
+            .unwrap_or(0);
+        argv.truncate(cut);
+        argv.push_str("...");
+    }
+    format!("{cmd} (pid {pid}): {argv}")
 }
 
 /// True if the running proxy's argv contains every flag we expect this build
@@ -8427,7 +8651,10 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
         .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONIOENCODING", "utf-8")
+        // `backslashreplace`, matching `proc::command` -- plain "utf-8" here
+        // silently overrode it and re-armed the RUST-7C UnicodeEncodeError kill
+        // for every child this builds (a lone surrogate must not be fatal).
+        .env("PYTHONIOENCODING", "utf-8:backslashreplace")
         .env("LC_ALL", "C.UTF-8")
         .env("LANG", "C.UTF-8")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
@@ -8517,21 +8744,42 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
         failure.stdout.as_str()
     };
     let trimmed = source.trim_end();
-    let tail = if trimmed.len() > TAIL_BUDGET {
-        // Byte offset, so walk forward to a char boundary before slicing:
-        // pip on a non-English Windows locale emits multi-byte stderr and
-        // `&trimmed[start..]` would panic mid-character.
-        let mut start = trimmed.len() - TAIL_BUDGET;
-        while !trimmed.is_char_boundary(start) {
-            start += 1;
-        }
-        let aligned = trimmed[start..]
-            .find('\n')
-            .map(|i| start + i + 1)
-            .unwrap_or(start);
-        &trimmed[aligned..]
+    // "The reason lives at the end" holds for pip run directly, but not when it
+    // is reached through ensurepip: pip prints its `ERROR:` diagnosis, then a
+    // Python traceback follows, so the tail is `CalledProcessError ... returned
+    // non-zero exit status 1` -- the one line in the whole stream with no cause
+    // in it. That is how RUST-82 reached triage: an install-blocking venv
+    // failure classified `other`, with nothing in it to act on. Where pip named
+    // a reason, start from it; otherwise the tail is still the best guess.
+    let from_pip_error = if trimmed.starts_with("ERROR: ") {
+        Some(trimmed)
     } else {
-        trimmed
+        trimmed.find("\nERROR: ").map(|i| &trimmed[i + 1..])
+    };
+    let tail = match from_pip_error {
+        // Byte offsets, so walk to a char boundary before slicing: pip on a
+        // non-English Windows locale emits multi-byte stderr and slicing
+        // mid-character would panic.
+        Some(head) if head.len() > TAIL_BUDGET => {
+            let mut end = TAIL_BUDGET;
+            while !head.is_char_boundary(end) {
+                end -= 1;
+            }
+            &head[..end]
+        }
+        Some(head) => head,
+        None if trimmed.len() > TAIL_BUDGET => {
+            let mut start = trimmed.len() - TAIL_BUDGET;
+            while !trimmed.is_char_boundary(start) {
+                start += 1;
+            }
+            let aligned = trimmed[start..]
+                .find('\n')
+                .map(|i| start + i + 1)
+                .unwrap_or(start);
+            &trimmed[aligned..]
+        }
+        None => trimmed,
     };
     let exit = failure
         .exit_code
@@ -8548,7 +8796,7 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
 /// One flat bucket would be the opposite mistake: resolving a shipped fix would
 /// regress the instant an unrelated cause reappeared (RUST-5Q). These classes
 /// match the buckets triage already sorts these into by hand.
-fn pip_failure_category(compact: &str) -> &'static str {
+pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
@@ -9025,10 +9273,11 @@ mod tests {
     use super::rotate_log_if_large;
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
-        bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
-        diagnose_proxy_port, exe_path_is_under, extract_required_pydantic_core_version,
-        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
+        bootstrap_requirements_lock_for_target, build_command, cc_switch_reconcile_for_runtime,
+        classify_kompress_prefetch_failure, codebase_memory_distribution_artifact,
+        compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
+        extract_required_pydantic_core_version, format_all_foreign_bail,
+        format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
@@ -9334,6 +9583,36 @@ mod tests {
         assert!(py.contains("HEADROOM_RESPONSES_DENOMINATOR_GUARD"));
         // The stash must be bounded: entries for failed requests never pop.
         assert!(py.contains("_HD_RD_MAX"));
+    }
+
+    #[test]
+    fn sitecustomize_lifts_codex_additional_tools() {
+        // Upstream issue #3185: Codex CLI 0.149.0 moved tool definitions off
+        // the top-level tools array into input items of type
+        // "additional_tools" (gpt-5.6-sol default), so every tools consumer
+        // classified those requests "notools" and savings recorded zero.
+        // Verified live against the ChatGPT Codex backend on 2026-08-21:
+        // lifted requests compact (608 tokens/turn) and tool calls execute.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_ADDITIONAL_TOOLS_GUARD"));
+        assert!(py.contains(r#"item.get("type") == "additional_tools""#));
+        // Self-neutralizes on classic-encoding requests: a present top-level
+        // tools array must short-circuit the lift.
+        assert!(py.contains(r#"or payload.get("tools"):"#));
+        // The wrapper must be installed on the executor seam (the single
+        // funnel for HTTP, WS, and passthrough responses compression)...
+        assert!(py.contains(
+            "_hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = ("
+        ));
+        // ...and AFTER the denominator guard's wrapper of the same method, so
+        // the lift is outermost and the widening sees the lifted tools.
+        let lift_pos = py
+            .find("_hd_at_openai.OpenAIHandlerMixin")
+            .expect("lift patch present");
+        let denom_pos = py
+            .find("_hd_rd_openai.OpenAIHandlerMixin")
+            .expect("denominator patch present");
+        assert!(denom_pos < lift_pos);
     }
 
     #[test]
@@ -10186,6 +10465,23 @@ mod tests {
     }
 
     #[test]
+    fn listener_identity_formats_and_truncates_on_char_boundaries() {
+        assert_eq!(
+            super::format_listener_identity("nginx", 42, None),
+            "nginx (pid 42)"
+        );
+        assert_eq!(
+            super::format_listener_identity("python3.12", 7, Some("  headroom proxy --port 6767 ")),
+            "python3.12 (pid 7): headroom proxy --port 6767"
+        );
+        // A multibyte char straddling the cap must not panic the truncate.
+        let argv = format!("{}é", "x".repeat(159));
+        let got = super::format_listener_identity("app", 1, Some(&argv));
+        assert!(got.ends_with("..."), "{got}");
+        assert!(got.len() < 200);
+    }
+
+    #[test]
     fn proxy_argv_matches_when_all_expected_flags_present() {
         let argv = "/Users/x/headroom proxy --port 6768 --log-messages \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
@@ -10369,7 +10665,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The real path observed on a Windows box was
     /// `...\Headroom\headroom\runtime\python\python.exe` -- the BASE
     /// interpreter. A first cut of this gate required "venv" in the path, which
@@ -10450,6 +10745,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn parse_lsof_listener_reads_the_row_below_the_header() {
         let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
                    python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";
@@ -10837,6 +11133,31 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert_eq!(savings_profile_for_runtime(Some("garbage")), "coding");
     }
 
+    /// The cc-switch reconciler must stay off on any runtime without the
+    /// Official-branch upstream reset (upstream PR #3166). Enabling it there
+    /// leaves a captured third-party endpoint live process-wide after the user
+    /// switches back to Claude Official, so Anthropic OAuth traffic goes to the
+    /// old provider. Unlike the savings persona, an unreadable version fails
+    /// CLOSED: the flag is an opt-in, and off is always the safe answer.
+    #[test]
+    #[serial_test::serial(backend_port)]
+    fn cc_switch_reconcile_gated_on_runtime_version() {
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.35.0")), "0");
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36.2")), "0");
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36.3")), "1");
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.37.0")), "1");
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("1.0.0")), "1");
+        // Unreadable version or the 0.28.0 boot-validation fallback: stay off.
+        assert_eq!(cc_switch_reconcile_for_runtime(None), "0");
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("garbage")), "0");
+        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36")), "0");
+        // The currently pinned wheel predates the fix, so this ships inert.
+        assert_eq!(
+            cc_switch_reconcile_for_runtime(Some(HEADROOM_PINNED_VERSION)),
+            "0"
+        );
+    }
+
     /// Regression: `start_headroom_background` previously built `startup_variants`
     /// before pre-flight ran, so when fallback called `backend_port::set(6769)`
     /// the variants still spawned with `--port 6768` and both failed with
@@ -11177,6 +11498,61 @@ after
         .expect("receipt");
         let manager = ToolManager::new(runtime.clone());
         (root, runtime, manager)
+    }
+
+    /// RUST-82: `python -m venv` runs ensurepip through `check_output` and
+    /// re-raises only its exit status, so an install-blocking failure reached
+    /// Sentry as a bare "returned non-zero exit status 1" with the cause
+    /// discarded. Creating the venv without pip and running ensurepip ourselves
+    /// is what venv does internally, but keeps ensurepip's stderr. If anyone
+    /// folds these back into one step, that blind spot returns.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn create_managed_venv_runs_ensurepip_as_its_own_step() {
+        let (root, runtime, manager) = seed_test_runtime("venv-ensurepip-split");
+        let log = root.join("argv.log");
+        let script = format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display());
+        write_executable(&runtime.standalone_python(), &script);
+        write_executable(&runtime.managed_python(), &script);
+
+        manager.create_managed_venv().expect("fake python succeeds");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let mut lines = calls.lines();
+        assert_eq!(
+            lines.next().map(str::to_string),
+            Some(format!(
+                "-m venv --without-pip {}",
+                runtime.venv_dir.to_string_lossy()
+            )),
+            "venv is created without pip: {calls}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("-m ensurepip --upgrade --default-pip"),
+            "ensurepip runs as its own command, so its stderr survives: {calls}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("-m pip --version"),
+            "pip is still verified afterwards: {calls}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `build_command` set plain "utf-8", silently overriding the
+    /// `utf-8:backslashreplace` that `proc::command` applies on purpose -- which
+    /// re-armed the RUST-7C UnicodeEncodeError kill for every python child
+    /// built here (a lone surrogate in a log line must not be fatal).
+    #[test]
+    fn build_command_keeps_the_backslashreplace_stdio_encoding() {
+        let cmd = build_command(Path::new("python3"), &["-V"], Path::new("."));
+        let encoding = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PYTHONIOENCODING"))
+            .and_then(|(_, value)| value)
+            .expect("PYTHONIOENCODING is set");
+        assert_eq!(encoding, std::ffi::OsStr::new("utf-8:backslashreplace"));
     }
 
     #[test]
@@ -12872,6 +13248,55 @@ exit 0
         })
     }
 
+    /// RUST-82: an install-blocking venv failure that reached triage with no
+    /// cause in it. Two defects stacked. `python -m venv` runs ensurepip via
+    /// `check_output` and re-raises only the exit status, so all Sentry ever saw
+    /// was "Command '[... -m ensurepip ...]' returned non-zero exit status 1";
+    /// and even once ensurepip is run directly, pip's `ERROR:` line is followed
+    /// by a traceback, so the 300-byte tail kept the traceback and dropped the
+    /// diagnosis. Verified against the real stderr of a failing ensurepip.
+    #[test]
+    fn compact_pip_failure_keeps_pips_diagnosis_ahead_of_a_traceback() {
+        let stderr = concat!(
+            "ERROR: Could not install packages due to an OSError: ",
+            "[Errno 13] Permission denied: '/opt/venv/lib/python3.14/site-packages/pip'\n",
+            "Check the permissions.\n",
+            "\n",
+            "Traceback (most recent call last):\n",
+            "  File \"<frozen runpy>\", line 203, in _run_module_as_main\n",
+            "  File \"/usr/lib/python3.14/ensurepip/__init__.py\", line 88, in _run_pip\n",
+            "    return subprocess.run(cmd, check=True).returncode\n",
+            "  File \"/usr/lib/python3.14/subprocess.py\", line 578, in run\n",
+            "    raise CalledProcessError(retcode, process.args,\n",
+            "subprocess.CalledProcessError: Command '['/opt/venv/bin/python', '-W', ",
+            "'ignore::DeprecationWarning', '-c', 'import runpy...']' ",
+            "returned non-zero exit status 1.\n",
+        );
+        let compact = compact_pip_failure(&pip_failure(stderr));
+        assert!(
+            compact.contains("Permission denied"),
+            "pip named the cause and it must survive: {compact}"
+        );
+        assert_eq!(
+            pip_failure_category(&compact),
+            "permission",
+            "a named cause must not sit in the `other` grab-bag: {compact}"
+        );
+    }
+
+    /// The tail is still right when pip prints no `ERROR:` line at all, so the
+    /// RUST-82 fix must not cost us the ordinary case.
+    #[test]
+    fn compact_pip_failure_still_tails_when_pip_named_no_error() {
+        let stderr = format!(
+            "{}\nno matching distribution found for onnxruntime",
+            "x".repeat(400)
+        );
+        let compact = compact_pip_failure(&pip_failure(&stderr));
+        assert!(compact.ends_with("no matching distribution found for onnxruntime"));
+        assert_eq!(pip_failure_category(&compact), "no-matching-dist");
+    }
+
     #[test]
     fn compact_pip_failure_survives_multibyte_stderr() {
         // Non-English Windows locale: the 300-byte tail offset lands mid-
@@ -12880,6 +13305,27 @@ exit 0
         let compact = compact_pip_failure(&pip_failure(&stderr));
         assert!(compact.starts_with("exit=1; stderr tail: "));
         assert!(compact.contains("エラー"));
+    }
+
+    #[test]
+    fn every_index_resolving_pip_install_is_wheels_only() {
+        // A dependency built from source needs a compiler the user was never
+        // asked to have, and fails minutes later with a clang/cargo error they
+        // cannot act on. `PIP_ONLY_BINARY` prevents that -- but only on the
+        // call sites that carry it, and these arg lists are copy-pasted across
+        // nine of them. Any install that resolves from an index must be
+        // wheels-only; the optional markitdown/serena addons deliberately do
+        // not resolve from `--extra-index-url` and so are not covered here.
+        let source = include_str!("tool_manager.rs");
+        let indexed = source.matches("\"--extra-index-url\",").count();
+        // Split so this needle does not count itself in the scan above.
+        let only_binary = source.matches(concat!("PIP_ONLY_", "BINARY,")).count();
+        assert!(indexed > 0, "sanity: expected index-resolving installs");
+        assert_eq!(
+            indexed, only_binary,
+            "an index-resolving pip install is missing PIP_ONLY_BINARY \
+             ({indexed} indexed installs vs {only_binary} wheels-only)"
+        );
     }
 
     #[test]
