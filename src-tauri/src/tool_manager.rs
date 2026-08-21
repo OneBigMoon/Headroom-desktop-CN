@@ -238,7 +238,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports three fixes owed upstream (remove each once a wheel ships it),
+Also ports four fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -266,6 +266,21 @@ clamp optimized to 0 and record savings rates above 100% ("4,436 -> 0,
 request's tools schema once per compressed HTTP request and widens the
 recorded pair at the outcome funnel so original - optimized == saved.
 Kill switch: HEADROOM_RESPONSES_DENOMINATOR_GUARD=0.
+Codex additional_tools guard (upstream issue #3185): Codex CLI 0.149.0
+stopped sending a top-level tools array on /v1/responses for models its
+capability cache flags (gpt-5.6-sol, its default) -- tool definitions
+ride inside input as items of type "additional_tools". Every tools
+consumer in the proxy (tool_schema_compaction, the output-shaper
+stratum, the tools token counts, the denominator guard above) reads
+only payload["tools"], so those requests classify "notools" and record
+zero savings (2026-08-21: 0/13 afternoon signups and 42/54 active
+codex users with frozen savings). The guard lifts the items' tools into
+a top-level array and drops the items from input before compression;
+the classic encoding is verified accepted by the ChatGPT Codex backend
+(live tool calls execute; Codex 0.142.4 sends it for the same model).
+No version gate: it self-neutralizes when payload["tools"] is already
+present, and 0.36.2 has no additional_tools support either. Kill
+switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
 """
 import faulthandler
 import signal
@@ -715,6 +730,78 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return await _hd_rd_orig_record(self, outcome)
 
                 _hd_rd_server.HeadroomProxy._record_request_outcome = _hd_rd_record
+    except Exception:
+        pass
+
+    # Codex additional_tools guard (upstream issue #3185; remove once a wheel
+    # ships support -- see the module docstring for the failure mode). Applied
+    # AFTER the denominator guard so this wrapper is outermost: the lift runs
+    # first at runtime and every inner layer (denominator widening included)
+    # sees the classic top-level tools shape. In-place on the caller's payload,
+    # so the outbound canonical serialization carries the lifted form too --
+    # deliberate: the ChatGPT Codex backend accepts the classic encoding for
+    # these models (Codex 0.142.4 still sends it), verified with live tool
+    # calls. Kill switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_ADDITIONAL_TOOLS_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import logging as _hd_at_logging
+
+            import headroom.proxy.handlers.openai as _hd_at_openai
+
+            _hd_at_log = _hd_at_logging.getLogger("headroom.proxy")
+            _hd_at_announced = False
+
+            def _hd_at_lift(payload):
+                # Lift additional_tools input items into a top-level tools
+                # array, in place. No-op (0) unless the request uses the
+                # Codex >= 0.149.0 encoding and has no top-level tools.
+                global _hd_at_announced
+                if not isinstance(payload, dict) or payload.get("tools"):
+                    return 0
+                items = payload.get("input")
+                if not isinstance(items, list):
+                    return 0
+                lifted = []
+                kept = []
+                for item in items:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "additional_tools"
+                        and isinstance(item.get("tools"), list)
+                        and item["tools"]
+                    ):
+                        lifted.extend(item["tools"])
+                    else:
+                        kept.append(item)
+                if not lifted:
+                    return 0
+                payload["tools"] = lifted
+                payload["input"] = kept
+                if not _hd_at_announced:
+                    _hd_at_announced = True
+                    _hd_at_log.info(
+                        "event=codex_additional_tools_lifted tools=%d "
+                        "(codex >= 0.149.0 encoding; desktop guard active)",
+                        len(lifted),
+                    )
+                return len(lifted)
+
+            _hd_at_orig_compress = (
+                _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
+            )
+
+            async def _hd_at_compress(self, payload, **kwargs):
+                try:
+                    _hd_at_lift(payload)
+                except Exception:
+                    pass
+                return await _hd_at_orig_compress(self, payload, **kwargs)
+
+            _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
+                _hd_at_compress
+            )
     except Exception:
         pass
 "#;
@@ -9334,6 +9421,36 @@ mod tests {
         assert!(py.contains("HEADROOM_RESPONSES_DENOMINATOR_GUARD"));
         // The stash must be bounded: entries for failed requests never pop.
         assert!(py.contains("_HD_RD_MAX"));
+    }
+
+    #[test]
+    fn sitecustomize_lifts_codex_additional_tools() {
+        // Upstream issue #3185: Codex CLI 0.149.0 moved tool definitions off
+        // the top-level tools array into input items of type
+        // "additional_tools" (gpt-5.6-sol default), so every tools consumer
+        // classified those requests "notools" and savings recorded zero.
+        // Verified live against the ChatGPT Codex backend on 2026-08-21:
+        // lifted requests compact (608 tokens/turn) and tool calls execute.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_ADDITIONAL_TOOLS_GUARD"));
+        assert!(py.contains(r#"item.get("type") == "additional_tools""#));
+        // Self-neutralizes on classic-encoding requests: a present top-level
+        // tools array must short-circuit the lift.
+        assert!(py.contains(r#"or payload.get("tools"):"#));
+        // The wrapper must be installed on the executor seam (the single
+        // funnel for HTTP, WS, and passthrough responses compression)...
+        assert!(py.contains(
+            "_hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = ("
+        ));
+        // ...and AFTER the denominator guard's wrapper of the same method, so
+        // the lift is outermost and the widening sees the lifted tools.
+        let lift_pos = py
+            .find("_hd_at_openai.OpenAIHandlerMixin")
+            .expect("lift patch present");
+        let denom_pos = py
+            .find("_hd_rd_openai.OpenAIHandlerMixin")
+            .expect("denominator patch present");
+        assert!(denom_pos < lift_pos);
     }
 
     #[test]
