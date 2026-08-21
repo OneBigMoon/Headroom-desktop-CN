@@ -1517,6 +1517,18 @@ enum BootstrapFailureKind {
     /// the user's machine — the only fix is a newer app, so the message must
     /// send them to the updater instead of to their network settings.
     UnsupportedPin,
+    /// The OS refused a read/write pip needed -- a TCC prompt denied, an MDM or
+    /// endpoint-protection policy guarding the app-support directory, or a
+    /// half-owned venv left by an install that ran as another user. Retrying
+    /// changes nothing until the permission does, so the message must not send
+    /// the user back to the Try again button.
+    Permission,
+    /// pip fell back to building a package from source and the build failed.
+    /// Since every install passes `--only-binary=:all:` (see `PIP_ONLY_BINARY`)
+    /// this should be unreachable, so reaching it means *we* shipped a lock or
+    /// a vendored wheel that does not cover this machine. Never tell the user
+    /// to install Xcode: needing a compiler at all is our bug, not their setup.
+    SourceBuild,
     Other,
 }
 
@@ -1527,6 +1539,10 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::NoUsableTempDir => "no_usable_tempdir",
             BootstrapFailureKind::NetworkDownload => "network_download",
             BootstrapFailureKind::UnsupportedPin => "unsupported_pin",
+            // Same vocabulary as `pip_failure_category`, so a support mail's
+            // failure_kind lines up with the pip-layer Sentry issue.
+            BootstrapFailureKind::Permission => "permission",
+            BootstrapFailureKind::SourceBuild => "build",
             BootstrapFailureKind::Other => "other",
         }
     }
@@ -1553,6 +1569,10 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
         BootstrapFailureKind::UnsupportedPin
+    } else if is_permission_signal(&haystack) {
+        BootstrapFailureKind::Permission
+    } else if is_source_build_signal(&haystack) {
+        BootstrapFailureKind::SourceBuild
     } else if is_network_download_signal(&haystack) {
         BootstrapFailureKind::NetworkDownload
     } else {
@@ -1568,6 +1588,28 @@ fn is_unsupported_pin_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies")
+}
+
+/// True when the OS refused an operation pip needed. Shares its signal strings
+/// with `pip_failure_category`'s `permission` bucket so the two layers agree.
+/// Checked before [`is_network_download_signal`] for the same reason as
+/// [`is_unsupported_pin_signal`]: pip's index-URL preamble is full of network
+/// vocabulary that would otherwise win.
+fn is_permission_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("check the permissions")
+        || lower.contains("access is denied")
+        || lower.contains("errno 13")
+}
+
+/// True when pip tried to build a package from source and failed. Mirrors
+/// `pip_failure_category`'s `build` bucket.
+fn is_source_build_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("failed building wheel")
+        || lower.contains("microsoft visual c++")
+        || lower.contains("error: subprocess-exited-with-error")
 }
 
 /// True when a bootstrap failure looks like a transient network/download
@@ -1630,11 +1672,26 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
         }
         BootstrapFailureKind::UnsupportedPin => {
             "Installation failed: this version of Headroom can't build its \
-             runtime on your Mac - one of its components has no release for \
-             your processor. This is a bug in the version you're running, not \
+             runtime on this computer - one of its components has no release \
+             for your processor. This is a bug in the version you're running, not \
              a problem with your machine, and retrying will keep failing. \
              Click Check for updates to get a newer Headroom, which fixes it. \
              If no update is offered, contact support@extraheadroom.com."
+        }
+        BootstrapFailureKind::Permission => {
+            "Installation failed: Headroom wasn't allowed to write the files it \
+             needs. That is almost always security software, an MDM profile, or \
+             a permission prompt that was declined - not your network, and not \
+             something clicking Try again will change. Restart your computer and \
+             reopen Headroom. If it still fails, use Contact support below and \
+             we'll read the details it sends."
+        }
+        BootstrapFailureKind::SourceBuild => {
+            "Installation failed: Headroom couldn't assemble its runtime on this \
+             computer, because one of its components has no prebuilt release for \
+             your system. Nothing is missing on your machine - this is a bug in \
+             the version you're running. Click Check for updates to get a newer \
+             Headroom. If no update is offered, use Contact support below."
         }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
@@ -1676,6 +1733,16 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
         return;
     }
 
+    // `Other` is the grab-bag, and a grab-bag on its own fingerprint is how
+    // RUST-1G reached 123 events that no fix could resolve and no one could
+    // triage -- so the only way to quiet it was to archive it, which is why
+    // nobody was paged. pip already classifies these more finely than we do
+    // (`no-pip`, `missing-file`, ...), so borrow that to split the bucket and
+    // let each distinct cause open -- and alert on -- its own issue. The named
+    // kinds are already specific; leave their fingerprints alone.
+    let other_category = matches!(kind, BootstrapFailureKind::Other)
+        .then(|| tool_manager::pip_failure_category(&tool_manager::compact_pip_failure(err)));
+
     // Transient network/download failures are self-recoverable via the retry
     // button; report them as warnings so they don't pollute the error feed.
     let level = match kind {
@@ -1686,8 +1753,9 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     if let Some(failure) = cmd_failure {
         sentry::with_scope(
             |scope| {
-                let fp: &[&str] = &["bootstrap_failed", kind.as_str()];
-                scope.set_fingerprint(Some(fp));
+                let mut fp: Vec<&str> = vec!["bootstrap_failed", kind.as_str()];
+                fp.extend(other_category);
+                scope.set_fingerprint(Some(fp.as_slice()));
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
@@ -1725,8 +1793,9 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     } else {
         sentry::with_scope(
             |scope| {
-                let fp: &[&str] = &["bootstrap_failed", kind.as_str()];
-                scope.set_fingerprint(Some(fp));
+                let mut fp: Vec<&str> = vec!["bootstrap_failed", kind.as_str()];
+                fp.extend(other_category);
+                scope.set_fingerprint(Some(fp.as_slice()));
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
@@ -5285,6 +5354,25 @@ fn execute_headroom_learn_run(
                             scope.set_tag("learn_agent", agent.as_tag());
                             scope.set_extra("reason", warnings.clone().into());
                             scope.set_extra("project_name", project_name.to_string().into());
+                            // The marker line ends at its colon: upstream
+                            // appends the child's stderr, and `claude -p
+                            // --output-format stream-json` writes its diagnosis
+                            // to stdout, so `reason` arrives empty and every
+                            // distinct cause -- usage limit, dead local route,
+                            // our own 400 -- collapses onto one fingerprint
+                            // (RUST-74: 14 events over six users' machines with
+                            // nothing in them to tell apart). The analyzer's
+                            // surrounding log lines are the only context left
+                            // on this side of the process boundary.
+                            //
+                            // stderr ONLY. stdout echoes written memory files
+                            // back verbatim (see `learn_step_label`), and that
+                            // is the user's project content -- it must never
+                            // reach Sentry.
+                            scope.set_extra(
+                                "stderr_tail",
+                                crate::state::tail_lines(&stderr, 32).join("\n").into(),
+                            );
                             scope.set_fingerprint(Some(
                                 ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
                             ));
@@ -8244,6 +8332,105 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_denied_writes_as_permission() {
+        let err: anyhow::Error = make_command_failure(
+            "ERROR: Could not install packages due to an OSError: \
+             [Errno 13] Permission denied: '/Users/x/Library/Application Support/\
+             Headroom/headroom/runtime/venv/lib/python3.12/site-packages/foo'\n\
+             Check the permissions.",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::Permission
+        ));
+    }
+
+    #[test]
+    fn classify_bootstrap_failure_flags_a_source_build_as_source_build() {
+        // Unreachable while every install passes `--only-binary=:all:`; if it
+        // fires, a wheel we promised is missing for this machine.
+        let err: anyhow::Error = make_command_failure(
+            "  error: subprocess-exited-with-error\n\
+             error: command '/usr/bin/clang' failed with exit code 1\n\
+             ERROR: Failed building wheel for hnswlib",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::SourceBuild
+        ));
+    }
+
+    #[test]
+    fn permission_and_source_build_win_over_the_network_heuristic() {
+        // Same trap as `unsupported_pin_wins_over_the_network_heuristic`: pip
+        // names every index it consulted before it names the real failure.
+        for (stderr, expected) in [
+            (
+                "WARNING: Retrying after connection timed out\n\
+                 ERROR: Could not install packages due to an OSError: \
+                 [Errno 13] Permission denied",
+                "permission",
+            ),
+            (
+                "WARNING: Retrying after connection timed out\n\
+                 ERROR: Failed building wheel for hnswlib",
+                "build",
+            ),
+        ] {
+            let err: anyhow::Error = make_command_failure(stderr).into();
+            assert_eq!(classify_bootstrap_failure(&err).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn no_failure_message_ever_asks_the_user_to_install_a_compiler() {
+        // Needing a toolchain to install a desktop app is our bug, never the
+        // user's homework -- `PIP_ONLY_BINARY` exists so it cannot be theirs.
+        for kind in [
+            BootstrapFailureKind::SslInterception,
+            BootstrapFailureKind::NoUsableTempDir,
+            BootstrapFailureKind::NetworkDownload,
+            BootstrapFailureKind::UnsupportedPin,
+            BootstrapFailureKind::Permission,
+            BootstrapFailureKind::SourceBuild,
+            BootstrapFailureKind::Other,
+        ] {
+            let msg = user_message_for(kind).to_ascii_lowercase();
+            for banned in ["xcode", "command line tools", "compiler", "cargo", "rustup"] {
+                assert!(
+                    !msg.contains(banned),
+                    "{} message tells the user about {banned}: {msg}",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_retryable_failures_mention_the_network() {
+        // The bug behind RUST-1G was not the bad pin, it was that every cause
+        // printed "check your internet connection" over a button that could
+        // never work. Only NetworkDownload is actually retryable.
+        for kind in [
+            BootstrapFailureKind::UnsupportedPin,
+            BootstrapFailureKind::Permission,
+            BootstrapFailureKind::SourceBuild,
+        ] {
+            let msg = user_message_for(kind).to_ascii_lowercase();
+            assert!(
+                !msg.contains("internet connection"),
+                "{} blames the network: {msg}",
+                kind.as_str()
+            );
+        }
+        assert!(user_message_for(BootstrapFailureKind::NetworkDownload)
+            .to_ascii_lowercase()
+            .contains("internet connection"));
+    }
+
+    #[test]
     fn unsupported_pin_wins_over_the_network_heuristic() {
         // pip echoes every index it consulted before reporting the resolution
         // failure, so a timeout word in that preamble must not steal the
@@ -9057,6 +9244,29 @@ Some unrelated content.
         ] {
             assert_eq!(LearnAgent::parse(agent.as_tag()), Ok(agent));
         }
+    }
+
+    /// RUST-74 arrived with `reason` = "LLM analysis failed: `claude -p ...`
+    /// failed (exit 1):" and nothing after the colon, 14 events over six users'
+    /// machines that no fix could be aimed at. The capture now attaches the
+    /// analyzer's stderr tail -- and must attach ONLY that: stdout echoes
+    /// written memory files back verbatim (see `learn_step_label`), so reading
+    /// it here would start shipping users' project content to Sentry.
+    #[test]
+    fn learn_llm_failure_capture_attaches_stderr_tail_and_never_stdout() {
+        let source = include_str!("lib.rs");
+        let (_, after) = source
+            .split_once(r#"set_tag("learn_outcome", "llm_analysis_failed")"#)
+            .expect("capture block present");
+        let block = &after[..after.find("capture_message").expect("capture block end")];
+        assert!(
+            block.contains("tail_lines(&stderr"),
+            "the analyzer's stderr tail is the only cause context we have: {block}"
+        );
+        assert!(
+            !block.contains("&stdout") && !block.contains("&merged"),
+            "stdout carries memory-file contents and must never reach Sentry: {block}"
+        );
     }
 
     #[test]

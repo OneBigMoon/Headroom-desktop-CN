@@ -5604,11 +5604,24 @@ fn warn_stats_fetch_failed(reason: &str) {
         return;
     }
     *last = Some(Instant::now());
-    let message = format!(
-        "headroom /stats fetch failed ({reason}); dashboard loses the layers only \
-         this endpoint reports (output shaping, tool schema)"
-    );
     let category = stats_fetch_failure_category(reason);
+    // A 4xx means SOMETHING answered 6767 without the backend's routes, and
+    // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
+    // there deliberately counts as reachable). The listener's identity is the
+    // one fact that splits "foreign squatter" from "orphaned old Headroom" --
+    // RUST-87 shipped three unattributable 404s before this. Throttled to one
+    // lookup per 15-minute warn window, so the lsof subprocess is free here.
+    let held_by = if category.starts_with("http-4") {
+        crate::tool_manager::listener_identity(6767)
+            .map(|who| format!("; port 6767 is held by {who}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "headroom /stats fetch failed ({reason}){held_by}; dashboard loses the layers \
+         only this endpoint reports (output shaping, tool schema)"
+    );
     sentry::with_scope(
         |scope| {
             scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
@@ -7056,6 +7069,12 @@ fn group_kill_target(pid: i32) -> Option<String> {
     (pid > 1).then(|| format!("-{pid}"))
 }
 
+/// NTSTATUS 0xC0000142, surfaced by `ExitStatus::code()` as -1073741502 (the
+/// number in RUST-7N's title). Not cfg(windows)-gated so the conversion test
+/// below runs everywhere.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC0000142_u32 as i32;
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -7123,6 +7142,22 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
             })?;
 
         if status.success() {
+            return Ok(());
+        }
+
+        // STATUS_DLL_INIT_FAILED: powershell cannot start because the user
+        // session is ending (logoff/shutdown reaches stop_headroom via
+        // WM_ENDSESSION). The logoff reaps every process in the session,
+        // orphans included, and the next launch's reclaim_orphan_proxy covers
+        // anything that survives - a sweep that cannot run here has nothing
+        // left to do (RUST-7N). The venv-lock-holder caller loses nothing
+        // either: if powershell is this broken outside a logoff, the pip
+        // install right after fails with its own actionable error.
+        if status.code() == Some(STATUS_DLL_INIT_FAILED) {
+            log::info!(
+                "powershell unavailable (0xC0000142, session ending); skipping process sweep for '{}'",
+                exe.display()
+            );
             return Ok(());
         }
 
@@ -7453,6 +7488,14 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn status_dll_init_failed_matches_the_exit_code_sentry_reports() {
+        // RUST-7N's title says "powershell exited with status Some(-1073741502)";
+        // the benign-classification in kill_processes_by_command_pattern only
+        // works if the hex constant converts to exactly that decimal.
+        assert_eq!(super::STATUS_DLL_INIT_FAILED, -1073741502);
+    }
+
+    #[test]
     fn stats_fetch_failure_category_splits_the_grab_bag() {
         // RUST-6V held 53 timeouts + 47 404s under one un-resolvable issue.
         use super::stats_fetch_failure_category as cat;
@@ -7488,11 +7531,10 @@ mod tests {
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible,
         support_tier_for_platform, tcp_port_accepts_connection, tool_schema_savings_usd,
-        total_dir_size_bytes,
-        warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
-        DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
-        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
-        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BootValidationOutcome,
+        ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
+        HeadroomSavingsHistoryPoint, Instant, PersistedSavingsState, SavingsObservation,
+        SavingsRecord, SavingsTracker, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
     };
 
     #[test]
