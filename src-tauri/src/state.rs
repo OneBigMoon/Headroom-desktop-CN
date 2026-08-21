@@ -2496,6 +2496,7 @@ impl AppState {
         let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
             + lifetime_output_savings_usd
             + lifetime_tool_schema_savings_usd;
+        warn_once_if_savings_rate_implausible(&daily_savings);
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
         // must not jump when a new savings layer starts reporting.
@@ -7199,6 +7200,46 @@ fn drop_rollup_backfill<T>(
 /// shallower, so 10% is the conservative choice across providers.
 const CACHE_READ_PRICE_RATIO: f64 = 0.10;
 
+/// True when the buckets imply a savings $/token materially above the $/token
+/// actually paid for input on the same traffic. A saved input token can never
+/// be worth more than sending it would have cost, so a rate past the paid rate
+/// means the upstream wheel changed what `compression_savings_usd` contains
+/// (e.g. 0.36.0 folded full-input-rate tool-schema dollars into it, implying
+/// $33/M on traffic actually paying $5/M). Both rates come from the same
+/// buckets, so the check self-calibrates to the user's model mix; the 1.5x
+/// headroom absorbs mix drift between saved and sent tokens. Volume floors
+/// keep a few cheap requests from tripping it on noise.
+fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<(f64, f64)> {
+    let saved_usd: f64 = daily_savings.iter().map(|p| p.estimated_savings_usd).sum();
+    let saved_tokens: u64 = daily_savings.iter().map(|p| p.estimated_tokens_saved).sum();
+    let paid_usd: f64 = daily_savings.iter().map(|p| p.actual_cost_usd).sum();
+    let sent_tokens: u64 = daily_savings.iter().map(|p| p.total_tokens_sent).sum();
+    if saved_tokens < 1_000_000 || sent_tokens < 1_000_000 || paid_usd < 1.0 {
+        return None;
+    }
+    let savings_rate = saved_usd / saved_tokens as f64;
+    let paid_rate = paid_usd / sent_tokens as f64;
+    (savings_rate > paid_rate * 1.5).then_some((savings_rate * 1e6, paid_rate * 1e6))
+}
+
+/// Warn-only canary, once per process: a contaminated rate silently corrected
+/// is worse than a loud one, so nothing is clamped -- the warn reaches Sentry
+/// through the log bridge and the numbers keep rendering as reported.
+fn warn_once_if_savings_rate_implausible(daily_savings: &[DailySavingsPoint]) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Some((savings_per_m, paid_per_m)) = savings_rate_implausible(daily_savings) {
+        WARNED.store(true, std::sync::atomic::Ordering::Relaxed);
+        log::warn!(
+            "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved vs \
+             ${paid_per_m:.2}/M actually paid for input; upstream savings semantics \
+             likely changed under the pinned wheel"
+        );
+    }
+}
+
 /// Lifetime dollars saved by tool-schema deferral.
 ///
 /// Tool definitions are re-sent on every request and sit at the very front of
@@ -7445,8 +7486,9 @@ mod tests {
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
-        rebuild_persisted_savings_from_records, support_tier_for_platform,
-        tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
+        rebuild_persisted_savings_from_records, savings_rate_implausible,
+        support_tier_for_platform, tcp_port_accepts_connection, tool_schema_savings_usd,
+        total_dir_size_bytes,
         warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
         DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
         PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
@@ -7557,6 +7599,44 @@ mod tests {
             tool_schema_savings_usd(&[daily("2026-08-05", 0, 0.0)], 2_000_000),
             0.0
         );
+    }
+
+    #[test]
+    fn savings_rate_canary_flags_a_rate_above_what_input_actually_cost() {
+        let with_spend = |tokens: u64, usd: f64, sent: u64, paid: f64| DailySavingsPoint {
+            actual_cost_usd: paid,
+            total_tokens_sent: sent,
+            ..daily("2026-08-21", tokens, usd)
+        };
+
+        // Healthy: $5/M saved on traffic paying $5/M for input.
+        assert_eq!(
+            savings_rate_implausible(&[with_spend(2_000_000, 10.0, 20_000_000, 100.0)]),
+            None
+        );
+
+        // The 0.36.0 fold shape: $33/M implied on traffic paying $5/M.
+        let (savings_per_m, paid_per_m) =
+            savings_rate_implausible(&[with_spend(2_000_000, 66.0, 20_000_000, 100.0)])
+                .expect("contaminated rate must trip the canary");
+        assert!((savings_per_m - 33.0).abs() < 1e-6, "{savings_per_m}");
+        assert!((paid_per_m - 5.0).abs() < 1e-6, "{paid_per_m}");
+
+        // Below the volume/spend floors nothing fires, however wild the ratio:
+        // a handful of cheap requests is noise, not a semantics change.
+        assert_eq!(
+            savings_rate_implausible(&[with_spend(500_000, 66.0, 20_000_000, 100.0)]),
+            None
+        );
+        assert_eq!(
+            savings_rate_implausible(&[with_spend(2_000_000, 66.0, 500_000, 100.0)]),
+            None
+        );
+        assert_eq!(
+            savings_rate_implausible(&[with_spend(2_000_000, 66.0, 20_000_000, 0.5)]),
+            None
+        );
+        assert_eq!(savings_rate_implausible(&[]), None);
     }
 
     #[test]
@@ -9506,6 +9586,95 @@ mod tests {
         assert_eq!(parsed.savings_history.len(), 1);
         // No traffic_learner block in this payload (older backend shape).
         assert!(parsed.learner_progress.is_none());
+    }
+
+    /// The /stats contract, in one place: every primary JSON path this app
+    /// consumes from the backend, each carrying a distinct sentinel. Run this
+    /// against the diff of `savings_tracker.py` / `prometheus_metrics.py` /
+    /// `server.py` before any wheel bump -- when upstream moves or re-defines
+    /// a field (0.36.0 silently widened `compression_savings_usd` to include
+    /// tool-schema dollars), this is the test that should force the
+    /// conversation. A failing assertion here means the bump changes what
+    /// users' savings numbers mean, not just how they are produced.
+    #[test]
+    fn stats_contract_pins_every_consumed_path() {
+        let parsed = parse_headroom_stats_from_json(
+            r#"{
+                "requests": { "total": 41 },
+                "tokens": { "saved": 1200, "input": 34000 },
+                "cost": { "compression_savings_usd": 3.25, "total_input_cost_usd": 7.5 },
+                "prefix_cache": {
+                    "totals": { "cache_write_tokens": 900, "uncached_input_tokens": 100 }
+                },
+                "compression_savings_history": [
+                    { "timestamp": "2026-08-21T09:00:00Z", "total_tokens_saved": 700 },
+                    { "timestamp": "2026-08-21T10:00:00Z", "total_tokens_saved": 1200 }
+                ],
+                "summary": { "compression": { "tool_schema_tokens_saved": 777 } },
+                "savings": {
+                    "by_layer": {
+                        "output_shaping": {
+                            "available": true,
+                            "method": "holdout",
+                            "reduction_percent": 12.5,
+                            "ci_low_percent": 10.0,
+                            "ci_high_percent": 15.0,
+                            "requests": 9,
+                            "tokens_saved": 4321,
+                            "baseline_tokens": 34568
+                        },
+                        "tool_search": { "tokens_saved": 555 }
+                    }
+                },
+                "traffic_learner": {
+                    "requests_processed": 40,
+                    "patterns_extracted": 7,
+                    "patterns_saved": 1,
+                    "pending_patterns": 3,
+                    "min_evidence": 5,
+                    "history_size": 12
+                }
+            }"#,
+        )
+        .expect("contract fixture must parse");
+
+        assert_eq!(parsed.session_requests, Some(41));
+        assert_eq!(parsed.session_estimated_tokens_saved, Some(1200));
+        assert_eq!(parsed.session_estimated_savings_usd, Some(3.25));
+        assert_eq!(parsed.session_actual_cost_usd, Some(7.5));
+        // New-input denominator: cache_write + uncached (1000), never
+        // tokens.input -- re-sent cached prefix must not dilute the ratio.
+        assert_eq!(parsed.session_total_tokens_sent, Some(1000));
+        let pct = parsed.session_savings_pct.expect("pct derived");
+        assert!((pct - 1200.0 / 2200.0 * 100.0).abs() < 1e-9, "{pct}");
+
+        assert_eq!(parsed.savings_history.len(), 2);
+        assert_eq!(parsed.savings_history[0].total_tokens_saved, 700);
+        assert_eq!(parsed.savings_history[1].total_tokens_saved, 1200);
+
+        // summary.compression is the process-cumulative counter and must win
+        // over the windowed by_layer figure (555).
+        assert_eq!(parsed.tool_schema_tokens_saved, Some(777));
+
+        let output = parsed.output_reduction.expect("output layer parsed");
+        assert_eq!(output.method, "holdout");
+        assert!((output.reduction_percent - 12.5).abs() < 1e-9);
+        assert_eq!(output.tokens_saved, 4321);
+        assert_eq!(output.baseline_tokens, 34568);
+
+        let learner = parsed.learner_progress.expect("learner parsed");
+        assert_eq!(learner.pending_patterns, 3);
+
+        // Fallback contract: without the cumulative counter, the windowed
+        // by_layer figure is still accepted for shape.
+        let fallback = parse_headroom_stats_from_json(
+            r#"{
+                "requests": { "total": 1 },
+                "savings": { "by_layer": { "tool_search": { "tokens_saved": 555 } } }
+            }"#,
+        )
+        .expect("fallback fixture must parse");
+        assert_eq!(fallback.tool_schema_tokens_saved, Some(555));
     }
 
     #[test]
