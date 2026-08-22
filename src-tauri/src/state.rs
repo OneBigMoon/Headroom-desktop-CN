@@ -4183,6 +4183,17 @@ struct OutputSampleBucket {
     baseline_tokens: u64,
 }
 
+/// Semantics version of the sampled output series. The samples are deltas of
+/// `crate::output_savings::estimate()`, so they are only comparable to other
+/// samples taken under the same estimator rules. Bump this when those rules
+/// change and the persisted series + watermark pair are dropped once on load:
+/// mixing units keeps stale artifacts on the chart (the 98.7% ping buckets of
+/// 2026-08) and parks the seed watermark above the new, smaller cumulative,
+/// which silences the sampler until it re-climbs the difference.
+/// Version history: 0 = pre-field (prefix-fallback lookup), 1 = exact-stratum
+/// lookup with MIN_BASELINE_N (2026-08-22).
+const OUTPUT_SAMPLE_SERIES_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct PersistedSavingsState {
@@ -4221,6 +4232,9 @@ struct PersistedSavingsState {
     /// local (`local_hour_key`, joining the local-keyed hourly points).
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// See [`OUTPUT_SAMPLE_SERIES_VERSION`]. Container default (0) marks a
+    /// file written before the field existed, whose series is in old units.
+    output_sample_series_version: u8,
     /// Last reading of the output shaper's durable estimator total. Cached so
     /// the lifetime headline can price this layer while the backend is still
     /// starting: without it, cold start falls back to the (understating)
@@ -4337,6 +4351,19 @@ impl SavingsTracker {
                 })
             });
 
+        // Old-units sampled series (see OUTPUT_SAMPLE_SERIES_VERSION) is
+        // dropped wholesale: buckets, plus the watermark seed pair -- keeping
+        // the pair would floor the first-poll seed at the OLD estimator's
+        // larger cumulative and silence the sampler until it re-climbs there.
+        let output_series_current = persisted_state.as_ref().is_some_and(|state| {
+            state.output_sample_series_version >= OUTPUT_SAMPLE_SERIES_VERSION
+        });
+        if persisted_state.is_some() && !output_series_current {
+            log::info!(
+                "sampled output series predates estimator semantics v{OUTPUT_SAMPLE_SERIES_VERSION}; dropping it"
+            );
+        }
+
         let mut tracker = Self {
             records_path,
             state_path,
@@ -4375,16 +4402,20 @@ impl SavingsTracker {
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
             output_daily_samples: persisted_state
                 .as_ref()
+                .filter(|_| output_series_current)
                 .map_or_else(BTreeMap::new, |state| state.output_daily_samples.clone()),
             output_hourly_samples: persisted_state
                 .as_ref()
+                .filter(|_| output_series_current)
                 .map_or_else(BTreeMap::new, |state| state.output_hourly_samples.clone()),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: persisted_state
                 .as_ref()
+                .filter(|_| output_series_current)
                 .and_then(|state| state.last_output_estimator_tokens_saved),
             last_output_estimator_baseline_tokens: persisted_state
                 .as_ref()
+                .filter(|_| output_series_current)
                 .and_then(|state| state.last_output_estimator_baseline_tokens),
             last_written_at: None,
         };
@@ -5173,6 +5204,7 @@ impl SavingsTracker {
             output_hourly_samples: self.output_hourly_samples.clone(),
             last_output_estimator_tokens_saved: self.last_output_estimator_tokens_saved,
             last_output_estimator_baseline_tokens: self.last_output_estimator_baseline_tokens,
+            output_sample_series_version: OUTPUT_SAMPLE_SERIES_VERSION,
         }
     }
 
@@ -7543,8 +7575,9 @@ mod tests {
         support_tier_for_platform, tcp_port_accepts_connection, tool_schema_savings_usd,
         total_dir_size_bytes, warn_stats_fetch_failed, AppState, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, Instant, PersistedSavingsState, SavingsObservation,
-        SavingsRecord, SavingsTracker, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
+        SavingsObservation, SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
     };
 
     #[test]
@@ -8508,6 +8541,70 @@ mod tests {
         assert_eq!(
             reloaded.last_output_estimator_tokens_saved,
             Some(22_000_000)
+        );
+    }
+
+    #[test]
+    fn old_units_sampled_output_series_is_dropped_once_on_load() {
+        // A file written before OUTPUT_SAMPLE_SERIES_VERSION existed carries
+        // sampled buckets in the old estimator's units (the 98.7% ping
+        // artifacts) and a watermark pair far above the new cumulative, which
+        // would silence the sampler for weeks. Both go; everything else stays.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("config")).expect("config dir");
+        let mut old = PersistedSavingsState {
+            schema_version: 3,
+            lifetime_requests: 12,
+            last_output_estimator_tokens_saved: Some(11_644_822),
+            last_output_estimator_baseline_tokens: Some(36_147_591),
+            output_sample_series_version: 0,
+            ..Default::default()
+        };
+        old.output_daily_samples.insert(
+            "2026-08-21".into(),
+            OutputSampleBucket {
+                saved_tokens: 6_360,
+                baseline_tokens: 6_444,
+            },
+        );
+        old.output_hourly_samples.insert(
+            "2026-08-21T09:00".into(),
+            OutputSampleBucket {
+                saved_tokens: 1_586,
+                baseline_tokens: 1_611,
+            },
+        );
+        std::fs::write(
+            config_file(dir.path(), "savings-state.json"),
+            serde_json::to_vec(&old).expect("serialize"),
+        )
+        .expect("write old state");
+
+        let tracker = SavingsTracker::load_or_create(dir.path()).expect("load");
+        assert!(tracker.output_daily_samples.is_empty());
+        assert!(tracker.output_hourly_samples.is_empty());
+        assert_eq!(tracker.last_output_estimator_tokens_saved, None);
+        assert_eq!(tracker.last_output_estimator_baseline_tokens, None);
+        assert_eq!(tracker.lifetime_requests, 12, "unrelated fields survive");
+
+        // The initial persist in load_or_create stamps the current version,
+        // so the drop happens exactly once: new-units samples then survive.
+        let mut tracker = tracker;
+        tracker.output_daily_samples.insert(
+            "2026-08-22".into(),
+            OutputSampleBucket {
+                saved_tokens: 100,
+                baseline_tokens: 400,
+            },
+        );
+        tracker.persist_state().expect("persist");
+        let reloaded = SavingsTracker::load_or_create(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.output_daily_samples.get("2026-08-22"),
+            Some(&OutputSampleBucket {
+                saved_tokens: 100,
+                baseline_tokens: 400,
+            })
         );
     }
 
@@ -10986,6 +11083,7 @@ mod tests {
             output_hourly_samples: std::collections::BTreeMap::new(),
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
+            output_sample_series_version: OUTPUT_SAMPLE_SERIES_VERSION,
         };
         std::fs::write(
             config_file(&base_dir, "savings-state.json"),

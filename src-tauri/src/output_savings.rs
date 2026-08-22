@@ -37,6 +37,13 @@ const MEASURED_MIN_COVERAGE: f64 = 0.5;
 /// the correct outcome -- they keep the synthetic-control number.
 const MEASURED_MAX_CI_HALF_WIDTH_PCT: f64 = 10.0;
 
+/// A baseline stratum speaks for a treatment stratum only with this many
+/// observations behind it. Below it, one long pre-install reply becomes the
+/// "mean" an entire request class is scored against (a real ledger held
+/// `opus|new_user_ask|m|notools` at n=1, mean 849 — and 3,022 quota pings
+/// averaging 40 tokens each booked ~809 "saved" against it).
+const MIN_BASELINE_N: u64 = 10;
+
 /// Running count / sum / sum-of-squares, mirroring the backend's `_Accum` so
 /// mean and variance come out bit-comparable.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -84,34 +91,24 @@ struct Baseline {
 }
 
 impl Baseline {
-    /// `(mean, var, n)` for *key*: the exact stratum, else every stratum
-    /// sharing its longest matching prefix, merged.
+    /// `(mean, var, n)` for *key*: the exact stratum only, and only with
+    /// [`MIN_BASELINE_N`] observations behind it.
     ///
-    /// Upstream trims trailing fields the same way but takes the first hash
-    /// order match, so a re-serialized ledger can change its answer. Merging
-    /// every match is order-independent and uses more evidence. Returns `None`
-    /// rather than falling back to the global mean.
+    /// This used to back off to the longest matching key prefix, merged.
+    /// That readmitted the global-mean overcount one level down: an
+    /// `opus|new_user_ask|xs|notools` ping (a ~24-token quota check) has no
+    /// exact stratum, so it borrowed the merged `opus|new_user_ask|` mean of
+    /// 1,611 tokens and booked a 98.7% "reduction" per ping — 49% of one real
+    /// ledger's claimed savings, and a permanent "Output −99%" day chip once
+    /// pings were the only scored traffic. A verbosity baseline is only
+    /// evidence for the stratum it observed; anything else returns `None` and
+    /// the request stays out of the estimate.
     fn lookup(&self, key: &str) -> Option<(f64, f64, u64)> {
-        if let Some(acc) = self.strata.get(key) {
-            if acc.n > 0 {
-                return Some((acc.mean(), acc.var(), acc.n));
-            }
+        let acc = self.strata.get(key)?;
+        if acc.n < MIN_BASELINE_N {
+            return None;
         }
-        let mut parts: Vec<&str> = key.split('|').collect();
-        while parts.len() > 1 {
-            parts.pop();
-            let prefix = format!("{}|", parts.join("|"));
-            let mut merged = Accum::default();
-            for (k, acc) in &self.strata {
-                if acc.n > 0 && k.starts_with(&prefix) {
-                    merged.merge(acc);
-                }
-            }
-            if merged.n > 0 {
-                return Some((merged.mean(), merged.var(), merged.n));
-            }
-        }
-        None
+        Some((acc.mean(), acc.var(), acc.n))
     }
 }
 
@@ -255,10 +252,17 @@ fn measured_if_ready(
     Some(measured)
 }
 
-/// Percent + 95% normal-approximation band, or `None` when the result is not a
-/// reduction we can honestly display. A reduction is definitionally within
-/// [0, 100]: a freshly seeded baseline divides by near-zero and blows up, and
-/// the dashboard used to render that as "Output --6,130.7%".
+/// Percent + 95% normal-approximation band, or `None` when the result is not
+/// one we can honestly display (no covered requests, a degenerate baseline, or
+/// a >100% blowup from a near-zero one — the dashboard once rendered such a
+/// blowup as "Output --6,130.7%").
+///
+/// A NEGATIVE result floors to 0% instead of returning `None`. "No reduction"
+/// is an answer, not an error: discarding it meant a holdout measuring ~0
+/// could never replace the estimate, and a `None` from this module lets the
+/// caller fall back to the backend's global-mean-credited number — strictly
+/// worse than an honest zero. The CI is left unclamped so the gate in
+/// [`measured_if_ready`] still sees the real band.
 fn finalize(
     method: &'static str,
     saved: f64,
@@ -270,13 +274,13 @@ fn finalize(
         return None;
     }
     let pct = saved / baseline_tokens * 100.0;
-    if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+    if !pct.is_finite() || pct > 100.0 {
         return None;
     }
     let se = var.max(0.0).sqrt();
     Some(OutputEstimate {
         method,
-        reduction_percent: pct,
+        reduction_percent: pct.max(0.0),
         ci_low_percent: (saved - 1.96 * se) / baseline_tokens * 100.0,
         ci_high_percent: (saved + 1.96 * se) / baseline_tokens * 100.0,
         requests,
@@ -332,26 +336,32 @@ mod tests {
     fn excludes_strata_the_baseline_never_saw() {
         let e = estimate(MIXED);
         assert_eq!(e.method, "estimated");
-        // 4 opus|ask|l|tools + 2 opus|ask|l|notools; the 3 fable requests have
-        // no baseline evidence and must not be credited against the global mean.
-        assert_eq!(e.requests, 6);
-        assert_eq!(e.tokens_saved, 1300);
-        assert_eq!(e.baseline_tokens, 6000);
-        assert!((e.reduction_percent - 21.666_667).abs() < 1e-5);
-        assert!((e.ci_low_percent - 12.363_196).abs() < 1e-5);
-        assert!((e.ci_high_percent - 30.970_137).abs() < 1e-5);
+        // Only the 4 opus|ask|l|tools requests have an exact, well-fed
+        // baseline stratum. The 2 opus|ask|l|notools (no exact stratum) and
+        // the 3 fable requests (no evidence at all) stay out.
+        assert_eq!(e.requests, 4);
+        assert_eq!(e.tokens_saved, 800);
+        assert_eq!(e.baseline_tokens, 4000);
+        assert!((e.reduction_percent - 20.0).abs() < 1e-9);
+        assert!((e.ci_low_percent - 7.777_253).abs() < 1e-5);
+        assert!((e.ci_high_percent - 32.222_747).abs() < 1e-5);
     }
 
     #[test]
-    fn prefix_backoff_supplies_a_near_neighbour() {
-        // opus|ask|l|notools has no exact stratum but shares the opus|ask|l|
-        // prefix with one, so it is scored -- against 1000, not the 1333 global.
+    fn lookup_is_exact_stratum_only_with_enough_evidence() {
         let ledger: Ledger = serde_json::from_str(MIXED).expect("parse");
+        // Exact stratum with n >= MIN_BASELINE_N qualifies.
         let (mu, _var, n) = ledger
             .baseline
-            .lookup("opus|ask|l|notools")
-            .expect("prefix hit");
+            .lookup("opus|ask|l|tools")
+            .expect("exact hit");
         assert_eq!((mu, n), (1000.0, 10));
+        // No prefix backoff: an xs ping must not borrow the merged opus|ask|
+        // mean (the "Output -99%" day-chip artifact).
+        assert!(ledger.baseline.lookup("opus|ask|l|notools").is_none());
+        assert!(ledger.baseline.lookup("opus|ask|xs|notools").is_none());
+        // Exact stratum below MIN_BASELINE_N is not evidence either.
+        assert!(ledger.baseline.lookup("opus|ask|xl|tools").is_none());
         assert!(ledger.baseline.lookup("fable|ask|l|tools").is_none());
     }
 
@@ -407,13 +417,33 @@ mod tests {
     }
 
     #[test]
-    fn a_shaper_that_made_replies_longer_is_not_shown_as_a_reduction() {
+    fn a_shaper_that_made_replies_longer_floors_at_zero() {
         // Treatment above baseline gives a negative percent, which the tile
-        // used to render as "Output --6,130.7%".
+        // used to render as "Output --6,130.7%". It floors to an honest 0%
+        // rather than vanishing: a None here makes the dashboard fall back to
+        // the backend's global-mean-credited number, which is worse than zero.
         let json = r#"{
           "baseline": {"strata": {"opus|ask|l|tools": {"n": 10, "sum": 1000, "sumsq": 110000}}, "glob": {"n": 0, "sum": 0, "sumsq": 0}},
           "treatment": {"opus|ask|l|tools": {"n": 4, "sum": 3200, "sumsq": 2580000}}
         }"#;
-        assert!(estimate_from_bytes(json.as_bytes()).is_none());
+        let e = estimate_from_bytes(json.as_bytes()).expect("floored estimate");
+        assert_eq!(e.method, "estimated");
+        assert_eq!(e.reduction_percent, 0.0);
+        assert_eq!(e.tokens_saved, 0);
+    }
+
+    #[test]
+    fn a_solid_holdout_measuring_no_reduction_still_takes_over() {
+        // Control replies come out SHORTER than treatment: the true effect is
+        // ~zero-or-negative. Once the holdout is solid (full coverage, tight
+        // band) that honest zero must replace the synthetic estimate -- the
+        // old [0,100] validity check discarded it, so a shaper that saved
+        // nothing kept its estimated percentage forever.
+        let e = estimate(&with_control(
+            r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 70000, "sumsq": 49010000}}"#,
+        ));
+        assert_eq!(e.method, "measured");
+        assert_eq!(e.reduction_percent, 0.0);
+        assert!(e.ci_high_percent < 0.0, "band stays unclamped for the gate");
     }
 }
