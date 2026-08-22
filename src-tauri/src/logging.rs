@@ -100,6 +100,23 @@ fn is_updater_endpoint_error(msg: &str) -> bool {
     msg.contains("update endpoint did not respond with a successful status code")
 }
 
+// tao panics with this on Windows session end (sign-out, shutdown, restart): the
+// event loop reaches a window whose state the OS already tore down while handling
+// WM_ENDSESSION. Our own teardown has run by then and the process is exiting
+// either way, so nothing is lost and no release can change the outcome. Fixed in
+// tao 0.37.0, which tauri-runtime-wry cannot take yet -- 2.11.4, the latest, still
+// requires `tao ^0.35.0`. RUST-84 and RUST-8D are the same panic from two more
+// hosts. Drop the event; re-check when tauri moves the pin.
+fn is_windows_session_end_panic(msg: &str) -> bool {
+    msg.contains("cannot move state from Destroyed")
+}
+
+// Environmental or otherwise unfixable-by-release: keep the local log, never
+// send. One predicate so panics and log records answer it the same way.
+fn is_unreportable(msg: &str) -> bool {
+    is_disk_full(msg) || is_windows_session_end_panic(msg)
+}
+
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
 // from Sentry. They still hit the local log file via write_record.
 fn skip_sentry(target: &str, msg: &str) -> bool {
@@ -298,6 +315,28 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib") && msg.starts_with("tray: set_tooltip failed") {
         return true;
     }
+    // tauri-runtime-wry logs a BARE `{e}` when webview.evaluate_script fails, so
+    // every Tauri emit to a webview that is minimized, suspended or already torn
+    // down bridges here as an error with no context and no call site. On one
+    // Windows host that is a per-emit loop: RUST-6H took 988 events in 24h from
+    // `Jan2022` alone, more than the entire fleet's Sentry volume over the same
+    // window. Nothing is actionable -- the backend keeps proxying, only the UI
+    // misses the event, and it heals when the webview comes back. Matched on the
+    // wry error Display because that is the whole message; keep the local log.
+    if target.starts_with("tauri_runtime_wry") && msg.starts_with("WebView2 error:") {
+        return true;
+    }
+    // Stopping without the lifecycle lock is the DESIGNED path, not a failure:
+    // `stop_headroom` deliberately caps its wait so a quit racing a launch can
+    // never hang the app with the window stuck on "Restarting...". The pkill
+    // sweep reaps whatever the racing spawn leaves behind. It fires on ordinary
+    // quit-during-launch across unrelated hosts (RUST-7Z), and there is no fix
+    // to ship -- the alternative is the unbounded wait this replaced.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("stop_headroom: lifecycle lock still held")
+    {
+        return true;
+    }
     false
 }
 
@@ -329,17 +368,17 @@ pub(crate) fn scrub_home(msg: &str) -> String {
 pub(crate) fn sanitize_event(
     event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
-    let environmental = event.message.as_deref().is_some_and(is_disk_full)
+    let environmental = event.message.as_deref().is_some_and(is_unreportable)
         || event
             .logentry
             .as_ref()
-            .is_some_and(|entry| is_disk_full(&entry.message))
+            .is_some_and(|entry| is_unreportable(&entry.message))
         || event
             .exception
             .values
             .iter()
             .filter_map(|exception| exception.value.as_deref())
-            .any(is_disk_full);
+            .any(is_unreportable);
     if environmental {
         return None;
     }
@@ -618,6 +657,53 @@ mod tests {
             "headroom_desktop_lib",
             "uninstall: removing serena failed: removing ~\\AppData\\Local\\Headroom\\headroom\\serena-venv: Access is denied. (os error 5)"
         ));
+    }
+
+    #[test]
+    fn skips_wry_evaluate_script_failures_but_not_other_wry_errors() {
+        // RUST-6H: 988 events in 24h from one Windows host, every one of them
+        // this bare wry Display bridged from tauri-runtime-wry's `log::error!("{e}")`.
+        assert!(skip_sentry(
+            "tauri_runtime_wry",
+            "WebView2 error: WindowsError(Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" })"
+        ));
+        // Other wry failures still report -- only the evaluate_script shape floods.
+        assert!(!skip_sentry(
+            "tauri_runtime_wry",
+            "failed to navigate to url http://localhost:1420: some error"
+        ));
+        // And the string alone is not a licence to drop it from our own modules.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "WebView2 error: something we emitted ourselves"
+        ));
+    }
+
+    #[test]
+    fn skips_stop_headroom_lifecycle_lock_fallback() {
+        // RUST-7Z: the capped wait IS the fix for the unbounded one; quitting
+        // during a launch takes this branch by design, on any platform.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "stop_headroom: lifecycle lock still held after 2s; stopping without it"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "stop_headroom: something else entirely"
+        ));
+    }
+
+    #[test]
+    fn drops_the_windows_session_end_panic() {
+        use super::is_unreportable;
+        // RUST-84/8D: tao's WM_ENDSESSION panic. Arrives as a panic through
+        // sentry's own integration, so skip_sentry never sees it -- sanitize_event
+        // is the only gate, and it reads this predicate.
+        assert!(is_unreportable("cannot move state from Destroyed"));
+        assert!(!is_unreportable("cannot move state from Running"));
+        // The disk-full rule this predicate absorbed still holds.
+        assert!(is_unreportable("write failed: No space left on device"));
+        assert!(!is_unreportable("write failed: permission denied"));
     }
 
     #[test]

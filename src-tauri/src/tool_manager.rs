@@ -289,9 +289,12 @@ stratum, the tools token counts, the denominator guard above) reads
 only payload["tools"], so those requests classify "notools" and record
 zero savings (2026-08-21: 0/13 afternoon signups and 42/54 active
 codex users with frozen savings). The guard lifts the items' tools into
-a top-level array and drops the items from input before compression;
-the classic encoding is verified accepted by the ChatGPT Codex backend
-(live tool calls execute; Codex 0.142.4 sends it for the same model).
+a top-level array before compression and puts the compacted definitions
+back into the carrier before the payload is forwarded. The lift is
+internal only: tools is a per-request parameter while additional_tools
+is an input item, so forwarding the lifted shape costs a stateful
+session (Codex TUI/app-server over WS) its whole tool surface after
+turn one -- upstream #3194, the 0.36.3 regression from the same lift.
 No version gate: it self-neutralizes when payload["tools"] is already
 present, and 0.36.2 has no additional_tools support either. Kill
 switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
@@ -751,11 +754,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # ships support -- see the module docstring for the failure mode). Applied
     # AFTER the denominator guard so this wrapper is outermost: the lift runs
     # first at runtime and every inner layer (denominator widening included)
-    # sees the classic top-level tools shape. In-place on the caller's payload,
-    # so the outbound canonical serialization carries the lifted form too --
-    # deliberate: the ChatGPT Codex backend accepts the classic encoding for
-    # these models (Codex 0.142.4 still sends it), verified with live tool
-    # calls. Kill switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+    # sees the classic top-level tools shape. Symmetric: the lift is in place
+    # for the compression pass only, and the carrier goes back on the wire
+    # before the payload is forwarded (see _hd_at_restore -- forwarding the
+    # lifted shape is upstream's 0.36.3 regression, #3194). Kill switch:
+    # HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
     try:
         if _hd_os.environ.get(
             "HEADROOM_ADDITIONAL_TOOLS_GUARD", "1"
@@ -767,10 +770,14 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             _hd_at_log = _hd_at_logging.getLogger("headroom.proxy")
             _hd_at_announced = False
 
-            def _hd_at_lift(payload):
+            _hd_at_warned = False
+
+            def _hd_at_lift(payload, plan):
                 # Lift additional_tools input items into a top-level tools
-                # array, in place. No-op (0) unless the request uses the
-                # Codex >= 0.149.0 encoding and has no top-level tools.
+                # array, in place, recording the carrier in `plan` so the
+                # forwarded payload can be put back the way Codex sent it.
+                # No-op (0) unless the request uses the Codex >= 0.149.0
+                # encoding and has no top-level tools.
                 global _hd_at_announced
                 if not isinstance(payload, dict) or payload.get("tools"):
                     return 0
@@ -779,6 +786,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return 0
                 lifted = []
                 kept = []
+                carrier = None
                 for item in items:
                     if (
                         isinstance(item, dict)
@@ -786,6 +794,17 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         and isinstance(item.get("tools"), list)
                         and item["tools"]
                     ):
+                        if carrier is None:
+                            # Restore template: the carrier's own fields
+                            # minus the definitions, plus its position among
+                            # the items that survive the lift. Codex sends a
+                            # single carrier; extra carriers merge into this
+                            # one rather than being split on a boundary that
+                            # compaction may have invalidated.
+                            carrier = (
+                                {k: v for k, v in item.items() if k != "tools"},
+                                len(kept),
+                            )
                         lifted.extend(item["tools"])
                     else:
                         kept.append(item)
@@ -793,6 +812,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return 0
                 payload["tools"] = lifted
                 payload["input"] = kept
+                plan.append((carrier[0], carrier[1], list(lifted)))
                 if not _hd_at_announced:
                     _hd_at_announced = True
                     _hd_at_log.info(
@@ -802,16 +822,86 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     )
                 return len(lifted)
 
+            def _hd_at_restore(payload, plan):
+                # Put the definitions back into the carrier Codex sent them
+                # in, post-compaction, and drop the top-level array. The lift
+                # is an internal normalization for the tools consumers; the
+                # forwarded shape must match what the client sent. `tools` is
+                # a per-request parameter while additional_tools is an input
+                # item and therefore part of the transcript, so a stateful
+                # session (Codex TUI/app-server over WS) declares its tools
+                # once and relies on the transcript for every later turn --
+                # forwarding the lifted shape leaves that transcript
+                # tool-less: turn one works, then all shell/filesystem access
+                # vanishes for the rest of the session (upstream #3194).
+                if not isinstance(payload, dict) or not plan:
+                    return 0
+                items = payload.get("input")
+                if not isinstance(items, list):
+                    return 0
+                if any(
+                    isinstance(item, dict)
+                    and item.get("type") == "additional_tools"
+                    and item.get("tools")
+                    for item in items
+                ):
+                    # Already in carrier form; restoring again would
+                    # duplicate the definitions. Keeps the restore idempotent.
+                    return 0
+                template, position, original = plan[0]
+                tools = payload.get("tools")
+                if not isinstance(tools, list) or not tools:
+                    # A consumer emptied the array. Restoring what Codex sent
+                    # is strictly safer than forwarding a tool-less payload.
+                    tools = original
+                if not tools:
+                    return 0
+                carrier = dict(template)
+                carrier["type"] = "additional_tools"
+                carrier["tools"] = list(tools)
+                restored = list(items)
+                restored.insert(min(max(position, 0), len(restored)), carrier)
+                payload["input"] = restored
+                payload.pop("tools", None)
+                return len(carrier["tools"])
+
             _hd_at_orig_compress = (
                 _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
             )
 
             async def _hd_at_compress(self, payload, **kwargs):
+                global _hd_at_warned
+                plan = []
                 try:
-                    _hd_at_lift(payload)
+                    _hd_at_lift(payload, plan)
                 except Exception:
+                    # The plan is deliberately kept: a lift that raised after
+                    # mutating the payload is undone by the restore below.
                     pass
-                return await _hd_at_orig_compress(self, payload, **kwargs)
+                result = await _hd_at_orig_compress(self, payload, **kwargs)
+                if plan:
+                    try:
+                        # result[0] is what the call sites forward; the caller
+                        # payload is restored too, for the paths that forward
+                        # the object they passed in when nothing was modified.
+                        targets = [payload]
+                        out = result[0] if isinstance(result, tuple) and result else None
+                        if isinstance(out, dict) and out is not payload:
+                            targets.append(out)
+                        failed = [t for t in targets if not _hd_at_restore(t, plan)]
+                    except Exception:
+                        failed = targets
+                    if failed and not _hd_at_warned:
+                        # Logged once: the lifted shape is about to go out and
+                        # a stateful client will lose its tools after this
+                        # turn. Never silent.
+                        _hd_at_warned = True
+                        _hd_at_log.warning(
+                            "event=codex_additional_tools_restore_failed "
+                            "(forwarding lifted shape; set "
+                            "HEADROOM_ADDITIONAL_TOOLS_GUARD=0 to opt out)"
+                        )
+                return result
 
             _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
                 _hd_at_compress
@@ -9604,6 +9694,36 @@ mod tests {
         assert!(py.contains(
             "_hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = ("
         ));
+        // ...and the lift must be symmetric. Upstream #3194: tools is a
+        // per-request parameter, additional_tools is an input item and so
+        // part of the transcript, so a stateful Codex session (TUI/app-server
+        // over WS) declares its tools once and relies on the transcript
+        // afterwards -- forwarding the lifted shape gives it tools on turn
+        // one and none for the rest of the session. The carrier goes back,
+        // carrying the compacted definitions, before the payload is
+        // forwarded, and the top-level array is dropped.
+        assert!(py.contains("def _hd_at_restore(payload, plan):"));
+        assert!(py.contains(r#"payload.pop("tools", None)"#));
+        assert!(py.contains("failed = [t for t in targets if not _hd_at_restore(t, plan)]"));
+        // Both what the call sites forward (result[0]) and the payload the
+        // caller passed in are restored.
+        assert!(py.contains("out = result[0] if isinstance(result, tuple) and result else None"));
+        assert!(py.contains("targets = [payload]"));
+        // Restoring an already-restored payload must not duplicate the
+        // definitions, and an emptied array falls back to what Codex sent
+        // rather than forwarding a tool-less payload.
+        assert!(py.contains("if not isinstance(tools, list) or not tools:"));
+        assert!(py.contains("tools = original"));
+        // A restore that cannot happen is logged, never silent.
+        assert!(py.contains("event=codex_additional_tools_restore_failed"));
+        let restore_pos = py.find("def _hd_at_restore").expect("restore present");
+        let call_pos = py
+            .find("failed = [t for t in targets")
+            .expect("restore call present");
+        let orig_pos = py
+            .find("result = await _hd_at_orig_compress")
+            .expect("inner compress call present");
+        assert!(restore_pos < orig_pos && orig_pos < call_pos);
         // ...and AFTER the denominator guard's wrapper of the same method, so
         // the lift is outermost and the widening sees the lifted tools.
         let lift_pos = py

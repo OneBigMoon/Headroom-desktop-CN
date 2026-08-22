@@ -61,6 +61,10 @@
   --warning-tint:       rgba(203, 128, 39, 0.12);
   --danger:             #c14b24;
   --danger-tint:        rgba(193, 75, 36, 0.12);
+  /* Passing-check green. Same pair .connector-state.is-good has always used
+     in both modes, promoted to a token so text on a plain surface can reach
+     for it without re-inlining the hex. */
+  --success:            #1f4a36;
 
   /* Activity feed badge accents — one hue per event kind */
   --activity-train-strong:     #2a5e80;
@@ -104,6 +108,7 @@
     --warning-tint:       rgba(220, 143, 26, 0.2);
     --danger:             #e76d3d;
     --danger-tint:        rgba(193, 75, 36, 0.2);
+    --success:            #6cbf9b;
 
     --activity-train-strong:     #8ac0e0;
     --activity-train-tint:       rgba(80, 150, 200, 0.22);
@@ -4005,6 +4010,44 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.35;
   color: #59514a !important;
   max-width: 56ch;
+}
+
+.connector-tooltip > p {
+  margin: 0;
+}
+
+.connector-diagnostics {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-sunken);
+}
+
+.connector-diagnostics ul {
+  margin: 5px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.connector-diagnostics li {
+  margin-top: 3px;
+}
+
+.connector-diagnostics .is-good {
+  color: var(--success);
+}
+
+.connector-diagnostics .is-bad {
+  color: var(--danger);
+}
+
+.connector-diagnostics .is-waiting {
+  color: var(--warning);
+}
+
+.connector-diagnostics__refresh {
+  margin-top: 6px;
 }
 
 .connector-tooltip--warning {
