@@ -999,7 +999,16 @@ async fn handle(
     // funnel signal: it can't fire on bypass/direct-to-provider or before the
     // backend is up (e.g. during bootstrap). Once per process; server is
     // first-write-wins so an extra send is cheap.
-    if !FIRST_OPTIMIZED_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
+    //
+    // `!is_local_backend_path` is load-bearing, not a tidy-up: the desktop polls
+    // its own dashboard through this listener (`127.0.0.1:6767/stats`), so
+    // without the guard the app fired this beacon at itself on the first
+    // successful poll after bootstrap -- landing in the same second as
+    // `bootstrap_completed`, before any client was even configured, and
+    // overstating the funnel step past the number of installs that finished
+    // bootstrapping. Same exclusion the per-client counters above already make.
+    // Note it also gates the `swap`: a local poll must not burn the one-shot.
+    if !is_local_backend_path && !FIRST_OPTIMIZED_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
         crate::pricing::report_funnel_step_device_only("first_optimized_request");
     }
     if parsed_head.as_ref().is_some_and(is_prompt_request_head)
@@ -2618,7 +2627,7 @@ mod tests {
         set_response_content_length, should_report_throttled, stamp_client_header,
         stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
         strip_request_header, BypassFlag, CodexTerminalReader, ModelsRewrite, ParsedRequestHead,
-        SharedToken,
+        SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2992,6 +3001,85 @@ mod tests {
                 .value_if_fresh(Duration::from_secs(60))
                 .map(|s| s.to_string()),
             Some("test-token-123".to_string())
+        );
+
+        run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// The desktop polls its own dashboard through this listener
+    /// (`127.0.0.1:6767/stats`), so a local path reaching a live backend must
+    /// not fire the `first_optimized_request` funnel beacon -- it is supposed to
+    /// mean "a coding tool sent a request", and self-polling made it fire in the
+    /// same second bootstrap finished, before any client was configured.
+    ///
+    /// Only the negative case is asserted: letting the beacon fire would spawn a
+    /// thread POSTing to the real headroom-web.
+    #[tokio::test]
+    #[serial(backend_port)]
+    async fn local_backend_path_does_not_fire_first_optimized_request() {
+        use std::sync::atomic::Ordering;
+
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+        backend_port::set(backend_addr.port());
+
+        // Other tests in this serial group may have flipped the one-shot; clear
+        // it so the assertion below is about this request and not test order.
+        FIRST_OPTIMIZED_REQUEST_REPORTED.store(false, Ordering::Release);
+
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        // Unroutable on purpose -- see the sibling test: a stray direct fallback
+        // must fail fast locally instead of calling api.anthropic.com.
+        let upstream_base = Arc::new("http://127.0.0.1:1".to_string());
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                upstream_base,
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(stream) = TcpStream::connect(intercept_addr).await {
+                client = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("connect to intercept");
+        client
+            .write_all(b"GET /stats HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write stats probe");
+
+        // The backend task completing proves the request was forwarded, so the
+        // beacon's fire site was reached and the guard is what held it back.
+        backend_task.await.expect("backend served the stats probe");
+
+        assert!(
+            !FIRST_OPTIMIZED_REQUEST_REPORTED.load(Ordering::Acquire),
+            "/stats is the app polling itself, not client traffic"
         );
 
         run_task.abort();

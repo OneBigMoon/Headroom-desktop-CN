@@ -142,6 +142,7 @@ import {
 } from "./lib/dashboardHelpers";
 import {
   buildInitialProxyVerificationRows,
+  formatConnectorNameList,
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
@@ -813,7 +814,7 @@ function WindowRateChip({
     <div className="output-chip" ref={ref}>
       <button
         type="button"
-        className={`output-chip__button${open ? " is-open" : ""}`}
+        className={`output-chip__button${badge === "estimated" ? " output-chip__button--estimated" : ""}${open ? " is-open" : ""}`}
         aria-expanded={open}
         aria-label={`${title} details`}
         onClick={(e) => {
@@ -888,7 +889,7 @@ function OutputReductionChip({
     <div className="output-chip" ref={ref}>
       <button
         type="button"
-        className={`output-chip__button${open ? " is-open" : ""}`}
+        className={`output-chip__button${isMeasured ? "" : " output-chip__button--estimated"}${open ? " is-open" : ""}`}
         aria-expanded={open}
         aria-label="Output token reduction details"
         onClick={(e) => {
@@ -1624,6 +1625,13 @@ export default function App() {
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
+  // Leaving the verify step unverified takes two clicks: the first arms the
+  // warning, the second leaves. 86% of installs used to click straight past
+  // this screen (median 26s, 45% under 15s) and the ones that did went on to
+  // send a first prompt 59% of the time vs 76% for the ones that waited -- the
+  // single biggest activation leak in onboarding, and invisible in support
+  // reports because nothing errors.
+  const [proxyVerifySkipArmed, setProxyVerifySkipArmed] = useState(false);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
@@ -4441,6 +4449,7 @@ export default function App() {
 
     setLauncherStage("proxy_verify");
     setProxyVerificationHint(null);
+    setProxyVerifySkipArmed(false);
     setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     // Reset to null so the polling effect re-anchors on its first reachable
     // /stats reading. Setting it here would risk anchoring on a stale value
@@ -5297,6 +5306,12 @@ export default function App() {
     const allVerified =
       hasEnabledApps &&
       proxyVerificationRows.every((row) => row.state === "verified");
+    const unverified = proxyVerificationRows.filter((row) => row.state !== "verified");
+    const unverifiedNames = formatConnectorNameList(unverified.map((row) => row.name));
+    const finishSetup = () => {
+      void invoke("complete_setup_wizard");
+      setLauncherStage("post_install");
+    };
 
     return (
       <LauncherShell
@@ -5309,7 +5324,10 @@ export default function App() {
         <div className="post-install__lead">
           <h1>Test your setup</h1>
           <p>
-            Send "Say hi" in each connected tool to verify the connection is working. You may need to restart it first.
+            Restart each tool below, then send it any message - "Say hi" is
+            enough. Tools only pick up Headroom's setting when they launch, so
+            the restart is usually the missing step. This screen ticks over by
+            itself as each one checks in.
           </p>
           {hasEnabledApps ? (
             <div className="connector-list">
@@ -5348,6 +5366,13 @@ export default function App() {
               {proxyVerificationHint.text}
             </p>
           ) : null}
+          {!allVerified && proxyVerifySkipArmed ? (
+            <p className="install-progress__notice">
+              {hasEnabledApps
+                ? `We have not detected any ${unverifiedNames} activity flowing through our savings pipeline yet. You can skip and continue for now, but Headroom can only compress requests it sees, so your savings are likely to stay at zero. Restart ${unverifiedNames} to fix this.`
+                : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
+            </p>
+          ) : null}
         </div>
         <div className="post-install__actions">
           <button
@@ -5359,16 +5384,32 @@ export default function App() {
           >
             Back
           </button>
-          <button
-            className="primary-button primary-button--large primary-button--success"
-            onClick={() => {
-              void invoke("complete_setup_wizard");
-              setLauncherStage("post_install");
-            }}
-            type="button"
-          >
-            Continue
-          </button>
+          {allVerified ? (
+            <button
+              className="primary-button primary-button--large primary-button--success"
+              onClick={finishSetup}
+              type="button"
+            >
+              Continue
+            </button>
+          ) : (
+            // Deliberately not a primary button: leaving without a single
+            // verified connector is the path that ends in "Headroom didn't
+            // work", so it should not look like the happy path.
+            <button
+              className="secondary-button"
+              onClick={() => {
+                if (proxyVerifySkipArmed) {
+                  finishSetup();
+                  return;
+                }
+                setProxyVerifySkipArmed(true);
+              }}
+              type="button"
+            >
+              {proxyVerifySkipArmed ? "Skip anyway" : "Skip for now"}
+            </button>
+          )}
         </div>
       </LauncherShell>
     );

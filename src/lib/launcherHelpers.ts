@@ -224,3 +224,14 @@ export function buildInitialProxyVerificationRows(
       message: `Waiting for a ${connector.name} prompt...`
     }));
 }
+
+/// Join connector names for the skip warning on the proxy-verify step. Up to
+/// four connectors can be enabled at once, so a plain `join(" and ")` mangles
+/// the 3+ case. `Intl.ListFormat` does this properly but needs an ES2021 lib,
+/// and one warning line is not worth raising the whole project's target.
+export function formatConnectorNameList(names: string[]): string {
+  if (names.length <= 1) {
+    return names.join("");
+  }
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
