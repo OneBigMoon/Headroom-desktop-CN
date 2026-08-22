@@ -65,6 +65,24 @@ describe("OptimizePanel", () => {
     ).toBeDisabled();
   });
 
+  it("collapses to a single 'not scanned yet' pill when Learn has never run", () => {
+    render(
+      <OptimizePanel
+        projectPath="/proj"
+        preloadedApplied={{ claudeMd: [], memoryMd: [] }}
+        neverScanned
+      />
+    );
+
+    expect(screen.getByRole("button", { name: /not scanned yet/i })).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: /learnings in CLAUDE.local\.md/i })
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /reminders in MEMORY\.md/i })
+    ).toBeNull();
+  });
+
   it("opens the CLAUDE.md modal with the section list when the pill is clicked", async () => {
     render(
       <OptimizePanel projectPath="/proj" preloadedApplied={samplePatterns} />

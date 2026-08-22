@@ -7235,26 +7235,36 @@ fn drop_rollup_backfill<T>(
 /// shallower, so 10% is the conservative choice across providers.
 const CACHE_READ_PRICE_RATIO: f64 = 0.10;
 
-/// True when the buckets imply a savings $/token materially above the $/token
-/// actually paid for input on the same traffic. A saved input token can never
-/// be worth more than sending it would have cost, so a rate past the paid rate
-/// means the upstream wheel changed what `compression_savings_usd` contains
-/// (e.g. 0.36.0 folded full-input-rate tool-schema dollars into it, implying
-/// $33/M on traffic actually paying $5/M). Both rates come from the same
-/// buckets, so the check self-calibrates to the user's model mix; the 1.5x
-/// headroom absorbs mix drift between saved and sent tokens. Volume floors
-/// keep a few cheap requests from tripping it on noise.
-fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<(f64, f64)> {
+/// The most any provider bills for a single input token, in USD per million.
+/// Claude Fable 5 tops the Anthropic table at $10/M; the headroom above it
+/// absorbs a pricier model shipping before this constant is revisited.
+const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 15.0;
+
+/// True when the buckets imply a savings $/token that no provider charges for
+/// an input token. A saved input token is worth exactly the rate it would have
+/// been billed at, so a rate above every published input price means the
+/// upstream wheel changed what `compression_savings_usd` contains (0.36.0
+/// folded full-input-rate tool-schema dollars into it, implying $33/M).
+///
+/// The first cut compared against the rate actually paid on the same buckets --
+/// self-calibrating, and wrong: `total_tokens_sent` counts provider cache
+/// reads, which bill at a tenth of fresh input, so the paid rate is diluted by
+/// the user's cache hit rate. Past ~37% reads that dilution alone clears a 1.5x
+/// check, and Claude Code routinely runs 80%+. RUST-89/8C is what that cost: 12
+/// events across 9 hosts on the pinned, uncontaminated 0.35.0, plus a live
+/// /stats here reading 5.9x. The buckets carry no cache-free denominator
+/// (`cache_read_tokens` is None for any day the app did not observe), so the
+/// check is an absolute ceiling instead. Price paid: contamination that stays
+/// under the ceiling on a cheap-model mix goes unseen.
+fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<f64> {
     let saved_usd: f64 = daily_savings.iter().map(|p| p.estimated_savings_usd).sum();
     let saved_tokens: u64 = daily_savings.iter().map(|p| p.estimated_tokens_saved).sum();
-    let paid_usd: f64 = daily_savings.iter().map(|p| p.actual_cost_usd).sum();
-    let sent_tokens: u64 = daily_savings.iter().map(|p| p.total_tokens_sent).sum();
-    if saved_tokens < 1_000_000 || sent_tokens < 1_000_000 || paid_usd < 1.0 {
+    // Volume floors: a handful of cheap requests is noise, not a semantics change.
+    if saved_tokens < 1_000_000 || saved_usd < 1.0 {
         return None;
     }
-    let savings_rate = saved_usd / saved_tokens as f64;
-    let paid_rate = paid_usd / sent_tokens as f64;
-    (savings_rate > paid_rate * 1.5).then_some((savings_rate * 1e6, paid_rate * 1e6))
+    let savings_per_m = saved_usd / saved_tokens as f64 * 1e6;
+    (savings_per_m > MAX_PLAUSIBLE_INPUT_USD_PER_M).then_some(savings_per_m)
 }
 
 /// Warn-only canary, once per process: a contaminated rate silently corrected
@@ -7265,12 +7275,12 @@ fn warn_once_if_savings_rate_implausible(daily_savings: &[DailySavingsPoint]) {
     if WARNED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if let Some((savings_per_m, paid_per_m)) = savings_rate_implausible(daily_savings) {
+    if let Some(savings_per_m) = savings_rate_implausible(daily_savings) {
         WARNED.store(true, std::sync::atomic::Ordering::Relaxed);
         log::warn!(
-            "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved vs \
-             ${paid_per_m:.2}/M actually paid for input; upstream savings semantics \
-             likely changed under the pinned wheel"
+            "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved, above the \
+             ${MAX_PLAUSIBLE_INPUT_USD_PER_M:.2}/M ceiling for an input token; upstream savings \
+             semantics likely changed under the pinned wheel"
         );
     }
 }
@@ -7644,38 +7654,42 @@ mod tests {
     }
 
     #[test]
-    fn savings_rate_canary_flags_a_rate_above_what_input_actually_cost() {
+    fn savings_rate_canary_flags_a_rate_no_input_token_can_cost() {
         let with_spend = |tokens: u64, usd: f64, sent: u64, paid: f64| DailySavingsPoint {
             actual_cost_usd: paid,
             total_tokens_sent: sent,
             ..daily("2026-08-21", tokens, usd)
         };
 
-        // Healthy: $5/M saved on traffic paying $5/M for input.
+        // Healthy: $5/M saved, Opus 5's input rate.
         assert_eq!(
             savings_rate_implausible(&[with_spend(2_000_000, 10.0, 20_000_000, 100.0)]),
             None
         );
 
-        // The 0.36.0 fold shape: $33/M implied on traffic paying $5/M.
-        let (savings_per_m, paid_per_m) =
+        // The 0.36.0 fold shape: $33/M implied, past every published input price.
+        let savings_per_m =
             savings_rate_implausible(&[with_spend(2_000_000, 66.0, 20_000_000, 100.0)])
                 .expect("contaminated rate must trip the canary");
         assert!((savings_per_m - 33.0).abs() < 1e-6, "{savings_per_m}");
-        assert!((paid_per_m - 5.0).abs() < 1e-6, "{paid_per_m}");
 
-        // Below the volume/spend floors nothing fires, however wild the ratio:
+        // RUST-89/8C: a cache-heavy user on the pinned wheel. $5/M saved against
+        // 20M tokens sent for $17 -- a $0.85/M paid rate, because cache reads
+        // bill at a tenth and dominate the denominator. The old relative check
+        // read that as 5.9x and fired; a plausible savings rate must not.
+        assert_eq!(
+            savings_rate_implausible(&[with_spend(2_000_000, 10.0, 20_000_000, 17.0)]),
+            None
+        );
+
+        // Below the volume/spend floors nothing fires, however wild the rate:
         // a handful of cheap requests is noise, not a semantics change.
         assert_eq!(
             savings_rate_implausible(&[with_spend(500_000, 66.0, 20_000_000, 100.0)]),
             None
         );
         assert_eq!(
-            savings_rate_implausible(&[with_spend(2_000_000, 66.0, 500_000, 100.0)]),
-            None
-        );
-        assert_eq!(
-            savings_rate_implausible(&[with_spend(2_000_000, 66.0, 20_000_000, 0.5)]),
+            savings_rate_implausible(&[with_spend(2_000_000, 0.5, 20_000_000, 100.0)]),
             None
         );
         assert_eq!(savings_rate_implausible(&[]), None);

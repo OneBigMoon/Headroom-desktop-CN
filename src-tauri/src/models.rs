@@ -395,6 +395,8 @@ pub struct ClientConnectorStatus {
     pub enabled: bool,
     pub verified: bool,
     pub last_configured_at: Option<String>,
+    #[serde(default)]
+    pub verification: Option<ClientSetupVerification>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -848,6 +850,11 @@ pub enum CodexPlanTier {
     Free,
     Go,
     Plus,
+    /// ChatGPT Pro Lite, the ~$100/mo mid-tier between Plus and Pro. Seen in
+    /// the fleet from 2026-08 (caught by the `plan_raw` passthrough) before
+    /// OpenAI announced it; any other spelling still falls through to
+    /// `Unknown` and rides out as a raw claim.
+    ProLite,
     Pro,
     Team,
     Business,
@@ -865,6 +872,7 @@ impl CodexPlanTier {
             "free" => CodexPlanTier::Free,
             "go" => CodexPlanTier::Go,
             "plus" => CodexPlanTier::Plus,
+            "prolite" => CodexPlanTier::ProLite,
             "pro" => CodexPlanTier::Pro,
             "team" => CodexPlanTier::Team,
             "business" => CodexPlanTier::Business,
@@ -884,6 +892,7 @@ impl CodexPlanTier {
             CodexPlanTier::Free => "free",
             CodexPlanTier::Go => "go",
             CodexPlanTier::Plus => "plus",
+            CodexPlanTier::ProLite => "prolite",
             CodexPlanTier::Pro => "pro",
             CodexPlanTier::Team => "team",
             CodexPlanTier::Business => "business",
@@ -921,9 +930,9 @@ pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubs
         CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::Team | CodexPlanTier::Business => {
             Some(HeadroomSubscriptionTier::Pro)
         }
-        CodexPlanTier::SelfServeBusinessUsageBased | CodexPlanTier::Edu => {
-            Some(HeadroomSubscriptionTier::Max5x)
-        }
+        CodexPlanTier::ProLite
+        | CodexPlanTier::SelfServeBusinessUsageBased
+        | CodexPlanTier::Edu => Some(HeadroomSubscriptionTier::Max5x),
         CodexPlanTier::Pro
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
@@ -1271,6 +1280,9 @@ mod tests {
     fn codex_plan_tier_from_claim_is_trimmed_case_insensitive_with_unknown_fallback() {
         assert_eq!(CodexPlanTier::from_claim("Plus"), CodexPlanTier::Plus);
         assert_eq!(CodexPlanTier::from_claim("  TEAM "), CodexPlanTier::Team);
+        // ChatGPT Pro Lite: the claim OpenAI mints for the ~$100/mo mid-tier.
+        assert_eq!(CodexPlanTier::from_claim("prolite"), CodexPlanTier::ProLite);
+        assert_eq!(CodexPlanTier::ProLite.as_header_str(), "prolite");
         assert_eq!(
             CodexPlanTier::from_claim("chatgptpaidplan"),
             CodexPlanTier::Unknown
@@ -1299,6 +1311,7 @@ mod tests {
             assert_eq!(headroom_tier_for_codex_plan(&plan), Some(Max20x));
         }
         for plan in [
+            CodexPlanTier::ProLite,
             CodexPlanTier::SelfServeBusinessUsageBased,
             CodexPlanTier::Edu,
         ] {

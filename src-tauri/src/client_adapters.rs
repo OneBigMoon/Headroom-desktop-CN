@@ -481,6 +481,10 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             );
             if normalized_setup_id(client_id) == "codex_cli" {
                 steps.push(
+                    "Quit and reopen any Codex desktop app, CLI, or IDE sessions to load the managed provider."
+                        .into(),
+                );
+                steps.push(
                     "In Codex, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
                         .into(),
                 );
@@ -740,13 +744,12 @@ pub fn list_client_connectors(
                 || setup_state
                     .remembered_clients
                     .contains_key(normalized_setup_id(spec.id));
-            let verified = if enabled {
-                verify_client_setup(spec.id)
-                    .map(|result| result.verified)
-                    .unwrap_or(false)
+            let verification = if enabled {
+                verify_client_setup(spec.id).ok()
             } else {
-                false
+                None
             };
+            let verified = verification.as_ref().is_some_and(|result| result.verified);
 
             ClientConnectorStatus {
                 client_id: spec.id.to_string(),
@@ -755,6 +758,7 @@ pub fn list_client_connectors(
                 enabled,
                 verified,
                 last_configured_at: configured_timestamp(&setup_state, spec.id),
+                verification,
             }
         })
         .collect();
@@ -8331,6 +8335,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "quit-time clear after a pause must keep the restore snapshot, got: {:?}",
             state.remembered_clients
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_client_connectors_carries_verification_only_for_enabled_clients() {
+        // The connector panel keys its status line off these two fields: an
+        // enabled client must arrive with its checks attached (the panel has
+        // no other way to say what is wrong), and a disabled one must carry
+        // none, so the list never implies it verified something it skipped.
+        let _home = TestHome::new();
+        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+
+        // installed: false is the Codex desktop-app/IDE user -- they share
+        // ~/.codex/config.toml with the CLI, so the connector is configurable
+        // and verifiable without the CLI binary on disk.
+        let detected = vec![crate::models::ClientStatus {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            installed: false,
+            configured: true,
+            health: crate::models::ClientHealth::Healthy,
+            notes: Vec::new(),
+        }];
+        let connectors = super::list_client_connectors(&detected).expect("listing succeeds");
+
+        let codex = connectors
+            .iter()
+            .find(|connector| connector.client_id == "codex")
+            .expect("codex connector listed");
+        assert!(!codex.installed);
+        assert!(codex.enabled);
+        assert!(codex.verified);
+        let verification = codex
+            .verification
+            .as_ref()
+            .expect("verification attached for an enabled client");
+        assert_eq!(verification.verified, codex.verified);
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|check| check.contains("config.toml")),
+            "config.toml check reported, got: {:?}",
+            verification.checks
+        );
+
+        let grok = connectors
+            .iter()
+            .find(|connector| connector.client_id == "grok_build")
+            .expect("grok connector listed");
+        assert!(!grok.enabled);
+        assert!(grok.verification.is_none());
     }
 
     #[test]

@@ -107,6 +107,7 @@ import {
   aggregateClientConnectors,
   addDays,
   addMonths,
+  baseUrlTakeoverNotice,
   buildHourlySavingsChartData,
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
@@ -116,6 +117,8 @@ import {
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
+  connectorStatusLine,
+  clientSetupNotice,
   currency,
   currencyExact,
   dayOfMonthTickFormatter,
@@ -128,6 +131,7 @@ import {
   formatSelectedDayLabel,
   getEnabledSupportedConnectors,
   hasEnabledConnector,
+  hasNeverScanned,
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
@@ -307,7 +311,7 @@ const connectorSetupDetails: Record<string, string> = {
   claude_code:
     "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom.",
   codex:
-    "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom. It also installs a guard hook that warns you inside Codex if routing ever breaks - run /hooks in Codex once to trust it (re-trust after a Headroom update).",
+    "Codex CLI, the IDE extension, and the desktop app share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
   grok_build:
     "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
   opencode:
@@ -346,7 +350,7 @@ const connectorUnavailableReasons: Record<string, string> = {
   claude_code:
     "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
   codex:
-    "Codex was not detected. Install the Codex CLI and restart Headroom.",
+    "Codex CLI was not detected. Headroom can still configure the Codex desktop app and IDE extension; install the CLI only if you also want terminal use.",
   grok_build:
     "Grok Build was not detected. Install Grok Build and restart Headroom.",
   opencode:
@@ -569,10 +573,6 @@ function FirstSavingsChecklist({
       )}
     </div>
   );
-}
-
-function baseUrlTakeoverNotice(replaced: string): string {
-  return `Claude Code was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
 }
 
 const idleHeadroomLearnStatus: HeadroomLearnStatus = {
@@ -4456,9 +4456,7 @@ export default function App() {
         const result = await invoke<ClientSetupResult>("apply_client_setup", {
           clientId: connector.clientId,
         });
-        setConnectorsNotice(
-          result.replacedBaseUrl ? baseUrlTakeoverNotice(result.replacedBaseUrl) : null
-        );
+        setConnectorsNotice(clientSetupNotice(connector.name, result));
       } else {
         await invoke("disable_client_setup", { clientId: connector.clientId });
         setConnectorsNotice(null);
@@ -5125,7 +5123,7 @@ export default function App() {
               const unavailableReason = getConnectorUnavailableReason(connector);
               const detectionWarning = getConnectorDetectionWarning(connector);
               const supportWarning = getConnectorSupportWarning(connector);
-              const needsRestart = connector.enabled && !connector.verified;
+              const statusLine = connectorStatusLine(connector);
               const gateBlocksEnable = connectorGateBlocksEnable(connector);
               return (
                 <article className="connector-item" key={connector.clientId}>
@@ -5175,10 +5173,8 @@ export default function App() {
                         {supportWarning}
                       </p>
                     ) : null}
-                    {needsRestart ? (
-                      <p className="connector-item__restart">
-                        Restart {connector.name} to apply changes.
-                      </p>
+                    {statusLine ? (
+                      <p className={`connector-item__${statusLine.tone}`}>{statusLine.text}</p>
                     ) : null}
                     {(detectionWarning ?? unavailableReason) ? (
                       <p className="connector-item__reason">
@@ -5394,8 +5390,8 @@ export default function App() {
       .filter((plan): plan is UpgradePlan => plan !== undefined);
     const paywallPlanFit: Record<string, string> = {
       pro: "For Claude Pro or ChatGPT Plus",
-      max5x: "Claude Max x5 & Codex Pro x5",
-      max20x: "Claude Max x20 & Codex Pro x20"
+      max5x: "Claude Max x5 & ChatGPT Pro Lite",
+      max20x: "Claude Max x20 & ChatGPT Pro"
     };
     const signedIn = pricingStatus?.authenticated === true;
     return (
@@ -6571,6 +6567,7 @@ export default function App() {
                                   {!isRunning ? (
                                     <OptimizePanel
                                       projectPath={project.projectPath}
+                                      neverScanned={hasNeverScanned(project)}
                                       refreshSignal={
                                         isLatestLearnProject && !headroomLearnStatus.running
                                           ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
@@ -7372,6 +7369,7 @@ export default function App() {
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
                     const gateBlocksEnable = connectorGateBlocksEnable(connector);
+                    const statusLine = connectorStatusLine(connector);
                     const toggleDisabled =
                       connectorsBusy ||
                       !canConfigureConnectorWithoutDetection(connector) ||
@@ -7399,14 +7397,50 @@ export default function App() {
                             </button>
                           </h3>
                           {openConnectorHelpId === connector.clientId ? (
-                            <p className="connector-tooltip">
-                              {connectorSetupDetails[connector.clientId] ??
-                                "Headroom applies local connector configuration."}
-                            </p>
+                            <div className="connector-tooltip">
+                              <p>
+                                {connectorSetupDetails[connector.clientId] ??
+                                  "Headroom applies local connector configuration."}
+                              </p>
+                              {connector.enabled ? (
+                                <div className="connector-diagnostics">
+                                  <strong>Connection checks</strong>
+                                  {connector.verification ? (
+                                    <ul>
+                                      {connector.verification.checks.map((check) => (
+                                        <li className="is-good" key={check}>
+                                          ✓ {check}
+                                        </li>
+                                      ))}
+                                      {connector.verification.failures.map((failure) => (
+                                        <li className="is-bad" key={failure}>
+                                          × {failure}
+                                        </li>
+                                      ))}
+                                      {!connector.verification.proxyReachable ? (
+                                        <li className="is-waiting">
+                                          … Headroom proxy is not answering on 127.0.0.1:6767.
+                                        </li>
+                                      ) : null}
+                                    </ul>
+                                  ) : (
+                                    <p>Verification details are not available yet.</p>
+                                  )}
+                                  <button
+                                    className="addon-card__link connector-diagnostics__refresh"
+                                    disabled={connectorsBusy}
+                                    onClick={() => void refreshConnectors()}
+                                    type="button"
+                                  >
+                                    {connectorsBusy ? "Checking…" : "Re-check"}
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
                           ) : null}
-                          {connector.enabled && !connector.verified && connector.installed ? (
-                            <p className="connector-item__restart">
-                              Restart {connector.name} to start routing through Headroom.
+                          {statusLine ? (
+                            <p className={`connector-item__${statusLine.tone}`}>
+                              {statusLine.text}
                             </p>
                           ) : null}
                           {(detectionWarning ?? unavailableReason) ? (

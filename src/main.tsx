@@ -11,11 +11,18 @@ if (!navigator.userAgent.includes("Mac")) {
   document.documentElement.dataset.vibrancy = "none";
 }
 
-Sentry.init({
-  dsn: import.meta.env.VITE_SENTRY_DSN,
-  integrations: [Sentry.browserTracingIntegration()],
-  tracesSampleRate: 0.1,
-});
+// Packaged builds only. `npm run dev` serves this page to a plain browser, where
+// window.__TAURI_INTERNALS__ does not exist, so every startup invoke and event
+// listener throws on it -- RUST-8A/8B are 16 events of that, reported against no
+// release from a dev machine. Sentry calls are no-ops until init, so the rest of
+// the app's capture sites stay silent in dev rather than needing their own guard.
+if (import.meta.env.PROD) {
+  Sentry.init({
+    dsn: import.meta.env.VITE_SENTRY_DSN,
+    integrations: [Sentry.browserTracingIntegration()],
+    tracesSampleRate: 0.1,
+  });
+}
 
 function hideBootLoading() {
   const bootLoading = document.getElementById("boot-loading");

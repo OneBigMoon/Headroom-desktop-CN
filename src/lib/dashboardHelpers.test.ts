@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   aggregateClientConnectors,
+  baseUrlTakeoverNotice,
   buildHourlySavingsChartData,
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
@@ -10,6 +11,8 @@ import {
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
+  connectorStatusLine,
+  clientSetupNotice,
   currency,
   currencyExact,
   dayOfMonthTickFormatter,
@@ -18,6 +21,7 @@ import {
   formatDateTime,
   formatDayKey,
   formatLearnStatus,
+  hasNeverScanned,
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hourOfDayTickFormatter,
@@ -28,6 +32,7 @@ import {
 } from "./dashboardHelpers";
 import type {
   ClientConnectorStatus,
+  ClientSetupResult,
   DailySavingsPoint,
   HourlySavingsPoint
 } from "./types";
@@ -217,6 +222,82 @@ describe("dashboard helpers", () => {
     ]);
   });
 
+  it("keeps connector setup follow-up steps visible", () => {
+    const result: ClientSetupResult = {
+      clientId: "codex",
+      applied: true,
+      alreadyConfigured: false,
+      summary: "Configured",
+      changedFiles: [],
+      backupFiles: [],
+      nextSteps: ["Restart Codex.", "Run /hooks."],
+      verification: {
+        clientId: "codex",
+        verified: true,
+        proxyReachable: true,
+        checks: [],
+        failures: []
+      }
+    };
+
+    expect(clientSetupNotice("Codex", result)).toBe(
+      "Codex is configured through Headroom. Restart Codex. Run /hooks."
+    );
+    expect(baseUrlTakeoverNotice("https://gateway.example")).toContain(
+      "https://gateway.example"
+    );
+  });
+
+  it("reports connector status without mistaking an unrestarted client for a broken one", () => {
+    const now = Date.parse("2026-08-22T12:00:00Z");
+    const base: ClientConnectorStatus = {
+      clientId: "codex",
+      name: "Codex",
+      installed: false,
+      enabled: true,
+      verified: true,
+      lastConfiguredAt: "2026-08-22T11:00:00Z",
+      verification: {
+        clientId: "codex",
+        verified: true,
+        proxyReachable: true,
+        checks: ["Found Headroom-managed provider block in ~/.codex/config.toml."],
+        failures: []
+      }
+    };
+
+    // Just configured: the one thing Headroom cannot do for the user.
+    expect(connectorStatusLine(base, now)).toEqual({
+      text: "Quit and reopen Codex if it was running when you enabled this.",
+      tone: "restart"
+    });
+    // ...and it stops nagging a working setup the next day.
+    expect(connectorStatusLine(base, now + 25 * 60 * 60 * 1000)).toBeNull();
+    // Not installed is not a fault: Codex desktop/IDE share ~/.codex/config.toml.
+    expect(connectorStatusLine({ ...base, lastConfiguredAt: null }, now)).toBeNull();
+    expect(connectorStatusLine({ ...base, enabled: false }, now)).toBeNull();
+
+    expect(connectorStatusLine({ ...base, verified: false }, now)).toEqual({
+      text: "Setup is incomplete - open the info panel for the exact checks.",
+      tone: "reason"
+    });
+    expect(
+      connectorStatusLine({ ...base, verified: false, verification: null }, now)
+    ).toEqual({
+      text: "Setup could not be verified - open the info panel and re-check.",
+      tone: "reason"
+    });
+    expect(
+      connectorStatusLine(
+        { ...base, verification: { ...base.verification!, proxyReachable: false } },
+        now
+      )
+    ).toEqual({
+      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6767 yet.",
+      tone: "reason"
+    });
+  });
+
   it("keeps codex, grok_build and opencode alongside claude_code as supported connectors", () => {
     const connectors: ClientConnectorStatus[] = [
       { clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false },
@@ -280,6 +361,9 @@ describe("dashboard helpers", () => {
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-27T08:00:00Z" })).toBe("last scan: today");
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-26T08:00:00Z" })).toBe("last scan: yesterday");
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe("last scan: 5 days ago");
+    expect(hasNeverScanned({ lastLearnRanAt: null })).toBe(true);
+    expect(hasNeverScanned({ lastLearnRanAt: "invalid" })).toBe(true);
+    expect(hasNeverScanned({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe(false);
   });
 });
 

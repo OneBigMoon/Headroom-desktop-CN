@@ -935,7 +935,10 @@ fn metered_window(snapshot: &CodexRateLimitSnapshot) -> Option<&crate::models::C
 /// a weekly window — the gate depends on it and we previously had no field
 /// visibility. Credits ride along to spot seats burning workspace credits
 /// beyond their plan allowance (post-April-2026 credit-billed Codex): the
-/// upsell cohort the plan claim alone can't identify.
+/// upsell cohort the plan claim alone can't identify. Field result after four
+/// days (prod, 2026-08-22): 14 identities reported credits, 11 of them `0` on
+/// consumer Plus/Pro, and only one Business row - Business seats publish
+/// `primary=0@0` windows, so this string is all we will ever get from them.
 fn codex_usage_windows_summary(snapshot: &CodexRateLimitSnapshot) -> String {
     let part = |name: &str, window: Option<&crate::models::CodexUsageWindow>| {
         window.map(|w| match w.window_minutes {
@@ -2342,11 +2345,13 @@ fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
         | CodexPlanTier::Edu => Some(plan.as_header_str().to_string()),
-        CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::Pro => Some(if has_org {
-            plan.as_header_str().to_string()
-        } else {
-            "subscription".to_string()
-        }),
+        CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::ProLite | CodexPlanTier::Pro => {
+            Some(if has_org {
+                plan.as_header_str().to_string()
+            } else {
+                "subscription".to_string()
+            })
+        }
     }
 }
 

@@ -510,13 +510,13 @@ export function getUpgradePlans(
         "Use on all your devices with one account",
         "Email-based support"
       ], "Get Pro"),
-      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 or ChatGPT Pro x5 accounts", "Includes:", [
-        "Unlimited use with Claude Max x5 or ChatGPT Pro x5",
+      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 or ChatGPT Pro Lite accounts", "Includes:", [
+        "Unlimited use with Claude Max x5 or ChatGPT Pro Lite",
         "Use on all your devices with one account",
         "Email-based support"
       ], "Get Max x5"),
-      max20x: paidPlan("max20x", "Max x20", "For Claude Max x20 or ChatGPT Pro x20 accounts", "Includes:", [
-        "Unlimited use with Claude Max x20 or ChatGPT Pro x20",
+      max20x: paidPlan("max20x", "Max x20", "For Claude Max x20 or ChatGPT Pro accounts", "Includes:", [
+        "Unlimited use with Claude Max x20 or ChatGPT Pro",
         "Use on all your devices with one account",
         "Priority support"
       ], "Get Max x20"),

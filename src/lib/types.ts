@@ -254,6 +254,7 @@ export interface ClientConnectorStatus {
   enabled: boolean;
   verified: boolean;
   lastConfiguredAt?: string | null;
+  verification?: ClientSetupVerification | null;
 }
 
 export interface RuntimeStatus {
@@ -524,6 +525,7 @@ export type CodexPlanTier =
   | "free"
   | "go"
   | "plus"
+  | "prolite"
   | "pro"
   | "team"
   | "business"

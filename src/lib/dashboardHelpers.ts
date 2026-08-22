@@ -1,5 +1,6 @@
 import type {
   ClientConnectorStatus,
+  ClientSetupResult,
   DailySavingsPoint,
   HourlySavingsPoint,
   ProviderSavingsPoint
@@ -526,14 +527,25 @@ export function formatRelativeTime(
   }).format(d);
 }
 
+function parsedLearnDate(project: { lastLearnRanAt: string | null }): Date | null {
+  if (!project.lastLearnRanAt) {
+    return null;
+  }
+  const parsed = new Date(project.lastLearnRanAt);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+// True when Learn has never produced a usable timestamp for this project, so
+// empty pattern counts mean "not scanned yet" rather than "scanned, found none".
+export function hasNeverScanned(project: { lastLearnRanAt: string | null }): boolean {
+  return parsedLearnDate(project) === null;
+}
+
 export function formatLearnStatus(project: {
   lastLearnRanAt: string | null;
 }): string {
-  if (!project.lastLearnRanAt) {
-    return "never scan";
-  }
-  const parsed = new Date(project.lastLearnRanAt);
-  if (Number.isNaN(parsed.getTime())) {
+  const parsed = parsedLearnDate(project);
+  if (!parsed) {
     return "never scan";
   }
   const diffMs = Date.now() - parsed.getTime();
@@ -549,6 +561,64 @@ const SUPPORTED_CONNECTOR_IDS = new Set([
   "grok_build",
   "opencode"
 ]);
+
+export function baseUrlTakeoverNotice(replaced: string): string {
+  return `This client was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
+}
+
+export function clientSetupNotice(clientName: string, result: ClientSetupResult): string {
+  return [
+    result.replacedBaseUrl
+      ? baseUrlTakeoverNotice(result.replacedBaseUrl)
+      : `${clientName} is configured through Headroom.`,
+    ...result.nextSteps
+  ].join(" ");
+}
+
+export type ConnectorStatusLine = {
+  text: string;
+  tone: "reason" | "restart";
+};
+
+// A client picks up routing only when it restarts, and nothing local tells us
+// whether the user did. Rather than nag forever, the hint rides the configure
+// timestamp: relevant right after enabling, gone by the next day.
+const RESTART_HINT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export function connectorStatusLine(
+  connector: ClientConnectorStatus,
+  now: number = Date.now()
+): ConnectorStatusLine | null {
+  if (!connector.enabled) {
+    return null;
+  }
+  // `verified` attests only that Headroom wrote what it needed to write, so it
+  // is a setup failure, never "the client has not restarted yet".
+  if (!connector.verified) {
+    return {
+      text: connector.verification
+        ? "Setup is incomplete - open the info panel for the exact checks."
+        : "Setup could not be verified - open the info panel and re-check.",
+      tone: "reason"
+    };
+  }
+  if (connector.verification && !connector.verification.proxyReachable) {
+    return {
+      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6767 yet.",
+      tone: "reason"
+    };
+  }
+  const configuredAt = connector.lastConfiguredAt
+    ? Date.parse(connector.lastConfiguredAt)
+    : Number.NaN;
+  if (Number.isFinite(configuredAt) && now - configuredAt < RESTART_HINT_WINDOW_MS) {
+    return {
+      text: `Quit and reopen ${connector.name} if it was running when you enabled this.`,
+      tone: "restart"
+    };
+  }
+  return null;
+}
 
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {
   return connectors.filter((connector) =>
@@ -603,4 +673,3 @@ export function connectorDashboardStatus(
   }
   return { label: "Active", tone: "active" };
 }
-
