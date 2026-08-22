@@ -15,6 +15,7 @@ mod port_conflict;
 mod pricing;
 mod proc;
 mod proxy_intercept;
+mod savings_canary;
 mod state;
 mod storage;
 mod tool_manager;
@@ -3235,6 +3236,9 @@ fn run_activity_observation(app: &AppHandle) {
 
     if let Ok(feed) = fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
         let _ = state.observe_activity_from_transformations(&feed.transformations);
+        // Same batch, second reader: flags a client whose requests all stopped
+        // compressing (see savings_canary for why the server cannot see this).
+        savings_canary::observe(&feed.transformations);
     }
 
     let projects = state.list_claude_code_projects().unwrap_or_default();
