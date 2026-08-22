@@ -1941,7 +1941,19 @@ impl ToolManager {
     }
 
     pub fn python_runtime_installed(&self) -> bool {
-        self.runtime.ready_flag().exists() && self.runtime.managed_python().exists()
+        // The base interpreter counts too, not just the venv. A venv's
+        // `Scripts/python.exe` is a redirector stub that execs the interpreter
+        // recorded in `pyvenv.cfg`; deleting `runtime/python` (AV quarantine,
+        // disk cleanup) leaves the stub and the READY flag on disk, so a
+        // venv-only gate reads "installed" while every spawn dies with exit 103
+        // / `No Python at '...'` (RUST-8E). That matters because this gate is
+        // what routes a missing runtime back to setup, and bootstrap already
+        // re-downloads the distribution and rebuilds the venv from it -- the
+        // only thing standing between the user and a self-repair was this
+        // check. Same blind spot as RUST-66/6M one level down.
+        self.runtime.ready_flag().exists()
+            && self.runtime.managed_python().exists()
+            && self.runtime.standalone_python().exists()
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -11702,6 +11714,31 @@ after
         .expect("receipt");
         let manager = ToolManager::new(runtime.clone());
         (root, runtime, manager)
+    }
+
+    /// RUST-8E: a venv orphaned from its base interpreter keeps its redirector
+    /// stub and READY flag, so the venv-only gate reported "installed" and the
+    /// launch dead-ended in a Sentry start failure (exit 103, `No Python at`)
+    /// instead of routing to setup, which re-downloads the runtime.
+    #[test]
+    fn python_runtime_installed_requires_the_standalone_base() {
+        let (_root, runtime, manager) = seed_test_runtime("orphaned-venv-base");
+        for marker in [runtime.ready_flag(), runtime.managed_python()] {
+            fs::create_dir_all(marker.parent().expect("parent")).expect("mkdir");
+            fs::write(&marker, b"").expect("marker");
+        }
+        assert!(
+            !manager.python_runtime_installed(),
+            "a venv whose standalone base is gone must not read as installed"
+        );
+
+        let base = runtime.standalone_python();
+        fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
+        fs::write(&base, b"").expect("base");
+        assert!(
+            manager.python_runtime_installed(),
+            "all three markers present must read as installed"
+        );
     }
 
     /// RUST-82: `python -m venv` runs ensurepip through `check_output` and
