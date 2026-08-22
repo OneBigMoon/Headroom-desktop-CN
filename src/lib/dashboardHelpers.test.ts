@@ -21,6 +21,7 @@ import {
   formatDateTime,
   formatDayKey,
   formatLearnStatus,
+  hasNeverScanned,
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hourOfDayTickFormatter,
@@ -360,6 +361,9 @@ describe("dashboard helpers", () => {
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-27T08:00:00Z" })).toBe("last scan: today");
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-26T08:00:00Z" })).toBe("last scan: yesterday");
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe("last scan: 5 days ago");
+    expect(hasNeverScanned({ lastLearnRanAt: null })).toBe(true);
+    expect(hasNeverScanned({ lastLearnRanAt: "invalid" })).toBe(true);
+    expect(hasNeverScanned({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe(false);
   });
 });
 

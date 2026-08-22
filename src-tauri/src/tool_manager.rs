@@ -872,35 +872,38 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             async def _hd_at_compress(self, payload, **kwargs):
                 global _hd_at_warned
                 plan = []
+                result = None
                 try:
                     _hd_at_lift(payload, plan)
                 except Exception:
                     # The plan is deliberately kept: a lift that raised after
                     # mutating the payload is undone by the restore below.
                     pass
-                result = await _hd_at_orig_compress(self, payload, **kwargs)
-                if plan:
-                    try:
-                        # result[0] is what the call sites forward; the caller
-                        # payload is restored too, for the paths that forward
-                        # the object they passed in when nothing was modified.
+                try:
+                    result = await _hd_at_orig_compress(self, payload, **kwargs)
+                finally:
+                    if plan:
                         targets = [payload]
-                        out = result[0] if isinstance(result, tuple) and result else None
-                        if isinstance(out, dict) and out is not payload:
-                            targets.append(out)
-                        failed = [t for t in targets if not _hd_at_restore(t, plan)]
-                    except Exception:
-                        failed = targets
-                    if failed and not _hd_at_warned:
-                        # Logged once: the lifted shape is about to go out and
-                        # a stateful client will lose its tools after this
-                        # turn. Never silent.
-                        _hd_at_warned = True
-                        _hd_at_log.warning(
-                            "event=codex_additional_tools_restore_failed "
-                            "(forwarding lifted shape; set "
-                            "HEADROOM_ADDITIONAL_TOOLS_GUARD=0 to opt out)"
-                        )
+                        try:
+                            # result[0] is what the call sites forward; the caller
+                            # payload is restored too, for the paths that forward
+                            # the object they passed in when nothing was modified.
+                            out = result[0] if isinstance(result, tuple) and result else None
+                            if isinstance(out, dict) and out is not payload:
+                                targets.append(out)
+                            failed = [t for t in targets if not _hd_at_restore(t, plan)]
+                        except Exception:
+                            failed = targets
+                        if failed and not _hd_at_warned:
+                            # Logged once: the lifted shape is about to go out and
+                            # a stateful client will lose its tools after this
+                            # turn. Never silent.
+                            _hd_at_warned = True
+                            _hd_at_log.warning(
+                                "event=codex_additional_tools_restore_failed "
+                                "(forwarding lifted shape; set "
+                                "HEADROOM_ADDITIONAL_TOOLS_GUARD=0 to opt out)"
+                            )
                 return result
 
             _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
@@ -9733,6 +9736,87 @@ mod tests {
             .find("_hd_rd_openai.OpenAIHandlerMixin")
             .expect("denominator patch present");
         assert!(denom_pos < lift_pos);
+    }
+
+    #[test]
+    fn sitecustomize_restores_codex_additional_tools_when_compression_raises() {
+        let py = super::SITECUSTOMIZE_PY;
+        let guard = &py[py
+            .find("    # Codex additional_tools guard")
+            .expect("additional_tools guard present")..];
+        let mut script = r#"
+import asyncio
+import copy
+import os as _hd_os
+import sys
+import types
+
+headroom = types.ModuleType("headroom")
+headroom.__path__ = []
+proxy = types.ModuleType("headroom.proxy")
+proxy.__path__ = []
+handlers = types.ModuleType("headroom.proxy.handlers")
+handlers.__path__ = []
+openai = types.ModuleType("headroom.proxy.handlers.openai")
+
+class OpenAIHandlerMixin:
+    async def _compress_openai_responses_payload_in_executor(self, payload, **kwargs):
+        assert payload.get("tools"), payload
+        raise TimeoutError("boom")
+
+openai.OpenAIHandlerMixin = OpenAIHandlerMixin
+headroom.proxy = proxy
+proxy.handlers = handlers
+handlers.openai = openai
+sys.modules.update({
+    "headroom": headroom,
+    "headroom.proxy": proxy,
+    "headroom.proxy.handlers": handlers,
+    "headroom.proxy.handlers.openai": openai,
+})
+"#
+        .to_string();
+        script.push_str("if True:\n");
+        script.push_str(guard);
+        script.push_str(
+            r#"
+payload = {
+    "input": [
+        {"type": "message", "content": "before"},
+        {
+            "type": "additional_tools",
+            "id": "carrier",
+            "tools": [{"type": "function", "name": "shell"}],
+        },
+        {"type": "message", "content": "after"},
+    ]
+}
+original = copy.deepcopy(payload)
+
+async def verify():
+    try:
+        await OpenAIHandlerMixin()._compress_openai_responses_payload_in_executor(payload)
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("compressor did not raise")
+    assert payload == original, (payload, original)
+
+asyncio.run(verify())
+"#,
+        );
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let out = match crate::proc::command(python).args(["-c", &script]).output() {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => panic!("spawn failed: {e}"),
+        };
+        assert!(
+            out.status.success(),
+            "additional_tools exception round-trip failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

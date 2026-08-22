@@ -321,9 +321,13 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // Windows host that is a per-emit loop: RUST-6H took 988 events in 24h from
     // `Jan2022` alone, more than the entire fleet's Sentry volume over the same
     // window. Nothing is actionable -- the backend keeps proxying, only the UI
-    // misses the event, and it heals when the webview comes back. Matched on the
-    // wry error Display because that is the whole message; keep the local log.
-    if target.starts_with("tauri_runtime_wry") && msg.starts_with("WebView2 error:") {
+    // misses the event, and it heals when the webview comes back. Match the
+    // known transient HRESULT rather than wry's generic prefix so webview
+    // creation and startup failures still reach Sentry; keep the local log.
+    if target.starts_with("tauri_runtime_wry")
+        && msg.starts_with("WebView2 error:")
+        && msg.contains("HRESULT(0x8007139F)")
+    {
         return true;
     }
     // Stopping without the lifecycle lock is the DESIGNED path, not a failure:
@@ -667,7 +671,11 @@ mod tests {
             "tauri_runtime_wry",
             "WebView2 error: WindowsError(Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" })"
         ));
-        // Other wry failures still report -- only the evaluate_script shape floods.
+        // Other bare WebView2 errors may be creation/startup failures.
+        assert!(!skip_sentry(
+            "tauri_runtime_wry",
+            "WebView2 error: WindowsError(Error { code: HRESULT(0x80004005), message: \"Unspecified error.\" })"
+        ));
         assert!(!skip_sentry(
             "tauri_runtime_wry",
             "failed to navigate to url http://localhost:1420: some error"

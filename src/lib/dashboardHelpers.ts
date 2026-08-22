@@ -527,14 +527,25 @@ export function formatRelativeTime(
   }).format(d);
 }
 
+function parsedLearnDate(project: { lastLearnRanAt: string | null }): Date | null {
+  if (!project.lastLearnRanAt) {
+    return null;
+  }
+  const parsed = new Date(project.lastLearnRanAt);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+// True when Learn has never produced a usable timestamp for this project, so
+// empty pattern counts mean "not scanned yet" rather than "scanned, found none".
+export function hasNeverScanned(project: { lastLearnRanAt: string | null }): boolean {
+  return parsedLearnDate(project) === null;
+}
+
 export function formatLearnStatus(project: {
   lastLearnRanAt: string | null;
 }): string {
-  if (!project.lastLearnRanAt) {
-    return "never scan";
-  }
-  const parsed = new Date(project.lastLearnRanAt);
-  if (Number.isNaN(parsed.getTime())) {
+  const parsed = parsedLearnDate(project);
+  if (!parsed) {
     return "never scan";
   }
   const diffMs = Date.now() - parsed.getTime();

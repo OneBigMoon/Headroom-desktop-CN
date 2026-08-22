@@ -19,6 +19,9 @@ interface OptimizePanelProps {
   // Called after the panel mutates applied patterns (delete) so the parent
   // can refetch the shared aggregate. Only used when preloadedApplied is set.
   onAppliedMutated?: () => void;
+  // Learn has never run here, so zero counts mean "not scanned yet" rather
+  // than "scanned and found nothing". Collapses the two pills into one.
+  neverScanned?: boolean;
 }
 
 type ModalKind = null | "claude" | "memory";
@@ -28,6 +31,7 @@ export function OptimizePanel({
   refreshSignal,
   preloadedApplied,
   onAppliedMutated,
+  neverScanned = false,
 }: OptimizePanelProps) {
   const hasPreloadedApplied = preloadedApplied !== undefined;
   const [applied, setApplied] = useState<AppliedPatterns | null>(
@@ -107,6 +111,16 @@ export function OptimizePanel({
   const memoryCount = applied?.memoryMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0;
   const claudeDisabled = applied === null || claudeCount === 0;
   const memoryDisabled = applied === null || memoryCount === 0;
+
+  if (neverScanned) {
+    return (
+      <span className="optimize-panel__pills">
+        <button type="button" className="optimize-panel__pill optimize-panel__pill--empty" disabled>
+          not scanned yet
+        </button>
+      </span>
+    );
+  }
 
   return (
     <>

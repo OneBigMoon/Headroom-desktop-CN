@@ -131,6 +131,7 @@ import {
   formatSelectedDayLabel,
   getEnabledSupportedConnectors,
   hasEnabledConnector,
+  hasNeverScanned,
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
@@ -6566,6 +6567,7 @@ export default function App() {
                                   {!isRunning ? (
                                     <OptimizePanel
                                       projectPath={project.projectPath}
+                                      neverScanned={hasNeverScanned(project)}
                                       refreshSignal={
                                         isLatestLearnProject && !headroomLearnStatus.running
                                           ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
