@@ -4357,15 +4357,27 @@ impl SavingsTracker {
             });
 
         // Sampled series recorded under older estimator semantics (see
-        // OUTPUT_SAMPLE_SERIES_VERSION): the buckets stay -- they are the
+        // OUTPUT_SAMPLE_SERIES_VERSION): completed days stay -- they are the
         // user's history -- but the watermark seed pair is dropped so the
         // first poll reseeds against the new, smaller cumulative.
+        //
+        // The bucket covering the moment of the bump is the exception. It is a
+        // part-day of OLD-units samples that new-units samples are about to be
+        // added to, so it represents nothing: on 2026-08-22 it left the day
+        // chip reading 93% (pure pre-bump ping artifacts) while every other
+        // number had moved to the new estimator. Dropping just that bucket
+        // costs the current day's partial figure -- which the all-time
+        // fallback covers -- and keeps every completed day.
         let output_series_current = persisted_state.as_ref().is_some_and(|state| {
             state.output_sample_series_version >= OUTPUT_SAMPLE_SERIES_VERSION
         });
+        // Daily keys are UTC dates, hourly keys are local (see the field docs),
+        // so the seam has to be named in each series' own timezone.
+        let seam_day_utc = Utc::now().format("%Y-%m-%d").to_string();
+        let seam_day_local = local_day_key(Local::now());
         if persisted_state.is_some() && !output_series_current {
             log::info!(
-                "sampled output series predates estimator semantics v{OUTPUT_SAMPLE_SERIES_VERSION}; reseeding the watermark, keeping recorded buckets"
+                "sampled output series predates estimator semantics v{OUTPUT_SAMPLE_SERIES_VERSION}; reseeding the watermark, dropping the {seam_day_utc} seam bucket, keeping completed days"
             );
         }
 
@@ -4407,10 +4419,22 @@ impl SavingsTracker {
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
             output_daily_samples: persisted_state
                 .as_ref()
-                .map_or_else(BTreeMap::new, |state| state.output_daily_samples.clone()),
+                .map_or_else(BTreeMap::new, |state| {
+                    let mut samples = state.output_daily_samples.clone();
+                    if !output_series_current {
+                        samples.remove(&seam_day_utc);
+                    }
+                    samples
+                }),
             output_hourly_samples: persisted_state
                 .as_ref()
-                .map_or_else(BTreeMap::new, |state| state.output_hourly_samples.clone()),
+                .map_or_else(BTreeMap::new, |state| {
+                    let mut samples = state.output_hourly_samples.clone();
+                    if !output_series_current {
+                        samples.retain(|key, _| !key.starts_with(&seam_day_local));
+                    }
+                    samples
+                }),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: persisted_state
                 .as_ref()
@@ -8578,6 +8602,25 @@ mod tests {
                 baseline_tokens: 1_611,
             },
         );
+        // The seam: a part-day of old-units samples that new-units samples
+        // would be added to. Kept, it reads as the day's figure (93% of pure
+        // ping artifacts, 2026-08-22) long after everything else has moved on.
+        let seam_day_utc = Utc::now().format("%Y-%m-%d").to_string();
+        let seam_hour_local = super::local_hour_key(Local::now());
+        old.output_daily_samples.insert(
+            seam_day_utc.clone(),
+            OutputSampleBucket {
+                saved_tokens: 17_995,
+                baseline_tokens: 19_332,
+            },
+        );
+        old.output_hourly_samples.insert(
+            seam_hour_local.clone(),
+            OutputSampleBucket {
+                saved_tokens: 1_590,
+                baseline_tokens: 1_611,
+            },
+        );
         std::fs::write(
             config_file(dir.path(), "savings-state.json"),
             serde_json::to_vec(&old).expect("serialize"),
@@ -8585,6 +8628,11 @@ mod tests {
         .expect("write old state");
 
         let tracker = SavingsTracker::load_or_create(dir.path()).expect("load");
+        assert!(
+            !tracker.output_daily_samples.contains_key(&seam_day_utc),
+            "the mixed-units seam bucket is dropped"
+        );
+        assert!(!tracker.output_hourly_samples.contains_key(&seam_hour_local));
         assert_eq!(
             tracker.output_daily_samples.get("2026-08-21"),
             Some(&OutputSampleBucket {
