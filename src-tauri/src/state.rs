@@ -4184,12 +4184,17 @@ struct OutputSampleBucket {
 }
 
 /// Semantics version of the sampled output series. The samples are deltas of
-/// `crate::output_savings::estimate()`, so they are only comparable to other
-/// samples taken under the same estimator rules. Bump this when those rules
-/// change and the persisted series + watermark pair are dropped once on load:
-/// mixing units keeps stale artifacts on the chart (the 98.7% ping buckets of
-/// 2026-08) and parks the seed watermark above the new, smaller cumulative,
-/// which silences the sampler until it re-climbs the difference.
+/// `crate::output_savings::estimate()`, so a sample is only comparable to
+/// others taken under the same estimator rules. Bump this when those rules
+/// change: the persisted *watermark pair* is then dropped once on load, so the
+/// next poll reseeds against the new cumulative instead of parking above it
+/// (the new number is smaller, and a mark left at the old one silences the
+/// sampler until it re-climbs the difference — weeks, on a real ledger).
+///
+/// Recorded BUCKETS are deliberately kept across a bump. They are the history
+/// the chart draws, and a percentage measured honestly under the rules of its
+/// day is worth more than a gap: v1 dropped them and simply erased two weeks
+/// of a user's output history. Only the seed pair is unit-sensitive.
 /// Version history: 0 = pre-field (prefix-fallback lookup), 1 = exact-stratum
 /// lookup with MIN_BASELINE_N (2026-08-22).
 const OUTPUT_SAMPLE_SERIES_VERSION: u8 = 1;
@@ -4351,16 +4356,16 @@ impl SavingsTracker {
                 })
             });
 
-        // Old-units sampled series (see OUTPUT_SAMPLE_SERIES_VERSION) is
-        // dropped wholesale: buckets, plus the watermark seed pair -- keeping
-        // the pair would floor the first-poll seed at the OLD estimator's
-        // larger cumulative and silence the sampler until it re-climbs there.
+        // Sampled series recorded under older estimator semantics (see
+        // OUTPUT_SAMPLE_SERIES_VERSION): the buckets stay -- they are the
+        // user's history -- but the watermark seed pair is dropped so the
+        // first poll reseeds against the new, smaller cumulative.
         let output_series_current = persisted_state.as_ref().is_some_and(|state| {
             state.output_sample_series_version >= OUTPUT_SAMPLE_SERIES_VERSION
         });
         if persisted_state.is_some() && !output_series_current {
             log::info!(
-                "sampled output series predates estimator semantics v{OUTPUT_SAMPLE_SERIES_VERSION}; dropping it"
+                "sampled output series predates estimator semantics v{OUTPUT_SAMPLE_SERIES_VERSION}; reseeding the watermark, keeping recorded buckets"
             );
         }
 
@@ -4402,11 +4407,9 @@ impl SavingsTracker {
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
             output_daily_samples: persisted_state
                 .as_ref()
-                .filter(|_| output_series_current)
                 .map_or_else(BTreeMap::new, |state| state.output_daily_samples.clone()),
             output_hourly_samples: persisted_state
                 .as_ref()
-                .filter(|_| output_series_current)
                 .map_or_else(BTreeMap::new, |state| state.output_hourly_samples.clone()),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: persisted_state
@@ -8545,11 +8548,12 @@ mod tests {
     }
 
     #[test]
-    fn old_units_sampled_output_series_is_dropped_once_on_load() {
+    fn old_units_sampled_output_series_keeps_history_and_reseeds_the_watermark() {
         // A file written before OUTPUT_SAMPLE_SERIES_VERSION existed carries
-        // sampled buckets in the old estimator's units (the 98.7% ping
-        // artifacts) and a watermark pair far above the new cumulative, which
-        // would silence the sampler for weeks. Both go; everything else stays.
+        // sampled buckets recorded under the old estimator plus a watermark
+        // pair far above the new cumulative. The watermark must go (it would
+        // silence the sampler for weeks); the buckets must NOT -- dropping
+        // them erased two weeks of a real user's output history.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("config")).expect("config dir");
         let mut old = PersistedSavingsState {
@@ -8581,14 +8585,21 @@ mod tests {
         .expect("write old state");
 
         let tracker = SavingsTracker::load_or_create(dir.path()).expect("load");
-        assert!(tracker.output_daily_samples.is_empty());
-        assert!(tracker.output_hourly_samples.is_empty());
+        assert_eq!(
+            tracker.output_daily_samples.get("2026-08-21"),
+            Some(&OutputSampleBucket {
+                saved_tokens: 6_360,
+                baseline_tokens: 6_444,
+            }),
+            "recorded history survives an estimator-semantics bump"
+        );
+        assert_eq!(tracker.output_hourly_samples.len(), 1);
         assert_eq!(tracker.last_output_estimator_tokens_saved, None);
         assert_eq!(tracker.last_output_estimator_baseline_tokens, None);
         assert_eq!(tracker.lifetime_requests, 12, "unrelated fields survive");
 
-        // The initial persist in load_or_create stamps the current version,
-        // so the drop happens exactly once: new-units samples then survive.
+        // The initial persist in load_or_create stamps the current version, so
+        // the reseed happens exactly once and later buckets accumulate on top.
         let mut tracker = tracker;
         tracker.output_daily_samples.insert(
             "2026-08-22".into(),
@@ -8597,14 +8608,14 @@ mod tests {
                 baseline_tokens: 400,
             },
         );
+        tracker.last_output_estimator_tokens_saved = Some(5_308_371);
         tracker.persist_state().expect("persist");
         let reloaded = SavingsTracker::load_or_create(dir.path()).expect("reload");
+        assert_eq!(reloaded.output_daily_samples.len(), 2);
         assert_eq!(
-            reloaded.output_daily_samples.get("2026-08-22"),
-            Some(&OutputSampleBucket {
-                saved_tokens: 100,
-                baseline_tokens: 400,
-            })
+            reloaded.last_output_estimator_tokens_saved,
+            Some(5_308_371),
+            "watermark survives once the series is current"
         );
     }
 

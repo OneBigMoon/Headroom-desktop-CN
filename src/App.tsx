@@ -860,10 +860,15 @@ function WindowRateChip({
 
 function OutputReductionChip({
   reduction,
-  flip = false
+  flip = false,
+  allTimeFallback = false
 }: {
   reduction: OutputReduction;
   flip?: boolean;
+  /** Rendered because the visible window has no samples of its own, so this
+   * is the lifetime figure standing in. Says so, rather than letting an
+   * all-time number read as that period's. */
+  allTimeFallback?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -909,7 +914,9 @@ function OutputReductionChip({
           onClick={(e) => e.stopPropagation()}
         >
           <div className="output-chip__pop-head">
-            <span className="output-chip__pop-title">Output token reduction</span>
+            <span className="output-chip__pop-title">
+              Output token reduction{allTimeFallback ? " · all-time" : ""}
+            </span>
             <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
           </div>
           <div className="output-chip__pop-value">{percent1(reduction.reductionPercent)}%</div>
@@ -926,6 +933,7 @@ function OutputReductionChip({
             </div>
           </dl>
           <p className="output-chip__pop-note">
+            {allTimeFallback ? "No output samples landed in this window, so this is the all-time figure, not this period's. " : ""}
             {isMeasured
               ? "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down — measured against an unshaped A/B holdout."
               : "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down. Output savings are counterfactual, so this is an estimate vs a learned baseline."}
@@ -983,17 +991,16 @@ function DailySavingsChart({
   const compressibleRate = compressibleInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow
   );
-  // Window-scoped output reduction from the locally-sampled series. Falls
-  // back to the all-time estimator chip only when the window includes now —
-  // a historical window with no samples shows no output figure rather than
-  // an all-time number masquerading as that period's.
+  // Window-scoped output reduction from the locally-sampled series, falling
+  // back to the all-time figure for any window without samples of its own.
+  // The fallback labels itself all-time (see OutputReductionChip) so it can't
+  // read as that period's number — but it does render: since the estimator
+  // only scores strata its baseline actually observed, a window of purely
+  // unscored traffic has no samples at all, and showing nothing there reads
+  // as "the shaper did nothing" rather than "this window can't be measured".
   const windowOutput = outputReductionForWindow(
     view === "month" ? monthlyWindow : hourlyWindow
   );
-  const windowIncludesToday =
-    view === "month"
-      ? visibleMonth.getTime() === currentMonth.getTime()
-      : visibleDay.getTime() === today.getTime();
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -1102,9 +1109,7 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {compressibleRate !== null ||
-            windowOutput !== null ||
-            (windowIncludesToday && outputReduction) ? (
+            {compressibleRate !== null || windowOutput !== null || outputReduction ? (
               <span className="savings-chart__overlay-chips">
                 {compressibleRate !== null && (
                   <WindowRateChip
@@ -1140,8 +1145,8 @@ function DailySavingsChart({
                     ]}
                     note="Estimate vs the shaper's learned baseline, sampled while the app runs."
                   />
-                ) : windowIncludesToday && outputReduction ? (
-                  <OutputReductionChip flip reduction={outputReduction} />
+                ) : outputReduction ? (
+                  <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
                 ) : null}
               </span>
             ) : null}
