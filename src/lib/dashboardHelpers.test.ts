@@ -151,12 +151,34 @@ describe("dashboard helpers", () => {
       actualCostUsd: 10,
       totalTokensSent: 1000,
       compressibleCostUsd: 9,
-      compressibleTokensSent: 400
+      // $9 compressible out of $19 of full-price input, applied to our own
+      // token count -- never `totalTokensSent - cacheReadTokens`.
+      compressibleTokensSent: 474
     });
 
     // No cache coverage: nothing to subtract, bars keep the full figure.
     const uncovered = buildHourlySavingsChartData([{ ...covered[0], cacheReadTokens: undefined, cacheSavingsUsd: undefined }]);
     expect(uncovered[0]).toMatchObject({ compressibleCostUsd: 10, compressibleTokensSent: 1000 });
+  });
+
+  it("keeps the token bar non-zero when provider cache reads exceed forwarded input", () => {
+    // Real 2026-08-21T08:00 bucket: differencing the two scales clamped this
+    // to a flat zero bar while the dollar bar showed $11.78.
+    const chartData = buildHourlySavingsChartData([
+      {
+        hour: "2026-08-21T08:00",
+        estimatedSavingsUsd: 1,
+        estimatedTokensSaved: 100,
+        actualCostUsd: 98.46,
+        totalTokensSent: 77_148_652,
+        cacheReadTokens: 102_285_108,
+        cacheSavingsUsd: 780.1,
+        byProvider: []
+      }
+    ]);
+    expect(chartData[0].compressibleCostUsd).toBeGreaterThan(0);
+    expect(chartData[0].compressibleTokensSent).toBeGreaterThan(0);
+    expect(chartData[0].compressibleTokensSent).toBeLessThan(77_148_652);
   });
 
   it("builds monthly chart data and finds earliest visible history", () => {
