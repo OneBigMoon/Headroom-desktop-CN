@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildInitialProxyVerificationRows,
+  formatConnectorNameList,
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
@@ -275,5 +276,18 @@ describe("launcher helpers", () => {
       expect(recommendedHeadroomTier("free", "free")).toBe("pro");
       expect(recommendedHeadroomTier("unknown", "unknown")).toBe("pro");
     });
+  });
+});
+
+describe("formatConnectorNameList", () => {
+  // Feeds the proxy-verify skip warning, which names the connectors that never
+  // checked in. Four can be enabled at once, so the 3+ case is real.
+  it("reads naturally at every connector count", () => {
+    expect(formatConnectorNameList([])).toBe("");
+    expect(formatConnectorNameList(["Claude Code"])).toBe("Claude Code");
+    expect(formatConnectorNameList(["Claude Code", "Codex"])).toBe("Claude Code and Codex");
+    expect(formatConnectorNameList(["Claude Code", "Codex", "OpenCode"])).toBe(
+      "Claude Code, Codex and OpenCode"
+    );
   });
 });
