@@ -1,0 +1,165 @@
+name: Linux Preview Build
+
+# Manual-only channel for ad-hoc Linux builds, mirroring windows-preview.yml.
+# Publishes an AppImage + .deb plus its own updater manifest to the rolling
+# linux-preview prerelease; never touches the stable v* releases or their
+# latest.json, so there is no manifest race. The predecessor (release-linux.yml,
+# removed in fb98d55) published straight into the stable v__VERSION__ release
+# alongside macOS, which is exactly the race this layout avoids.
+#
+# When Linux graduates to stable it moves into release-macos.yml as a third job
+# that merges linux-x86_64 into the stable latest.json, the way the Windows job
+# already does, and that job should also refresh linux-preview/latest.json so
+# preview installs roll forward onto stable.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Linux x86_64 preview
+    # ubuntu-22.04 would give a lower glibc floor, but it enters brownout
+    # deprecation on 2026-09-17 (actions/runner-images#14254), so builds would
+    # start failing within weeks. 24.04 sets the floor at glibc 2.39: this
+    # AppImage will not start on Ubuntu 22.04 or Debian 12, which the release
+    # notes below state outright. To widen support later, build inside an older
+    # container (`container: ubuntu:22.04`) rather than pinning the runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      # Preview builds update from the linux-preview channel, not stable.
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/linux-preview/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/linux-preview/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        # Same set test.yml installs, so a build here cannot need a library the
+        # PR suite never had. libayatana-appindicator3-dev backs the tray icon.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build AppImage and deb
+        shell: bash
+        env:
+          # linuxdeploy ships as an AppImage and needs FUSE to mount itself,
+          # which GitHub runners do not provide; extracting instead is the
+          # supported workaround and the usual cause of "dlopen(): error
+          # loading libfuse.so.2" in Tauri AppImage CI builds.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        # appimage is the only Linux format tauri-plugin-updater can install,
+        # so it has to be built for the manifest below to mean anything; deb
+        # covers apt users, who update via a fresh download. bundle.targets is
+        # "all", which would also attempt rpm.
+        run: npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage
+
+      - name: Publish to linux-preview prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          bundle_dir="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+          appimage="$(ls "$bundle_dir"/appimage/*.AppImage)"
+          deb="$(ls "$bundle_dir"/deb/*.deb)"
+
+          # The updater artifact is whichever file the bundler signed, which is
+          # not always the bare .AppImage: Linux has historically been shipped
+          # as .AppImage.tar.gz, and tauri-plugin-updater accepts either (it
+          # sniffs for gzip and otherwise rewrites the binary in place). Derive
+          # it from the .sig instead of assuming, so a bundler change surfaces
+          # as a missing file here rather than as a manifest whose signature
+          # does not match the bytes users download.
+          sig="$(ls "$bundle_dir"/appimage/*.sig 2>/dev/null | head -1)"
+          [ -n "$sig" ] || { echo "no updater signature in $bundle_dir/appimage" >&2; exit 1; }
+          updater_artifact="${sig%.sig}"
+          [ -f "$updater_artifact" ] || { echo "signed artifact missing: $updater_artifact" >&2; exit 1; }
+          asset_name="$(basename "$updater_artifact")"
+
+          jq -n \
+            --arg version "$version" \
+            --arg notes "Linux preview build of Headroom ${version} (${GITHUB_SHA})." \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat "$sig")" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/linux-preview/${asset_name}" \
+            '{version: $version, notes: $notes, pub_date: $pub_date,
+              platforms: {"linux-x86_64": {signature: $signature, url: $url}}}' \
+            > latest.json
+
+          # The bare AppImage is what a human downloads; when the signed
+          # updater artifact is a different file, ship both.
+          assets=("$appimage" "$sig" "$deb" latest.json)
+          [ "$updater_artifact" = "$appimage" ] || assets+=("$updater_artifact")
+
+          notes="Rolling Linux preview (experimental tier). Current: v${version} @ ${GITHUB_SHA}.
+          Install: download the .AppImage (chmod +x, then run) or the .deb (sudo apt install ./<file>.deb).
+          Built on Ubuntu 24.04, needs glibc 2.39 or newer, so it will not start on Ubuntu 22.04 or Debian 12.
+          Sign-in stores its token in the system keyring, which needs a running secret-service provider (gnome-keyring or kwallet); headless sessions will fail at sign-in.
+          Only the AppImage self-updates; .deb installs update by downloading a newer one."
+          if gh release view linux-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            for asset in $(gh release view linux-preview --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
+              gh release delete-asset linux-preview "$asset" --yes --repo "$GITHUB_REPOSITORY"
+            done
+            gh release upload linux-preview "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+            gh release edit linux-preview --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Linux preview (rolling)" --notes "$notes"
+          else
+            gh release create linux-preview \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Linux preview (rolling)" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              "${assets[@]}"
+          fi
+          echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/linux-preview"
