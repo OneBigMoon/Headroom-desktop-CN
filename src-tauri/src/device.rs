@@ -230,6 +230,9 @@ mod tests {
 
     #[test]
     fn chopratejas_instance_id_is_none_when_home_missing() {
+        // This one does not swap $HOME, it deletes it. Anything reading the
+        // home dir concurrently gets None.
+        let _home_lock = crate::test_env_lock::lock_home();
         let previous = std::env::var_os("HOME");
         std::env::remove_var("HOME");
         let result = read_chopratejas_instance_id();

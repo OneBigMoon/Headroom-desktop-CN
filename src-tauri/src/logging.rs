@@ -932,6 +932,10 @@ mod tests {
 
     #[test]
     fn scrub_home_replaces_home_dir_with_tilde() {
+        // scrub_home reads $HOME again internally, so a TestHome elsewhere
+        // swapping it between our read and theirs makes the scrub a no-op.
+        let _home_lock = crate::test_env_lock::lock_home();
+
         let home = dirs::home_dir().unwrap();
         let msg = format!(
             "cleanup: removing {}/Library/Application Support/x",
@@ -947,6 +951,10 @@ mod tests {
 
     #[test]
     fn scrub_event_covers_message_tags_and_extras() {
+        // scrub_home reads $HOME again internally, so a TestHome elsewhere
+        // swapping it between our read and theirs makes the scrub a no-op.
+        let _home_lock = crate::test_env_lock::lock_home();
+
         let home = dirs::home_dir().unwrap();
         let home = home.display().to_string();
         let mut event = sentry::protocol::Event::new();

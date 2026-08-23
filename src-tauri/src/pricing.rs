@@ -131,6 +131,39 @@ fn is_transient_transport_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request()
 }
 
+/// Describe a round trip that never produced a response.
+///
+/// reqwest's `Display` is only "error sending request for url (https://...)":
+/// the cause lives in the source chain and is dropped, so the user gets an
+/// unactionable URL dump. That is what issue #58 reported, hit during a
+/// headroom-web deploy switchover. Classify into three stable phrases rather
+/// than interpolating the cause - the user gets something to act on, and
+/// Sentry gets a message that groups instead of splintering on `os error 61`.
+fn transport_failure(action: &str, err: &reqwest::Error) -> String {
+    let kind = if err.is_timeout() {
+        "the request timed out"
+    } else if err.is_connect() {
+        "the server could not be reached"
+    } else {
+        "the request failed"
+    };
+    format!("Could not {action}: {kind}. Check your connection and try again in a moment.")
+}
+
+/// Report transport failures, but rank them. Before issue #58 the auth path
+/// dropped transient ones entirely, so we could not answer "how many users hit
+/// this" from the client at all - the whole investigation had to be done from
+/// headroom-web's deploy log. Sign-in runs ~15x/day fleet-wide, so capturing
+/// every failure at Warning costs little; only a non-transport failure (which
+/// implies something wrong on our side) is worth an Error.
+fn transport_level(err: &reqwest::Error) -> sentry::Level {
+    if is_transient_transport_error(err) {
+        sentry::Level::Warning
+    } else {
+        sentry::Level::Error
+    }
+}
+
 fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
     match tier {
         ClaudePlanTier::Free => "free",
@@ -1149,10 +1182,8 @@ pub(crate) fn request_auth_code_with_base_url(
         })
         .send()
         .map_err(|err| {
-            let msg = format!("Could not request sign-in code: {err}");
-            if !is_transient_transport_error(&err) {
-                sentry::capture_message(&msg, sentry::Level::Warning);
-            }
+            let msg = transport_failure("request a sign-in code", &err);
+            sentry::capture_message(&msg, transport_level(&err));
             msg
         })?;
 
@@ -1213,7 +1244,11 @@ pub(crate) fn verify_auth_code_with_base_url(
             identity: IdentityPayload::for_state(state),
         })
         .send()
-        .map_err(|err| format!("Could not verify sign-in code: {err}"))?;
+        .map_err(|err| {
+            let msg = transport_failure("verify your sign-in code", &err);
+            sentry::capture_message(&msg, transport_level(&err));
+            msg
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1290,10 +1325,8 @@ pub(crate) fn activate_account_with_base_url(
         .json(&serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved }))
         .send()
         .map_err(|err| {
-            let msg = format!("Could not activate Headroom desktop access: {err}");
-            if !is_transient_transport_error(&err) {
-                sentry::capture_message(&msg, sentry::Level::Warning);
-            }
+            let msg = transport_failure("activate Headroom desktop access", &err);
+            sentry::capture_message(&msg, transport_level(&err));
             msg
         })?;
 
@@ -1575,7 +1608,7 @@ pub(crate) fn create_checkout_session_with_base_url(
             pricing_model: "intro",
         })
         .send()
-        .map_err(|err| format!("Could not create checkout session: {err}"))?;
+        .map_err(|err| transport_failure("start checkout", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1623,7 +1656,7 @@ pub(crate) fn change_subscription_plan_with_base_url(
             pricing_model: "intro",
         })
         .send()
-        .map_err(|err| format!("Could not change subscription plan: {err}"))?;
+        .map_err(|err| transport_failure("change your plan", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1655,7 +1688,7 @@ pub(crate) fn reactivate_subscription_with_base_url(base_url: &str) -> Result<()
         .post(join_url(base_url, "desktop/subscriptions/reactivate"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
-        .map_err(|err| format!("Could not reactivate subscription: {err}"))?;
+        .map_err(|err| transport_failure("reactivate your subscription", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1695,7 +1728,7 @@ pub(crate) fn get_billing_portal_url_with_base_url(
     }
     let response = request
         .send()
-        .map_err(|err| format!("Could not reach billing portal: {err}"))?;
+        .map_err(|err| transport_failure("open the billing portal", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1733,7 +1766,7 @@ pub(crate) fn get_save_offer_with_base_url(base_url: &str) -> Result<Option<Save
         .get(join_url(base_url, "desktop/save_offer"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
-        .map_err(|err| format!("Could not check for an offer: {err}"))?;
+        .map_err(|err| transport_failure("check for an offer", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1777,7 +1810,7 @@ pub(crate) fn submit_cancellation_intent_with_base_url(
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({ "reason": reason, "note": note }))
         .send()
-        .map_err(|err| format!("Could not reach Headroom: {err}"))?;
+        .map_err(|err| transport_failure("send your note", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1812,7 +1845,7 @@ pub(crate) fn redeem_save_offer_with_base_url(base_url: &str) -> Result<(), Stri
         .post(join_url(base_url, "desktop/save_offer"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
-        .map_err(|err| format!("Could not apply the offer: {err}"))?;
+        .map_err(|err| transport_failure("apply the offer", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -4146,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(unauth_sync_counter)]
+    #[serial_test::serial]
     fn unauthorized_background_sync_tolerates_blips_then_escalates() {
         CONSECUTIVE_UNAUTHORIZED_SYNCS.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -4195,7 +4228,7 @@ mod tests {
     #[test]
     // Ok resets the unauthorized counter, so keep it off the escalation
     // test's timeline.
-    #[serial_test::serial(unauth_sync_counter)]
+    #[serial_test::serial]
     fn successful_background_sync_returns_remote_account_profile() {
         let (authenticated, account, error) =
             merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
@@ -5651,6 +5684,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn verify_auth_code_decodes_and_writes_session_token() {
+        let _home_lock = crate::test_env_lock::lock_home();
         // Override HOME / XDG_DATA_HOME so the keychain debug store and
         // app_data_dir live in a fresh tempdir, not the dev's real profile.
         let prev_home = std::env::var_os("HOME");
@@ -5725,6 +5759,34 @@ mod tests {
         )
         .expect_err("blank code rejected");
         assert!(err.contains("authentication code"));
+        drop_state(dir);
+    }
+
+    /// Issue #58: a headroom-web deploy switchover left the API unreachable for
+    /// ~75s and the user was shown reqwest's raw
+    /// "error sending request for url (https://...)". The message has to say
+    /// what to do, and must not leak the endpoint.
+    #[test]
+    fn verify_auth_code_reports_an_unreachable_server_in_plain_language() {
+        let _home_lock = crate::test_env_lock::lock_home();
+        let (state, dir) = temp_app_state();
+        let err = super::verify_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            "123456",
+            None,
+            "http://127.0.0.1:1", // nothing listens here
+        )
+        .expect_err("unreachable server surfaces as error");
+
+        assert!(
+            err.contains("Check your connection"),
+            "not actionable: {err}"
+        );
+        assert!(
+            !err.contains("error sending request") && !err.contains("127.0.0.1"),
+            "leaked reqwest internals: {err}"
+        );
         drop_state(dir);
     }
 
@@ -5889,6 +5951,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn activate_account_requires_session_token() {
+        let _home_lock = crate::test_env_lock::lock_home();
         // No AuthedTestEnv → no token in keychain. Override HOME so any
         // keychain read still goes to a tempdir, not the dev profile.
         let scratch = tempfile::tempdir().expect("scratch");

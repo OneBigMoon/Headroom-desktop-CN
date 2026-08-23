@@ -1621,7 +1621,16 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
     // (notably Server 2022) does not ship. Nothing retriable and nothing the
     // app can repair, but it must not sit in the "other" grab-bag: that bucket
     // is what made RUST-3C/RUST-45 unresolvable.
-    } else if t.contains("winerror 126") || t.contains("importerror: dll load failed") {
+    //
+    // 126 is "the DLL is absent", 1114 is "it is there and its init routine
+    // failed" (RUST-75, c10.dll) -- different Windows errnos, same broken
+    // native stack, same non-answer for us, so one bucket. Match the number,
+    // not the sentence after it: Windows localizes that text, and 1114 landed
+    // in the grab-bag as Korean.
+    } else if t.contains("winerror 126")
+        || t.contains("winerror 1114")
+        || t.contains("importerror: dll load failed")
+    {
         "missing native dep"
     } else {
         "other"
@@ -1941,7 +1950,19 @@ impl ToolManager {
     }
 
     pub fn python_runtime_installed(&self) -> bool {
-        self.runtime.ready_flag().exists() && self.runtime.managed_python().exists()
+        // The base interpreter counts too, not just the venv. A venv's
+        // `Scripts/python.exe` is a redirector stub that execs the interpreter
+        // recorded in `pyvenv.cfg`; deleting `runtime/python` (AV quarantine,
+        // disk cleanup) leaves the stub and the READY flag on disk, so a
+        // venv-only gate reads "installed" while every spawn dies with exit 103
+        // / `No Python at '...'` (RUST-8E). That matters because this gate is
+        // what routes a missing runtime back to setup, and bootstrap already
+        // re-downloads the distribution and rebuilds the venv from it -- the
+        // only thing standing between the user and a self-repair was this
+        // check. Same blind spot as RUST-66/6M one level down.
+        self.runtime.ready_flag().exists()
+            && self.runtime.managed_python().exists()
+            && self.runtime.standalone_python().exists()
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -3475,6 +3496,40 @@ impl ToolManager {
         )
     }
 
+    /// Run a directory operation that Windows can transiently deny.
+    ///
+    /// `DeleteFile`/`RemoveDirectory` only MARK a name for deletion: it stays
+    /// on disk until the last handle closes, and a rename onto it meanwhile
+    /// returns ACCESS_DENIED. Defender opens every file we just unpacked for
+    /// the same second or two. RUST-8K is that race hitting `rename` on a
+    /// fresh 0.8.6 install (os error 5, localized so the text is not even
+    /// greppable) -- and it dead-ends the bootstrap, so the user never gets a
+    /// runtime at all.
+    ///
+    /// Retries every error, not a classified subset: on a genuinely broken
+    /// install this costs ~2.5s on a path that already failed, and the alt is
+    /// a per-platform errno table (5/32/33 mean something else entirely on
+    /// Unix) guarding a branch no test on a Mac can reach.
+    /// ponytail: linear backoff, no jitter -- one process, no contention.
+    fn retry_fs<T>(what: &str, mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        const ATTEMPTS: u32 = 5;
+        let mut attempt = 1;
+        loop {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(err) if attempt < ATTEMPTS => {
+                    // info, not warn: a retry that then succeeds is a
+                    // non-event, and warn bridges to Sentry. The caller
+                    // reports the final failure as bootstrap_failed.
+                    log::info!("{what} failed ({err}), retry {attempt}/{ATTEMPTS}");
+                    std::thread::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)));
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     fn install_python_distribution<F>(&self, mut emit_step: F) -> Result<()>
     where
         F: FnMut(BootstrapStepUpdate),
@@ -3540,8 +3595,10 @@ impl ToolManager {
         // deletion.
         let staging_dir = self.runtime.runtime_dir.join("python.extracting");
         if staging_dir.exists() {
-            std::fs::remove_dir_all(&staging_dir)
-                .with_context(|| format!("clearing stale {}", staging_dir.display()))?;
+            Self::retry_fs("clearing stale staging dir", || {
+                std::fs::remove_dir_all(&staging_dir)
+            })
+            .with_context(|| format!("clearing stale {}", staging_dir.display()))?;
         }
         std::fs::create_dir_all(&staging_dir)
             .with_context(|| format!("creating {}", staging_dir.display()))?;
@@ -3564,11 +3621,15 @@ impl ToolManager {
             );
         }
         if self.runtime.python_dir.exists() {
-            std::fs::remove_dir_all(&self.runtime.python_dir).with_context(|| {
-                format!("removing partial {}", self.runtime.python_dir.display())
-            })?;
+            Self::retry_fs("removing partial python dir", || {
+                std::fs::remove_dir_all(&self.runtime.python_dir)
+            })
+            .with_context(|| format!("removing partial {}", self.runtime.python_dir.display()))?;
         }
-        std::fs::rename(&extracted_root, &self.runtime.python_dir).with_context(|| {
+        Self::retry_fs("publishing extracted python", || {
+            std::fs::rename(&extracted_root, &self.runtime.python_dir)
+        })
+        .with_context(|| {
             format!(
                 "publishing extracted python into {}",
                 self.runtime.python_dir.display()
@@ -6381,8 +6442,12 @@ impl PluginHost {
     }
 }
 
-fn claude_installed_plugins() -> Option<Value> {
-    let path = dirs::home_dir()?
+pub(crate) fn claude_installed_plugins() -> Option<Value> {
+    // Not `dirs::home_dir()`: on Windows that reads the profile known folder
+    // and ignores `$HOME`, so a redirected home (tests, Git Bash) resolves
+    // against the REAL profile. Every OSS-plugin test failed on Windows CI
+    // that way -- reading the runner's own ~/.claude and finding no plugin.
+    let path = crate::client_adapters::home_dir()
         .join(".claude")
         .join("plugins")
         .join("installed_plugins.json");
@@ -8909,6 +8974,14 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
         || lower.contains("check the permissions")
         || lower.contains("access is denied")
         || lower.contains("errno 13")
+        // Windows LOCALIZES its error text: RUST-8K arrived as
+        // "액세스가 거부되었습니다. (os error 5)" and fell through to the
+        // grab-bag this function exists to prevent. The numeric code is the
+        // one locale-independent handle. Not gated to Windows: errno 5 is EIO
+        // on Unix, but a mislabelled bucket on an all-but-unseen pip EIO is a
+        // cheaper bug than a Windows-only branch no test here can reach. Keep
+        // the closing paren -- os error 50/51 are macOS network errors.
+        || lower.contains("(os error 5)")
     {
         "permission"
     } else if lower.contains("no such file or directory") || lower.contains("errno 2") {
@@ -9352,6 +9425,7 @@ impl std::error::Error for HeadroomStartupFailure {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -9915,6 +9989,14 @@ asyncio.run(verify())
             classify_kompress_prefetch_failure(
                 "OSError: [WinError 126] The specified module could not be found. \
                  Error loading \"...\\torch\\lib\\c10.dll\" or one of its dependencies"
+            ),
+            "missing native dep"
+        );
+        // RUST-75, verbatim from the event: only the errno survives the locale.
+        assert_eq!(
+            classify_kompress_prefetch_failure(
+                "OSError: [WinError 1114] DLL 초기화 루틴을 실행할 수 없습니다. \
+                 Error loading \"...\\torch\\lib\\c10.dll\" or one of its dependencies."
             ),
             "missing native dep"
         );
@@ -11218,7 +11300,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     }
 
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn managed_headroom_startup_uses_supported_proxy_args() {
         backend_port::reset_for_tests();
         let default_port = backend_port::DEFAULT_BACKEND_PORT.to_string();
@@ -11262,7 +11344,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// validation attempt exit 2 and the upgrade time out. The flag must be
     /// gated on runtime >= 0.28.0; unknown versions assume the pinned runtime.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn entrypoint_args_gate_no_http2_on_runtime_version() {
         backend_port::reset_for_tests();
 
@@ -11292,7 +11374,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
     /// click would exit 2 and boot validation would fail like RUST-4A.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn entrypoint_args_gate_no_ccr_on_runtime_version() {
         backend_port::reset_for_tests();
 
@@ -11326,7 +11408,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// the proxy raise on startup and exit before opening the port. Must gate on
     /// runtime >= 0.30.0; unknown versions assume the pinned (current) runtime.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn savings_profile_gated_on_runtime_version() {
         assert_eq!(savings_profile_for_runtime(Some("0.28.0")), "agent-90");
         assert_eq!(savings_profile_for_runtime(Some("0.29.9")), "agent-90");
@@ -11344,7 +11426,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// old provider. Unlike the savings persona, an unreadable version fails
     /// CLOSED: the flag is an opt-in, and off is always the safe answer.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn cc_switch_reconcile_gated_on_runtime_version() {
         assert_eq!(cc_switch_reconcile_for_runtime(Some("0.35.0")), "0");
         assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36.2")), "0");
@@ -11369,7 +11451,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// the helpers are invoked AFTER fallback has updated the atomic, the
     /// chosen fallback port flows through.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn startup_args_reflect_fallback_port_set_after_default() {
         backend_port::reset_for_tests();
         backend_port::set(6770);
@@ -11702,6 +11784,31 @@ after
         .expect("receipt");
         let manager = ToolManager::new(runtime.clone());
         (root, runtime, manager)
+    }
+
+    /// RUST-8E: a venv orphaned from its base interpreter keeps its redirector
+    /// stub and READY flag, so the venv-only gate reported "installed" and the
+    /// launch dead-ended in a Sentry start failure (exit 103, `No Python at`)
+    /// instead of routing to setup, which re-downloads the runtime.
+    #[test]
+    fn python_runtime_installed_requires_the_standalone_base() {
+        let (_root, runtime, manager) = seed_test_runtime("orphaned-venv-base");
+        for marker in [runtime.ready_flag(), runtime.managed_python()] {
+            fs::create_dir_all(marker.parent().expect("parent")).expect("mkdir");
+            fs::write(&marker, b"").expect("marker");
+        }
+        assert!(
+            !manager.python_runtime_installed(),
+            "a venv whose standalone base is gone must not read as installed"
+        );
+
+        let base = runtime.standalone_python();
+        fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
+        fs::write(&base, b"").expect("base");
+        assert!(
+            manager.python_runtime_installed(),
+            "all three markers present must read as installed"
+        );
     }
 
     /// RUST-82: `python -m venv` runs ensurepip through `check_output` and
@@ -12835,9 +12942,7 @@ after
 
     impl HomeGuard {
         fn new(root: &Path) -> Self {
-            let env_lock = crate::test_env_lock::HOME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let env_lock = crate::test_env_lock::lock_home();
             let prev_home = std::env::var_os("HOME");
             let prev_codex = std::env::var_os("CODEX_HOME");
             std::env::set_var("HOME", root);
@@ -13567,6 +13672,19 @@ exit 0
                 "network",
             ),
             ("exit=1; stderr tail: something new", "other"),
+            // RUST-8K, verbatim: Windows access-denied on a Korean install.
+            // Only the numeric code survives translation.
+            (
+                "publishing extracted python into ~\\AppData\\Local\\Headroom: \
+                 액세스가 거부되었습니다. (os error 5)",
+                "permission",
+            ),
+            // The macOS network errnos must not read as a denial: the
+            // closing paren in the needle is what keeps 51 out of "permission".
+            (
+                "exit=1; stderr tail: error sending request (os error 51)",
+                "other",
+            ),
         ];
         for (compact, expected) in cases {
             assert_eq!(pip_failure_category(compact), expected, "for: {compact}");
@@ -13618,5 +13736,43 @@ exit 0
             seen.len() >= 5,
             "the five RUST-6K shapes must land in distinct buckets, got: {seen:?}"
         );
+    }
+
+    #[test]
+    fn retry_fs_survives_a_transient_denial() {
+        // RUST-8K: Windows kept the old python dir alive after remove_dir_all
+        // and denied the rename onto it. The op succeeds once the handle
+        // closes, so the bootstrap must not dead-end on the first refusal.
+        let attempts = Cell::new(0u32);
+        let result = ToolManager::retry_fs("unit", || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(attempts.get())
+            }
+        });
+        assert_eq!(result.expect("third attempt succeeds"), 3);
+        assert_eq!(
+            attempts.get(),
+            3,
+            "must retry, not give up on the first Err"
+        );
+    }
+
+    #[test]
+    fn retry_fs_gives_up_and_returns_the_last_error() {
+        // The bound matters as much as the retry: an unbounded loop would hang
+        // the bootstrap on a genuinely broken install instead of reporting it.
+        let attempts = Cell::new(0u32);
+        let result = ToolManager::retry_fs("unit", || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            result.expect_err("exhausted").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(attempts.get(), 5, "bounded at ATTEMPTS");
     }
 }

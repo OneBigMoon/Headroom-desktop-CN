@@ -15,6 +15,7 @@ mod port_conflict;
 mod pricing;
 mod proc;
 mod proxy_intercept;
+mod savings_canary;
 mod state;
 mod storage;
 mod tool_manager;
@@ -28,6 +29,18 @@ mod usage_counters;
 #[cfg(test)]
 pub(crate) mod test_env_lock {
     pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold this for the whole time `$HOME` is swapped. Tests that only READ
+    /// the home dir need it too: `logging::scrub_home` and everything behind
+    /// `dirs::home_dir()` resolve it at call time, so an unlocked swapper in
+    /// another module makes their assertion silently vacuous -- and
+    /// `device.rs` removes `$HOME` outright, which turns the scrub into a
+    /// no-op and fails the test outright.
+    pub(crate) fn lock_home() -> std::sync::MutexGuard<'static, ()> {
+        HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 use std::future::Future;
@@ -3017,6 +3030,63 @@ fn report_funnel_step(state: State<'_, AppState>, step: String) {
     pricing::report_funnel_step(&state, &step);
 }
 
+/// Credentials handed over by a `headroom://auth` magic link, waiting for the
+/// UI to claim them.
+///
+/// A cold start races the frontend: macOS delivers the URL before React has
+/// mounted a listener, so an event alone is lost exactly when the app was
+/// launched *by* the link. The slot is the source of truth and the event is
+/// only a nudge for the already-running case; both paths drain it through
+/// `take_pending_magic_link`.
+static PENDING_MAGIC_LINK: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Parks the email/code from `headroom://auth?email=..&code=..` and nudges the UI.
+///
+/// The browser never signs the user in (it cannot supply the device
+/// fingerprints `verify_code` needs), so this is the ordinary typed-code flow
+/// with the typing removed.
+fn capture_magic_link_auth(app: &AppHandle, url: &tauri::Url) {
+    let Some(credentials) = parse_magic_link_auth(url) else {
+        return;
+    };
+    if let Ok(mut slot) = PENDING_MAGIC_LINK.lock() {
+        *slot = Some(credentials);
+    }
+    let _ = app.emit("magic-link-auth", ());
+}
+
+/// `headroom://auth?email=..&code=..` -> `(email, code)`.
+///
+/// Every other `headroom://` URL is the post-checkout return and must fall
+/// through to the pricing refresh untouched.
+fn parse_magic_link_auth(url: &tauri::Url) -> Option<(String, String)> {
+    if url.host_str() != Some("auth") {
+        return None;
+    }
+    let mut email = None;
+    let mut code = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "email" => email = Some(value.into_owned()),
+            "code" => code = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let email = email?;
+    let code = code?;
+    (!email.is_empty() && !code.is_empty()).then_some((email, code))
+}
+
+/// Drains the pending magic-link credentials. Returns `None` on a normal
+/// launch; one-shot so a reload cannot replay a spent code.
+#[tauri::command]
+fn take_pending_magic_link() -> Option<(String, String)> {
+    PENDING_MAGIC_LINK
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
 #[tauri::command]
 async fn request_headroom_auth_code(
     app: AppHandle,
@@ -3054,12 +3124,20 @@ async fn verify_headroom_auth_code(
         "auth_verified",
         Some(json!({ "invite_code_used": used_invite_code })),
     );
+    // Pricing status is per-window UI state, so the window that did not run
+    // the sign-in keeps rendering the signed-out code form until its own poll
+    // ticks. Broadcast so every window re-reads it now.
+    let _ = app.emit("pricing-refreshed", &status);
     Ok(status)
 }
 
 #[tauri::command]
-async fn sign_out_headroom_account() -> Result<(), String> {
-    pricing::sign_out()
+async fn sign_out_headroom_account(app: AppHandle) -> Result<(), String> {
+    pricing::sign_out()?;
+    // Same broadcast as verify: the other window must not keep showing the
+    // account as signed in.
+    let _ = app.emit("pricing-refreshed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -3235,6 +3313,9 @@ fn run_activity_observation(app: &AppHandle) {
 
     if let Ok(feed) = fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
         let _ = state.observe_activity_from_transformations(&feed.transformations);
+        // Same batch, second reader: flags a client whose requests all stopped
+        // compressing (see savings_canary for why the server cannot see this).
+        savings_canary::observe(&feed.transformations);
     }
 
     let projects = state.list_claude_code_projects().unwrap_or_default();
@@ -4055,6 +4136,9 @@ async fn set_auto_learn_enabled(app: AppHandle, enabled: bool) -> Result<bool, S
 
 #[tauri::command]
 async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
+    // Prevent the launch-time OSS-plugin worker from mutating Claude's hook
+    // cache after cleanup has restored it.
+    SHUTTING_DOWN.store(true, Ordering::Release);
     {
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
@@ -4355,6 +4439,59 @@ pub fn run() {
                     "autostart_launch": launched_from_autostart
                 })),
             );
+
+            // Absorb the open-source `headroom` Claude Code plugin. Its hooks
+            // run a bare `headroom init hook ensure`, which exits 127 here
+            // because the app ships no `headroom` on PATH. When the plugin is
+            // present and no real CLI is visible, replace only that exact hook
+            // command with `exit 0`. No global PATH changes, nothing pointing
+            // at a file of ours that could later go missing, and the same
+            // rewrite works on Windows, macOS, and Linux.
+            // `HEADROOM_ABSORB_OSS_PLUGIN=0` opts out and restores.
+            //
+            // Off the setup closure: nothing downstream waits on the result,
+            // and the status probe opens a TCP connection to :8787. That must
+            // never sit on the main thread's launch path, least of all for the
+            // majority of users who do not have the plugin at all.
+            // A plugin update lands a fresh version dir with the bare command
+            // back, so one pass at startup is not enough for a tray app that
+            // stays up for weeks. Re-check on a slow timer; the check itself is
+            // a receipt read that returns immediately for everyone we are not
+            // already managing.
+            const OSS_PLUGIN_RECHECK_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(300);
+            let oss_handle = app_handle.clone();
+            std::thread::spawn(move || {
+                let oss = client_adapters::absorb_oss_plugin();
+                // Only worth an event when there is something to report; every
+                // launch already counts in `app_started`. `base_url_ours: false`
+                // alongside `oss_proxy_8787: true` is the state where the user
+                // ran `headroom init` themselves and their traffic bypasses us,
+                // so our savings under-report — measured, not fought.
+                if oss.plugin_installed || oss.oss_proxy_8787 {
+                    analytics::track_event(
+                        &oss_handle,
+                        "oss_plugin_detected",
+                        Some(json!({
+                            "plugin_installed": oss.plugin_installed,
+                            "hook_absorbed": oss.hook_absorbed,
+                            "cli_on_path": oss.cli_on_path,
+                            "oss_proxy_8787": oss.oss_proxy_8787,
+                            "base_url_ours": oss.base_url_ours
+                        })),
+                    );
+                }
+                // Startup cadence for the event, not for the repair.
+                loop {
+                    std::thread::sleep(OSS_PLUGIN_RECHECK_INTERVAL);
+                    if SHUTTING_DOWN.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if client_adapters::oss_plugin_hook_needs_absorbing() {
+                        client_adapters::absorb_oss_plugin();
+                    }
+                }
+            });
             // Wire up the bearer-triggered identity-pusher worker. The
             // intercept thread sends a signal here every time it captures a
             // bearer whose value differs from what was previously in the
@@ -4491,6 +4628,7 @@ pub fn run() {
                         if url.scheme() == "headroom" {
                             let app_handle = deep_link_app.clone();
                             let _ = show_launcher_window(&app_handle);
+                            capture_magic_link_auth(&app_handle, &url);
                             // Run the reconciliation on a worker thread — the
                             // deep-link callback is on the main thread and we
                             // don't want pricing's blocking HTTP call there.
@@ -4505,7 +4643,12 @@ pub fn run() {
                                         );
                                         state
                                             .apply_codex_pricing_gate_status(status.codex.as_ref());
-                                        let _ = app_handle.emit("pricing-refreshed", &status);
+                                        // Payload-less on purpose: this status
+                                        // was fetched before any magic link in
+                                        // the same URL was redeemed, so it is
+                                        // stale by the time it lands. The
+                                        // frontend refetches instead.
+                                        let _ = app_handle.emit("pricing-refreshed", ());
                                     }
                                     Err(err) => {
                                         sentry::capture_message(
@@ -4561,6 +4704,7 @@ pub fn run() {
             get_claude_profile,
             get_headroom_pricing_status,
             report_funnel_step,
+            take_pending_magic_link,
             request_headroom_auth_code,
             verify_headroom_auth_code,
             sign_out_headroom_account,
@@ -5233,6 +5377,16 @@ fn execute_headroom_learn_run(
 
     let mut command = crate::proc::command(&entrypoint);
     command.arg("learn").arg("--apply");
+    // The analysis CLI is killed after this long with no stream event. Upstream
+    // defaults to 60s, which kills a healthy run: the digest is large, it is
+    // routed through our own proxy, and the model can think past a minute
+    // before the first token (RUST-6W: 14 kills across 8 unrelated machines,
+    // every release from 0.8.2 to 0.8.6). Same failure the /stats probe had at
+    // 500ms -- a cap tight enough to turn "slow" into "broken".
+    //
+    // Only the IDLE cap moves. Upstream's 300s hard cap still bounds a genuine
+    // hang, so this trades a slower failure for runs that now finish.
+    command.env("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", "180");
     match agent {
         LearnAgent::Claude => {
             // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
@@ -6963,17 +7117,18 @@ mod tests {
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        onboarding_recovery_copy, parse_live_learnings, parse_request_count_from_stats_body,
-        parse_request_counts_by_agent, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
-        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        select_updater_endpoints, store_checked_update, take_pending_magic_link, user_message_for,
+        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
         AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
         HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
         MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -9618,5 +9773,60 @@ Some unrelated content.
                 .expect("run sh -n");
             assert!(status.success(), "sh rejected the script: {script}");
         }
+    }
+
+    #[test]
+    fn magic_link_auth_extracts_email_and_code() {
+        let url = tauri::Url::parse("headroom://auth?email=a%40b.com&code=123456").unwrap();
+        assert_eq!(
+            parse_magic_link_auth(&url),
+            Some(("a@b.com".to_string(), "123456".to_string()))
+        );
+    }
+
+    #[test]
+    fn magic_link_auth_ignores_the_checkout_return_url() {
+        // Every other headroom:// URL must fall through to the pricing refresh.
+        for raw in [
+            "headroom://checkout-complete",
+            "headroom://",
+            "headroom://auth",
+        ] {
+            let url = tauri::Url::parse(raw).unwrap();
+            assert_eq!(parse_magic_link_auth(&url), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn magic_link_auth_rejects_half_filled_links() {
+        for raw in [
+            "headroom://auth?email=a%40b.com",
+            "headroom://auth?code=123456",
+            "headroom://auth?email=&code=123456",
+            "headroom://auth?email=a%40b.com&code=",
+        ] {
+            let url = tauri::Url::parse(raw).unwrap();
+            assert_eq!(parse_magic_link_auth(&url), None, "{raw}");
+        }
+    }
+
+    /// The slot is one-shot: a window reload re-runs the claim on mount, and a
+    /// second hand-out would replay a code the server has already spent. Sole
+    /// owner of PENDING_MAGIC_LINK in the suite, so no serialisation needed.
+    #[test]
+    fn pending_magic_link_is_handed_out_exactly_once() {
+        assert_eq!(take_pending_magic_link(), None, "slot starts empty");
+
+        *PENDING_MAGIC_LINK.lock().unwrap() = Some(("a@b.com".to_string(), "123456".to_string()));
+
+        assert_eq!(
+            take_pending_magic_link(),
+            Some(("a@b.com".to_string(), "123456".to_string()))
+        );
+        assert_eq!(
+            take_pending_magic_link(),
+            None,
+            "a reload must not replay a spent code"
+        );
     }
 }

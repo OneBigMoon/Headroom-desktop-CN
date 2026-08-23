@@ -1764,7 +1764,7 @@ fn maybe_spawn_codex_usage_poll(buf: &[u8], codex_slot: &CodexRateLimitSlot) {
 /// Best-effort decode of one claim from the nested OpenAI auth object in a
 /// Codex OAuth bearer JWT. No signature verification: callers use this only
 /// to classify routing or show a local plan hint, never to grant access.
-fn decode_codex_auth_claim(token: &str, claim: &str) -> Option<String> {
+pub(crate) fn decode_codex_auth_claim(token: &str, claim: &str) -> Option<String> {
     let payload_b64 = token.split('.').nth(1)?;
     // JWT payloads are base64url without padding; tolerate either form.
     let trimmed = payload_b64.trim_end_matches('=');
@@ -2899,7 +2899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn intercept_captures_bearer_and_forwards_headers_to_backend() {
         // Fake backend: accept one connection, read its header block, hold the
         // connection open long enough for the test to inspect what arrived.
@@ -2916,8 +2916,12 @@ mod tests {
         });
 
         // Point the intercept's per-connection backend lookup at our fake
-        // backend's ephemeral port. Serialized via #[serial(backend_port)] so
-        // tests that mutate the global don't race.
+        // backend's ephemeral port. Serialized via #[serial] so tests that
+        // mutate the global don't race. Deliberately the unnamed key: every
+        // serial test in this crate shares it. A named group (#[serial(foo)])
+        // is an INDEPENDENT lock, so it would let a backend-port test run
+        // alongside an unnamed one and hand the loser a port pointing at
+        // someone else's fixture. Do not reintroduce named groups here.
         backend_port::set(backend_addr.port());
 
         // Run the intercept on its own ephemeral port.
@@ -3016,7 +3020,7 @@ mod tests {
     /// Only the negative case is asserted: letting the beacon fire would spawn a
     /// thread POSTing to the real headroom-web.
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn local_backend_path_does_not_fire_first_optimized_request() {
         use std::sync::atomic::Ordering;
 
@@ -3087,7 +3091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn intercept_falls_back_direct_when_backend_is_unreachable() {
         // Pick a backend port that nothing is listening on. Bind+immediately
         // drop a listener to grab a free port, then connect attempts will fail.
@@ -3638,7 +3642,7 @@ mod tests {
     /// forwards a request to a fake upstream, then streams the upstream's
     /// response back to the client as HTTP/1.1 chunked transfer.
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn bypass_forwards_request_to_upstream_and_streams_response_back() {
         let (upstream_listener, upstream_addr) = bind_ephemeral().await;
         let upstream_base = format!("http://127.0.0.1:{}", upstream_addr.port());
@@ -3828,7 +3832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn bypass_returns_502_when_upstream_unreachable() {
         // Bind+drop to grab a free port nothing is listening on.
         let (probe, dead_addr) = bind_ephemeral().await;
@@ -3908,7 +3912,7 @@ mod tests {
     /// when `tool_manager` selects a fallback port mid-launch, in-flight
     /// clients get routed to the new backend without a thread restart.
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn intercept_picks_up_backend_port_changes_between_connections() {
         let (first_listener, first_addr) = bind_ephemeral().await;
         let (second_listener, second_addr) = bind_ephemeral().await;
@@ -4254,7 +4258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn intercept_rewrites_use_responses_lite_in_models_response() {
         let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
         let (backend_listener, backend_addr) = bind_ephemeral().await;
@@ -4366,7 +4370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(backend_port)]
+    #[serial]
     async fn intercept_skips_models_rewrite_for_anthropic_fetch() {
         // Same catalog shape, but the request carries Anthropic markers —
         // the Codex-only lite-flag rewrite must leave it untouched.

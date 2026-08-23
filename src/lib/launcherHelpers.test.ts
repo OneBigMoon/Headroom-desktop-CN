@@ -6,6 +6,7 @@ import {
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
+  magicLinkScreenCopy,
   getLauncherAutoConfigureDecision,
   isValidEmailAddress,
   needsTermsAcceptance,
@@ -144,6 +145,21 @@ describe("launcher helpers", () => {
         message: "Waiting for a Claude Code prompt..."
       }
     ]);
+  });
+
+  describe("magicLinkScreenCopy", () => {
+    it("names the account while verifying", () => {
+      expect(magicLinkScreenCopy("verifying", "a@b.com", null).body).toContain("a@b.com");
+    });
+
+    it("surfaces the verify error, falling back to a retry hint", () => {
+      expect(magicLinkScreenCopy("failed", "a@b.com", "Code expired.").body).toBe(
+        "Code expired."
+      );
+      expect(magicLinkScreenCopy("failed", "a@b.com", null).body).toContain(
+        "Request a new sign-in link"
+      );
+    });
   });
 
   describe("getInitialLauncherStage", () => {

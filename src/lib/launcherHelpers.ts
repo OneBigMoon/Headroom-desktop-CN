@@ -158,6 +158,24 @@ export function getLauncherAutoConfigureDecision(
   return "begin_proxy_verification";
 }
 
+/// Copy for the launcher's magic-link screen (headroom://auth). Success has no
+/// screen of its own - it drops straight through to the next onboarding step.
+export type MagicLinkState = "verifying" | "failed";
+
+export function magicLinkScreenCopy(
+  state: MagicLinkState,
+  email: string,
+  error: string | null
+): { title: string; body: string } {
+  if (state === "verifying") {
+    return { title: "Signing you in…", body: `Finishing sign-in for ${email}.` };
+  }
+  return {
+    title: "That sign-in link did not work",
+    body: error ?? "Request a new sign-in link and try again.",
+  };
+}
+
 /// Given a launcher-window startup result, return the stage the launcher
 /// should land on, or `null` to leave the current stage untouched (the caller
 /// is in a non-launcher window, or bootstrap hasn't completed yet).

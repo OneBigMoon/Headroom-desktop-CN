@@ -2214,6 +2214,12 @@ select {
   color: var(--text-primary);
 }
 
+/* Provisional numbers look provisional: a chip whose figure is an estimate
+   (vs measured against the A/B holdout) gets a dashed border. */
+.output-chip__button--estimated {
+  border-style: dashed;
+}
+
 .output-chip__dot {
   width: 6px;
   height: 6px;

@@ -29,20 +29,34 @@ fn detect_cli(name: &str) -> Option<PathBuf> {
     // Context7 and plugin addons reported "not found on PATH" on every Windows
     // box regardless of what was installed. On Unix it is a cheap extra hit
     // ahead of the 2s interactive-shell probe.
-    if let Some(path) = crate::client_adapters::find_on_path(&[name]) {
-        if is_runnable(&path) {
-            return Some(path);
-        }
+    if let Some(path) = probe_on_path(name) {
+        return Some(path);
     }
     probe_via_login_shell(name)
 }
 
-fn probe_known_paths(name: &str) -> Option<PathBuf> {
+pub(crate) fn probe_on_path(name: &str) -> Option<PathBuf> {
+    let path = crate::client_adapters::find_on_path(&[name])?;
+    is_runnable(&path).then_some(path)
+}
+
+pub(crate) fn probe_known_paths(name: &str) -> Option<PathBuf> {
     first_runnable(known_path_candidates(home_dir(), name).into_iter())
 }
 
 fn known_path_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
-    vec![
+    known_path_candidates_for_platform(home, name, cfg!(windows))
+}
+
+fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) -> Vec<PathBuf> {
+    let base = vec![
+        // The official installer (`curl -fsSL https://claude.ai/install.sh | bash`,
+        // which our own "Install the Claude Code CLI" banner suggests) drops the
+        // binary here. GUI launches inherit launchd's bare PATH so `find_on_path`
+        // cannot see it, and the login-shell probe is a coin flip against a noisy
+        // or slow `.zshrc` -- so a stock install was undetectable (issue #59).
+        // First, because that is the order the user's own shell resolves it in.
+        home.join(".local").join("bin").join(name),
         home.join(".claude").join("local").join(name),
         PathBuf::from(format!("/opt/homebrew/bin/{name}")),
         PathBuf::from(format!("/usr/local/bin/{name}")),
@@ -50,7 +64,19 @@ fn known_path_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
         home.join(".volta").join("bin").join(name),
         home.join(".bun").join("bin").join(name),
         PathBuf::from(format!("/usr/bin/{name}")),
-    ]
+    ];
+    if !windows {
+        return base;
+    }
+
+    let mut candidates = Vec::with_capacity(base.len() * 5);
+    for path in base {
+        for extension in ["exe", "cmd", "bat", "com"] {
+            candidates.push(path.with_extension(extension));
+        }
+        candidates.push(path);
+    }
+    candidates
 }
 
 fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
@@ -75,7 +101,7 @@ fn probe_via_login_shell(name: &str) -> Option<PathBuf> {
     read_path_from_shell(command, SHELL_LOOKUP_TIMEOUT)
 }
 
-/// Spawns `command`, reads the first non-empty line from its stdout, kills
+/// Spawns `command`, reads the first stdout line naming an existing file, kills
 /// the child, and returns the line as a validated `PathBuf`. The timeout
 /// bounds how long we wait for that first line — NOT how long we wait for
 /// the child to exit. Interactive shells (`-ilc`) print the `command -v`
@@ -95,7 +121,11 @@ fn read_path_from_shell(mut command: Command, timeout: Duration) -> Option<PathB
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim().to_string();
-            if trimmed.is_empty() {
+            // Interactive shells source the user's rc files *before* running
+            // our `command -v`, so the first line on the pipe is frequently an
+            // rc-file banner. Skip anything that does not name a real file
+            // instead of handing the caller the banner and giving up.
+            if trimmed.is_empty() || !Path::new(&trimmed).is_file() {
                 continue;
             }
             let _ = tx.send(trimmed);
@@ -338,6 +368,24 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn probe_on_path_rejects_an_existing_but_broken_entry() {
+        let _env_lock = crate::test_env_lock::lock_home();
+        let tmp = ScopedTempDir::new("path_broken");
+        fs::write(tmp.path().join("headroom"), "not executable\n").unwrap();
+        let saved_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", tmp.path());
+
+        let found = probe_on_path("headroom");
+
+        match saved_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(found.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn first_runnable_walks_past_broken_candidates() {
         // Reproduces the production scenario: an Intel-only `/usr/local/bin/claude`
         // remnant on an arm64 Mac is the second candidate examined; the first
@@ -490,6 +538,56 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "should return as soon as the first line arrives, not wait for the sleep; took {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn known_path_candidates_probe_the_official_installer_target_first() {
+        // Issue #59: `curl -fsSL https://claude.ai/install.sh | bash` installs to
+        // ~/.local/bin, which GUI-launched processes cannot see (launchd hands us
+        // PATH=/usr/bin:/bin:/usr/sbin:/sbin). Absent from this list, a stock
+        // install was invisible whenever the login-shell probe also failed.
+        // Assert the directory, not the filename: on Windows the first
+        // candidate is `claude.exe` in that same directory (the extension
+        // sweep is pinned by known_windows_paths_probe_executable_extensions).
+        let candidates = known_path_candidates(PathBuf::from("/Users/test"), "claude");
+        assert_eq!(
+            candidates.first().and_then(|path| path.parent()),
+            Some(Path::new("/Users/test/.local/bin")),
+        );
+    }
+
+    #[test]
+    fn known_windows_paths_probe_executable_extensions() {
+        let candidates =
+            known_path_candidates_for_platform(PathBuf::from("/Users/test"), "headroom", true);
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(Path::new("/Users/test/.local/bin/headroom.exe")),
+        );
+        assert!(candidates
+            .iter()
+            .any(|path| path == Path::new("/Users/test/.local/bin/headroom.cmd")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_path_from_shell_skips_rc_file_banner_lines() {
+        // Regression: `zsh -ilc` sources .zshrc before running `command -v`, so
+        // anything the user's rc file prints lands on the pipe first. Taking the
+        // first non-empty line handed us the banner and reported "not installed".
+        let tmp = ScopedTempDir::new("probe_noisy_rc");
+        let fake_claude = tmp.path().join("claude");
+        make_executable(&fake_claude);
+        let claude_str = fake_claude.display().to_string();
+
+        let mut cmd = crate::proc::command("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("echo 'Welcome back!'; echo ''; echo {claude_str}"));
+
+        assert_eq!(
+            read_path_from_shell(cmd, Duration::from_secs(2)).as_deref(),
+            Some(fake_claude.as_path()),
         );
     }
 

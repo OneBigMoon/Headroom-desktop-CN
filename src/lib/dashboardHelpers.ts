@@ -3,7 +3,8 @@ import type {
   ClientSetupResult,
   DailySavingsPoint,
   HourlySavingsPoint,
-  ProviderSavingsPoint
+  ProviderSavingsPoint,
+  SavingsBreakdown
 } from "./types";
 
 export interface SavingsChartDatum {
@@ -126,6 +127,24 @@ export function cacheHitPair(
   // remainder rather than hiding the (excellent) hit rate.
   const compressedPct = baseline > 0 ? Math.min(100, (saved / baseline) * 100) : 0;
   return { hitPct, compressedPct };
+}
+
+/** The all-time cache-hit pair, from the lifetime breakdown rather than a
+ * window of buckets. Null when the client has never cached anything: there is
+ * no hit rate to report, and `cacheHitPair` would be dividing into an empty
+ * window. */
+export function allTimeCacheHitPair(
+  breakdown: SavingsBreakdown | null | undefined,
+  lifetimeEstimatedSavingsUsd: number
+) {
+  if (!breakdown || breakdown.cacheReadTokens <= 0) return null;
+  return cacheHitPair([
+    {
+      cacheSavingsUsd: breakdown.cacheSavingsUsd,
+      actualCostUsd: breakdown.totalInputCostUsd,
+      estimatedSavingsUsd: lifetimeEstimatedSavingsUsd
+    }
+  ]);
 }
 
 /** Canonical input-compression rate for a window of buckets: the share of the
@@ -309,18 +328,36 @@ export function buildHourlySavingsWindow(data: HourlySavingsPoint[], day: Date) 
  * above it (which uses the same denominator, see `compressibleInputSavingsRate`).
  * Read cost is recovered from the read discount the same way: `usd / 9`.
  *
+ * The TOKEN figure is priced the same way rather than differenced, for the
+ * reason spelled out on `compressibleInputSavingsRate`: `cacheReadTokens` is
+ * the provider's count and `totalTokensSent` is our tokenizer's count of the
+ * forwarded prompt, and on real data the reads routinely exceed the forwarded
+ * input -- `totalTokensSent - cacheReadTokens` clamped 27 of 36 live hourly
+ * buckets to a flat zero bar while the same buckets' dollar bars were fine.
+ * So we split our own token count by the compressible share the dollar pair
+ * implies (reads bill at ~0.1x, so their full-price value is `discount * 10/9`
+ * and full-price input is `actualCostUsd + cacheSavingsUsd`).
+ *
  * Falls back to the full figure on buckets with no cache coverage - local
  * tracker buckets, and days aged out of the backend's checkpoint history. */
 export function compressibleSpend(point: {
-  cacheReadTokens?: number | null;
   cacheSavingsUsd?: number | null;
   actualCostUsd: number;
   totalTokensSent: number;
 }) {
-  const readCostUsd = point.cacheSavingsUsd == null ? 0 : Math.max(0, point.cacheSavingsUsd) / 9;
+  if (point.cacheSavingsUsd == null) {
+    return {
+      compressibleCostUsd: Math.max(0, point.actualCostUsd),
+      compressibleTokensSent: Math.max(0, point.totalTokensSent)
+    };
+  }
+  const cacheSavingsUsd = Math.max(0, point.cacheSavingsUsd);
+  const compressibleCostUsd = Math.max(0, point.actualCostUsd - cacheSavingsUsd / 9);
+  const fullPriceInput = Math.max(0, point.actualCostUsd) + cacheSavingsUsd;
+  const compressibleShare = fullPriceInput > 0 ? compressibleCostUsd / fullPriceInput : 1;
   return {
-    compressibleCostUsd: Math.max(0, point.actualCostUsd - readCostUsd),
-    compressibleTokensSent: Math.max(0, point.totalTokensSent - (point.cacheReadTokens ?? 0))
+    compressibleCostUsd,
+    compressibleTokensSent: Math.round(Math.max(0, point.totalTokensSent) * compressibleShare)
   };
 }
 

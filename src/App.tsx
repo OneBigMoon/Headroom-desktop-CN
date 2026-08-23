@@ -92,6 +92,7 @@ import {
   recentDailySavingsUsd,
   setServerPlanPrices,
   tierRecommendationSourceLabel,
+  scheduledPlanChange,
   upgradePlanIntentLabel,
   type BillingPeriod,
   type PricingAudience,
@@ -113,6 +114,7 @@ import {
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
+  allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
@@ -146,6 +148,7 @@ import {
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
+  magicLinkScreenCopy,
   getLauncherAutoConfigureDecision,
   isValidEmailAddress,
   needsTermsAcceptance,
@@ -153,6 +156,7 @@ import {
   nextAutoConfigureStepAfterApply,
   recommendedHeadroomTier,
   type LauncherStage,
+  type MagicLinkState,
   type InstallWizardStep
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
@@ -860,10 +864,15 @@ function WindowRateChip({
 
 function OutputReductionChip({
   reduction,
-  flip = false
+  flip = false,
+  allTimeFallback = false
 }: {
   reduction: OutputReduction;
   flip?: boolean;
+  /** Rendered because the visible window has no samples of its own, so this
+   * is the lifetime figure standing in. Says so, rather than letting an
+   * all-time number read as that period's. */
+  allTimeFallback?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -909,7 +918,9 @@ function OutputReductionChip({
           onClick={(e) => e.stopPropagation()}
         >
           <div className="output-chip__pop-head">
-            <span className="output-chip__pop-title">Output token reduction</span>
+            <span className="output-chip__pop-title">
+              Output token reduction{allTimeFallback ? " · all-time" : ""}
+            </span>
             <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
           </div>
           <div className="output-chip__pop-value">{percent1(reduction.reductionPercent)}%</div>
@@ -926,6 +937,7 @@ function OutputReductionChip({
             </div>
           </dl>
           <p className="output-chip__pop-note">
+            {allTimeFallback ? "No output samples landed in this window, so this is the all-time figure, not this period's. " : ""}
             {isMeasured
               ? "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down — measured against an unshaped A/B holdout."
               : "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down. Output savings are counterfactual, so this is an estimate vs a learned baseline."}
@@ -983,17 +995,16 @@ function DailySavingsChart({
   const compressibleRate = compressibleInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow
   );
-  // Window-scoped output reduction from the locally-sampled series. Falls
-  // back to the all-time estimator chip only when the window includes now —
-  // a historical window with no samples shows no output figure rather than
-  // an all-time number masquerading as that period's.
+  // Window-scoped output reduction from the locally-sampled series, falling
+  // back to the all-time figure for any window without samples of its own.
+  // The fallback labels itself all-time (see OutputReductionChip) so it can't
+  // read as that period's number — but it does render: since the estimator
+  // only scores strata its baseline actually observed, a window of purely
+  // unscored traffic has no samples at all, and showing nothing there reads
+  // as "the shaper did nothing" rather than "this window can't be measured".
   const windowOutput = outputReductionForWindow(
     view === "month" ? monthlyWindow : hourlyWindow
   );
-  const windowIncludesToday =
-    view === "month"
-      ? visibleMonth.getTime() === currentMonth.getTime()
-      : visibleDay.getTime() === today.getTime();
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -1102,9 +1113,7 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {compressibleRate !== null ||
-            windowOutput !== null ||
-            (windowIncludesToday && outputReduction) ? (
+            {compressibleRate !== null || windowOutput !== null || outputReduction ? (
               <span className="savings-chart__overlay-chips">
                 {compressibleRate !== null && (
                   <WindowRateChip
@@ -1140,8 +1149,8 @@ function DailySavingsChart({
                     ]}
                     note="Estimate vs the shaper's learned baseline, sampled while the app runs."
                   />
-                ) : windowIncludesToday && outputReduction ? (
-                  <OutputReductionChip flip reduction={outputReduction} />
+                ) : outputReduction ? (
+                  <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
                 ) : null}
               </span>
             ) : null}
@@ -1600,6 +1609,10 @@ export default function App() {
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
   // flags cannot bypass the install step's readiness gate.
   const [launcherStage, setLauncherStage] = useState<LauncherStage>("install");
+  // Set while a headroom://auth magic link is being redeemed. The launcher is
+  // already on screen by then (the deep-link handler shows it), so without this
+  // the sign-in ran invisibly behind whatever onboarding stage it landed on.
+  const [magicLinkState, setMagicLinkState] = useState<MagicLinkState | null>(null);
   // Paywall-first experiment flag, served from the Rust-side cache (never
   // blocks). Gated flow applies only to fresh installs: an installed runtime
   // means the user is grandfathered and sees zero difference.
@@ -1706,6 +1719,12 @@ export default function App() {
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
   const pricingRefreshInFlightRef = useRef(false);
+  // When the last authoritative status (verify / sign-out) was applied. A slow
+  // pricing fetch issued before it must not land afterwards and overwrite it:
+  // on a fresh install the very first fetch is the slowest, and it was still in
+  // flight when the magic link signed the user in, so it clobbered the signed-in
+  // status with its own stale signed-out one.
+  const pricingStatusStampRef = useRef(0);
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
@@ -3227,7 +3246,15 @@ export default function App() {
   // poll tick.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen("pricing-refreshed", () => {
+    void listen<HeadroomPricingStatus | null>("pricing-refreshed", (event) => {
+      // Auth mutations ship the new status with the event. Using it beats a
+      // refetch that the in-flight guard may drop outright, leaving this window
+      // stale until the next poll tick (60s focused, 600s not).
+      if (event.payload) {
+        pricingStatusStampRef.current = Date.now();
+        setPricingStatus(event.payload);
+        return;
+      }
       void refreshPricingStatus();
     }).then((fn) => {
       unlisten = fn;
@@ -3723,7 +3750,7 @@ export default function App() {
       applyConnectorsIfChanged(items);
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not load connector status."
+        describeInvokeError(error, "Could not load connector status.")
       );
     }
   }
@@ -3735,7 +3762,7 @@ export default function App() {
       void maybeFireUrgentRuntimeNotification(runtime);
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not load runtime status."
+        describeInvokeError(error, "Could not load runtime status.")
       );
     }
   }
@@ -3751,7 +3778,7 @@ export default function App() {
       await refreshRuntimeStatus();
     } catch (error) {
       setResumeError(
-        error instanceof Error ? error.message : "Could not restart Headroom."
+        describeInvokeError(error, "Could not restart Headroom.")
       );
     } finally {
       setResuming(false);
@@ -3764,15 +3791,26 @@ export default function App() {
     }
     pricingRefreshInFlightRef.current = true;
     setPricingBusy(true);
+    const issuedAt = Date.now();
     try {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
+      if (pricingStatusStampRef.current > issuedAt) {
+        return;
+      }
       setPricingStatus(status);
+      // The code step is local UI state, so a sign-in that happened elsewhere
+      // (the magic link, or the other window) leaves this one still asking for
+      // a code nobody needs to enter. Every refresh path lands here.
+      if (status.authenticated) {
+        setAuthCode("");
+        setAuthCodeRequestedFor(null);
+      }
       void maybeFireTrialNotifications(status);
       void maybeFireUrgentPricingNotifications(status);
       setPricingError(null);
     } catch (error) {
       setPricingError(
-        error instanceof Error ? error.message : "Could not load pricing status."
+        describeInvokeError(error, "Could not load pricing status.")
       );
     } finally {
       pricingRefreshInFlightRef.current = false;
@@ -3788,7 +3826,7 @@ export default function App() {
       applyClaudeProjectsIfChanged(projects);
     } catch (error) {
       setClaudeProjectsError(
-        error instanceof Error ? error.message : "Could not load Claude Code projects."
+        describeInvokeError(error, "Could not load Claude Code projects.")
       );
     } finally {
       setClaudeProjectsBusy(false);
@@ -3861,7 +3899,7 @@ export default function App() {
       await beginProxyVerificationStep();
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not configure your coding tools automatically."
+        describeInvokeError(error, "Could not configure your coding tools automatically.")
       );
       setLauncherStage("client_setup");
     } finally {
@@ -3940,7 +3978,7 @@ export default function App() {
         ...current,
         running: false,
         summary: "headroom learn could not be started.",
-        error: error instanceof Error ? error.message : "Failed to start headroom learn."
+        error: describeInvokeError(error, "Failed to start headroom learn.")
       }));
     } finally {
       setHeadroomLearnBusy(false);
@@ -4018,7 +4056,7 @@ export default function App() {
       }
     } catch (error) {
       setAddonError(
-        error instanceof Error ? error.message : "The addon action could not be completed."
+        describeInvokeError(error, "The addon action could not be completed.")
       );
     } finally {
       setAddonBusyId(null);
@@ -4072,15 +4110,20 @@ export default function App() {
       setAuthFlowError("Enter the authentication code from your email.");
       return;
     }
+    await verifyAuthCode(authEmail.trim(), authCode.trim());
+  }
+
+  async function verifyAuthCode(email: string, code: string): Promise<boolean> {
     setAuthVerifyBusy(true);
     setAuthFlowError(null);
     setAuthFlowSuccess(null);
     try {
       const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
-        email: authEmail.trim(),
-        code: authCode.trim(),
+        email,
+        code,
         inviteCode: null
       });
+      pricingStatusStampRef.current = Date.now();
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
@@ -4093,26 +4136,74 @@ export default function App() {
         setActiveView("upgrade");
       }
       await refreshConnectors();
+      return true;
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not verify sign-in code."));
+      return false;
     } finally {
       setAuthVerifyBusy(false);
     }
   }
+
+  // Magic sign-in link (headroom://auth). The browser deliberately cannot sign
+  // anyone in -- it has none of the device fingerprints verify_code needs -- so
+  // it only hands over the code and this is the ordinary typed-code flow with
+  // the typing removed.
+  //
+  // Drained on mount as well as on the event: a cold start launched *by* the
+  // link delivers the URL before this listener exists, so an event alone would
+  // be lost exactly when the link was the thing that opened the app. Rust hands
+  // the slot out once, so both windows can race for it harmlessly.
+  // Only the launcher claims it: both windows mount this component and the slot
+  // is one-shot, so the hidden main window could win the race and sign the user
+  // in where nobody could see it. The deep-link handler shows the launcher
+  // before parking the credentials, so it is the window on screen.
+  useEffect(() => {
+    if (windowLabel !== "launcher") {
+      return;
+    }
+    let cancelled = false;
+    async function claimMagicLink() {
+      const pending = await invoke<[string, string] | null>("take_pending_magic_link");
+      if (cancelled || !pending) {
+        return;
+      }
+      const [email, code] = pending;
+      setAuthEmail(email);
+      setMagicLinkState("verifying");
+      const verified = await verifyAuthCode(email, code);
+      if (cancelled) {
+        return;
+      }
+      // Success needs no screen: clearing this drops the user straight onto the
+      // next onboarding step, already signed in.
+      setMagicLinkState(verified ? null : "failed");
+    }
+    void claimMagicLink();
+    const unlistenPromise = listen("magic-link-auth", () => {
+      void claimMagicLink();
+    });
+    return () => {
+      cancelled = true;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [windowLabel]);
 
   async function handleSignOutHeadroomAccount() {
     setAuthFlowError(null);
     setAuthFlowSuccess(null);
     try {
       await invoke("sign_out_headroom_account");
-      setPricingStatus(await invoke<HeadroomPricingStatus>("get_headroom_pricing_status"));
+      const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
+      pricingStatusStampRef.current = Date.now();
+      setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
       setAuthFlowSuccess("Signed out of Headroom.");
       setPendingUpgradePlanId(null);
     } catch (error) {
       setAuthFlowError(
-        error instanceof Error ? error.message : "Could not sign out of Headroom."
+        describeInvokeError(error, "Could not sign out of Headroom.")
       );
     }
   }
@@ -4122,7 +4213,7 @@ export default function App() {
       await openExternalLink(CLAUDE_CODE_INSTALL_DOCS_URL);
     } catch (error) {
       setLearnInstallCopyNotice(
-        error instanceof Error ? error.message : "Could not open the install guide."
+        describeInvokeError(error, "Could not open the install guide.")
       );
       window.setTimeout(() => setLearnInstallCopyNotice(null), 3000);
     }
@@ -4226,7 +4317,7 @@ export default function App() {
         setCheckoutPollingDeadline(Date.now() + 5 * 60_000);
       } catch (error) {
         setUpgradeActionError(
-          error instanceof Error ? error.message : typeof error === "string" ? error : "Could not start checkout."
+          describeInvokeError(error, "Could not start checkout.")
         );
       } finally {
         setUpgradeActionBusy(null);
@@ -4244,7 +4335,7 @@ export default function App() {
         await openBillingPortal();
       } catch (error) {
         setUpgradeActionError(
-          error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+          describeInvokeError(error, "Could not open billing portal.")
         );
       } finally {
         setUpgradeActionBusy(null);
@@ -4264,7 +4355,7 @@ export default function App() {
       await openExternalLink(action.url);
     } catch (error) {
       setUpgradeActionError(
-        error instanceof Error ? error.message : "Could not open the selected plan link."
+        describeInvokeError(error, "Could not open the selected plan link.")
       );
     } finally {
       setUpgradeActionBusy(null);
@@ -4341,7 +4432,7 @@ export default function App() {
       await openBillingPortal();
     } catch (error) {
       setUpgradeActionError(
-        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+        describeInvokeError(error, "Could not open billing portal.")
       );
     } finally {
       setUpgradeActionBusy(null);
@@ -4377,7 +4468,7 @@ export default function App() {
       await openBillingPortal();
     } catch (error) {
       setUpgradeActionError(
-        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+        describeInvokeError(error, "Could not open billing portal.")
       );
     } finally {
       setUpgradeActionBusy(null);
@@ -4431,7 +4522,7 @@ export default function App() {
       setContactSubmitSuccess("Thanks. Check your inbox for a confirmation email.");
     } catch (error) {
       setContactSubmitError(
-        error instanceof Error ? error.message : "Could not submit the contact request."
+        describeInvokeError(error, "Could not submit the contact request.")
       );
     } finally {
       setContactSubmitBusy(false);
@@ -4476,7 +4567,7 @@ export default function App() {
       await refreshConnectors();
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Failed to update connector."
+        describeInvokeError(error, "Failed to update connector.")
       );
     } finally {
       setConnectorsBusy(false);
@@ -4549,17 +4640,10 @@ export default function App() {
   // feeds it the lifetime breakdown as a single synthetic bucket;
   // cacheReadTokens is used only as an existence signal for coverage, never
   // ratioed against our own token counts.
-  const cachePairAllTime = (() => {
-    const b = dashboard.savingsBreakdown;
-    if (!b || b.cacheReadTokens <= 0) return null;
-    return cacheHitPair([
-      {
-        cacheSavingsUsd: b.cacheSavingsUsd,
-        actualCostUsd: b.totalInputCostUsd,
-        estimatedSavingsUsd: dashboard.lifetimeEstimatedSavingsUsd
-      }
-    ]);
-  })();
+  const cachePairAllTime = allTimeCacheHitPair(
+    dashboard.savingsBreakdown,
+    dashboard.lifetimeEstimatedSavingsUsd
+  );
   const compressionOfRestPct = cachePairAllTime?.compressedPct ?? null;
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
@@ -4609,6 +4693,39 @@ export default function App() {
 
   if (!startupReady || windowLabel === null) {
     return null;
+  }
+
+  // Ahead of the terms gate: redemption is already under way by the time that
+  // gate renders, and its sign-in form has no busy state of its own, so the
+  // wait read as nothing happening at all.
+  if (windowLabel === "launcher" && magicLinkState !== null) {
+    const magicLinkCopy = magicLinkScreenCopy(
+      magicLinkState,
+      pricingStatus?.account?.email ?? authEmail,
+      authFlowError
+    );
+    return (
+      <LauncherShell
+        shellClassName="intro-shell intro-shell--post-install"
+        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+        copyClassName="intro-shell__copy intro-shell__copy--post-install"
+        onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
+        showSpinner={magicLinkState === "verifying"}
+      >
+        <h1>{magicLinkCopy.title}</h1>
+        <p className="launcher-install-notice">{magicLinkCopy.body}</p>
+        {magicLinkState === "verifying" ? null : (
+          <button
+            className="primary-button primary-button--large primary-button--success"
+            onClick={() => setMagicLinkState(null)}
+            type="button"
+          >
+            Continue
+          </button>
+        )}
+      </LauncherShell>
+    );
   }
 
   // Block every window (launcher and main) until the user accepts the current
@@ -5946,23 +6063,7 @@ export default function App() {
   // A downgrade waits for the end of the term already paid for, so between
   // confirming it and it landing the subscription still reports the old plan.
   // Without this the change leaves no trace anywhere in the app.
-  const pendingPlanChangeInfo = (() => {
-    const account = pricingStatus?.account;
-    const tier = account?.subscriptionPendingTier;
-    const effectiveAt = account?.subscriptionPendingEffectiveAt;
-    if (!tier || !effectiveAt) return null;
-    const period = account?.subscriptionPendingBillingPeriod === "monthly" ? "monthly" : "annual";
-    const on = new Date(effectiveAt).toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric"
-    });
-    // Same tier on a shorter cycle is a billing switch, not a plan change.
-    const note = tier === account?.subscriptionTier
-      ? `Switches to ${period} billing on ${on}`
-      : `Switches to ${upgradePlanIntentLabel(tier)} (${period}) on ${on}`;
-    return { tier, billingPeriod: period, note };
-  })();
+  const pendingPlanChangeInfo = scheduledPlanChange(pricingStatus?.account);
   // The card beside the active plan: the nearest step up, since that is what
   // this view is for. Only the top tier has none, and there the tier below it
   // is the sole remaining move.
