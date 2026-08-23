@@ -43,6 +43,13 @@ fn probe_known_paths(name: &str) -> Option<PathBuf> {
 
 fn known_path_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
     vec![
+        // The official installer (`curl -fsSL https://claude.ai/install.sh | bash`,
+        // which our own "Install the Claude Code CLI" banner suggests) drops the
+        // binary here. GUI launches inherit launchd's bare PATH so `find_on_path`
+        // cannot see it, and the login-shell probe is a coin flip against a noisy
+        // or slow `.zshrc` -- so a stock install was undetectable (issue #59).
+        // First, because that is the order the user's own shell resolves it in.
+        home.join(".local").join("bin").join(name),
         home.join(".claude").join("local").join(name),
         PathBuf::from(format!("/opt/homebrew/bin/{name}")),
         PathBuf::from(format!("/usr/local/bin/{name}")),
@@ -75,7 +82,7 @@ fn probe_via_login_shell(name: &str) -> Option<PathBuf> {
     read_path_from_shell(command, SHELL_LOOKUP_TIMEOUT)
 }
 
-/// Spawns `command`, reads the first non-empty line from its stdout, kills
+/// Spawns `command`, reads the first stdout line naming an existing file, kills
 /// the child, and returns the line as a validated `PathBuf`. The timeout
 /// bounds how long we wait for that first line — NOT how long we wait for
 /// the child to exit. Interactive shells (`-ilc`) print the `command -v`
@@ -95,7 +102,11 @@ fn read_path_from_shell(mut command: Command, timeout: Duration) -> Option<PathB
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim().to_string();
-            if trimmed.is_empty() {
+            // Interactive shells source the user's rc files *before* running
+            // our `command -v`, so the first line on the pipe is frequently an
+            // rc-file banner. Skip anything that does not name a real file
+            // instead of handing the caller the banner and giving up.
+            if trimmed.is_empty() || !Path::new(&trimmed).is_file() {
                 continue;
             }
             let _ = tx.send(trimmed);
@@ -490,6 +501,40 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "should return as soon as the first line arrives, not wait for the sleep; took {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn known_path_candidates_probe_the_official_installer_target_first() {
+        // Issue #59: `curl -fsSL https://claude.ai/install.sh | bash` installs to
+        // ~/.local/bin, which GUI-launched processes cannot see (launchd hands us
+        // PATH=/usr/bin:/bin:/usr/sbin:/sbin). Absent from this list, a stock
+        // install was invisible whenever the login-shell probe also failed.
+        let candidates = known_path_candidates(PathBuf::from("/Users/test"), "claude");
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(Path::new("/Users/test/.local/bin/claude")),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_path_from_shell_skips_rc_file_banner_lines() {
+        // Regression: `zsh -ilc` sources .zshrc before running `command -v`, so
+        // anything the user's rc file prints lands on the pipe first. Taking the
+        // first non-empty line handed us the banner and reported "not installed".
+        let tmp = ScopedTempDir::new("probe_noisy_rc");
+        let fake_claude = tmp.path().join("claude");
+        make_executable(&fake_claude);
+        let claude_str = fake_claude.display().to_string();
+
+        let mut cmd = crate::proc::command("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("echo 'Welcome back!'; echo ''; echo {claude_str}"));
+
+        assert_eq!(
+            read_path_from_shell(cmd, Duration::from_secs(2)).as_deref(),
+            Some(fake_claude.as_path()),
         );
     }
 

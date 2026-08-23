@@ -2847,11 +2847,32 @@ fn codex_uses_chatgpt_auth() -> bool {
     }
     // Older auth.json files predate `auth_mode`: infer ChatGPT mode from the
     // presence of an OAuth account id.
-    obj.get("tokens")
-        .and_then(Value::as_object)
-        .and_then(|tokens| tokens.get("account_id"))
+    let Some(tokens) = obj.get("tokens").and_then(Value::as_object) else {
+        return false;
+    };
+    if tokens
+        .get("account_id")
         .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return true;
+    }
+    // Newer Codex writes an auth.json with neither `auth_mode` nor a
+    // top-level `tokens.account_id`: the account identity lives only in the
+    // `id_token` claims (upstream #3206 / #3212). Those configs read as
+    // API-key mode, so `requires_openai_auth` is omitted, Codex attaches no
+    // Authorization header, and every request 401s with "Missing bearer".
+    // The payload is decoded, not verified: it is a local file the user
+    // already owns, and the result only picks which key we write into their
+    // own config.toml. An API-key user has no ChatGPT id_token, so this
+    // cannot resurrect the forced-OAuth-login regression in #406.
+    tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(|token| {
+            crate::proxy_intercept::decode_codex_auth_claim(token, "chatgpt_account_id")
+        })
+        .is_some_and(|id| !id.trim().is_empty())
 }
 
 fn codex_provider_table_body(requires_openai_auth: bool) -> String {
@@ -9205,6 +9226,94 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             !toml.contains("requires_openai_auth"),
             "API-key users must not be forced into an OpenAI OAuth login (#406), got:\n{toml}"
+        );
+    }
+
+    /// Build an unsigned JWT whose payload carries `claims`. Only the payload
+    /// segment is read, so header and signature are placeholders.
+    fn fake_id_token(claims: &str) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.sig",
+            b64.encode(b"{\"alg\":\"none\"}"),
+            b64.encode(claims.as_bytes())
+        )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_emits_requires_openai_auth_from_id_token_claim() {
+        // Newer Codex writes neither `auth_mode` nor `tokens.account_id`; the
+        // account id lives only in the id_token claims (upstream #3206). Read
+        // as API-key mode, Codex sends no Authorization header and every
+        // request 401s.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let token = fake_id_token(
+            "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
+        );
+        fs::write(
+            codex_dir.join("auth.json"),
+            format!("{{\"tokens\":{{\"id_token\":\"{token}\"}}}}"),
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(
+            toml.contains("requires_openai_auth = true"),
+            "id_token-only ChatGPT auth still needs the flag, got:\n{toml}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_omits_requires_openai_auth_when_apikey_mode_is_explicit() {
+        // An explicit `auth_mode` wins outright: a stale ChatGPT id_token
+        // alongside it must not force an OAuth login (#406).
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let token = fake_id_token(
+            "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
+        );
+        fs::write(
+            codex_dir.join("auth.json"),
+            format!("{{\"auth_mode\":\"apikey\",\"tokens\":{{\"id_token\":\"{token}\"}}}}"),
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(
+            !toml.contains("requires_openai_auth"),
+            "explicit apikey mode must win over a ChatGPT id_token (#406), got:\n{toml}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_omits_requires_openai_auth_for_id_token_without_claim() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let token = fake_id_token("{\"sub\":\"user_1\"}");
+        fs::write(
+            codex_dir.join("auth.json"),
+            format!("{{\"tokens\":{{\"id_token\":\"{token}\"}}}}"),
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(
+            !toml.contains("requires_openai_auth"),
+            "an id_token without the ChatGPT claim is not ChatGPT auth, got:\n{toml}"
         );
     }
 

@@ -120,6 +120,34 @@ struct Ledger {
     control: HashMap<String, Accum>,
 }
 
+impl Ledger {
+    /// What to score *key* against: the seeded verbosity baseline where it has
+    /// evidence, otherwise this stratum's own control arm.
+    ///
+    /// The verbosity baseline is learned once, at install, and never relearned
+    /// -- every transcript written since is already shaped. So it speaks only
+    /// for the strata that machine happened to run beforehand, and no amount
+    /// of waiting widens that. On one real ledger it covered 11 opus strata
+    /// and 42% of requests, with nothing at all for fable, sonnet or haiku:
+    /// more than half the traffic permanently unscoreable, and a day spent
+    /// entirely on those models produced no sample at all.
+    ///
+    /// A control-arm request is unshaped by construction, so it observes the
+    /// same counterfactual the baseline was seeded to capture -- in the same
+    /// period, from the same client, in exactly this stratum. It is the only
+    /// evidence that can ever arrive for a stratum the seeding missed.
+    ///
+    /// Baseline first and control only where it is silent, so filling the
+    /// holdout adds coverage without moving the number for strata that
+    /// already had some.
+    fn baseline_for(&self, key: &str) -> Option<(f64, f64, u64)> {
+        self.baseline.lookup(key).or_else(|| {
+            let c = self.control.get(key)?;
+            (c.n >= MIN_BASELINE_N).then(|| (c.mean(), c.var(), c.n))
+        })
+    }
+}
+
 /// One side of the counterfactual, ready for the dashboard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputEstimate {
@@ -166,8 +194,8 @@ fn estimate_from_bytes(bytes: &[u8]) -> Option<OutputEstimate> {
     }
 }
 
-/// Synthetic control: treatment output against the learned baseline, over the
-/// strata the baseline can actually speak to.
+/// Synthetic control: treatment output against the best counterfactual each
+/// stratum has (see [`Ledger::baseline_for`]), over the strata that have one.
 ///
 /// `Σ n·(μ − ȳ)` with `Var ≈ Σ [ n·σ²_y + n²·σ²_μ/m ]`, matching the backend's
 /// derivation so the only difference is which strata qualify.
@@ -181,7 +209,7 @@ fn estimate_from_baseline(ledger: &Ledger) -> Option<OutputEstimate> {
         if acc.n == 0 {
             continue;
         }
-        let Some((mu, mu_var, m)) = ledger.baseline.lookup(key) else {
+        let Some((mu, mu_var, m)) = ledger.baseline_for(key) else {
             continue;
         };
         let n = acc.n as f64;
@@ -321,6 +349,11 @@ mod tests {
       "control":   {"opus|ask|l|tools": {"n": 100,  "sum": 100000, "sumsq": 100990000}}
     }"#;
 
+    /// `MIXED` with a control arm swapped in.
+    fn mixed_with_control(control: &str) -> String {
+        MIXED.replace("\"control\": {}", &format!("\"control\": {control}"))
+    }
+
     fn with_control(control: &str) -> String {
         let idx = HOLDOUT
             .find("\"control\"")
@@ -345,6 +378,29 @@ mod tests {
         assert!((e.reduction_percent - 20.0).abs() < 1e-9);
         assert!((e.ci_low_percent - 7.777_253).abs() < 1e-5);
         assert!((e.ci_high_percent - 32.222_747).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_stratum_the_baseline_missed_is_scored_against_its_own_control_arm() {
+        // fable has no baseline stratum and never can -- the verbosity
+        // baseline was seeded once, before Headroom shaped anything. Its own
+        // control arm is unshaped by construction, so it is the counterfactual.
+        let e = estimate(&mixed_with_control(
+            r#"{"fable|ask|l|tools": {"n": 10, "sum": 10000, "sumsq": 10200000}}"#,
+        ));
+        assert_eq!(e.method, "estimated");
+        // 4 opus (seeded baseline, mu 1000 vs 800) + 3 fable (control mean
+        // 1000 vs 700). The 2 opus|ask|l|notools still have neither.
+        assert_eq!(e.requests, 7);
+        assert_eq!(e.tokens_saved, 1_700);
+        assert_eq!(e.baseline_tokens, 7_000);
+
+        // A thin control arm is not evidence: same floor as the baseline.
+        let thin = estimate(&mixed_with_control(
+            r#"{"fable|ask|l|tools": {"n": 9, "sum": 9000, "sumsq": 9180000}}"#,
+        ));
+        assert_eq!(thin.requests, 4);
+        assert_eq!(thin.tokens_saved, 800);
     }
 
     #[test]

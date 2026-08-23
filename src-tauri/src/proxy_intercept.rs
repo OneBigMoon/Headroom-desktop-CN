@@ -1764,7 +1764,7 @@ fn maybe_spawn_codex_usage_poll(buf: &[u8], codex_slot: &CodexRateLimitSlot) {
 /// Best-effort decode of one claim from the nested OpenAI auth object in a
 /// Codex OAuth bearer JWT. No signature verification: callers use this only
 /// to classify routing or show a local plan hint, never to grant access.
-fn decode_codex_auth_claim(token: &str, claim: &str) -> Option<String> {
+pub(crate) fn decode_codex_auth_claim(token: &str, claim: &str) -> Option<String> {
     let payload_b64 = token.split('.').nth(1)?;
     // JWT payloads are base64url without padding; tolerate either form.
     let trimmed = payload_b64.trim_end_matches('=');
