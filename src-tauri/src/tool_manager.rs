@@ -1621,7 +1621,16 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
     // (notably Server 2022) does not ship. Nothing retriable and nothing the
     // app can repair, but it must not sit in the "other" grab-bag: that bucket
     // is what made RUST-3C/RUST-45 unresolvable.
-    } else if t.contains("winerror 126") || t.contains("importerror: dll load failed") {
+    //
+    // 126 is "the DLL is absent", 1114 is "it is there and its init routine
+    // failed" (RUST-75, c10.dll) -- different Windows errnos, same broken
+    // native stack, same non-answer for us, so one bucket. Match the number,
+    // not the sentence after it: Windows localizes that text, and 1114 landed
+    // in the grab-bag as Korean.
+    } else if t.contains("winerror 126")
+        || t.contains("winerror 1114")
+        || t.contains("importerror: dll load failed")
+    {
         "missing native dep"
     } else {
         "other"
@@ -3487,6 +3496,40 @@ impl ToolManager {
         )
     }
 
+    /// Run a directory operation that Windows can transiently deny.
+    ///
+    /// `DeleteFile`/`RemoveDirectory` only MARK a name for deletion: it stays
+    /// on disk until the last handle closes, and a rename onto it meanwhile
+    /// returns ACCESS_DENIED. Defender opens every file we just unpacked for
+    /// the same second or two. RUST-8K is that race hitting `rename` on a
+    /// fresh 0.8.6 install (os error 5, localized so the text is not even
+    /// greppable) -- and it dead-ends the bootstrap, so the user never gets a
+    /// runtime at all.
+    ///
+    /// Retries every error, not a classified subset: on a genuinely broken
+    /// install this costs ~2.5s on a path that already failed, and the alt is
+    /// a per-platform errno table (5/32/33 mean something else entirely on
+    /// Unix) guarding a branch no test on a Mac can reach.
+    /// ponytail: linear backoff, no jitter -- one process, no contention.
+    fn retry_fs<T>(what: &str, mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        const ATTEMPTS: u32 = 5;
+        let mut attempt = 1;
+        loop {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(err) if attempt < ATTEMPTS => {
+                    // info, not warn: a retry that then succeeds is a
+                    // non-event, and warn bridges to Sentry. The caller
+                    // reports the final failure as bootstrap_failed.
+                    log::info!("{what} failed ({err}), retry {attempt}/{ATTEMPTS}");
+                    std::thread::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)));
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     fn install_python_distribution<F>(&self, mut emit_step: F) -> Result<()>
     where
         F: FnMut(BootstrapStepUpdate),
@@ -3552,8 +3595,10 @@ impl ToolManager {
         // deletion.
         let staging_dir = self.runtime.runtime_dir.join("python.extracting");
         if staging_dir.exists() {
-            std::fs::remove_dir_all(&staging_dir)
-                .with_context(|| format!("clearing stale {}", staging_dir.display()))?;
+            Self::retry_fs("clearing stale staging dir", || {
+                std::fs::remove_dir_all(&staging_dir)
+            })
+            .with_context(|| format!("clearing stale {}", staging_dir.display()))?;
         }
         std::fs::create_dir_all(&staging_dir)
             .with_context(|| format!("creating {}", staging_dir.display()))?;
@@ -3576,11 +3621,15 @@ impl ToolManager {
             );
         }
         if self.runtime.python_dir.exists() {
-            std::fs::remove_dir_all(&self.runtime.python_dir).with_context(|| {
-                format!("removing partial {}", self.runtime.python_dir.display())
-            })?;
+            Self::retry_fs("removing partial python dir", || {
+                std::fs::remove_dir_all(&self.runtime.python_dir)
+            })
+            .with_context(|| format!("removing partial {}", self.runtime.python_dir.display()))?;
         }
-        std::fs::rename(&extracted_root, &self.runtime.python_dir).with_context(|| {
+        Self::retry_fs("publishing extracted python", || {
+            std::fs::rename(&extracted_root, &self.runtime.python_dir)
+        })
+        .with_context(|| {
             format!(
                 "publishing extracted python into {}",
                 self.runtime.python_dir.display()
@@ -8921,6 +8970,14 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
         || lower.contains("check the permissions")
         || lower.contains("access is denied")
         || lower.contains("errno 13")
+        // Windows LOCALIZES its error text: RUST-8K arrived as
+        // "액세스가 거부되었습니다. (os error 5)" and fell through to the
+        // grab-bag this function exists to prevent. The numeric code is the
+        // one locale-independent handle. Not gated to Windows: errno 5 is EIO
+        // on Unix, but a mislabelled bucket on an all-but-unseen pip EIO is a
+        // cheaper bug than a Windows-only branch no test here can reach. Keep
+        // the closing paren -- os error 50/51 are macOS network errors.
+        || lower.contains("(os error 5)")
     {
         "permission"
     } else if lower.contains("no such file or directory") || lower.contains("errno 2") {
@@ -9364,6 +9421,7 @@ impl std::error::Error for HeadroomStartupFailure {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -9927,6 +9985,14 @@ asyncio.run(verify())
             classify_kompress_prefetch_failure(
                 "OSError: [WinError 126] The specified module could not be found. \
                  Error loading \"...\\torch\\lib\\c10.dll\" or one of its dependencies"
+            ),
+            "missing native dep"
+        );
+        // RUST-75, verbatim from the event: only the errno survives the locale.
+        assert_eq!(
+            classify_kompress_prefetch_failure(
+                "OSError: [WinError 1114] DLL 초기화 루틴을 실행할 수 없습니다. \
+                 Error loading \"...\\torch\\lib\\c10.dll\" or one of its dependencies."
             ),
             "missing native dep"
         );
@@ -13604,6 +13670,19 @@ exit 0
                 "network",
             ),
             ("exit=1; stderr tail: something new", "other"),
+            // RUST-8K, verbatim: Windows access-denied on a Korean install.
+            // Only the numeric code survives translation.
+            (
+                "publishing extracted python into ~\\AppData\\Local\\Headroom: \
+                 액세스가 거부되었습니다. (os error 5)",
+                "permission",
+            ),
+            // The macOS network errnos must not read as a denial: the
+            // closing paren in the needle is what keeps 51 out of "permission".
+            (
+                "exit=1; stderr tail: error sending request (os error 51)",
+                "other",
+            ),
         ];
         for (compact, expected) in cases {
             assert_eq!(pip_failure_category(compact), expected, "for: {compact}");
@@ -13655,5 +13734,43 @@ exit 0
             seen.len() >= 5,
             "the five RUST-6K shapes must land in distinct buckets, got: {seen:?}"
         );
+    }
+
+    #[test]
+    fn retry_fs_survives_a_transient_denial() {
+        // RUST-8K: Windows kept the old python dir alive after remove_dir_all
+        // and denied the rename onto it. The op succeeds once the handle
+        // closes, so the bootstrap must not dead-end on the first refusal.
+        let attempts = Cell::new(0u32);
+        let result = ToolManager::retry_fs("unit", || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(attempts.get())
+            }
+        });
+        assert_eq!(result.expect("third attempt succeeds"), 3);
+        assert_eq!(
+            attempts.get(),
+            3,
+            "must retry, not give up on the first Err"
+        );
+    }
+
+    #[test]
+    fn retry_fs_gives_up_and_returns_the_last_error() {
+        // The bound matters as much as the retry: an unbounded loop would hang
+        // the bootstrap on a genuinely broken install instead of reporting it.
+        let attempts = Cell::new(0u32);
+        let result = ToolManager::retry_fs("unit", || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            result.expect_err("exhausted").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(attempts.get(), 5, "bounded at ATTEMPTS");
     }
 }
