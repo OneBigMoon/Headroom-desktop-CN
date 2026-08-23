@@ -5627,10 +5627,26 @@ impl HeadroomSavingsHistoryResponse {
 /// timeout eat three days of output-shaping samples unnoticed, but the
 /// dashboard retries every 12s and `log::warn!` bridges to Sentry, so an
 /// unthrottled warn would flood it.
-/// ponytail: in-memory, resets on restart (one warn per launch while broken)
-/// and never resets on recovery, so a flap inside the window stays quiet.
+/// The window DOUBLES per consecutive warn up to `STATS_FETCH_WARN_MAX_INTERVAL`,
+/// because some causes are permanent and unfixable by any release we ship:
+/// RUST-87 is a single mac whose 6767 belongs to another app, and the flat
+/// 15-minute window sent 96 identical events a day from that one host with no
+/// end state. A first failure still speaks immediately; only the repeats decay.
+/// A successful fetch clears the streak, so a condition that heals and comes
+/// back is loud again.
+/// ponytail: one global slot, not per-category -- a host has one cause at a
+/// time in practice; key it by category if that stops being true.
 const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
-static STATS_FETCH_WARNED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+
+/// Window a warn must clear before the `streak`-th consecutive one may speak:
+/// 15m, 30m, 1h, 2h, 4h, then capped. `streak` is 1-based.
+fn stats_fetch_warn_interval(streak: u32) -> Duration {
+    STATS_FETCH_WARN_INTERVAL
+        .saturating_mul(1u32 << streak.clamp(1, 6).saturating_sub(1))
+        .min(STATS_FETCH_WARN_MAX_INTERVAL)
+}
 
 /// Coarse cause class for a `/stats` failure, used as the Sentry fingerprint.
 ///
@@ -5659,10 +5675,17 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 
 fn warn_stats_fetch_failed(reason: &str) {
     let mut last = STATS_FETCH_WARNED_AT.lock();
-    if last.is_some_and(|at| at.elapsed() < STATS_FETCH_WARN_INTERVAL) {
-        return;
-    }
-    *last = Some(Instant::now());
+    let streak = match *last {
+        Some((at, streak)) => {
+            if at.elapsed() < stats_fetch_warn_interval(streak) {
+                return;
+            }
+            streak.saturating_add(1)
+        }
+        None => 1,
+    };
+    *last = Some((Instant::now(), streak));
+    drop(last);
     let category = stats_fetch_failure_category(reason);
     // A 4xx means SOMETHING answered 6767 without the backend's routes, and
     // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
@@ -5747,6 +5770,8 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
+            // Recovery resets the backoff: the next outage warns immediately.
+            *STATS_FETCH_WARNED_AT.lock() = None;
             return Some(parsed);
         }
         last_failure = Some("payload had no recognised savings fields".to_string());
@@ -7599,12 +7624,13 @@ mod tests {
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible,
-        support_tier_for_platform, tcp_port_accepts_connection, tool_schema_savings_usd,
-        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BootValidationOutcome,
-        ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
-        SavingsObservation, SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION,
-        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
+        tool_schema_savings_usd, total_dir_size_bytes, warn_stats_fetch_failed, AppState,
+        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
+        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -10000,11 +10026,12 @@ mod tests {
         *STATS_FETCH_WARNED_AT.lock() = None;
 
         warn_stats_fetch_failed("timed out after 5s");
-        let first = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
+        let (first, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
+        assert_eq!(streak, 1);
 
         warn_stats_fetch_failed("timed out after 5s");
         assert_eq!(
-            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped"),
+            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
             first,
             "a repeat inside the window must not warn again"
         );
@@ -10013,15 +10040,54 @@ mod tests {
         if let Some(stale) =
             Instant::now().checked_sub(STATS_FETCH_WARN_INTERVAL + Duration::from_secs(1))
         {
-            *STATS_FETCH_WARNED_AT.lock() = Some(stale);
+            *STATS_FETCH_WARNED_AT.lock() = Some((stale, 1));
             warn_stats_fetch_failed("timed out after 5s");
+            let (at, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("re-stamped");
             assert!(
-                (*STATS_FETCH_WARNED_AT.lock()).expect("re-stamped") > stale,
+                at > stale,
                 "a failure after the window elapsed must warn again"
+            );
+            assert_eq!(
+                streak, 2,
+                "the streak advances so the next window is longer"
+            );
+
+            // The window that just elapsed no longer clears the new one.
+            *STATS_FETCH_WARNED_AT.lock() = Some((stale, 2));
+            warn_stats_fetch_failed("timed out after 5s");
+            assert_eq!(
+                (*STATS_FETCH_WARNED_AT.lock()).expect("unchanged").0,
+                stale,
+                "a permanent cause must back off instead of warning every window"
             );
         }
 
         *STATS_FETCH_WARNED_AT.lock() = None;
+    }
+
+    #[test]
+    fn stats_fetch_warn_interval_backs_off_and_caps() {
+        // RUST-87: one host whose 6767 is owned by another app warned 96x/day
+        // under a flat window. Backoff turns an unfixable cause into ~8/day.
+        assert_eq!(stats_fetch_warn_interval(1), STATS_FETCH_WARN_INTERVAL);
+        assert_eq!(stats_fetch_warn_interval(2), STATS_FETCH_WARN_INTERVAL * 2);
+        assert_eq!(stats_fetch_warn_interval(5), STATS_FETCH_WARN_INTERVAL * 16);
+        assert_eq!(stats_fetch_warn_interval(6), STATS_FETCH_WARN_MAX_INTERVAL);
+        assert_eq!(
+            stats_fetch_warn_interval(u32::MAX),
+            STATS_FETCH_WARN_MAX_INTERVAL
+        );
+        // A streak of 0 is unreachable, but must not shift by -1.
+        assert_eq!(stats_fetch_warn_interval(0), STATS_FETCH_WARN_INTERVAL);
+
+        // 24h of continuous failure, first warn at t=0.
+        let mut elapsed = Duration::ZERO;
+        let mut warns = 1u32;
+        while elapsed < Duration::from_secs(24 * 3600) {
+            elapsed += stats_fetch_warn_interval(warns);
+            warns += 1;
+        }
+        assert!(warns <= 10, "expected <=10 warns/day, got {warns}");
     }
 
     #[test]
