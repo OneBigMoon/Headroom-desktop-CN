@@ -148,6 +148,7 @@ import {
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
+  magicLinkScreenCopy,
   getLauncherAutoConfigureDecision,
   isValidEmailAddress,
   needsTermsAcceptance,
@@ -155,6 +156,7 @@ import {
   nextAutoConfigureStepAfterApply,
   recommendedHeadroomTier,
   type LauncherStage,
+  type MagicLinkState,
   type InstallWizardStep
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
@@ -1607,6 +1609,10 @@ export default function App() {
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
   // flags cannot bypass the install step's readiness gate.
   const [launcherStage, setLauncherStage] = useState<LauncherStage>("install");
+  // Set while a headroom://auth magic link is being redeemed. The launcher is
+  // already on screen by then (the deep-link handler shows it), so without this
+  // the sign-in ran invisibly behind whatever onboarding stage it landed on.
+  const [magicLinkState, setMagicLinkState] = useState<MagicLinkState | null>(null);
   // Paywall-first experiment flag, served from the Rust-side cache (never
   // blocks). Gated flow applies only to fresh installs: an installed runtime
   // means the user is grandfathered and sees zero difference.
@@ -4082,7 +4088,7 @@ export default function App() {
     await verifyAuthCode(authEmail.trim(), authCode.trim());
   }
 
-  async function verifyAuthCode(email: string, code: string) {
+  async function verifyAuthCode(email: string, code: string): Promise<boolean> {
     setAuthVerifyBusy(true);
     setAuthFlowError(null);
     setAuthFlowSuccess(null);
@@ -4104,8 +4110,10 @@ export default function App() {
         setActiveView("upgrade");
       }
       await refreshConnectors();
+      return true;
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not verify sign-in code."));
+      return false;
     } finally {
       setAuthVerifyBusy(false);
     }
@@ -4120,7 +4128,14 @@ export default function App() {
   // link delivers the URL before this listener exists, so an event alone would
   // be lost exactly when the link was the thing that opened the app. Rust hands
   // the slot out once, so both windows can race for it harmlessly.
+  // Only the launcher claims it: both windows mount this component and the slot
+  // is one-shot, so the hidden main window could win the race and sign the user
+  // in where nobody could see it. The deep-link handler shows the launcher
+  // before parking the credentials, so it is the window on screen.
   useEffect(() => {
+    if (windowLabel !== "launcher") {
+      return;
+    }
     let cancelled = false;
     async function claimMagicLink() {
       const pending = await invoke<[string, string] | null>("take_pending_magic_link");
@@ -4129,7 +4144,12 @@ export default function App() {
       }
       const [email, code] = pending;
       setAuthEmail(email);
-      await verifyAuthCode(email, code);
+      setMagicLinkState("verifying");
+      const verified = await verifyAuthCode(email, code);
+      if (cancelled) {
+        return;
+      }
+      setMagicLinkState(verified ? "signed_in" : "failed");
     }
     void claimMagicLink();
     const unlistenPromise = listen("magic-link-auth", () => {
@@ -4139,7 +4159,7 @@ export default function App() {
       cancelled = true;
       void unlistenPromise.then((unlisten) => unlisten());
     };
-  }, []);
+  }, [windowLabel]);
 
   async function handleSignOutHeadroomAccount() {
     setAuthFlowError(null);
@@ -4950,6 +4970,36 @@ export default function App() {
             </div>
           </>
         ) : null}
+      </LauncherShell>
+    );
+  }
+
+  if (windowLabel === "launcher" && magicLinkState !== null) {
+    const magicLinkCopy = magicLinkScreenCopy(
+      magicLinkState,
+      pricingStatus?.account?.email ?? authEmail,
+      authFlowError
+    );
+    return (
+      <LauncherShell
+        shellClassName="intro-shell intro-shell--post-install"
+        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+        copyClassName="intro-shell__copy intro-shell__copy--post-install"
+        onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
+        showSpinner={magicLinkState === "verifying"}
+      >
+        <h1>{magicLinkCopy.title}</h1>
+        <p className="launcher-install-notice">{magicLinkCopy.body}</p>
+        {magicLinkState === "verifying" ? null : (
+          <button
+            className="primary-button primary-button--large primary-button--success"
+            onClick={() => setMagicLinkState(null)}
+            type="button"
+          >
+            Continue
+          </button>
+        )}
       </LauncherShell>
     );
   }
