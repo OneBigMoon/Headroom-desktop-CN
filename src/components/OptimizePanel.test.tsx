@@ -114,18 +114,26 @@ describe("OptimizePanel", () => {
     });
   });
 
-  it("says so when the first load fails instead of reading as an empty scan", async () => {
+  it("offers a retry when the first load fails", async () => {
     // Without this the pills stay disabled at "0 learnings" forever: the modal
     // that holds the error cannot be opened, so an IPC failure is invisible.
-    invokeMock.mockRejectedValueOnce(new Error("list_applied_patterns: no such project"));
+    invokeMock
+      .mockRejectedValueOnce(new Error("list_applied_patterns: no such project"))
+      .mockResolvedValueOnce(samplePatterns);
 
     render(<OptimizePanel projectPath="/proj" />);
+    const user = userEvent.setup();
 
-    const pill = await screen.findByRole("button", { name: /could not load learnings/i });
+    const pill = await screen.findByRole("button", { name: /could not load learnings.*retry/i });
     expect(pill).toHaveAttribute("title", "list_applied_patterns: no such project");
+    expect(pill).toBeEnabled();
+
+    await user.click(pill);
+
     expect(
-      screen.queryByRole("button", { name: /learnings in CLAUDE.local\.md/i })
-    ).not.toBeInTheDocument();
+      await screen.findByRole("button", { name: /2 learnings in CLAUDE.local\.md/i })
+    ).toBeEnabled();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
   });
 
   it("surfaces a delete-pattern failure inside the open modal", async () => {

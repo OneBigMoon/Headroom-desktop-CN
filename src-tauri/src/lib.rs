@@ -4433,6 +4433,13 @@ pub fn run() {
             // and the status probe opens a TCP connection to :8787. That must
             // never sit on the main thread's launch path, least of all for the
             // majority of users who do not have the plugin at all.
+            // A plugin update lands a fresh version dir with the bare command
+            // back, so one pass at startup is not enough for a tray app that
+            // stays up for weeks. Re-check on a slow timer; the check itself is
+            // a receipt read that returns immediately for everyone we are not
+            // already managing.
+            const OSS_PLUGIN_RECHECK_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(300);
             let oss_handle = app_handle.clone();
             std::thread::spawn(move || {
                 let oss = client_adapters::absorb_oss_plugin();
@@ -4453,6 +4460,16 @@ pub fn run() {
                             "base_url_ours": oss.base_url_ours
                         })),
                     );
+                }
+                // Startup cadence for the event, not for the repair.
+                loop {
+                    std::thread::sleep(OSS_PLUGIN_RECHECK_INTERVAL);
+                    if SHUTTING_DOWN.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if client_adapters::oss_plugin_hook_needs_absorbing() {
+                        client_adapters::absorb_oss_plugin();
+                    }
                 }
             });
             // Wire up the bearer-triggered identity-pusher worker. The

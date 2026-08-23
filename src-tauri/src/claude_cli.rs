@@ -45,7 +45,11 @@ pub(crate) fn probe_known_paths(name: &str) -> Option<PathBuf> {
 }
 
 fn known_path_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
-    vec![
+    known_path_candidates_for_platform(home, name, cfg!(windows))
+}
+
+fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) -> Vec<PathBuf> {
+    let base = vec![
         // The official installer (`curl -fsSL https://claude.ai/install.sh | bash`,
         // which our own "Install the Claude Code CLI" banner suggests) drops the
         // binary here. GUI launches inherit launchd's bare PATH so `find_on_path`
@@ -60,7 +64,19 @@ fn known_path_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
         home.join(".volta").join("bin").join(name),
         home.join(".bun").join("bin").join(name),
         PathBuf::from(format!("/usr/bin/{name}")),
-    ]
+    ];
+    if !windows {
+        return base;
+    }
+
+    let mut candidates = Vec::with_capacity(base.len() * 5);
+    for path in base {
+        for extension in ["exe", "cmd", "bat", "com"] {
+            candidates.push(path.with_extension(extension));
+        }
+        candidates.push(path);
+    }
+    candidates
 }
 
 fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
@@ -538,6 +554,19 @@ mod tests {
             candidates.first().map(PathBuf::as_path),
             Some(Path::new("/Users/test/.local/bin/claude")),
         );
+    }
+
+    #[test]
+    fn known_windows_paths_probe_executable_extensions() {
+        let candidates =
+            known_path_candidates_for_platform(PathBuf::from("/Users/test"), "headroom", true);
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(Path::new("/Users/test/.local/bin/headroom.exe")),
+        );
+        assert!(candidates
+            .iter()
+            .any(|path| path == Path::new("/Users/test/.local/bin/headroom.cmd")));
     }
 
     #[test]

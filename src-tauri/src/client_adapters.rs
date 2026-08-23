@@ -5348,6 +5348,33 @@ pub fn absorb_oss_plugin() -> OssPluginStatus {
     absorb_oss_plugin_with_cli_on_path(probe && oss_cli_present())
 }
 
+/// Cheap poll for the one state a single startup pass cannot cover: Claude Code
+/// updated the plugin, which re-clones into a fresh version directory that never
+/// saw our rewrite, so the bare command is back and failing on every Bash call.
+/// A tray app can sit for weeks between launches, so waiting for the next start
+/// means weeks of 127s.
+///
+/// Deliberately narrow. It fires only for users we are already managing (a
+/// non-empty receipt) and only for a hook path we have not rewritten, so a user
+/// with a real OSS CLI -- whose receipt is empty because we restored theirs --
+/// never sends us back through the exec probe on a timer.
+pub fn oss_plugin_hook_needs_absorbing() -> bool {
+    if oss_absorb_disabled() {
+        return false;
+    }
+    let receipt = load_oss_plugin_hook_receipt();
+    if receipt.is_empty() {
+        return false;
+    }
+    oss_headroom_plugin_hook_paths().iter().any(|path| {
+        !receipt.contains(path)
+            && matches!(
+                hook_file_contains_command(path, OSS_PLUGIN_HOOK_COMMAND),
+                Ok(true)
+            )
+    })
+}
+
 fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> OssPluginStatus {
     let plugin_installed = oss_headroom_plugin_installed();
     let hooks = oss_headroom_plugin_hook_paths();
@@ -10761,6 +10788,57 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             original.to_string(),
             "we never rewrite a base URL the user set on purpose"
         );
+    }
+
+    /// A plugin update re-clones into a fresh version dir carrying the bare
+    /// command, which one startup pass can never see. The poll must catch that
+    /// and nothing else: a user we do not manage must not be dragged back
+    /// through the exec probe every five minutes forever.
+    #[test]
+    fn the_recheck_fires_only_for_a_fresh_hook_we_are_already_managing() {
+        let home = TestHome::new();
+        seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+
+        // Nobody managed yet: an untouched plugin is not the recheck's job.
+        assert!(!super::oss_plugin_hook_needs_absorbing());
+
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(
+            !super::oss_plugin_hook_needs_absorbing(),
+            "steady state must stay quiet"
+        );
+
+        // Claude Code updates the plugin: a new version dir, bare command back.
+        let updated = seed_oss_plugin(home.path(), "headroom@headroom-marketplace-v2");
+        assert!(super::oss_plugin_hook_needs_absorbing());
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(!fs::read_to_string(&updated)
+            .unwrap()
+            .contains(super::OSS_PLUGIN_HOOK_COMMAND));
+        assert!(!super::oss_plugin_hook_needs_absorbing());
+
+        // A real CLI appears, we hand the hook back, and the poll must not
+        // immediately claim it again.
+        assert!(!super::absorb_oss_plugin_with_cli_on_path(true).hook_absorbed);
+        assert!(
+            !super::oss_plugin_hook_needs_absorbing(),
+            "a restored user must not be re-absorbed on a timer"
+        );
+    }
+
+    #[test]
+    fn the_recheck_respects_the_kill_switch() {
+        let home = TestHome::new();
+        seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        seed_oss_plugin(home.path(), "headroom@headroom-marketplace-v2");
+        assert!(super::oss_plugin_hook_needs_absorbing());
+
+        std::env::set_var("HEADROOM_ABSORB_OSS_PLUGIN", "0");
+        let needs = super::oss_plugin_hook_needs_absorbing();
+        std::env::remove_var("HEADROOM_ABSORB_OSS_PLUGIN");
+
+        assert!(!needs);
     }
 
     #[test]
