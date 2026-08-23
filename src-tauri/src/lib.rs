@@ -3124,12 +3124,20 @@ async fn verify_headroom_auth_code(
         "auth_verified",
         Some(json!({ "invite_code_used": used_invite_code })),
     );
+    // Pricing status is per-window UI state, so the window that did not run
+    // the sign-in keeps rendering the signed-out code form until its own poll
+    // ticks. Broadcast so every window re-reads it now.
+    let _ = app.emit("pricing-refreshed", &status);
     Ok(status)
 }
 
 #[tauri::command]
-async fn sign_out_headroom_account() -> Result<(), String> {
-    pricing::sign_out()
+async fn sign_out_headroom_account(app: AppHandle) -> Result<(), String> {
+    pricing::sign_out()?;
+    // Same broadcast as verify: the other window must not keep showing the
+    // account as signed in.
+    let _ = app.emit("pricing-refreshed", ());
+    Ok(())
 }
 
 #[tauri::command]

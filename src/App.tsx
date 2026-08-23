@@ -3780,6 +3780,13 @@ export default function App() {
     try {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
       setPricingStatus(status);
+      // The code step is local UI state, so a sign-in that happened elsewhere
+      // (the magic link, or the other window) leaves this one still asking for
+      // a code nobody needs to enter. Every refresh path lands here.
+      if (status.authenticated) {
+        setAuthCode("");
+        setAuthCodeRequestedFor(null);
+      }
       void maybeFireTrialNotifications(status);
       void maybeFireUrgentPricingNotifications(status);
       setPricingError(null);
