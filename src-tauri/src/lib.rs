@@ -3018,6 +3018,63 @@ fn report_funnel_step(state: State<'_, AppState>, step: String) {
     pricing::report_funnel_step(&state, &step);
 }
 
+/// Credentials handed over by a `headroom://auth` magic link, waiting for the
+/// UI to claim them.
+///
+/// A cold start races the frontend: macOS delivers the URL before React has
+/// mounted a listener, so an event alone is lost exactly when the app was
+/// launched *by* the link. The slot is the source of truth and the event is
+/// only a nudge for the already-running case; both paths drain it through
+/// `take_pending_magic_link`.
+static PENDING_MAGIC_LINK: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Parks the email/code from `headroom://auth?email=..&code=..` and nudges the UI.
+///
+/// The browser never signs the user in (it cannot supply the device
+/// fingerprints `verify_code` needs), so this is the ordinary typed-code flow
+/// with the typing removed.
+fn capture_magic_link_auth(app: &AppHandle, url: &tauri::Url) {
+    let Some(credentials) = parse_magic_link_auth(url) else {
+        return;
+    };
+    if let Ok(mut slot) = PENDING_MAGIC_LINK.lock() {
+        *slot = Some(credentials);
+    }
+    let _ = app.emit("magic-link-auth", ());
+}
+
+/// `headroom://auth?email=..&code=..` -> `(email, code)`.
+///
+/// Every other `headroom://` URL is the post-checkout return and must fall
+/// through to the pricing refresh untouched.
+fn parse_magic_link_auth(url: &tauri::Url) -> Option<(String, String)> {
+    if url.host_str() != Some("auth") {
+        return None;
+    }
+    let mut email = None;
+    let mut code = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "email" => email = Some(value.into_owned()),
+            "code" => code = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let email = email?;
+    let code = code?;
+    (!email.is_empty() && !code.is_empty()).then_some((email, code))
+}
+
+/// Drains the pending magic-link credentials. Returns `None` on a normal
+/// launch; one-shot so a reload cannot replay a spent code.
+#[tauri::command]
+fn take_pending_magic_link() -> Option<(String, String)> {
+    PENDING_MAGIC_LINK
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
 #[tauri::command]
 async fn request_headroom_auth_code(
     app: AppHandle,
@@ -4495,6 +4552,7 @@ pub fn run() {
                         if url.scheme() == "headroom" {
                             let app_handle = deep_link_app.clone();
                             let _ = show_launcher_window(&app_handle);
+                            capture_magic_link_auth(&app_handle, &url);
                             // Run the reconciliation on a worker thread — the
                             // deep-link callback is on the main thread and we
                             // don't want pricing's blocking HTTP call there.
@@ -4565,6 +4623,7 @@ pub fn run() {
             get_claude_profile,
             get_headroom_pricing_status,
             report_funnel_step,
+            take_pending_magic_link,
             request_headroom_auth_code,
             verify_headroom_auth_code,
             sign_out_headroom_account,
@@ -6977,17 +7036,17 @@ mod tests {
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        onboarding_recovery_copy, parse_live_learnings, parse_request_count_from_stats_body,
-        parse_request_counts_by_agent, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
-        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        select_updater_endpoints, store_checked_update, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -9631,6 +9690,41 @@ Some unrelated content.
                 .status()
                 .expect("run sh -n");
             assert!(status.success(), "sh rejected the script: {script}");
+        }
+    }
+
+    #[test]
+    fn magic_link_auth_extracts_email_and_code() {
+        let url = tauri::Url::parse("headroom://auth?email=a%40b.com&code=123456").unwrap();
+        assert_eq!(
+            parse_magic_link_auth(&url),
+            Some(("a@b.com".to_string(), "123456".to_string()))
+        );
+    }
+
+    #[test]
+    fn magic_link_auth_ignores_the_checkout_return_url() {
+        // Every other headroom:// URL must fall through to the pricing refresh.
+        for raw in [
+            "headroom://checkout-complete",
+            "headroom://",
+            "headroom://auth",
+        ] {
+            let url = tauri::Url::parse(raw).unwrap();
+            assert_eq!(parse_magic_link_auth(&url), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn magic_link_auth_rejects_half_filled_links() {
+        for raw in [
+            "headroom://auth?email=a%40b.com",
+            "headroom://auth?code=123456",
+            "headroom://auth?email=&code=123456",
+            "headroom://auth?email=a%40b.com&code=",
+        ] {
+            let url = tauri::Url::parse(raw).unwrap();
+            assert_eq!(parse_magic_link_auth(&url), None, "{raw}");
         }
     }
 }

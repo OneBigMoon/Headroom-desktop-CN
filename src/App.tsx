@@ -4077,13 +4077,17 @@ export default function App() {
       setAuthFlowError("Enter the authentication code from your email.");
       return;
     }
+    await verifyAuthCode(authEmail.trim(), authCode.trim());
+  }
+
+  async function verifyAuthCode(email: string, code: string) {
     setAuthVerifyBusy(true);
     setAuthFlowError(null);
     setAuthFlowSuccess(null);
     try {
       const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
-        email: authEmail.trim(),
-        code: authCode.trim(),
+        email,
+        code,
         inviteCode: null
       });
       setPricingStatus(status);
@@ -4104,6 +4108,36 @@ export default function App() {
       setAuthVerifyBusy(false);
     }
   }
+
+  // Magic sign-in link (headroom://auth). The browser deliberately cannot sign
+  // anyone in -- it has none of the device fingerprints verify_code needs -- so
+  // it only hands over the code and this is the ordinary typed-code flow with
+  // the typing removed.
+  //
+  // Drained on mount as well as on the event: a cold start launched *by* the
+  // link delivers the URL before this listener exists, so an event alone would
+  // be lost exactly when the link was the thing that opened the app. Rust hands
+  // the slot out once, so both windows can race for it harmlessly.
+  useEffect(() => {
+    let cancelled = false;
+    async function claimMagicLink() {
+      const pending = await invoke<[string, string] | null>("take_pending_magic_link");
+      if (cancelled || !pending) {
+        return;
+      }
+      const [email, code] = pending;
+      setAuthEmail(email);
+      await verifyAuthCode(email, code);
+    }
+    void claimMagicLink();
+    const unlistenPromise = listen("magic-link-auth", () => {
+      void claimMagicLink();
+    });
+    return () => {
+      cancelled = true;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   async function handleSignOutHeadroomAccount() {
     setAuthFlowError(null);
