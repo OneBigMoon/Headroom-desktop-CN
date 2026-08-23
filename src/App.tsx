@@ -1719,6 +1719,12 @@ export default function App() {
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
   const pricingRefreshInFlightRef = useRef(false);
+  // When the last authoritative status (verify / sign-out) was applied. A slow
+  // pricing fetch issued before it must not land afterwards and overwrite it:
+  // on a fresh install the very first fetch is the slowest, and it was still in
+  // flight when the magic link signed the user in, so it clobbered the signed-in
+  // status with its own stale signed-out one.
+  const pricingStatusStampRef = useRef(0);
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
@@ -3240,7 +3246,15 @@ export default function App() {
   // poll tick.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen("pricing-refreshed", () => {
+    void listen<HeadroomPricingStatus | null>("pricing-refreshed", (event) => {
+      // Auth mutations ship the new status with the event. Using it beats a
+      // refetch that the in-flight guard may drop outright, leaving this window
+      // stale until the next poll tick (60s focused, 600s not).
+      if (event.payload) {
+        pricingStatusStampRef.current = Date.now();
+        setPricingStatus(event.payload);
+        return;
+      }
       void refreshPricingStatus();
     }).then((fn) => {
       unlisten = fn;
@@ -3777,8 +3791,12 @@ export default function App() {
     }
     pricingRefreshInFlightRef.current = true;
     setPricingBusy(true);
+    const issuedAt = Date.now();
     try {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
+      if (pricingStatusStampRef.current > issuedAt) {
+        return;
+      }
       setPricingStatus(status);
       // The code step is local UI state, so a sign-in that happened elsewhere
       // (the magic link, or the other window) leaves this one still asking for
@@ -4105,6 +4123,7 @@ export default function App() {
         code,
         inviteCode: null
       });
+      pricingStatusStampRef.current = Date.now();
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
@@ -4156,7 +4175,9 @@ export default function App() {
       if (cancelled) {
         return;
       }
-      setMagicLinkState(verified ? "signed_in" : "failed");
+      // Success needs no screen: clearing this drops the user straight onto the
+      // next onboarding step, already signed in.
+      setMagicLinkState(verified ? null : "failed");
     }
     void claimMagicLink();
     const unlistenPromise = listen("magic-link-auth", () => {
@@ -4173,7 +4194,9 @@ export default function App() {
     setAuthFlowSuccess(null);
     try {
       await invoke("sign_out_headroom_account");
-      setPricingStatus(await invoke<HeadroomPricingStatus>("get_headroom_pricing_status"));
+      const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
+      pricingStatusStampRef.current = Date.now();
+      setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
       setAuthFlowSuccess("Signed out of Headroom.");
@@ -4672,6 +4695,39 @@ export default function App() {
     return null;
   }
 
+  // Ahead of the terms gate: redemption is already under way by the time that
+  // gate renders, and its sign-in form has no busy state of its own, so the
+  // wait read as nothing happening at all.
+  if (windowLabel === "launcher" && magicLinkState !== null) {
+    const magicLinkCopy = magicLinkScreenCopy(
+      magicLinkState,
+      pricingStatus?.account?.email ?? authEmail,
+      authFlowError
+    );
+    return (
+      <LauncherShell
+        shellClassName="intro-shell intro-shell--post-install"
+        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+        copyClassName="intro-shell__copy intro-shell__copy--post-install"
+        onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
+        showSpinner={magicLinkState === "verifying"}
+      >
+        <h1>{magicLinkCopy.title}</h1>
+        <p className="launcher-install-notice">{magicLinkCopy.body}</p>
+        {magicLinkState === "verifying" ? null : (
+          <button
+            className="primary-button primary-button--large primary-button--success"
+            onClick={() => setMagicLinkState(null)}
+            type="button"
+          >
+            Continue
+          </button>
+        )}
+      </LauncherShell>
+    );
+  }
+
   // Block every window (launcher and main) until the user accepts the current
   // Terms of Service. New installs hit this in the launcher; updating users —
   // who may never see the launcher — hit it in the main window. Bumping the
@@ -4977,36 +5033,6 @@ export default function App() {
             </div>
           </>
         ) : null}
-      </LauncherShell>
-    );
-  }
-
-  if (windowLabel === "launcher" && magicLinkState !== null) {
-    const magicLinkCopy = magicLinkScreenCopy(
-      magicLinkState,
-      pricingStatus?.account?.email ?? authEmail,
-      authFlowError
-    );
-    return (
-      <LauncherShell
-        shellClassName="intro-shell intro-shell--post-install"
-        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
-        copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
-        version={appSemver}
-        showSpinner={magicLinkState === "verifying"}
-      >
-        <h1>{magicLinkCopy.title}</h1>
-        <p className="launcher-install-notice">{magicLinkCopy.body}</p>
-        {magicLinkState === "verifying" ? null : (
-          <button
-            className="primary-button primary-button--large primary-button--success"
-            onClick={() => setMagicLinkState(null)}
-            type="button"
-          >
-            Continue
-          </button>
-        )}
       </LauncherShell>
     );
   }

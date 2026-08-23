@@ -4643,7 +4643,12 @@ pub fn run() {
                                         );
                                         state
                                             .apply_codex_pricing_gate_status(status.codex.as_ref());
-                                        let _ = app_handle.emit("pricing-refreshed", &status);
+                                        // Payload-less on purpose: this status
+                                        // was fetched before any magic link in
+                                        // the same URL was redeemed, so it is
+                                        // stale by the time it lands. The
+                                        // frontend refetches instead.
+                                        let _ = app_handle.emit("pricing-refreshed", ());
                                     }
                                     Err(err) => {
                                         sentry::capture_message(

@@ -148,9 +148,8 @@ describe("launcher helpers", () => {
   });
 
   describe("magicLinkScreenCopy", () => {
-    it("names the account in every terminal state", () => {
+    it("names the account while verifying", () => {
       expect(magicLinkScreenCopy("verifying", "a@b.com", null).body).toContain("a@b.com");
-      expect(magicLinkScreenCopy("signed_in", "a@b.com", null).body).toContain("a@b.com");
     });
 
     it("surfaces the verify error, falling back to a retry hint", () => {
