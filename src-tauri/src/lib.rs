@@ -5237,6 +5237,16 @@ fn execute_headroom_learn_run(
 
     let mut command = crate::proc::command(&entrypoint);
     command.arg("learn").arg("--apply");
+    // The analysis CLI is killed after this long with no stream event. Upstream
+    // defaults to 60s, which kills a healthy run: the digest is large, it is
+    // routed through our own proxy, and the model can think past a minute
+    // before the first token (RUST-6W: 14 kills across 8 unrelated machines,
+    // every release from 0.8.2 to 0.8.6). Same failure the /stats probe had at
+    // 500ms -- a cap tight enough to turn "slow" into "broken".
+    //
+    // Only the IDLE cap moves. Upstream's 300s hard cap still bounds a genuine
+    // hang, so this trades a slower failure for runs that now finish.
+    command.env("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", "180");
     match agent {
         LearnAgent::Claude => {
             // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
