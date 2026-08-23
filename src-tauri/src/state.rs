@@ -3509,7 +3509,17 @@ impl AppState {
                 self.proxy_bypass.store(false, Release);
                 self.claude_only_bypass.store(false, Release);
             }
-            Err(_) => {}
+            // Leave the flags on their last known value: a pricing lookup that
+            // failed is not evidence the user became gated, and flipping
+            // bypass on a transient error would drop them to unoptimized
+            // traffic. Deliberately fail-open, but NOT silent -- if this
+            // starts failing persistently the gate freezes on whatever it last
+            // decided and nothing else in the app would ever say so. warn!
+            // bridges to Sentry, so a sustained outage surfaces instead of
+            // looking like a healthy ungated fleet.
+            Err(err) => {
+                log::warn!("enforce_pricing_gate: pricing status unavailable, leaving gate flags unchanged: {err}");
+            }
         }
     }
 

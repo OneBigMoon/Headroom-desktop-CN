@@ -11300,7 +11300,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     }
 
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn managed_headroom_startup_uses_supported_proxy_args() {
         backend_port::reset_for_tests();
         let default_port = backend_port::DEFAULT_BACKEND_PORT.to_string();
@@ -11344,7 +11344,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// validation attempt exit 2 and the upgrade time out. The flag must be
     /// gated on runtime >= 0.28.0; unknown versions assume the pinned runtime.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn entrypoint_args_gate_no_http2_on_runtime_version() {
         backend_port::reset_for_tests();
 
@@ -11374,7 +11374,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
     /// click would exit 2 and boot validation would fail like RUST-4A.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn entrypoint_args_gate_no_ccr_on_runtime_version() {
         backend_port::reset_for_tests();
 
@@ -11408,7 +11408,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// the proxy raise on startup and exit before opening the port. Must gate on
     /// runtime >= 0.30.0; unknown versions assume the pinned (current) runtime.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn savings_profile_gated_on_runtime_version() {
         assert_eq!(savings_profile_for_runtime(Some("0.28.0")), "agent-90");
         assert_eq!(savings_profile_for_runtime(Some("0.29.9")), "agent-90");
@@ -11426,7 +11426,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// old provider. Unlike the savings persona, an unreadable version fails
     /// CLOSED: the flag is an opt-in, and off is always the safe answer.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn cc_switch_reconcile_gated_on_runtime_version() {
         assert_eq!(cc_switch_reconcile_for_runtime(Some("0.35.0")), "0");
         assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36.2")), "0");
@@ -11451,7 +11451,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     /// the helpers are invoked AFTER fallback has updated the atomic, the
     /// chosen fallback port flows through.
     #[test]
-    #[serial_test::serial(backend_port)]
+    #[serial_test::serial]
     fn startup_args_reflect_fallback_port_set_after_default() {
         backend_port::reset_for_tests();
         backend_port::set(6770);

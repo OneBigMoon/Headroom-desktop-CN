@@ -4179,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(unauth_sync_counter)]
+    #[serial_test::serial]
     fn unauthorized_background_sync_tolerates_blips_then_escalates() {
         CONSECUTIVE_UNAUTHORIZED_SYNCS.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -4228,7 +4228,7 @@ mod tests {
     #[test]
     // Ok resets the unauthorized counter, so keep it off the escalation
     // test's timeline.
-    #[serial_test::serial(unauth_sync_counter)]
+    #[serial_test::serial]
     fn successful_background_sync_returns_remote_account_profile() {
         let (authenticated, account, error) =
             merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
