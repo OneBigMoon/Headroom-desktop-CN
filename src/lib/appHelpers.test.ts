@@ -12,11 +12,12 @@ import {
   introSaleBadgeLabel,
   isTierDowngrade,
   paybackLabel,
+  scheduledPlanChange,
   recentDailySavingsUsd,
   setServerPlanPrices,
   upgradePlanIntentLabel,
 } from "./appHelpers";
-import type { ClientConnectorStatus, RuntimeStatus } from "./types";
+import type { ClientConnectorStatus, HeadroomAccountProfile, RuntimeStatus } from "./types";
 import type { DailySavingsPoint, IntroOffer } from "./types";
 
 const daily = (usd: number): DailySavingsPoint => ({
@@ -73,6 +74,10 @@ describe("app helpers", () => {
     expect(describeInvokeError({ message: "typed message" }, "fallback")).toBe("typed message");
     expect(describeInvokeError({ error: "nested error" }, "fallback")).toBe("nested error");
     expect(describeInvokeError({ message: "   " }, "fallback")).toBe("fallback");
+    // 20 call sites in App.tsx lean on this, several on the billing path.
+    expect(describeInvokeError(new Error(""), "fallback")).toBe("fallback");
+    expect(describeInvokeError(null, "fallback")).toBe("fallback");
+    expect(describeInvokeError(undefined, "fallback")).toBe("fallback");
   });
 
   it("returns the next lower visible plan for paid subscriptions", () => {
@@ -702,5 +707,79 @@ describe("buildInstallFailureMailto", () => {
     );
     expect(decoded).toContain("unknown");
     expect(decoded).toContain("(none captured)");
+  });
+});
+
+describe("scheduledPlanChange", () => {
+  const account = (over: Partial<HeadroomAccountProfile> = {}): HeadroomAccountProfile => ({
+    email: "dev@example.com",
+    trialActive: false,
+    subscriptionActive: true,
+    subscriptionTier: "pro",
+    acceptedInvitesCount: 0,
+    inviteBonusPercent: 0,
+    ...over,
+  });
+
+  // TZ-independent: the runner's local rendering of the same instant.
+  const on = (iso: string) =>
+    new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+
+  it("calls a same-tier change a billing switch, not a plan change", () => {
+    const info = scheduledPlanChange(
+      account({
+        subscriptionTier: "pro",
+        subscriptionPendingTier: "pro",
+        subscriptionPendingBillingPeriod: "monthly",
+        subscriptionPendingEffectiveAt: "2026-09-01T12:00:00Z",
+      })
+    );
+    expect(info).toEqual({
+      tier: "pro",
+      billingPeriod: "monthly",
+      note: `Switches to monthly billing on ${on("2026-09-01T12:00:00Z")}`,
+    });
+  });
+
+  it("names the incoming plan when the tier actually changes", () => {
+    const info = scheduledPlanChange(
+      account({
+        subscriptionTier: "max20x",
+        subscriptionPendingTier: "max5x",
+        subscriptionPendingBillingPeriod: "annual",
+        subscriptionPendingEffectiveAt: "2026-09-01T12:00:00Z",
+      })
+    );
+    expect(info?.tier).toBe("max5x");
+    expect(info?.note).toBe(`Switches to Max x5 (annual) on ${on("2026-09-01T12:00:00Z")}`);
+  });
+
+  it("defaults an unknown billing period to annual", () => {
+    const info = scheduledPlanChange(
+      account({
+        subscriptionPendingTier: "max5x",
+        subscriptionPendingBillingPeriod: null,
+        subscriptionPendingEffectiveAt: "2026-09-01T12:00:00Z",
+      })
+    );
+    expect(info?.billingPeriod).toBe("annual");
+  });
+
+  it("reports nothing without both a tier and a usable date", () => {
+    expect(scheduledPlanChange(null)).toBeNull();
+    expect(scheduledPlanChange(undefined)).toBeNull();
+    expect(scheduledPlanChange(account())).toBeNull();
+    expect(
+      scheduledPlanChange(account({ subscriptionPendingTier: "max5x" }))
+    ).toBeNull();
+    expect(
+      scheduledPlanChange(account({ subscriptionPendingEffectiveAt: "2026-09-01T12:00:00Z" }))
+    ).toBeNull();
+    // An unparseable date must not reach the billing screen as "Invalid Date".
+    expect(
+      scheduledPlanChange(
+        account({ subscriptionPendingTier: "max5x", subscriptionPendingEffectiveAt: "soon" })
+      )
+    ).toBeNull();
   });
 });

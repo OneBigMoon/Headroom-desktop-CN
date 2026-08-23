@@ -3,6 +3,7 @@ import type {
   ClientConnectorStatus,
   RuntimeStatus,
   DailySavingsPoint,
+  HeadroomAccountProfile,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
   IntroOffer,
@@ -226,6 +227,39 @@ export function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
     default:
       return null;
   }
+}
+
+export interface ScheduledPlanChange {
+  tier: HeadroomSubscriptionTier;
+  billingPeriod: BillingPeriod;
+  note: string;
+}
+
+/** A plan change the server has scheduled for the next cycle. Until it lands
+ * the subscription still reports the plan being paid for, so the pending
+ * fields are the only sign of it. Null unless both the tier and a usable
+ * effective date are known -- an unparseable date would otherwise reach the
+ * billing screen as "on Invalid Date". */
+export function scheduledPlanChange(
+  account: HeadroomAccountProfile | null | undefined
+): ScheduledPlanChange | null {
+  const tier = account?.subscriptionPendingTier;
+  const effectiveAt = account?.subscriptionPendingEffectiveAt;
+  if (!tier || !effectiveAt) return null;
+  const effective = new Date(effectiveAt);
+  if (Number.isNaN(effective.getTime())) return null;
+  const billingPeriod: BillingPeriod =
+    account?.subscriptionPendingBillingPeriod === "monthly" ? "monthly" : "annual";
+  const on = effective.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric"
+  });
+  // Same tier on a shorter cycle is a billing switch, not a plan change.
+  const note = tier === account?.subscriptionTier
+    ? `Switches to ${billingPeriod} billing on ${on}`
+    : `Switches to ${upgradePlanIntentLabel(tier)} (${billingPeriod}) on ${on}`;
+  return { tier, billingPeriod, note };
 }
 
 // Connector(s) whose detected plan drives a tier-mismatch recommendation, for

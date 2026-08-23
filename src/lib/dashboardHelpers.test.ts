@@ -7,6 +7,7 @@ import {
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
+  allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
@@ -508,6 +509,40 @@ describe("cacheHitPair", () => {
     ]);
     expect(pair!.hitPct).toBe(100);
     expect(pair!.compressedPct).toBe(0);
+  });
+});
+
+describe("allTimeCacheHitPair", () => {
+  const breakdown = {
+    compressionSavingsUsd: 4,
+    outputSavingsUsd: 0,
+    cacheSavingsUsd: 9, // read discount $9 -> read cost $1
+    cacheReadTokens: 900,
+    totalInputTokens: 1000,
+    totalInputCostUsd: 3 // $1 reads + $2 billable
+  };
+
+  it("prices the lifetime breakdown as one synthetic bucket", () => {
+    const pair = allTimeCacheHitPair(breakdown, 4);
+    const direct = cacheHitPair([
+      {
+        cacheSavingsUsd: breakdown.cacheSavingsUsd,
+        actualCostUsd: breakdown.totalInputCostUsd,
+        estimatedSavingsUsd: 4
+      }
+    ]);
+    expect(pair).toEqual(direct);
+    expect(pair!.hitPct).toBeCloseTo(83.33, 2);
+    // $4 saved against $4 saved + $2 paid at full price.
+    expect(pair!.compressedPct).toBeCloseTo(66.67, 2);
+  });
+
+  it("is null without cache coverage, whatever the dollars say", () => {
+    // cacheReadTokens is the existence signal: no reads means no hit rate to
+    // report, even though cacheSavingsUsd would divide fine.
+    expect(allTimeCacheHitPair({ ...breakdown, cacheReadTokens: 0 }, 4)).toBeNull();
+    expect(allTimeCacheHitPair(null, 4)).toBeNull();
+    expect(allTimeCacheHitPair(undefined, 4)).toBeNull();
   });
 });
 

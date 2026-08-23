@@ -4116,6 +4116,9 @@ async fn set_auto_learn_enabled(app: AppHandle, enabled: bool) -> Result<bool, S
 
 #[tauri::command]
 async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
+    // Prevent the launch-time OSS-plugin worker from mutating Claude's hook
+    // cache after cleanup has restored it.
+    SHUTTING_DOWN.store(true, Ordering::Release);
     {
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
@@ -4416,6 +4419,42 @@ pub fn run() {
                     "autostart_launch": launched_from_autostart
                 })),
             );
+
+            // Absorb the open-source `headroom` Claude Code plugin. Its hooks
+            // run a bare `headroom init hook ensure`, which exits 127 here
+            // because the app ships no `headroom` on PATH. When the plugin is
+            // present and no real CLI is visible, replace only that exact hook
+            // command with `exit 0`. No global PATH changes, nothing pointing
+            // at a file of ours that could later go missing, and the same
+            // rewrite works on Windows, macOS, and Linux.
+            // `HEADROOM_ABSORB_OSS_PLUGIN=0` opts out and restores.
+            //
+            // Off the setup closure: nothing downstream waits on the result,
+            // and the status probe opens a TCP connection to :8787. That must
+            // never sit on the main thread's launch path, least of all for the
+            // majority of users who do not have the plugin at all.
+            let oss_handle = app_handle.clone();
+            std::thread::spawn(move || {
+                let oss = client_adapters::absorb_oss_plugin();
+                // Only worth an event when there is something to report; every
+                // launch already counts in `app_started`. `base_url_ours: false`
+                // alongside `oss_proxy_8787: true` is the state where the user
+                // ran `headroom init` themselves and their traffic bypasses us,
+                // so our savings under-report — measured, not fought.
+                if oss.plugin_installed || oss.oss_proxy_8787 {
+                    analytics::track_event(
+                        &oss_handle,
+                        "oss_plugin_detected",
+                        Some(json!({
+                            "plugin_installed": oss.plugin_installed,
+                            "hook_absorbed": oss.hook_absorbed,
+                            "cli_on_path": oss.cli_on_path,
+                            "oss_proxy_8787": oss.oss_proxy_8787,
+                            "base_url_ours": oss.base_url_ours
+                        })),
+                    );
+                }
+            });
             // Wire up the bearer-triggered identity-pusher worker. The
             // intercept thread sends a signal here every time it captures a
             // bearer whose value differs from what was previously in the
@@ -7042,11 +7081,12 @@ mod tests {
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        select_updater_endpoints, store_checked_update, take_pending_magic_link, user_message_for,
+        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -9726,5 +9766,25 @@ Some unrelated content.
             let url = tauri::Url::parse(raw).unwrap();
             assert_eq!(parse_magic_link_auth(&url), None, "{raw}");
         }
+    }
+
+    /// The slot is one-shot: a window reload re-runs the claim on mount, and a
+    /// second hand-out would replay a code the server has already spent. Sole
+    /// owner of PENDING_MAGIC_LINK in the suite, so no serialisation needed.
+    #[test]
+    fn pending_magic_link_is_handed_out_exactly_once() {
+        assert_eq!(take_pending_magic_link(), None, "slot starts empty");
+
+        *PENDING_MAGIC_LINK.lock().unwrap() = Some(("a@b.com".to_string(), "123456".to_string()));
+
+        assert_eq!(
+            take_pending_magic_link(),
+            Some(("a@b.com".to_string(), "123456".to_string()))
+        );
+        assert_eq!(
+            take_pending_magic_link(),
+            None,
+            "a reload must not replay a spent code"
+        );
     }
 }

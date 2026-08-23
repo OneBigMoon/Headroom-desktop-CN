@@ -1,3 +1,5 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -343,6 +345,49 @@ describe("ActivityFeed", () => {
       />
     );
     expect(markup).toContain("activity-feed__item--clickable");
+  });
+
+  // Both diff branches live behind the expand click, so these two drive the
+  // real DOM rather than renderToStaticMarkup.
+  it("labels the diff with the token pair when both counts are known", async () => {
+    render(
+      <ActivityFeed
+        feed={feedWith({
+          transformation: transformation({
+            inputTokensOriginal: 1000,
+            inputTokensOptimized: 250,
+            requestMessages: [{ role: "user", content: "before" }],
+            compressedMessages: [{ role: "user", content: "after" }]
+          })
+        })}
+        error={null}
+      />
+    );
+    await userEvent.click(screen.getByRole("button", { name: /Recent large compression/ }));
+    expect(screen.getByText(/Compression diff \(1,000 → 250 tokens\)/)).toBeInTheDocument();
+  });
+
+  it("dumps both sides when the pair is too large to diff", async () => {
+    // Past MAX_DIFF_CELLS the LCS table would be gigabytes, so diffLines
+    // returns null and the detail view must still show the user something.
+    // 6000 x 6000 lines is ~36M cells, just over the cap.
+    const lines = (tag: string) =>
+      Array.from({ length: 6000 }, (_, i) => `${tag} ${i}`).join("\n");
+    render(
+      <ActivityFeed
+        feed={feedWith({
+          transformation: transformation({
+            requestMessages: [{ role: "user", content: lines("orig") }],
+            compressedMessages: [{ role: "user", content: lines("comp") }]
+          })
+        })}
+        error={null}
+      />
+    );
+    await userEvent.click(screen.getByRole("button", { name: /Recent large compression/ }));
+    expect(screen.getByText("Request (original)")).toBeInTheDocument();
+    expect(screen.getByText("Request (compressed)")).toBeInTheDocument();
+    expect(screen.queryByText(/Compression diff/)).not.toBeInTheDocument();
   });
 
   it("falls back to the raw transform string when unknown", () => {
@@ -937,6 +982,25 @@ describe("formatRequestMessages", () => {
     expect(formatRequestMessages([{ content: "orphan content" }])).toBe(
       "(unknown):\norphan content"
     );
+  });
+
+  it("survives block shapes the proxy log can hand it", () => {
+    // Everything here comes off the wire, so no shape is guaranteed. The rule
+    // is the same throughout: render what is legible, drop what is not, never
+    // throw -- a malformed block must not take the whole detail view down.
+    const cases: Array<[unknown, string]> = [
+      [null, ""], // content absent entirely
+      [42, ""], // neither string nor block list
+      [{ type: "text", text: "not in a list" }, ""], // a bare block, unwrapped
+      [[null, "raw string entry", { type: "text", text: "kept" }], "kept"],
+      [[{ tool_use_id: "x" }], ""], // no text, no content, no type
+      [[{ type: "tool_result", content: [] }], "[tool_result]"] // empty payload
+    ];
+    for (const [content, expected] of cases) {
+      expect(
+        formatRequestMessages([{ role: "user", content } as never])
+      ).toBe(`user:\n${expected}`);
+    }
   });
 });
 

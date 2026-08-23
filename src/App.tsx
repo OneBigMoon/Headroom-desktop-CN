@@ -92,6 +92,7 @@ import {
   recentDailySavingsUsd,
   setServerPlanPrices,
   tierRecommendationSourceLabel,
+  scheduledPlanChange,
   upgradePlanIntentLabel,
   type BillingPeriod,
   type PricingAudience,
@@ -113,6 +114,7 @@ import {
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
+  allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
@@ -3728,7 +3730,7 @@ export default function App() {
       applyConnectorsIfChanged(items);
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not load connector status."
+        describeInvokeError(error, "Could not load connector status.")
       );
     }
   }
@@ -3740,7 +3742,7 @@ export default function App() {
       void maybeFireUrgentRuntimeNotification(runtime);
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not load runtime status."
+        describeInvokeError(error, "Could not load runtime status.")
       );
     }
   }
@@ -3756,7 +3758,7 @@ export default function App() {
       await refreshRuntimeStatus();
     } catch (error) {
       setResumeError(
-        error instanceof Error ? error.message : "Could not restart Headroom."
+        describeInvokeError(error, "Could not restart Headroom.")
       );
     } finally {
       setResuming(false);
@@ -3777,7 +3779,7 @@ export default function App() {
       setPricingError(null);
     } catch (error) {
       setPricingError(
-        error instanceof Error ? error.message : "Could not load pricing status."
+        describeInvokeError(error, "Could not load pricing status.")
       );
     } finally {
       pricingRefreshInFlightRef.current = false;
@@ -3793,7 +3795,7 @@ export default function App() {
       applyClaudeProjectsIfChanged(projects);
     } catch (error) {
       setClaudeProjectsError(
-        error instanceof Error ? error.message : "Could not load Claude Code projects."
+        describeInvokeError(error, "Could not load Claude Code projects.")
       );
     } finally {
       setClaudeProjectsBusy(false);
@@ -3866,7 +3868,7 @@ export default function App() {
       await beginProxyVerificationStep();
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not configure your coding tools automatically."
+        describeInvokeError(error, "Could not configure your coding tools automatically.")
       );
       setLauncherStage("client_setup");
     } finally {
@@ -3945,7 +3947,7 @@ export default function App() {
         ...current,
         running: false,
         summary: "headroom learn could not be started.",
-        error: error instanceof Error ? error.message : "Failed to start headroom learn."
+        error: describeInvokeError(error, "Failed to start headroom learn.")
       }));
     } finally {
       setHeadroomLearnBusy(false);
@@ -4023,7 +4025,7 @@ export default function App() {
       }
     } catch (error) {
       setAddonError(
-        error instanceof Error ? error.message : "The addon action could not be completed."
+        describeInvokeError(error, "The addon action could not be completed.")
       );
     } finally {
       setAddonBusyId(null);
@@ -4151,7 +4153,7 @@ export default function App() {
       setPendingUpgradePlanId(null);
     } catch (error) {
       setAuthFlowError(
-        error instanceof Error ? error.message : "Could not sign out of Headroom."
+        describeInvokeError(error, "Could not sign out of Headroom.")
       );
     }
   }
@@ -4161,7 +4163,7 @@ export default function App() {
       await openExternalLink(CLAUDE_CODE_INSTALL_DOCS_URL);
     } catch (error) {
       setLearnInstallCopyNotice(
-        error instanceof Error ? error.message : "Could not open the install guide."
+        describeInvokeError(error, "Could not open the install guide.")
       );
       window.setTimeout(() => setLearnInstallCopyNotice(null), 3000);
     }
@@ -4265,7 +4267,7 @@ export default function App() {
         setCheckoutPollingDeadline(Date.now() + 5 * 60_000);
       } catch (error) {
         setUpgradeActionError(
-          error instanceof Error ? error.message : typeof error === "string" ? error : "Could not start checkout."
+          describeInvokeError(error, "Could not start checkout.")
         );
       } finally {
         setUpgradeActionBusy(null);
@@ -4283,7 +4285,7 @@ export default function App() {
         await openBillingPortal();
       } catch (error) {
         setUpgradeActionError(
-          error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+          describeInvokeError(error, "Could not open billing portal.")
         );
       } finally {
         setUpgradeActionBusy(null);
@@ -4303,7 +4305,7 @@ export default function App() {
       await openExternalLink(action.url);
     } catch (error) {
       setUpgradeActionError(
-        error instanceof Error ? error.message : "Could not open the selected plan link."
+        describeInvokeError(error, "Could not open the selected plan link.")
       );
     } finally {
       setUpgradeActionBusy(null);
@@ -4380,7 +4382,7 @@ export default function App() {
       await openBillingPortal();
     } catch (error) {
       setUpgradeActionError(
-        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+        describeInvokeError(error, "Could not open billing portal.")
       );
     } finally {
       setUpgradeActionBusy(null);
@@ -4416,7 +4418,7 @@ export default function App() {
       await openBillingPortal();
     } catch (error) {
       setUpgradeActionError(
-        error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
+        describeInvokeError(error, "Could not open billing portal.")
       );
     } finally {
       setUpgradeActionBusy(null);
@@ -4470,7 +4472,7 @@ export default function App() {
       setContactSubmitSuccess("Thanks. Check your inbox for a confirmation email.");
     } catch (error) {
       setContactSubmitError(
-        error instanceof Error ? error.message : "Could not submit the contact request."
+        describeInvokeError(error, "Could not submit the contact request.")
       );
     } finally {
       setContactSubmitBusy(false);
@@ -4515,7 +4517,7 @@ export default function App() {
       await refreshConnectors();
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Failed to update connector."
+        describeInvokeError(error, "Failed to update connector.")
       );
     } finally {
       setConnectorsBusy(false);
@@ -4588,17 +4590,10 @@ export default function App() {
   // feeds it the lifetime breakdown as a single synthetic bucket;
   // cacheReadTokens is used only as an existence signal for coverage, never
   // ratioed against our own token counts.
-  const cachePairAllTime = (() => {
-    const b = dashboard.savingsBreakdown;
-    if (!b || b.cacheReadTokens <= 0) return null;
-    return cacheHitPair([
-      {
-        cacheSavingsUsd: b.cacheSavingsUsd,
-        actualCostUsd: b.totalInputCostUsd,
-        estimatedSavingsUsd: dashboard.lifetimeEstimatedSavingsUsd
-      }
-    ]);
-  })();
+  const cachePairAllTime = allTimeCacheHitPair(
+    dashboard.savingsBreakdown,
+    dashboard.lifetimeEstimatedSavingsUsd
+  );
   const compressionOfRestPct = cachePairAllTime?.compressedPct ?? null;
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
@@ -5985,23 +5980,7 @@ export default function App() {
   // A downgrade waits for the end of the term already paid for, so between
   // confirming it and it landing the subscription still reports the old plan.
   // Without this the change leaves no trace anywhere in the app.
-  const pendingPlanChangeInfo = (() => {
-    const account = pricingStatus?.account;
-    const tier = account?.subscriptionPendingTier;
-    const effectiveAt = account?.subscriptionPendingEffectiveAt;
-    if (!tier || !effectiveAt) return null;
-    const period = account?.subscriptionPendingBillingPeriod === "monthly" ? "monthly" : "annual";
-    const on = new Date(effectiveAt).toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric"
-    });
-    // Same tier on a shorter cycle is a billing switch, not a plan change.
-    const note = tier === account?.subscriptionTier
-      ? `Switches to ${period} billing on ${on}`
-      : `Switches to ${upgradePlanIntentLabel(tier)} (${period}) on ${on}`;
-    return { tier, billingPeriod: period, note };
-  })();
+  const pendingPlanChangeInfo = scheduledPlanChange(pricingStatus?.account);
   // The card beside the active plan: the nearest step up, since that is what
   // this view is for. Only the top tier has none, and there the tier below it
   // is the sole remaining move.

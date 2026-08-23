@@ -122,6 +122,25 @@ export function OptimizePanel({
     );
   }
 
+  // A failed first load leaves `applied` null, which disables both pills -- so
+  // the modal holding `loadError` can never be opened and the panel reads
+  // "0 learnings", indistinguishable from a clean empty scan. Say so instead.
+  // (A refetch failure after a good load still surfaces inside the modal.)
+  if (loadError && applied === null) {
+    return (
+      <span className="optimize-panel__pills">
+        <button
+          type="button"
+          className="optimize-panel__pill optimize-panel__pill--empty"
+          disabled
+          title={loadError}
+        >
+          could not load learnings
+        </button>
+      </span>
+    );
+  }
+
   return (
     <>
       <span className="optimize-panel__pills">

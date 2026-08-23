@@ -6442,7 +6442,7 @@ impl PluginHost {
     }
 }
 
-fn claude_installed_plugins() -> Option<Value> {
+pub(crate) fn claude_installed_plugins() -> Option<Value> {
     let path = dirs::home_dir()?
         .join(".claude")
         .join("plugins")

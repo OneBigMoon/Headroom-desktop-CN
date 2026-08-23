@@ -29,15 +29,18 @@ fn detect_cli(name: &str) -> Option<PathBuf> {
     // Context7 and plugin addons reported "not found on PATH" on every Windows
     // box regardless of what was installed. On Unix it is a cheap extra hit
     // ahead of the 2s interactive-shell probe.
-    if let Some(path) = crate::client_adapters::find_on_path(&[name]) {
-        if is_runnable(&path) {
-            return Some(path);
-        }
+    if let Some(path) = probe_on_path(name) {
+        return Some(path);
     }
     probe_via_login_shell(name)
 }
 
-fn probe_known_paths(name: &str) -> Option<PathBuf> {
+pub(crate) fn probe_on_path(name: &str) -> Option<PathBuf> {
+    let path = crate::client_adapters::find_on_path(&[name])?;
+    is_runnable(&path).then_some(path)
+}
+
+pub(crate) fn probe_known_paths(name: &str) -> Option<PathBuf> {
     first_runnable(known_path_candidates(home_dir(), name).into_iter())
 }
 
@@ -345,6 +348,26 @@ mod tests {
         fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
         // Exec bit not set — must short-circuit without spawning.
         assert!(!is_runnable(&path));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_on_path_rejects_an_existing_but_broken_entry() {
+        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = ScopedTempDir::new("path_broken");
+        fs::write(tmp.path().join("headroom"), "not executable\n").unwrap();
+        let saved_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", tmp.path());
+
+        let found = probe_on_path("headroom");
+
+        match saved_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(found.is_none());
     }
 
     #[test]

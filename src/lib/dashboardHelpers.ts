@@ -3,7 +3,8 @@ import type {
   ClientSetupResult,
   DailySavingsPoint,
   HourlySavingsPoint,
-  ProviderSavingsPoint
+  ProviderSavingsPoint,
+  SavingsBreakdown
 } from "./types";
 
 export interface SavingsChartDatum {
@@ -126,6 +127,24 @@ export function cacheHitPair(
   // remainder rather than hiding the (excellent) hit rate.
   const compressedPct = baseline > 0 ? Math.min(100, (saved / baseline) * 100) : 0;
   return { hitPct, compressedPct };
+}
+
+/** The all-time cache-hit pair, from the lifetime breakdown rather than a
+ * window of buckets. Null when the client has never cached anything: there is
+ * no hit rate to report, and `cacheHitPair` would be dividing into an empty
+ * window. */
+export function allTimeCacheHitPair(
+  breakdown: SavingsBreakdown | null | undefined,
+  lifetimeEstimatedSavingsUsd: number
+) {
+  if (!breakdown || breakdown.cacheReadTokens <= 0) return null;
+  return cacheHitPair([
+    {
+      cacheSavingsUsd: breakdown.cacheSavingsUsd,
+      actualCostUsd: breakdown.totalInputCostUsd,
+      estimatedSavingsUsd: lifetimeEstimatedSavingsUsd
+    }
+  ]);
 }
 
 /** Canonical input-compression rate for a window of buckets: the share of the

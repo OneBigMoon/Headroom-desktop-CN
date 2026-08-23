@@ -48,6 +48,11 @@ const ALLOWED_EVENTS: &[&str] = &[
     "caveman_enabled",
     "caveman_disabled",
     "caveman_uninstalled",
+    // Open-source plugin/CLI coexistence, at most once per app start and only
+    // when something is actually present. Tells us how many users run the OSS
+    // Claude Code plugin next to the app, whether its bare hook was absorbed, and
+    // how many have an OSS proxy on :8787 taking traffic we never see.
+    "oss_plugin_detected",
     // Feature engagement: learn runs (per run, `agent` property) and Activity
     // tab opens (once per app run, mirroring app_started's cadence).
     "headroom_learn_run",

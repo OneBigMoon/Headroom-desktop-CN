@@ -114,6 +114,20 @@ describe("OptimizePanel", () => {
     });
   });
 
+  it("says so when the first load fails instead of reading as an empty scan", async () => {
+    // Without this the pills stay disabled at "0 learnings" forever: the modal
+    // that holds the error cannot be opened, so an IPC failure is invisible.
+    invokeMock.mockRejectedValueOnce(new Error("list_applied_patterns: no such project"));
+
+    render(<OptimizePanel projectPath="/proj" />);
+
+    const pill = await screen.findByRole("button", { name: /could not load learnings/i });
+    expect(pill).toHaveAttribute("title", "list_applied_patterns: no such project");
+    expect(
+      screen.queryByRole("button", { name: /learnings in CLAUDE.local\.md/i })
+    ).not.toBeInTheDocument();
+  });
+
   it("surfaces a delete-pattern failure inside the open modal", async () => {
     invokeMock.mockRejectedValueOnce(new Error("write CLAUDE.local.md: permission denied"));
 

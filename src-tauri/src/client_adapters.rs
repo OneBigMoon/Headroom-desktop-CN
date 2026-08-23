@@ -1015,7 +1015,7 @@ fn clear_readonly(path: &Path, perms: std::fs::Permissions) {
 /// stanza without destroying user data that belongs to `zap` — see
 /// docs/macos-release.md. Idempotent: safe to run when the app is not running,
 /// and safe to run twice.
-pub fn revert_external_mutations() -> Vec<String> {
+fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     let mut removed: Vec<String> = Vec::new();
 
     // Reverse settings.json mutations and shell blocks for every known client.
@@ -1061,6 +1061,10 @@ pub fn revert_external_mutations() -> Vec<String> {
         log::warn!("cleanup: removing Claude guard hook failed: {err}");
     }
 
+    // Restore the open-source Claude Code plugin hook if we neutralized it.
+    let (oss_hooks_pending, restored_oss_hooks) = restore_oss_plugin_hooks();
+    removed.extend(restored_oss_hooks);
+
     for hook_path in [headroom_rtk_hook_path(), headroom_markitdown_hook_path()] {
         if hook_path.exists() {
             match std::fs::remove_file(&hook_path) {
@@ -1105,7 +1109,11 @@ pub fn revert_external_mutations() -> Vec<String> {
     #[cfg(target_os = "linux")]
     removed.extend(remove_linux_autostart_entries());
 
-    removed
+    (removed, oss_hooks_pending)
+}
+
+pub fn revert_external_mutations() -> Vec<String> {
+    revert_external_mutations_with_status().0
 }
 
 /// Full uninstall: everything `revert_external_mutations` undoes, plus every
@@ -1116,7 +1124,7 @@ pub fn revert_external_mutations() -> Vec<String> {
 /// a Homebrew cask's `uninstall` must not delete user data, which is what `zap`
 /// is for.
 pub fn perform_full_cleanup() -> Vec<String> {
-    let mut removed = revert_external_mutations();
+    let (mut removed, oss_hooks_pending) = revert_external_mutations_with_status();
 
     // Also wipe the per-client setup-state file so a reinstall starts clean.
     let setup_state = setup_state_path();
@@ -1126,9 +1134,16 @@ pub fn perform_full_cleanup() -> Vec<String> {
 
     let app_dir = app_data_dir();
     if app_dir.exists() {
-        match remove_dir_all_retry(&app_dir) {
-            Ok(_) => removed.push(app_dir.display().to_string()),
-            Err(err) => log::warn!("cleanup: removing {} failed: {err}", app_dir.display()),
+        if oss_hooks_pending {
+            log::warn!(
+                "cleanup: preserving {} because an OSS Claude plugin hook still needs restoration",
+                app_dir.display()
+            );
+        } else {
+            match remove_dir_all_retry(&app_dir) {
+                Ok(_) => removed.push(app_dir.display().to_string()),
+                Err(err) => log::warn!("cleanup: removing {} failed: {err}", app_dir.display()),
+            }
         }
     }
 
@@ -5161,6 +5176,278 @@ fn port_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// The open-source Claude Code plugin runs this bare command at SessionStart
+/// and before Bash/PowerShell calls, where it exits 127 because the app ships
+/// no `headroom` on PATH. Replace only that exact command: no global PATH
+/// mutation, and the same rewrite works on Windows, macOS, and Linux.
+const OSS_PLUGIN_HOOK_COMMAND: &str = "headroom init hook ensure";
+/// What we put in its place: a builtin every hook host we can be launched
+/// under (sh, cmd.exe, PowerShell) understands. Deliberately not a path to a
+/// file we ship -- an absolute path goes dead if our app data is ever removed
+/// or relocated, stranding the plugin with a hook that fails on every Bash
+/// call and a restore string we can no longer match.
+const OSS_PLUGIN_MANAGED_COMMAND: &str = "exit 0";
+static OSS_PLUGIN_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Escape hatch. `HEADROOM_ABSORB_OSS_PLUGIN=0` restores anything we already
+/// rewrote and then leaves the plugin alone.
+fn oss_absorb_disabled() -> bool {
+    std::env::var_os("HEADROOM_ABSORB_OSS_PLUGIN").is_some_and(|v| v == "0")
+}
+
+/// True when Claude Code has the open-source `headroom` plugin installed, from
+/// any marketplace. It is mirrored under several marketplace names, so match the
+/// plugin half of the `<plugin>@<marketplace>` key rather than a fixed ref.
+fn oss_headroom_plugin_installed() -> bool {
+    let Some(plugins) = crate::tool_manager::claude_installed_plugins() else {
+        return false;
+    };
+    let Some(map) = plugins.get("plugins").and_then(Value::as_object) else {
+        return false;
+    };
+    map.iter().any(|(key, installs)| {
+        key.split('@').next() == Some("headroom")
+            && installs.as_array().is_some_and(|list| !list.is_empty())
+    })
+}
+
+/// Installed plugin records carry their cache directory. Resolve the hooks file
+/// from there instead of guessing where Claude or its shell looks for commands.
+fn oss_headroom_plugin_hook_paths() -> Vec<PathBuf> {
+    let Some(plugins) = crate::tool_manager::claude_installed_plugins() else {
+        return Vec::new();
+    };
+    let Some(map) = plugins.get("plugins").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut hooks = Vec::new();
+    for (key, installs) in map {
+        if key.split('@').next() != Some("headroom") {
+            continue;
+        }
+        let Some(installs) = installs.as_array() else {
+            continue;
+        };
+        for install in installs {
+            let Some(root) = install.get("installPath").and_then(Value::as_str) else {
+                continue;
+            };
+            let root = PathBuf::from(root);
+            hooks.push(root.join("hooks").join("hooks.json"));
+            hooks.push(root.join("hooks.json"));
+        }
+    }
+    hooks.retain(|path| path.is_file());
+    dedupe_paths(hooks)
+}
+
+fn oss_plugin_hook_receipt_path() -> PathBuf {
+    config_file(&app_data_dir(), "oss-plugin-hooks.json")
+}
+
+fn load_oss_plugin_hook_receipt() -> Vec<PathBuf> {
+    let path = oss_plugin_hook_receipt_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(paths) => paths,
+        Err(err) => {
+            // This file is the only record of which third-party hooks we
+            // rewrote. Silently overwriting an unreadable one strands them
+            // neutralized with nothing left pointing at them, so keep a copy.
+            log::warn!(
+                "oss plugin hook: unreadable receipt {}: {err}",
+                path.display()
+            );
+            let _ = backup_if_exists(&path);
+            Vec::new()
+        }
+    }
+}
+
+fn save_oss_plugin_hook_receipt(paths: &[PathBuf]) -> Result<()> {
+    let path = oss_plugin_hook_receipt_path();
+    if paths.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    atomic_write(&path, &serde_json::to_vec_pretty(paths)?)
+}
+
+fn hook_file_contains_command(path: &Path, command: &str) -> Result<bool> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading OSS plugin hooks {}", path.display()))?;
+    Ok(raw.contains(&serde_json::to_string(command)?))
+}
+
+/// Exact JSON-string replacement preserves the plugin's formatting and becomes
+/// a no-op if upstream changes the command or schema.
+fn replace_oss_plugin_hook_command(path: &Path, from: &str, to: &str) -> Result<bool> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading OSS plugin hooks {}", path.display()))?;
+    serde_json::from_str::<Value>(&raw)
+        .with_context(|| format!("parsing OSS plugin hooks {}", path.display()))?;
+    let from = serde_json::to_string(from)?;
+    if !raw.contains(&from) {
+        return Ok(false);
+    }
+    let updated = raw.replace(&from, &serde_json::to_string(to)?);
+    atomic_write(path, updated.as_bytes())?;
+    Ok(true)
+}
+
+/// What the open-source plugin/CLI look like on this machine right now.
+pub struct OssPluginStatus {
+    pub plugin_installed: bool,
+    pub hook_absorbed: bool,
+    pub cli_on_path: bool,
+    /// An open-source proxy is serving on :8787 (the OSS default port).
+    pub oss_proxy_8787: bool,
+    /// Claude Code's `ANTHROPIC_BASE_URL` still points at our proxy.
+    pub base_url_ours: bool,
+}
+
+/// True when Claude Code's `ANTHROPIC_BASE_URL` still points at our proxy.
+fn claude_base_url_is_ours() -> bool {
+    std::fs::read_to_string(claude_settings_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("env")?
+                .get("ANTHROPIC_BASE_URL")?
+                .as_str()
+                .map(|url| url == HEADROOM_ANTHROPIC_BASE_URL)
+        })
+        .unwrap_or(false)
+}
+
+/// True when a real open-source `headroom` CLI exists for the plugin hook to
+/// run. `find_on_path` alone is not enough: a GUI launch inherits launchd's
+/// bare PATH, which never contains `~/.local/bin` -- exactly where the OSS
+/// installer puts the binary. Probing the known install locations too is what
+/// keeps us from neutralizing a plugin hook that works. Same helper Claude/
+/// Codex detection uses, so a broken binary counts as absent and gets absorbed.
+fn oss_cli_present() -> bool {
+    crate::claude_cli::probe_on_path("headroom").is_some()
+        || crate::claude_cli::probe_known_paths("headroom").is_some()
+}
+
+pub fn absorb_oss_plugin() -> OssPluginStatus {
+    // Probing runs `headroom --version` against every known install location,
+    // so it execs whatever binary of that name happens to be on disk. Nobody
+    // without the plugin needs that at every launch: the answer only decides
+    // whether to leave a plugin hook alone.
+    let probe = !oss_absorb_disabled() && oss_headroom_plugin_installed();
+    absorb_oss_plugin_with_cli_on_path(probe && oss_cli_present())
+}
+
+fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> OssPluginStatus {
+    let plugin_installed = oss_headroom_plugin_installed();
+    let hooks = oss_headroom_plugin_hook_paths();
+    let absorb = plugin_installed && !cli_on_path && !oss_absorb_disabled();
+    let hook_absorbed = {
+        let _guard = OSS_PLUGIN_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+            false
+        } else {
+            reconcile_oss_plugin_hooks(&hooks, absorb).0
+        }
+    };
+
+    OssPluginStatus {
+        plugin_installed,
+        hook_absorbed,
+        cli_on_path,
+        oss_proxy_8787: port_listening(8787),
+        base_url_ours: claude_base_url_is_ours(),
+    }
+}
+
+/// Neutralize or restore the exact OSS hook command. The receipt retains cache
+/// paths after plugin removal, so uninstall can still restore inactive caches.
+fn reconcile_oss_plugin_hooks(current_hooks: &[PathBuf], absorb: bool) -> (bool, Vec<String>) {
+    let managed = OSS_PLUGIN_MANAGED_COMMAND;
+    let mut hooks = load_oss_plugin_hook_receipt();
+    hooks.extend_from_slice(current_hooks);
+    hooks = dedupe_paths(hooks);
+
+    // Persist targets before touching third-party files. If the app crashes
+    // after the rewrite, the next launch or uninstall can still restore them.
+    if absorb {
+        if let Err(err) = save_oss_plugin_hook_receipt(&hooks) {
+            log::warn!("oss plugin hook: preparing receipt failed: {err:#}");
+            return (false, Vec::new());
+        }
+    }
+
+    let mut changed = Vec::new();
+    let mut still_managed = Vec::new();
+    for path in hooks {
+        // The receipt outlives the files it names: a plugin update re-clones
+        // into a new version dir and the old one goes away. That is the normal
+        // end of an entry, not a failure -- skipping it here keeps the read
+        // error out of the log (and out of Sentry) and lets the entry fall off
+        // the receipt below.
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                log::warn!(
+                    "oss plugin hook: inspecting {} failed: {err}",
+                    path.display()
+                );
+                if !absorb {
+                    still_managed.push(path);
+                }
+                continue;
+            }
+        }
+        let result = if absorb {
+            replace_oss_plugin_hook_command(&path, OSS_PLUGIN_HOOK_COMMAND, managed)
+        } else {
+            replace_oss_plugin_hook_command(&path, managed, OSS_PLUGIN_HOOK_COMMAND)
+        };
+        match result {
+            Ok(true) => changed.push(path.display().to_string()),
+            Ok(false) => {}
+            Err(err) => log::warn!("oss plugin hook: {err:#}"),
+        }
+        match hook_file_contains_command(&path, managed) {
+            Ok(true) => still_managed.push(path),
+            Ok(false) => {}
+            Err(err) => {
+                log::warn!("oss plugin hook: {err:#}");
+                if !absorb {
+                    still_managed.push(path);
+                }
+            }
+        }
+    }
+
+    if let Err(err) = save_oss_plugin_hook_receipt(&still_managed) {
+        log::warn!("oss plugin hook: saving receipt failed: {err:#}");
+    }
+    (!still_managed.is_empty(), changed)
+}
+
+fn restore_oss_plugin_hooks() -> (bool, Vec<String>) {
+    let _guard = OSS_PLUGIN_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let hooks = oss_headroom_plugin_hook_paths();
+    reconcile_oss_plugin_hooks(&hooks, false)
+}
+
 fn resolve_default_shell_targets() -> Vec<PathBuf> {
     let mut targets =
         discover_managed_shell_targets(&["managed_rtk", "claude_code"]).unwrap_or_default();
@@ -6054,6 +6341,12 @@ mod tests {
 
     #[test]
     fn strip_headroom_mcp_toml_removes_owned_tables_keeps_user_tables() {
+        // Same straddled-HOME race as the JSON twin below: this reads
+        // app_data_dir() to build the fixture and strip_headroom_mcp_toml
+        // reads it again to match, while sibling tests flip HOME to a tempdir.
+        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let app_dir = crate::storage::app_data_dir().display().to_string();
         let content = format!(
             "model = \"gpt-5\"\n\
@@ -10194,5 +10487,319 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(script.contains("(expected \" + BASE_URL + \")"));
         assert!(script.contains("DEBOUNCE_PATH.touch()"));
         assert!(script.contains("time.sleep(2)\n    return probe()"));
+    }
+
+    // --- Open-source plugin coexistence -------------------------------------
+    //
+    // The four states from the investigation. `headroom init hook ensure` (the
+    // plugin's only command) never writes ANTHROPIC_BASE_URL and never picks a
+    // port, so the whole surface we own is: does a `headroom` exist on PATH for
+    // the hook to run, and did we avoid touching anyone who already had one.
+
+    fn seed_oss_plugin(home: &Path, plugin_ref: &str) -> PathBuf {
+        let dir = home.join(".claude").join("plugins");
+        fs::create_dir_all(&dir).unwrap();
+        let install = dir
+            .join("cache")
+            .join(plugin_ref.replace('@', "-"))
+            .join("0.36.5");
+        let hooks = install.join("hooks").join("hooks.json");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        fs::write(
+            &hooks,
+            json!({
+                "hooks": {
+                    "SessionStart": [{
+                        "hooks": [{ "type": "command", "command": super::OSS_PLUGIN_HOOK_COMMAND }]
+                    }],
+                    "PreToolUse": [{
+                        "matcher": "Bash|PowerShell",
+                        "hooks": [{ "type": "command", "command": super::OSS_PLUGIN_HOOK_COMMAND }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("installed_plugins.json"),
+            json!({
+                "version": 2,
+                "plugins": { plugin_ref: [{
+                    "scope": "user",
+                    "version": "0.36.5",
+                    "installPath": install
+                }] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        hooks
+    }
+
+    /// Every file under `root`, with its bytes, for before/after comparison.
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = fs::read(&path) {
+                    out.insert(path, bytes);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn state_1_app_alone_touches_nothing_on_disk() {
+        // The guarantee for the majority of users: someone running the desktop
+        // app without the open-source plugin must come out of this byte-for-byte
+        // unchanged. Not "no shim" — nothing at all.
+        let home = TestHome::new();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude/settings.json"),
+            json!({ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:6767" } }).to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(home.path().join(".local/bin")).unwrap();
+
+        let before = snapshot_tree(home.path());
+        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let after = snapshot_tree(home.path());
+
+        assert_eq!(before, after, "no-plugin users must see zero writes");
+        assert!(!status.plugin_installed);
+        assert!(!status.hook_absorbed);
+        assert!(
+            status.base_url_ours,
+            "our routing is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn state_1_app_alone_stays_inert() {
+        let _home = TestHome::new();
+
+        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+
+        assert!(!status.plugin_installed);
+        assert!(!status.hook_absorbed);
+        assert!(!super::oss_plugin_hook_receipt_path().exists());
+    }
+
+    #[test]
+    fn state_2_plugin_without_cli_gets_a_noop_hook() {
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+
+        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+
+        assert!(status.plugin_installed);
+        assert!(status.hook_absorbed);
+        let raw = fs::read_to_string(&hooks).unwrap();
+        assert_eq!(
+            raw.matches(&serde_json::to_string(super::OSS_PLUGIN_MANAGED_COMMAND).unwrap())
+                .count(),
+            2
+        );
+        assert!(!raw.contains(super::OSS_PLUGIN_HOOK_COMMAND));
+    }
+
+    #[test]
+    fn plugin_is_recognised_from_any_marketplace_mirror() {
+        // The same plugin is listed under several marketplaces (sleetish,
+        // burgebj, oll4com) whose hooks.json are byte-identical.
+        for plugin_ref in ["headroom@headroom-marketplace", "headroom@sleetish"] {
+            let home = TestHome::new();
+            seed_oss_plugin(home.path(), plugin_ref);
+
+            assert!(
+                super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed,
+                "{plugin_ref} should be recognised"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_plugins_do_not_trigger_the_hook_rewrite() {
+        let home = TestHome::new();
+        seed_oss_plugin(home.path(), "ponytail@ponytail");
+
+        assert!(!super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(!super::oss_plugin_hook_receipt_path().exists());
+    }
+
+    #[test]
+    fn state_3_real_cli_on_path_is_never_shadowed() {
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+
+        let status = super::absorb_oss_plugin_with_cli_on_path(true);
+
+        assert!(status.cli_on_path);
+        assert!(!status.hook_absorbed);
+        assert_eq!(
+            fs::read_to_string(hooks)
+                .unwrap()
+                .matches(super::OSS_PLUGIN_HOOK_COMMAND)
+                .count(),
+            2
+        );
+    }
+
+    /// Regression: `state_3` proves the bool is honoured, but the bool itself
+    /// came from `find_on_path` alone, and a GUI launch inherits launchd's bare
+    /// PATH -- no `~/.local/bin`, which is where the OSS installer puts
+    /// `headroom`. Every such user read as "no CLI" and had a working plugin
+    /// hook neutralized. Asserts only the positive direction: a machine that
+    /// really does have a `headroom` elsewhere cannot make this pass wrongly.
+    #[test]
+    #[cfg(unix)]
+    fn an_oss_cli_in_local_bin_counts_even_when_path_cannot_see_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let cli = home.path().join(".local/bin/headroom");
+        fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&cli).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cli, perms).unwrap();
+
+        assert!(super::oss_cli_present());
+    }
+
+    /// The replacement must stay a shell builtin, not a path to anything we
+    /// ship. A path goes dead the moment our app data is removed or moved,
+    /// and takes the restore string -- our only way back -- with it.
+    #[test]
+    fn the_managed_hook_command_is_not_a_path() {
+        assert_eq!(super::OSS_PLUGIN_MANAGED_COMMAND, "exit 0");
+    }
+
+    #[test]
+    fn removing_the_plugin_restores_its_hook_and_clears_the_receipt() {
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+
+        seed_oss_plugin(home.path(), "ponytail@ponytail");
+        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        assert!(!status.plugin_installed);
+        assert!(!status.hook_absorbed);
+        assert!(!super::oss_plugin_hook_receipt_path().exists());
+        assert_eq!(
+            fs::read_to_string(&hooks)
+                .unwrap()
+                .matches(super::OSS_PLUGIN_HOOK_COMMAND)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_foreign_headroom_binary_is_never_clobbered() {
+        let home = TestHome::new();
+        let shim = home.path().join(".local/bin/headroom");
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&shim, "#!/bin/sh\necho not ours\n").unwrap();
+        seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert_eq!(
+            fs::read_to_string(&shim).unwrap(),
+            "#!/bin/sh\necho not ours\n"
+        );
+    }
+
+    #[test]
+    fn failed_restore_preserves_the_receipt_for_a_later_retry() {
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+
+        let managed = serde_json::to_string(super::OSS_PLUGIN_MANAGED_COMMAND).unwrap();
+        let corrupt = format!("{} trailing", fs::read_to_string(&hooks).unwrap());
+        fs::write(&hooks, corrupt).unwrap();
+
+        super::perform_full_cleanup();
+
+        assert!(super::app_data_dir().exists());
+        assert!(super::oss_plugin_hook_receipt_path().exists());
+        assert!(fs::read_to_string(hooks).unwrap().contains(&managed));
+    }
+
+    #[test]
+    fn state_4_oss_proxy_bypass_is_measured_not_fought() {
+        // The user ran `headroom init` themselves, so their ANTHROPIC_BASE_URL
+        // points at the open-source proxy. We report it and change nothing.
+        let home = TestHome::new();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        let original = json!({ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787" } });
+        fs::write(&settings, original.to_string()).unwrap();
+        seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+
+        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+
+        assert!(status.plugin_installed);
+        assert!(
+            !status.base_url_ours,
+            "the bypass must be visible to telemetry"
+        );
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            original.to_string(),
+            "we never rewrite a base URL the user set on purpose"
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_absorbs_nothing_and_restores_what_it_finds() {
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+
+        std::env::set_var("HEADROOM_ABSORB_OSS_PLUGIN", "0");
+        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        std::env::remove_var("HEADROOM_ABSORB_OSS_PLUGIN");
+
+        assert!(status.plugin_installed);
+        assert!(!status.hook_absorbed);
+        assert_eq!(
+            fs::read_to_string(&hooks)
+                .unwrap()
+                .matches(super::OSS_PLUGIN_HOOK_COMMAND)
+                .count(),
+            2,
+            "the opt-out must hand the hook back, not just stop touching it"
+        );
+    }
+
+    #[test]
+    fn absorbing_the_hook_does_not_hide_a_real_oss_remnant() {
+        let home = TestHome::new();
+        seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+
+        let foreign = home.path().join(".local/bin/headroom");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(&foreign, "#!/bin/sh\necho real OSS CLI\n").unwrap();
+
+        assert!(
+            super::detect_oss_remnants()
+                .iter()
+                .any(|w| w.contains("~/.local/bin/headroom")),
+            "absorbing the plugin hook must not hide a real OSS CLI"
+        );
     }
 }
