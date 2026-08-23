@@ -441,10 +441,13 @@ mod tests {
         _tmp: tempfile::TempDir,
         prev_home: Option<OsString>,
         prev_xdg: Option<OsString>,
+        // Held for the guard's lifetime: see test_env_lock::lock_home.
+        _env_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestHome {
         fn new() -> Self {
+            let env_lock = crate::test_env_lock::lock_home();
             let tmp = tempfile::tempdir().expect("create temp home");
             let home: PathBuf = tmp.path().to_path_buf();
             let prev_home = std::env::var_os("HOME");
@@ -457,6 +460,7 @@ mod tests {
                 _tmp: tmp,
                 prev_home,
                 prev_xdg,
+                _env_lock: env_lock,
             }
         }
     }

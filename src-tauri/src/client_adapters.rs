@@ -5914,7 +5914,7 @@ json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDe
 /// env override (TestHome in tests, Git Bash parity in production) would be
 /// silently bypassed and writes would land in the real profile. On Unix the
 /// two sources agree, so the order change is a no-op there.
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -6371,9 +6371,7 @@ mod tests {
         // Same straddled-HOME race as the JSON twin below: this reads
         // app_data_dir() to build the fixture and strip_headroom_mcp_toml
         // reads it again to match, while sibling tests flip HOME to a tempdir.
-        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = crate::test_env_lock::lock_home();
         let app_dir = crate::storage::app_data_dir().display().to_string();
         let content = format!(
             "model = \"gpt-5\"\n\
@@ -6422,9 +6420,7 @@ mod tests {
         // again to match. Sibling tests repoint HOME at a tempdir, so without
         // the lock the two reads can straddle a flip and disagree (~1 run in 6
         // of the full suite).
-        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = crate::test_env_lock::lock_home();
         let app_dir = crate::storage::app_data_dir().display().to_string();
         let mut servers = json!({
             "headroom": { "command": "python3", "args": ["mcp", "serve"] },
@@ -7134,9 +7130,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn zdotdir_unresolved_env_var_falls_back_to_none() {
         // TestHome sets XDG_CONFIG_HOME under this lock, so without it the
         // remove_var below races those tests (~1 run in 6 of the full suite).
-        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = crate::test_env_lock::lock_home();
         // Reproduces os error 30: `$XDG_CONFIG_HOME` unset under a Finder launch
         // must NOT yield a relative `$XDG_CONFIG_HOME/zsh` path.
         std::env::remove_var("XDG_CONFIG_HOME");
@@ -7729,9 +7723,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     impl TestHome {
         fn new() -> Self {
-            let env_lock = crate::test_env_lock::HOME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let env_lock = crate::test_env_lock::lock_home();
             let tmp = tempfile::tempdir().expect("create temp home");
             let home = tmp.path().to_path_buf();
             let prev_home = std::env::var_os("HOME");

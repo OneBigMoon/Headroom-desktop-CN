@@ -369,9 +369,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn probe_on_path_rejects_an_existing_but_broken_entry() {
-        let _env_lock = crate::test_env_lock::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = crate::test_env_lock::lock_home();
         let tmp = ScopedTempDir::new("path_broken");
         fs::write(tmp.path().join("headroom"), "not executable\n").unwrap();
         let saved_path = std::env::var_os("PATH");
@@ -549,10 +547,13 @@ mod tests {
         // ~/.local/bin, which GUI-launched processes cannot see (launchd hands us
         // PATH=/usr/bin:/bin:/usr/sbin:/sbin). Absent from this list, a stock
         // install was invisible whenever the login-shell probe also failed.
+        // Assert the directory, not the filename: on Windows the first
+        // candidate is `claude.exe` in that same directory (the extension
+        // sweep is pinned by known_windows_paths_probe_executable_extensions).
         let candidates = known_path_candidates(PathBuf::from("/Users/test"), "claude");
         assert_eq!(
-            candidates.first().map(PathBuf::as_path),
-            Some(Path::new("/Users/test/.local/bin/claude")),
+            candidates.first().and_then(|path| path.parent()),
+            Some(Path::new("/Users/test/.local/bin")),
         );
     }
 

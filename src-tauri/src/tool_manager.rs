@@ -6443,7 +6443,11 @@ impl PluginHost {
 }
 
 pub(crate) fn claude_installed_plugins() -> Option<Value> {
-    let path = dirs::home_dir()?
+    // Not `dirs::home_dir()`: on Windows that reads the profile known folder
+    // and ignores `$HOME`, so a redirected home (tests, Git Bash) resolves
+    // against the REAL profile. Every OSS-plugin test failed on Windows CI
+    // that way -- reading the runner's own ~/.claude and finding no plugin.
+    let path = crate::client_adapters::home_dir()
         .join(".claude")
         .join("plugins")
         .join("installed_plugins.json");
@@ -12938,9 +12942,7 @@ after
 
     impl HomeGuard {
         fn new(root: &Path) -> Self {
-            let env_lock = crate::test_env_lock::HOME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let env_lock = crate::test_env_lock::lock_home();
             let prev_home = std::env::var_os("HOME");
             let prev_codex = std::env::var_os("CODEX_HOME");
             std::env::set_var("HOME", root);

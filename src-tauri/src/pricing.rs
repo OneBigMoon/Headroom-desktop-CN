@@ -5684,6 +5684,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn verify_auth_code_decodes_and_writes_session_token() {
+        let _home_lock = crate::test_env_lock::lock_home();
         // Override HOME / XDG_DATA_HOME so the keychain debug store and
         // app_data_dir live in a fresh tempdir, not the dev's real profile.
         let prev_home = std::env::var_os("HOME");
@@ -5767,6 +5768,7 @@ mod tests {
     /// what to do, and must not leak the endpoint.
     #[test]
     fn verify_auth_code_reports_an_unreachable_server_in_plain_language() {
+        let _home_lock = crate::test_env_lock::lock_home();
         let (state, dir) = temp_app_state();
         let err = super::verify_auth_code_with_base_url(
             &state,
@@ -5949,6 +5951,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn activate_account_requires_session_token() {
+        let _home_lock = crate::test_env_lock::lock_home();
         // No AuthedTestEnv → no token in keychain. Override HOME so any
         // keychain read still goes to a tempdir, not the dev profile.
         let scratch = tempfile::tempdir().expect("scratch");

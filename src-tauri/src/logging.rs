@@ -934,9 +934,7 @@ mod tests {
     fn scrub_home_replaces_home_dir_with_tilde() {
         // scrub_home reads $HOME again internally, so a TestHome elsewhere
         // swapping it between our read and theirs makes the scrub a no-op.
-        let _home_lock = crate::test_env_lock::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_lock = crate::test_env_lock::lock_home();
 
         let home = dirs::home_dir().unwrap();
         let msg = format!(
@@ -955,9 +953,7 @@ mod tests {
     fn scrub_event_covers_message_tags_and_extras() {
         // scrub_home reads $HOME again internally, so a TestHome elsewhere
         // swapping it between our read and theirs makes the scrub a no-op.
-        let _home_lock = crate::test_env_lock::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_lock = crate::test_env_lock::lock_home();
 
         let home = dirs::home_dir().unwrap();
         let home = home.display().to_string();

@@ -29,6 +29,18 @@ mod usage_counters;
 #[cfg(test)]
 pub(crate) mod test_env_lock {
     pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold this for the whole time `$HOME` is swapped. Tests that only READ
+    /// the home dir need it too: `logging::scrub_home` and everything behind
+    /// `dirs::home_dir()` resolve it at call time, so an unlocked swapper in
+    /// another module makes their assertion silently vacuous -- and
+    /// `device.rs` removes `$HOME` outright, which turns the scrub into a
+    /// no-op and fails the test outright.
+    pub(crate) fn lock_home() -> std::sync::MutexGuard<'static, ()> {
+        HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 use std::future::Future;
