@@ -1787,8 +1787,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "headroom-desktop"
-version = "0.8.7"
+name = "headroom-local-community"
+version = "0.8.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

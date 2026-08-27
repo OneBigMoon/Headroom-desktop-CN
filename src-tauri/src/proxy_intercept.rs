@@ -1,10 +1,10 @@
 /// Transparent HTTP proxy intercept layer.
 ///
-/// Binds on 127.0.0.1:6767 (the address clients point at) and forwards every
+/// Binds on 127.0.0.1:6867 (the address clients point at) and forwards every
 /// request unchanged to 127.0.0.1:<backend_port>, where headroom actually
-/// listens. The backend port is normally 6768 but is selected at proxy spawn
-/// time and stored in `crate::backend_port`; it can shift to 6769..=6790 if
-/// 6768 is held by a foreign process. We re-read the port per connection so
+/// listens. The backend port is normally 6868 but is selected at proxy spawn
+/// time and stored in `crate::backend_port`; it can shift to 6869..=6890 if
+/// 6868 is held by a foreign process. We re-read the port per connection so
 /// the intercept (which spawns before proxy startup runs the selection) picks
 /// up the chosen value as soon as it's set.
 ///
@@ -28,7 +28,7 @@ use crate::backend_port;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
 use crate::models::{CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow};
 
-pub const INTERCEPT_PORT: u16 = 6767;
+pub const INTERCEPT_PORT: u16 = 6867;
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Request bodies arrive over loopback so even multi-MB payloads land in well
@@ -443,7 +443,7 @@ pub type CodexPlanSlot = Arc<Mutex<Option<crate::models::CodexPlanTier>>>;
 
 /// Why the intercept is not listening on [`INTERCEPT_PORT`], or `None` while it
 /// is serving normally. Shared with `AppState::intercept_bind_error` so the UI
-/// can name the real cause: clients are hard-configured to 127.0.0.1:6767, so a
+/// can name the real cause: clients are hard-configured to 127.0.0.1:6867, so a
 /// failed bind refuses every request regardless of the Python backend's state,
 /// and the banner would otherwise blame the runtime.
 pub type BindErrorSlot = Arc<Mutex<Option<String>>>;
@@ -1001,7 +1001,7 @@ async fn handle(
     // first-write-wins so an extra send is cheap.
     //
     // `!is_local_backend_path` is load-bearing, not a tidy-up: the desktop polls
-    // its own dashboard through this listener (`127.0.0.1:6767/stats`), so
+    // its own dashboard through this listener (`127.0.0.1:6867/stats`), so
     // without the guard the app fired this beacon at itself on the first
     // successful poll after bootstrap -- landing in the same second as
     // `bootstrap_completed`, before any client was even configured, and
@@ -1751,8 +1751,8 @@ fn maybe_spawn_codex_usage_poll(buf: &[u8], codex_slot: &CodexRateLimitSlot) {
         return;
     }
 
-    let user_agent =
-        extract_header_value(buf, "user-agent").unwrap_or_else(|| "headroom-desktop".to_string());
+    let user_agent = extract_header_value(buf, "user-agent")
+        .unwrap_or_else(|| "headroom-local-community".to_string());
     let slot = codex_slot.clone();
     tokio::task::spawn_blocking(move || {
         if let Some(snapshot) = fetch_codex_usage_snapshot(&token, &account_id, &user_agent) {
@@ -1837,7 +1837,7 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 /// Forward the request that produced `header_buf` directly to api.anthropic.com.
 ///
 /// Used when the pricing gate has stopped the local Python proxy. The CC
-/// session keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same
+/// session keeps speaking HTTP/1.1 to 127.0.0.1:6867; we re-issue the same
 /// request to the real Anthropic endpoint over TLS with `reqwest`, then stream
 /// the response back as HTTP/1.1 chunked transfer.
 async fn forward_direct_to_anthropic(
@@ -2679,7 +2679,7 @@ mod tests {
     #[serial]
     fn launch_time_unreachable_does_not_arm_the_down_timer() {
         use std::sync::atomic::Ordering;
-        let addr: SocketAddr = "127.0.0.1:6768".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:6868".parse().unwrap();
         super::BACKEND_REACHABILITY_STATE.store(0, Ordering::Release);
         *super::BACKEND_DOWN_SINCE.lock() = None;
 
@@ -2818,9 +2818,9 @@ mod tests {
 
     #[test]
     fn loopback_host_without_origin_is_accepted() {
-        let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n";
+        let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6867\r\n\r\n";
         assert!(request_is_loopback_safe(req));
-        let req = b"POST / HTTP/1.1\r\nHost: localhost:6767\r\n\r\n";
+        let req = b"POST / HTTP/1.1\r\nHost: localhost:6867\r\n\r\n";
         assert!(request_is_loopback_safe(req));
         let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         assert!(request_is_loopback_safe(req));
@@ -2837,7 +2837,7 @@ mod tests {
     #[test]
     fn origin_header_causes_rejection_even_on_loopback() {
         let req =
-            b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nOrigin: https://evil.example.com\r\n\r\n";
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nOrigin: https://evil.example.com\r\n\r\n";
         assert!(!request_is_loopback_safe(req));
     }
 
@@ -3012,7 +3012,7 @@ mod tests {
     }
 
     /// The desktop polls its own dashboard through this listener
-    /// (`127.0.0.1:6767/stats`), so a local path reaching a live backend must
+    /// (`127.0.0.1:6867/stats`), so a local path reaching a live backend must
     /// not fire the `first_optimized_request` funnel beacon -- it is supposed to
     /// mean "a coding tool sent a request", and self-polling made it fire in the
     /// same second bootstrap finished, before any client was configured.
@@ -3263,7 +3263,7 @@ mod tests {
 
     #[test]
     fn parse_request_head_extracts_method_path_and_content_length() {
-        let buf = b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nAuthorization: Bearer abc\r\nContent-Length: 42\r\n\r\n";
+        let buf = b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nAuthorization: Bearer abc\r\nContent-Length: 42\r\n\r\n";
         let parsed = parse_request_head(buf).expect("parsed");
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.path, "/v1/messages");
@@ -3339,7 +3339,7 @@ mod tests {
     #[test]
     fn stamp_codex_client_header_inserts_last_header() {
         let mut buf =
-            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: codex_vscode/1.0\r\n\r\n"
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nUser-Agent: codex_vscode/1.0\r\n\r\n"
                 .to_vec();
         stamp_codex_client_header(&mut buf);
         let parsed = parse_request_head(&buf).expect("still a valid request head");
@@ -3359,7 +3359,7 @@ mod tests {
 
     #[test]
     fn stamp_client_header_stamps_opencode() {
-        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n".to_vec();
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6867\r\n\r\n".to_vec();
         stamp_client_header(&mut buf, b"X-Client: opencode\r\n");
         assert!(buf.ends_with(b"X-Client: opencode\r\n\r\n"));
         // Second stamp (e.g. the codex path-based branch) must not double up.
@@ -3383,7 +3383,7 @@ mod tests {
     #[test]
     fn stamp_request_header_grok_base_url_and_client() {
         let mut buf =
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\n\r\n{}"
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\n\r\n{}"
                 .to_vec();
         stamp_request_header(
             &mut buf,
@@ -3523,7 +3523,7 @@ mod tests {
 
     #[test]
     fn strip_request_header_removes_lite_header_and_preserves_body() {
-        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nX-OpenAI-Internal-Codex-Responses-Lite: 1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nX-OpenAI-Internal-Codex-Responses-Lite: 1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
         assert!(!request_has_header(
             &buf,
@@ -3638,7 +3638,7 @@ mod tests {
         }
     }
 
-    /// Drive the bypass branch end-to-end: intercept on :6767 with bypass=true
+    /// Drive the bypass branch end-to-end: intercept on :6867 with bypass=true
     /// forwards a request to a fake upstream, then streams the upstream's
     /// response back to the client as HTTP/1.1 chunked transfer.
     #[tokio::test]

@@ -743,7 +743,7 @@ impl ActivityFacts {
         //     disk — `~/.claude/projects/` keeps session files for folders
         //     that have been moved or deleted, so scanning surfaces "ghost"
         //     projects whose display_name collides with the current working
-        //     copy and confuses the tile ("23 sessions on headroom-desktop
+        //     copy and confuses the tile ("23 sessions on headroom-local-community
         //     and no Train run yet" for a path that isn't there anymore).
         if let Some(latched) = self.last_train_suggestion.as_ref() {
             let still_qualifies = projects

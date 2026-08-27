@@ -45,7 +45,7 @@ describe("bootstrap sentry helpers", () => {
   it("infers runtime start failures from backend bootstrap messages", () => {
     expect(
       inferBootstrapFailurePhase(
-        "Install completed but Headroom failed to start: headroom exited before opening port 6768"
+        "Install completed but Headroom failed to start: headroom exited before opening port 6868"
       )
     ).toBe("start_runtime");
   });
@@ -101,27 +101,23 @@ describe("reportBootstrapFailure", () => {
     vi.clearAllMocks();
   });
 
-  it("calls withScope and captureException", () => {
+  it("keeps bootstrap failures local", () => {
     const report = buildBootstrapFailureReport(
       makeFailedProgress("Installation failed: disk full")
     );
 
     reportBootstrapFailure(report);
 
-    expect(Sentry.withScope).toHaveBeenCalledOnce();
-    expect(Sentry.captureException).toHaveBeenCalledOnce();
-    const err = vi.mocked(Sentry.captureException).mock.calls[0][0] as Error;
-    expect(err).toBeInstanceOf(Error);
-    expect(err.name).toBe("BootstrapFailedError");
-    expect(err.message).toBe("Installation failed: disk full");
+    expect(Sentry.withScope).not.toHaveBeenCalled();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
-  it("includes cause as extra when provided", () => {
+  it("does not transmit a provided cause", () => {
     const report = buildBootstrapFailureReport(makeFailedProgress("Installation failed: disk full"));
 
     reportBootstrapFailure(report, new Error("underlying cause"));
 
-    expect(mockScope.setExtra).toHaveBeenCalledWith("cause", expect.any(String));
+    expect(mockScope.setExtra).not.toHaveBeenCalled();
   });
 
   it("does not set extra when cause is not provided", () => {

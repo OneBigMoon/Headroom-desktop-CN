@@ -55,7 +55,7 @@ Timing matters either way: a `Read` result becomes part of Claude's *next* outgo
 **Claude Code subscription/OAuth traffic** (classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
+   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6867/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
    ```
 2. End the turn with a large Read in flight — ask Claude to read a long file (~1300-1500 lines).
 3. On the *next* turn, re-run the same `jq` command.
@@ -65,7 +65,7 @@ Expect: `primary_model` is a `claude-*` model, `cache_savings_usd` is strictly g
 **Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — the branch Codex hits):
 1. Capture the baseline:
    ```bash
-   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
+   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6867/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
    ```
 2. End the turn with the same large Read in flight (~1300-1500 lines clears the compression threshold).
 3. On the *next* turn, re-run the same `jq` command.
@@ -107,7 +107,7 @@ Run these from a Codex CLI session. Codex routes through Headroom via an `OPENAI
 ### C1. Codex is configured to route through Headroom
 ```bash
 grep -q 'model_provider = "headroom"' "$USERPROFILE/.codex/config.toml" && \
-  grep -q 'openai_base_url = "http://127.0.0.1:6767/v1"' "$USERPROFILE/.codex/config.toml" && \
+  grep -q 'openai_base_url = "http://127.0.0.1:6867/v1"' "$USERPROFILE/.codex/config.toml" && \
   grep -qF '[model_providers.headroom]' "$USERPROFILE/.codex/config.toml" && \
   grep -q 'supports_websockets = false' "$USERPROFILE/.codex/config.toml" && \
   echo PASS || echo FAIL
@@ -117,7 +117,7 @@ Expect: `PASS`.
 ### C2. Codex traffic is actively optimized (token mode)
 1. Capture the baseline:
    ```bash
-   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
+   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6867/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
    ```
 2. End the turn with a large file read in flight from Codex (~1300-1500 lines).
 3. On the next turn, re-run the same command.
@@ -139,7 +139,7 @@ Expect: after Pause it prints `0`; after Resume it is non-zero (back to `4` mark
 When inspecting the running proxy by hand (e.g. checking `/stats`), wrap `curl` with `rtk proxy` to bypass RTK's output filtering — otherwise large JSON responses get summarized into a type-shape view that looks like a broken endpoint:
 
 ```bash
-"$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq .summary
+"$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6867/stats | jq .summary
 ```
 
 ## When something fails

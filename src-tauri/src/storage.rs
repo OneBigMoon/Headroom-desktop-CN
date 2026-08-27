@@ -21,7 +21,11 @@ pub fn app_data_dir() -> PathBuf {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
         })
         .unwrap_or_else(std::env::temp_dir);
-    base.join("Headroom")
+    if crate::edition::LOCAL_COMMUNITY {
+        base.join("HeadroomLocalCommunity")
+    } else {
+        base.join("HeadroomLocalCommunity")
+    }
 }
 
 pub fn ensure_data_dirs(base_dir: &Path) -> Result<()> {

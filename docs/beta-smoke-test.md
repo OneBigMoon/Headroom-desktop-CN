@@ -69,7 +69,7 @@ Timing matters either way: a `Read` result becomes part of Claude's *next* outgo
 **Claude Code subscription/OAuth traffic** (UA `claude-code/`, classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before}'
+   rtk proxy curl -s http://127.0.0.1:6867/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before}'
    ```
 2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
@@ -79,7 +79,7 @@ Expect: `primary_model` is a `claude-*` model, `cache_savings_usd` is strictly g
 **Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
+   rtk proxy curl -s http://127.0.0.1:6867/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
    ```
 2. End the turn with the same large Read in flight (~1300-1500 lines clears the compression threshold).
 3. On the *next* turn, re-run the same `jq` command.
@@ -102,34 +102,34 @@ jq -r '.plugins | to_entries[] | "\(.key): \(.value[0].version // "?")"' ~/.clau
 ```
 Expect: the two markitdown versions are equal, and each plugin resolves to a version string. Plugin addons (ponytail, caveman) are the deliberate exception - `PLUGIN_DISPLAY_VERSION` is the literal `latest`, they track a marketplace rather than a pin, and `installed_addon_version` reads `installed_plugins.json` rather than the receipt. A plugin receipt lagging the installed version is therefore expected and not a failure; only the pinned addons (markitdown, serena, context7, codebase-memory) must agree.
 
-### 9. Backend port fallback when 6768 is held
-The desktop's internal proxy port (default `6768`) can be claimed by other macOS processes — most often `rapportd` at login. The desktop should scan `6769..=6790` and pick a free one instead of failing.
+### 9. Backend port fallback when 6868 is held
+The desktop's internal proxy port (default `6868`) can be claimed by other macOS processes — most often `rapportd` at login. The desktop should scan `6869..=6890` and pick a free one instead of failing.
 
 First, confirm the live port and verify the proxy answers there:
 ```bash
-lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
-curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
+lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6890)/ { print $9 }'
+curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6867/livez"
 ```
-Expect: at least one `127.0.0.1:67XX` line in the 6768-6790 range, and the curl returns `200`.
+Expect: at least one `127.0.0.1:67XX` line in the 6868-6890 range, and the curl returns `200`.
 
-Then, force a fallback. Quit Headroom, hold 6768 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. Three timing traps here. First: the quit must wait for the process to actually die — teardown takes 2s+ (`stop_headroom`'s bounded SIGTERM wait plus Codex thread retagging), and `open -a` against a still-dying instance just activates it, so nothing relaunches and the check strands with no app running (a fixed `sleep 2` loses this race; the executable is `headroom-desktop`, not `Headroom`, so poll with `pgrep -x headroom-desktop`). Second: the proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep. Third: every curl in the poll loop needs `--max-time` — against a half-booted intercept a timeout-less curl can hang for minutes, and with the backgrounded blocker still holding the shell's stdout open, one hung curl strands the whole script past any outer timeout even after the fallback has already succeeded (observed on the 0.7.6-rc.1 pass):
+Then, force a fallback. Quit Headroom, hold 6868 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. Three timing traps here. First: the quit must wait for the process to actually die — teardown takes 2s+ (`stop_headroom`'s bounded SIGTERM wait plus Codex thread retagging), and `open -a` against a still-dying instance just activates it, so nothing relaunches and the check strands with no app running (a fixed `sleep 2` loses this race; the executable is `headroom-desktop`, not `Headroom`, so poll with `pgrep -x headroom-desktop`). Second: the proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep. Third: every curl in the poll loop needs `--max-time` — against a half-booted intercept a timeout-less curl can hang for minutes, and with the backgrounded blocker still holding the shell's stdout open, one hung curl strands the whole script past any outer timeout even after the fallback has already succeeded (observed on the 0.7.6-rc.1 pass):
 ```bash
 osascript -e 'quit app "Headroom"' 2>/dev/null
 for _ in $(seq 1 30); do pgrep -xq headroom-desktop || break; sleep 0.5; done
-python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6768)); s.listen(16); time.sleep(180)" &
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6868)); s.listen(16); time.sleep(180)" &
 BLOCK_PID=$!
 sleep 1
 open -a Headroom
 for _ in $(seq 1 90); do
-  code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:6767/livez" 2>/dev/null)
+  code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:6867/livez" 2>/dev/null)
   [ "$code" = "200" ] && break
   sleep 1
 done
 echo "livez=$code"
-lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk -v IGNORECASE=1 '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
+lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk -v IGNORECASE=1 '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6890)/ { print $9 }'
 kill $BLOCK_PID 2>/dev/null
 ```
-Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). A second confirmation is the proxy log *filename*, which embeds the chosen port — a successful fallback leaves a `headroom-proxy---port-6769---....log` next to the usual `...port-6768...` one:
+Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). A second confirmation is the proxy log *filename*, which embeds the chosen port — a successful fallback leaves a `headroom-proxy---port-6869---....log` next to the usual `...port-6868...` one:
 ```bash
 ls -t ~/Library/Application\ Support/Headroom/headroom/logs/ | grep -m3 'headroom-proxy---port-'
 ```
@@ -184,7 +184,7 @@ Do not try to derive this from PERF `transforms=` instead. That field includes d
 The same class as check 11, one layer down: the desktop can *decide* on a flag and the live proxy never receive it. `--no-ccr` is deliberately excluded from `expected_proxy_arg_signature` in `tool_manager.rs` (a runtime too old to accept the flag would restart-loop, the same reason `--no-http2` is excluded), which means **adding it does not restart an already-running backend**. A build can ship the mitigation and run all day without it.
 
 ```bash
-PID=$(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)
+PID=$(lsof -ti TCP:6868 -sTCP:LISTEN | head -1)
 ps -o args= -p $PID | tr ' ' '\n' | grep -c -- '--no-ccr'
 ps eww -o command= -p $PID | grep -c 'pyinject'
 grep -c '_hd_sc_cacheable' \
@@ -192,9 +192,9 @@ grep -c '_hd_sc_cacheable' \
 ```
 Expect: `1` (flag live in the running process), `1` (PYTHONPATH points at the injection dir), and non-zero (the response-cache guard is in the file on disk, not just in the Rust literal). A `0` on line 1 with the flag present in `tool_manager.rs` means the backend predates the change - restart it and re-run, rather than trusting the source.
 
-Resolve the pid exactly as written. A bare `lsof -ti :6768` matches two processes - the backend that *listens* on 6768 and the desktop that holds a client connection to it - and `head -1` returns the lower pid, which is the desktop on any launch where it started first. Both counts then come back `0` and a healthy build reads as a hard FAIL (observed on the 0.8.1-rc.2 pass). `-sTCP:LISTEN` narrows it to the backend, but only when the protocol and port are a *single* selection (`-ti TCP:6768`): lsof ORs multiple `-i` arguments, so the plausible-looking `lsof -iTCP -sTCP:LISTEN -ti :6768` selects every TCP listener on the machine and `head -1` picks whatever unrelated daemon sorts first.
+Resolve the pid exactly as written. A bare `lsof -ti :6868` matches two processes - the backend that *listens* on 6868 and the desktop that holds a client connection to it - and `head -1` returns the lower pid, which is the desktop on any launch where it started first. Both counts then come back `0` and a healthy build reads as a hard FAIL (observed on the 0.8.1-rc.2 pass). `-sTCP:LISTEN` narrows it to the backend, but only when the protocol and port are a *single* selection (`-ti TCP:6868`): lsof ORs multiple `-i` arguments, so the plausible-looking `lsof -iTCP -sTCP:LISTEN -ti :6868` selects every TCP listener on the machine and `head -1` picks whatever unrelated daemon sorts first.
 
-Note the port: use the live backend port from check 9 if it fell back off `6768`.
+Note the port: use the live backend port from check 9 if it fell back off `6868`.
 
 The definitive probe of whether `sitecustomize.py` was actually *imported* (rather than merely present and on the path) is `kill -USR1 $PID`, which the injected code turns into a faulthandler thread dump in the proxy log. **It is destructive when it fails**: if injection did not happen, Python has no SIGUSR1 handler and the OS default terminates the proxy. That is an acceptable trade on a beta box - the signal is unambiguous either way and the restart is cheap - but do not run it against a session you care about.
 
@@ -277,10 +277,10 @@ Run these from a Codex CLI session (or with Codex configured and at least one Co
 ### C1. Codex is configured to route through Headroom
 ```bash
 grep -q 'model_provider = "headroom"' ~/.codex/config.toml && \
-  grep -q 'openai_base_url = "http://127.0.0.1:6767/v1"' ~/.codex/config.toml && \
+  grep -q 'openai_base_url = "http://127.0.0.1:6867/v1"' ~/.codex/config.toml && \
   grep -qF '[model_providers.headroom]' ~/.codex/config.toml && \
   grep -q 'supports_websockets = false' ~/.codex/config.toml && \
-  grep -q 'export OPENAI_BASE_URL=http://127.0.0.1:6767/v1' ~/.zshrc ~/.zprofile 2>/dev/null && \
+  grep -q 'export OPENAI_BASE_URL=http://127.0.0.1:6867/v1' ~/.zshrc ~/.zprofile 2>/dev/null && \
   echo PASS || echo FAIL
 ```
 Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `# >>> headroom:codex_cli >>>` with the root `model_provider`/`openai_base_url` keys, and `# >>> headroom:codex_cli_provider >>>` with the `[model_providers.headroom]` table — and a managed shell block exports `OPENAI_BASE_URL`. Headroom deliberately keeps `supports_websockets = false` so Codex uses the reliable HTTP Responses stream instead of failing the whole turn when an upstream WebSocket closes before `response.completed`. A `FAIL` means setup didn't write one of them (see `configure_codex_provider_block` / `configure_shell_block` in `client_adapters.rs`).
@@ -289,7 +289,7 @@ Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `#
 Codex is billed per token, so unlike a Claude Code subscription it runs in `token` mode and `requests_compressed` *does* move. Run this from inside Codex.
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
+   rtk proxy curl -s http://127.0.0.1:6867/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
    ```
 2. End the turn with a large file read in flight from Codex (~1300-1500 lines clears the compression threshold). As in check 7, the read lands in Codex's *next* prompt, so the re-check must be on a later turn.
 3. On the next turn, re-run the same command.
@@ -303,7 +303,7 @@ Open the dashboard and confirm a **Codex** group appears in the per-provider sav
 The Claude equivalent is check 6; Pause clears *all* client setups, so it must remove Codex's config too. In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
 ```bash
 grep -c 'headroom:codex_cli' ~/.codex/config.toml
-cat ~/.zshrc ~/.zprofile 2>/dev/null | grep -c 'OPENAI_BASE_URL=http://127.0.0.1:6767'
+cat ~/.zshrc ~/.zprofile 2>/dev/null | grep -c 'OPENAI_BASE_URL=http://127.0.0.1:6867'
 ```
 Expect: after Pause both print `0`; after Resume both are non-zero (config.toml back to `4` marker lines, shell back to one export per managed profile). Pause routes through `disable_codex_cli` — strips both TOML blocks, the `openai_base_url` root key, and the shell blocks; Resume re-applies them via `restore_client_setups`.
 
@@ -312,16 +312,16 @@ Expect: after Pause both print `0`; after Resume both are non-zero (config.toml 
 When inspecting the running proxy by hand (e.g. checking `/stats`), wrap `curl` with `rtk proxy` to bypass RTK's output filtering — otherwise large JSON responses get summarized into a type-shape view that looks like a broken endpoint:
 
 ```bash
-rtk proxy curl -s http://127.0.0.1:6767/stats | jq .summary
+rtk proxy curl -s http://127.0.0.1:6867/stats | jq .summary
 ```
 
 Every `rtk` invocation in this doc (checks 3, 7, C2, and above) has the same PATH caveat as check 3: when Claude Code or Codex runs them through their shell tool, `rtk` is not on PATH because the non-login shell never sources `~/.zprofile`. Either wrap the command in `zsh -lc '...'`, or call the binary by its managed path:
 
 ```bash
-"$HOME/Library/Application Support/Headroom/headroom/bin/rtk" proxy curl -s http://127.0.0.1:6767/stats | jq .summary
+"$HOME/Library/Application Support/Headroom/headroom/bin/rtk" proxy curl -s http://127.0.0.1:6867/stats | jq .summary
 ```
 
-When RTK is disabled (check 3's gate), the managed binary path above does not exist either — but no rewrite hook is active, so a plain `curl -s http://127.0.0.1:6767/stats | jq ...` is unfiltered and correct. Drop the `rtk proxy` wrapper entirely in that case.
+When RTK is disabled (check 3's gate), the managed binary path above does not exist either — but no rewrite hook is active, so a plain `curl -s http://127.0.0.1:6867/stats | jq ...` is unfiltered and correct. Drop the `rtk proxy` wrapper entirely in that case.
 
 ## When something fails
 

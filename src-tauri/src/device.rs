@@ -1,12 +1,10 @@
-use std::path::PathBuf;
-
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::keychain;
 
-const DEVICE_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.device";
+const DEVICE_KEYCHAIN_SERVICE: &str = "org.headroomlocal.community.device";
 const MACHINE_ID_DIGEST_ACCOUNT: &str = "machine-id-digest";
 
 static CACHED: Mutex<Option<DeviceIdentity>> = Mutex::new(None);
@@ -179,15 +177,14 @@ fn describe_os() -> String {
 }
 
 fn read_chopratejas_instance_id() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let headroom_dir = PathBuf::from(home).join(".headroom");
+    let headroom_dir = crate::edition::workspace_dir();
     if !headroom_dir.exists() {
         return None;
     }
-    // chopratejas/headroom stores its storage root under ~/.headroom. Their
-    // instance id is sha256(storage_path)[:16] when present, else
-    // sha256(hostname:uid)[:16]. We mirror that exactly so both tools land on
-    // the same value.
+    // headroom-ai derives its instance id from the configured storage root.
+    // Community points that root at ~/.headroom-local-community, so it never
+    // aliases the paid app's identity. The id remains
+    // sha256(storage_path)[:16].
     let path_str = headroom_dir.to_string_lossy().into_owned();
     Some(truncate_hex(&sha256_hex(&path_str), 16))
 }

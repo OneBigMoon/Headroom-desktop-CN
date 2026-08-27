@@ -1,0 +1,91 @@
+name: Release Headroom Local Community for macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: community-macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build universal macOS release
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate release version and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          tauri_version="$(node -p "JSON.parse(require('fs').readFileSync('./src-tauri/tauri.conf.json', 'utf8')).version")"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+          [[ "$package_version" == "$tauri_version" ]]
+          [[ "$package_version" == "$cargo_version" ]]
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" == "v${package_version}" ]]
+          fi
+          [[ -n "${HEADROOM_UPDATER_PUBLIC_KEY:-}" ]]
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust universal targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm run test:frontend
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
+
+      - name: Build and publish signed updater artifacts
+        uses: tauri-apps/tauri-action@action-v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Headroom Local Community v__VERSION__
+          releaseBody: |
+            Headroom Local Community macOS 社区发行版。
+
+            - 纯本地运行，不需要 Headroom 账户或付费后端。
+            - 更新包使用 Community 独立签名密钥验证。
+            - 全部代码复用与工具集成均依据相应开源许可证。
+            - 感谢 Headroom Desktop 原作者及所有集成工具作者和贡献者。
+
+            安装和签名问题请阅读 `docs/macos-install-and-signing.zh-CN.md`。
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target universal-apple-darwin --bundles app,dmg

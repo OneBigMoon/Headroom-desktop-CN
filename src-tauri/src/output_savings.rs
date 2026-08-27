@@ -163,14 +163,9 @@ pub struct OutputEstimate {
     pub baseline_tokens: u64,
 }
 
-/// Path to the proxy's savings ledger. Mirrors the backend's `workspace_dir()`
-/// default of `~/.headroom` (neither the proxy nor the seeding run sets
-/// `HEADROOM_WORKSPACE_DIR`, so both resolve here).
+/// Path to the proxy's savings ledger in the isolated Community workspace.
 pub fn ledger_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".headroom").join("output_savings.json"))
+    Some(crate::edition::workspace_dir().join("output_savings.json"))
 }
 
 /// Best available estimate from the on-disk ledger, or `None` when there is no

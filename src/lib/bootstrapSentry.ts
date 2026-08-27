@@ -1,5 +1,3 @@
-import * as Sentry from "@sentry/react";
-
 import { describeInvokeError } from "./appHelpers";
 import type { BootstrapProgress } from "./types";
 
@@ -73,26 +71,9 @@ export function bootstrapFailureSignature(report: BootstrapFailureReport): strin
   ].join("|");
 }
 
-export function reportBootstrapFailure(report: BootstrapFailureReport, cause?: unknown) {
-  const error = new Error(report.message);
-  error.name = "BootstrapFailedError";
-
-  Sentry.withScope((scope) => {
-    scope.setLevel("error");
-    scope.setTag("flow", "bootstrap");
-    scope.setTag("bootstrap_phase", report.phase);
-    scope.setTag("bootstrap_source", report.source);
-    scope.setFingerprint(["bootstrap_failed", report.phase, report.source]);
-    scope.setContext("bootstrap", {
-      currentStep: report.currentStep,
-      overallPercent: report.overallPercent,
-      currentStepEtaSeconds: report.currentStepEtaSeconds,
-    });
-
-    if (cause !== undefined) {
-      scope.setExtra("cause", describeInvokeError(cause, report.message));
-    }
-
-    Sentry.captureException(error);
-  });
+export function reportBootstrapFailure(
+  _report: BootstrapFailureReport,
+  _cause?: unknown
+) {
+  // Community builds keep failure details local in the UI and log files.
 }

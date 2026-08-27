@@ -35,6 +35,12 @@ function installStorage(initial: Record<string, string> = {}) {
   return values;
 }
 
+function localDayKey(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate()
+  ).padStart(2, "0")}`;
+}
+
 function makePricing(
   overrides: Partial<HeadroomPricingStatus> = {}
 ): HeadroomPricingStatus {
@@ -216,7 +222,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
 
   it("does not repeat a notification already fired today", async () => {
     isVisibleMock.mockResolvedValue(false);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey();
     installStorage({ headroom_urgent_needs_auth_date: today });
 
     await maybeFireUrgentPricingNotifications(
@@ -229,7 +235,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
   it("records today's date after sending", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey();
 
     await maybeFireUrgentPricingNotifications(
       makePricing({ needsAuthentication: true })
@@ -368,7 +374,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
   it("fires the generic reminder at most once per day", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage({
-      headroom_urgent_nudge_date: new Date().toISOString().slice(0, 10),
+      headroom_urgent_nudge_date: localDayKey(),
     });
 
     await maybeFireUrgentPricingNotifications(
@@ -617,12 +623,12 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     installStorage();
 
     await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false, startupError: "port 6767 busy" })
+      makeRuntime({ running: false, startupError: "port 6867 busy" })
     );
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
       title: "Headroom stopped running",
-      body: "Headroom isn't running: port 6767 busy",
+      body: "Headroom isn't running: port 6867 busy",
       action: "runtime",
     });
   });
@@ -634,7 +640,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     await maybeFireUrgentRuntimeNotification(
       makeRuntime({
         running: false,
-        startupError: "never opened port 6768 within 60000ms",
+        startupError: "never opened port 6868 within 60000ms",
         startupErrorHint: "Wait a moment and click Retry.",
       })
     );
@@ -692,7 +698,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
 
   it("does not repeat within the same day", async () => {
     isVisibleMock.mockResolvedValue(false);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey();
     installStorage({ headroom_urgent_runtime_down_date: today });
 
     await maybeFireUrgentRuntimeNotification(

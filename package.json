@@ -1,12 +1,13 @@
 {
-  "name": "headroom-desktop",
-  "version": "0.8.7",
-  "private": true,
+  "name": "headroom-local-community",
+  "version": "0.8.8",
+  "private": false,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:mac:dmg": "./scripts/build-macos-dmg.sh",
+    "build:mac:local": "./scripts/build-local-macos.sh",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",

@@ -17,8 +17,8 @@ The checks drive OpenCode with one-shot commands (`opencode run`), so they work 
 
 ```bash
 CFG=~/.config/opencode/opencode.json; [ -f ~/.config/opencode/opencode.jsonc ] && CFG=~/.config/opencode/opencode.jsonc
-jq -e '.provider.anthropic.options.baseURL == "http://127.0.0.1:6767/v1"
-   and .provider.openai.options.baseURL == "http://127.0.0.1:6767/v1"
+jq -e '.provider.anthropic.options.baseURL == "http://127.0.0.1:6867/v1"
+   and .provider.openai.options.baseURL == "http://127.0.0.1:6867/v1"
    and (.plugin | map(test("Headroom/opencode/entry\\.opencode\\.js$")) | any)' "$CFG" \
   && test -f ~/Library/Application\ Support/Headroom/opencode/entry.opencode.js \
   && echo PASS || echo FAIL
@@ -55,12 +55,12 @@ opencode run -m google/gemini-2.5-flash "say hi" 2>&1 | tail -2
 grep 'generativelanguage' ~/.headroom/logs/proxy.log | tail -1
 ```
 
-Expect: an error mentioning a Google API key (not an OpenAI or Anthropic error - the wording proves which vendor answered), and a proxy log line forwarding to `generativelanguage.googleapis.com` with `client=opencode` and `transforms=none`. `transforms=none` is EXPECTED: third-party formats are routed and attributed but not compressed (upstream issue #2602). If the error mentions `127.0.0.1:8787` instead, the vendored plugin's 6767 default regressed.
+Expect: an error mentioning a Google API key (not an OpenAI or Anthropic error - the wording proves which vendor answered), and a proxy log line forwarding to `generativelanguage.googleapis.com` with `client=opencode` and `transforms=none`. `transforms=none` is EXPECTED: third-party formats are routed and attributed but not compressed (upstream issue #2602). If the error mentions `127.0.0.1:8787` instead, the vendored plugin's 6867 default regressed.
 
 ### O5. Backend attributes the agent
 
 ```bash
-"$HOME/Library/Application Support/Headroom/headroom/bin/rtk" proxy curl -s http://127.0.0.1:6767/stats | jq '.agent_usage.agents | map(.name // .agent // .id)' 2>/dev/null | grep -i opencode && echo PASS || echo "check .agent_usage shape by hand"
+"$HOME/Library/Application Support/Headroom/headroom/bin/rtk" proxy curl -s http://127.0.0.1:6867/stats | jq '.agent_usage.agents | map(.name // .agent // .id)' 2>/dev/null | grep -i opencode && echo PASS || echo "check .agent_usage shape by hand"
 ```
 
 Expect: an `opencode` entry after O2/O3 traffic. (Key shape has drifted between backend versions - if the jq path misses, inspect `.agent_usage` by hand before calling FAIL.)
@@ -78,7 +78,7 @@ Learn view: an "OpenCode sessions" row must be present (connector enabled) and e
 Toggle the OpenCode connector off in Settings, then:
 
 ```bash
-jq -e '(.provider.anthropic.options.baseURL // "gone") != "http://127.0.0.1:6767/v1" and ((.plugin // []) | map(test("Headroom")) | any | not)' "$CFG" \
+jq -e '(.provider.anthropic.options.baseURL // "gone") != "http://127.0.0.1:6867/v1" and ((.plugin // []) | map(test("Headroom")) | any | not)' "$CFG" \
   && test ! -f ~/Library/Application\ Support/Headroom/opencode/entry.opencode.js \
   && echo PASS || echo FAIL
 ```
@@ -88,7 +88,7 @@ Expect: `PASS` - proxied baseURLs removed (or restored to the pre-Headroom value
 ## Cross-cutting
 
 - **Banner badge**: the OpenCode logo badge shows gray = off, green = active, red only when the connector is enabled while the proxy is unreachable. Tooltip opens downward and instantly on hover.
-- **Gate interplay**: with only OpenCode enabled, the Python backend must stay up (it is gate-exempt). `curl -s http://127.0.0.1:6767/livez` returns 200 with Claude and Codex both disabled.
+- **Gate interplay**: with only OpenCode enabled, the Python backend must stay up (it is gate-exempt). `curl -s http://127.0.0.1:6867/livez` returns 200 with Claude and Codex both disabled.
 - **Sentry**: the morning after, check the triage output for new error classes - misattributed connector errors (opencode traffic reported under codex fingerprints) would surface there first.
 
 ## When something fails

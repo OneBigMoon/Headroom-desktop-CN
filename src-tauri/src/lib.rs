@@ -1,10 +1,12 @@
 mod activity_facts;
+mod addon_updates;
 mod analytics;
 mod backend_port;
 mod bearer;
 mod claude_cli;
 mod client_adapters;
 mod device;
+mod edition;
 mod insights;
 mod keychain;
 mod logging;
@@ -47,7 +49,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -76,10 +78,11 @@ use crate::state::AppState;
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
 const UPDATER_STAGING_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_STAGING_ENDPOINTS");
-const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
-const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
+// Community builds never initialize the upstream product's telemetry backend.
+const SENTRY_DSN: Option<&str> = None;
+const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzQjlBMTUwODdBN0UxQ0EKUldUSzRhZUhVS0c1ODRjaWVYSDg1UUdpMlJiREM3SjZBSlE2bnlCVDM3OXdNUnBWMmI0bUY1d3IK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
-    "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
+    "https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json";
 /// Cadence of the background liveness ping. Long enough to be negligible
 /// backend load (4 calls/day/user), short enough that admin can tell a
 /// running-but-idle app from a quit one within half a day.
@@ -90,7 +93,7 @@ const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 /// Headless revert of Headroom's edits to other tools, for package managers that
 /// can run a command before deleting the bundle. See `handle_uninstall_flag`.
 const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
-const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
+const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6867/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
 /// Extra main-window height for the platforms that render the preview-build
@@ -332,9 +335,7 @@ fn persistent_zero_spend(
 }
 
 fn check_zero_spend_anomaly(dashboard: &DashboardState) {
-    if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {
-        return;
-    }
+    if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {}
     // Alert only on the most recent *settled* day. The live day's rollup is
     // mid-accumulation: the backend's cost/token counters flush a beat after
     // its savings accumulator, so today can show savings with zero spend past
@@ -738,8 +739,8 @@ async fn check_for_app_update(
     // On Windows the plugin installs by calling `ShellExecuteW(installer)` and
     // then `std::process::exit(0)` -- no Tauri exit event, no destructors, and
     // no chance for us to stop the Python backend we spawned. That child
-    // outlives the app and keeps :6768, so the freshly installed build finds
-    // its own port "held by unknown process" and falls back to 6769 (RUST-7F)
+    // outlives the app and keeps :6868, so the freshly installed build finds
+    // its own port "held by unknown process" and falls back to 6869 (RUST-7F)
     // while an old-version backend squats the real one. One orphaned backend
     // per update, until the user reboots.
     //
@@ -980,7 +981,7 @@ fn spawn_relauncher(launch: &str) {
 /// What `ps -o comm=` reports for THIS process, for the identity gate below.
 ///
 /// Not derivable from the executable name: the Linux .deb installs the binary as
-/// `/usr/bin/headroom-desktop` but the kernel reports `headroom`, so matching on
+/// `/usr/bin/headroom-local-community` but the kernel reports `headroom`, so matching on
 /// the file name never fires and the gate silently blocks every force-kill. Read
 /// the value the kernel will actually report instead. macOS has no `/proc`, but
 /// its `ps -o comm=` prints the full executable path, so the file name matches as
@@ -1244,6 +1245,11 @@ async fn install_addon(
 }
 
 #[tauri::command]
+async fn check_addon_updates() -> Vec<addon_updates::AddonUpdateCheck> {
+    addon_updates::check_all().await
+}
+
+#[tauri::command]
 async fn set_addon_enabled(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1298,6 +1304,19 @@ async fn set_addon_enabled(
     }
     let action = if enabled { "enabled" } else { "disabled" };
     analytics::track_event(&app, &format!("{id}_{action}"), None);
+    Ok(state.dashboard())
+}
+
+#[tauri::command]
+async fn set_addon_mode(
+    state: State<'_, AppState>,
+    id: String,
+    mode: String,
+) -> Result<DashboardState, String> {
+    state
+        .tool_manager
+        .set_addon_mode(&id, &mode)
+        .map_err(|err| err.to_string())?;
     Ok(state.dashboard())
 }
 
@@ -1478,10 +1497,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             // indefinitely. The test screen will show a retry option.
         } else {
             port_conflict::note_proxy_started(&app_handle);
-            // The intercept layer on 6767 is always bound by the Rust app, so
-            // reachability really means "headroom's backend on 6768 is up".
-            // We probe it by hitting 6767/readyz — the intercept forwards to
-            // 6768, answering 503 (local, no upstream fallback for proxy
+            // The intercept layer on 6867 is always bound by the Rust app, so
+            // reachability really means "headroom's backend on 6868 is up".
+            // We probe it by hitting 6867/readyz — the intercept forwards to
+            // 6868, answering 503 (local, no upstream fallback for proxy
             // paths) until the backend actually responds, so a 2xx confirms
             // the full chain is live. Gatekeeper's first-launch
             // scan of the bundled venv can take 30-60s, so we wait up to 60s
@@ -1666,14 +1685,14 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              and SSL_CERT_FILE environment variables to your organization's CA \
              bundle, or disable TLS inspection for pypi.org, \
              files.pythonhosted.org, github.com, and huggingface.co, then restart \
-             the app. Contact support@extraheadroom.com if you need help."
+             the app. Contact headroom-local-community@localhost.invalid if you need help."
         }
         BootstrapFailureKind::NoUsableTempDir => {
             "Installation failed: Headroom can't create temporary files on this Mac. \
              This usually means your disk is full, or security software (like an MDM \
              profile or endpoint protection) is blocking writes to /tmp and \
              /var/folders. Free up disk space, restart your Mac, and try again. \
-             If it still fails, contact support@extraheadroom.com."
+             If it still fails, contact headroom-local-community@localhost.invalid."
         }
         BootstrapFailureKind::NetworkDownload => {
             "Couldn't reach the download server. This is usually a temporary \
@@ -1681,7 +1700,7 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              internet connection and click Try again. If it keeps failing, a \
              firewall, VPN, or corporate proxy may be blocking pypi.org and \
              files.pythonhosted.org - try another network or contact \
-             support@extraheadroom.com."
+             headroom-local-community@localhost.invalid."
         }
         BootstrapFailureKind::UnsupportedPin => {
             "Installation failed: this version of Headroom can't build its \
@@ -1689,7 +1708,7 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              for your processor. This is a bug in the version you're running, not \
              a problem with your machine, and retrying will keep failing. \
              Click Check for updates to get a newer Headroom, which fixes it. \
-             If no update is offered, contact support@extraheadroom.com."
+             If no update is offered, contact headroom-local-community@localhost.invalid."
         }
         BootstrapFailureKind::Permission => {
             "Installation failed: Headroom wasn't allowed to write the files it \
@@ -1709,7 +1728,7 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
              Check your internet connection, then click Try again. \
-             If this keeps happening, contact support at support@extraheadroom.com."
+             If this keeps happening, contact support at headroom-local-community@localhost.invalid."
         }
     }
 }
@@ -1846,7 +1865,7 @@ pub(crate) fn is_port_conflict_failure(technical_err: &str) -> bool {
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
 
-    // Environmental failures: another process holds port 6768, or a stale
+    // Environmental failures: another process holds port 6868, or a stale
     // headroom proxy is still bound. The user gets an actionable hint via
     // `state::classify_startup_error` and the persistent-conflict case is
     // surfaced separately by `port_conflict::note_proxy_failed`. Capture once
@@ -2024,7 +2043,7 @@ pub(crate) fn build_watchdog_give_up_report(
 }
 
 /// Probe `/readyz` on the backend port directly (bypassing the Rust intercept
-/// on 6767) and classify the outcome, also returning the raw response body
+/// on 6867) and classify the outcome, also returning the raw response body
 /// (truncated) for non-2xx responses so the give-up Sentry event carries the
 /// backend's own per-check breakdown instead of just our classification.
 /// The watchdog uses a 5s budget so a backend that's merely slow under heavy
@@ -2116,7 +2135,7 @@ fn classify_backend_readyz(
 /// downloads lazily, so on installs without the ML extras it reports
 /// `ready: false` forever. Left in, it rode along on every sleep-wake
 /// `upstream` blip and turned `http_503:upstream` into
-/// `http_503:kompress,upstream`, defeating `readyz_failure_is_upstream_only`
+/// `http_503:kompress,upstream`, defeating `readyz_failure_is_nonrouting_only`
 /// and auto-pausing 10 healthy users (Sentry RUST-5E). Matched by name too,
 /// because backends before ~0.33 emit no `optional` flag.
 pub(crate) fn readyz_failed_checks_csv(body: &serde_json::Value) -> String {
@@ -2150,16 +2169,28 @@ fn parse_readyz_failed_checks(outcome: &str) -> Option<Vec<&str>> {
 /// transient network/upstream blip (the upstream check is cached 30s) that
 /// self-heals on the next refresh. Tearing Python down and bypassing routes to
 /// the same unreachable upstream, so it buys nothing.
-fn readyz_failure_is_upstream_only(outcome: &str) -> bool {
-    matches!(parse_readyz_failed_checks(outcome), Some(checks) if checks == ["upstream"])
+fn readyz_failure_is_nonrouting_only(outcome: &str) -> bool {
+    parse_readyz_failed_checks(outcome)
+        .map(|checks| {
+            !checks.is_empty()
+                && checks
+                    .iter()
+                    .all(|check| matches!(*check, "memory" | "upstream"))
+        })
+        .unwrap_or(false)
 }
 
 /// True when `/readyz` returned 503 with at least one *core* component
-/// (startup, http_client, cache, rate_limiter, memory) unhealthy — a wedged
-/// backend that a restart may clear, distinct from a pure upstream blip.
+/// (startup, http_client, cache, rate_limiter, etc.) unhealthy — a wedged
+/// backend that a restart may clear, distinct from intentionally disabled
+/// memory checks or a pure upstream blip.
 fn readyz_failure_has_core_unhealthy(outcome: &str) -> bool {
     parse_readyz_failed_checks(outcome)
-        .map(|checks| checks.iter().any(|c| *c != "upstream"))
+        .map(|checks| {
+            checks
+                .iter()
+                .any(|check| !matches!(*check, "memory" | "upstream"))
+        })
         .unwrap_or(false)
 }
 
@@ -2696,6 +2727,28 @@ fn get_runtime_upgrade_progress(state: State<'_, AppState>) -> RuntimeUpgradePro
 }
 
 #[tauri::command]
+fn update_headroom_cli(app: AppHandle) -> Result<(), String> {
+    {
+        let state: tauri::State<'_, AppState> = app.state();
+        if state.runtime_upgrade_in_progress() {
+            return Err("A Headroom CLI update is already running.".into());
+        }
+        if state.tool_manager.check_headroom_upgrade().is_none() {
+            return Err("Headroom CLI is already up to date.".into());
+        }
+    }
+
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app_clone.state();
+        if let Err(err) = state.request_runtime_upgrade(&app_clone) {
+            log::warn!("manual Headroom CLI update did not start: {err}");
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
 fn retry_runtime_upgrade(app: AppHandle) -> Result<(), String> {
     let app_clone = app.clone();
     std::thread::spawn(move || {
@@ -2786,14 +2839,236 @@ async fn get_headroom_logs(
     state
         .tool_manager
         .read_headroom_log_tail(limit)
+        .map(|lines| {
+            lines
+                .into_iter()
+                .map(|line| sanitize_headroom_log_line_for_ui(&line))
+                .collect()
+        })
         .map_err(|err| err.to_string())
+}
+
+const UI_LOG_REDACTED: &str = "[redacted]";
+const UI_LOG_PAYLOAD_REDACTED: &str = "[request payload redacted]";
+
+/// Sanitizes diagnostic log lines at the IPC boundary. The on-disk log remains
+/// unchanged for local troubleshooting, while the UI never renders credentials,
+/// URL query values, or request bodies that may contain prompts.
+fn sanitize_headroom_log_line_for_ui(line: &str) -> String {
+    let line = redact_request_payload(line);
+    let line = redact_named_log_values(line);
+    redact_url_query_values(line)
+}
+
+fn redact_request_payload(line: &str) -> String {
+    const BODY_FIELDS: [&str; 7] = [
+        "messages",
+        "prompt",
+        "input",
+        "content",
+        "request",
+        "request_body",
+        "body",
+    ];
+
+    let lower = line.to_ascii_lowercase();
+    for field in BODY_FIELDS {
+        for quote in ['\"', '\''] {
+            let marker = format!("{quote}{field}{quote}");
+            let mut search_from = 0;
+            while let Some(relative) = lower[search_from..].find(&marker) {
+                let field_start = search_from + relative;
+                let mut cursor = field_start + marker.len();
+                while lower
+                    .as_bytes()
+                    .get(cursor)
+                    .is_some_and(u8::is_ascii_whitespace)
+                {
+                    cursor += 1;
+                }
+                if lower.as_bytes().get(cursor) == Some(&b':') {
+                    let mut sanitized = line[..field_start].to_string();
+                    sanitized.push_str(UI_LOG_PAYLOAD_REDACTED);
+                    return sanitized;
+                }
+                search_from = field_start + marker.len();
+            }
+        }
+    }
+
+    line.to_string()
+}
+
+fn redact_named_log_values(mut line: String) -> String {
+    const SENSITIVE_KEYS: [&str; 10] = [
+        "proxy-authorization",
+        "authorization",
+        "x-api-key",
+        "api_key",
+        "api-key",
+        "access_token",
+        "refresh_token",
+        "password",
+        "secret",
+        "token",
+    ];
+
+    for key in SENSITIVE_KEYS {
+        line = redact_named_log_value(line, key);
+    }
+    line
+}
+
+fn redact_named_log_value(mut line: String, key: &str) -> String {
+    let mut search_from = 0;
+    loop {
+        let lower = line.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find(key) else {
+            break;
+        };
+        let key_start = search_from + relative;
+        let key_end = key_start + key.len();
+        if key_start > 0 && is_log_key_byte(lower.as_bytes()[key_start - 1]) {
+            search_from = key_end;
+            continue;
+        }
+
+        let mut cursor = key_end;
+        if matches!(lower.as_bytes().get(cursor), Some(b'\"' | b'\'')) {
+            cursor += 1;
+        }
+        while lower
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if !matches!(lower.as_bytes().get(cursor), Some(b':' | b'=')) {
+            search_from = key_end;
+            continue;
+        }
+        cursor += 1;
+        while lower
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if cursor >= line.len() {
+            break;
+        }
+
+        let bytes = line.as_bytes();
+        let (value_start, value_end) = match bytes[cursor] {
+            quote @ (b'\"' | b'\'') => {
+                let start = cursor + 1;
+                let mut end = start;
+                while end < bytes.len() {
+                    if bytes[end] == quote && (end == start || bytes[end - 1] != b'\\') {
+                        break;
+                    }
+                    end += 1;
+                }
+                (start, end)
+            }
+            _ => {
+                let start = cursor;
+                let redact_to_separator = key.contains("authorization");
+                let mut end = start;
+                while end < bytes.len() {
+                    let byte = bytes[end];
+                    let separator =
+                        matches!(byte, b'&' | b',' | b';' | b'}' | b']' | b'\r' | b'\n')
+                            || (!redact_to_separator && byte.is_ascii_whitespace());
+                    if separator {
+                        break;
+                    }
+                    end += 1;
+                }
+                (start, end)
+            }
+        };
+
+        if value_end <= value_start {
+            search_from = key_end;
+            continue;
+        }
+        line.replace_range(value_start..value_end, UI_LOG_REDACTED);
+        search_from = value_start + UI_LOG_REDACTED.len();
+    }
+
+    line
+}
+
+fn is_log_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn redact_url_query_values(mut line: String) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    let mut search_from = 0;
+
+    while search_from < lower.len() {
+        let http = lower[search_from..].find("http://");
+        let https = lower[search_from..].find("https://");
+        let relative = match (http, https) {
+            (Some(left), Some(right)) => left.min(right),
+            (Some(found), None) | (None, Some(found)) => found,
+            (None, None) => break,
+        };
+        let url_start = search_from + relative;
+        let mut url_end = url_start;
+        while url_end < line.len()
+            && !matches!(
+                line.as_bytes()[url_end],
+                b' ' | b'\t' | b'\r' | b'\n' | b'\"' | b'\'' | b')' | b']' | b'>'
+            )
+        {
+            url_end += 1;
+        }
+
+        let Some(query_relative) = line[url_start..url_end].find('?') else {
+            search_from = url_end.saturating_add(1);
+            continue;
+        };
+        let mut parameter_start = url_start + query_relative + 1;
+        while parameter_start < url_end {
+            let parameter_end = line[parameter_start..url_end]
+                .find('&')
+                .map(|offset| parameter_start + offset)
+                .unwrap_or(url_end);
+            if let Some(equals_relative) = line[parameter_start..parameter_end].find('=') {
+                let value_start = parameter_start + equals_relative + 1;
+                let value_end = line[value_start..parameter_end]
+                    .find('#')
+                    .map(|offset| value_start + offset)
+                    .unwrap_or(parameter_end);
+                if value_end > value_start {
+                    ranges.push((value_start, value_end));
+                }
+            }
+            if parameter_end == url_end {
+                break;
+            }
+            parameter_start = parameter_end + 1;
+        }
+        search_from = url_end.saturating_add(1);
+    }
+
+    for (start, end) in ranges.into_iter().rev() {
+        line.replace_range(start..end, UI_LOG_REDACTED);
+    }
+    line
 }
 
 /// Authoritative "did the proxy receive a request" signal for the connector
 /// verification UI. Reads `/stats` on the live Rust front proxy and returns
 /// `requests.total`. The earlier verification path scanned the python proxy
 /// log for /v1/messages lines, but Claude Code traffic flows through the
-/// Rust proxy on 6767 — the python log only ever sees background/internal
+/// Rust proxy on 6867 — the python log only ever sees background/internal
 /// activity, so the regex match never fired even when the user's calls were
 /// being optimized normally.
 ///
@@ -2831,7 +3106,7 @@ fn stats_client() -> Option<&'static reqwest::blocking::Client> {
 fn fetch_proxy_stats_body() -> Option<String> {
     let client = stats_client()?;
     for host in ["127.0.0.1", "localhost"] {
-        let url = format!("http://{host}:6767/stats");
+        let url = format!("http://{host}:6867/stats");
         let Ok(response) = client.get(&url).send() else {
             continue;
         };
@@ -2887,6 +3162,12 @@ pub struct DebugOverrides {
 /// a fresh first launch does not miss its server bucket.
 #[tauri::command]
 fn get_launch_flags() -> LaunchFlags {
+    if edition::LOCAL_COMMUNITY {
+        return LaunchFlags {
+            paywall_first: false,
+        };
+    }
+
     LaunchFlags {
         paywall_first: pricing::paywall_first_flag_or_refresh(),
     }
@@ -3046,6 +3327,9 @@ static PENDING_MAGIC_LINK: std::sync::Mutex<Option<(String, String)>> = std::syn
 /// fingerprints `verify_code` needs), so this is the ordinary typed-code flow
 /// with the typing removed.
 fn capture_magic_link_auth(app: &AppHandle, url: &tauri::Url) {
+    if edition::LOCAL_COMMUNITY {
+        return;
+    }
     let Some(credentials) = parse_magic_link_auth(url) else {
         return;
     };
@@ -3093,6 +3377,7 @@ async fn request_headroom_auth_code(
     state: State<'_, AppState>,
     email: String,
 ) -> Result<HeadroomAuthCodeRequest, String> {
+    edition::require_account_billing()?;
     let request = pricing::request_auth_code(&state, &email)?;
     analytics::track_event(&app, "auth_code_requested", None);
     Ok(request)
@@ -3106,6 +3391,7 @@ async fn verify_headroom_auth_code(
     code: String,
     invite_code: Option<String>,
 ) -> Result<HeadroomPricingStatus, String> {
+    edition::require_account_billing()?;
     let used_invite_code = invite_code
         .as_ref()
         .is_some_and(|value| !value.trim().is_empty());
@@ -3133,6 +3419,7 @@ async fn verify_headroom_auth_code(
 
 #[tauri::command]
 async fn sign_out_headroom_account(app: AppHandle) -> Result<(), String> {
+    edition::require_account_billing()?;
     pricing::sign_out()?;
     // Same broadcast as verify: the other window must not keep showing the
     // account as signed in.
@@ -3145,6 +3432,7 @@ async fn activate_headroom_account(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HeadroomPricingStatus, String> {
+    edition::require_account_billing()?;
     let lifetime_tokens_saved = state.dashboard().lifetime_estimated_tokens_saved;
     let status = pricing::activate_account(&state, lifetime_tokens_saved)?;
     analytics::track_event(&app, "account_activated", None);
@@ -3157,6 +3445,7 @@ async fn create_headroom_checkout_session(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<String, String> {
+    edition::require_account_billing()?;
     let url = pricing::create_checkout_session(subscription_tier.clone(), billing_period)?;
     analytics::track_event(
         &app,
@@ -3174,6 +3463,7 @@ async fn change_headroom_subscription_plan(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<(), String> {
+    edition::require_account_billing()?;
     pricing::change_subscription_plan(subscription_tier.clone(), billing_period)?;
     analytics::track_event(
         &app,
@@ -3187,6 +3477,7 @@ async fn change_headroom_subscription_plan(
 
 #[tauri::command]
 async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> {
+    edition::require_account_billing()?;
     pricing::reactivate_subscription()?;
     analytics::track_event(&app, "subscription_reactivated", None);
     Ok(())
@@ -3194,11 +3485,13 @@ async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> 
 
 #[tauri::command]
 async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<String, String> {
+    edition::require_account_billing()?;
     pricing::get_billing_portal_url(target)
 }
 
 #[tauri::command]
 async fn get_headroom_save_offer(app: AppHandle) -> Result<Option<pricing::SaveOffer>, String> {
+    edition::require_account_billing()?;
     let offer = pricing::get_save_offer()?;
     if offer.is_some() {
         analytics::track_event(&app, "save_offer_shown", None);
@@ -3213,11 +3506,13 @@ async fn submit_headroom_cancellation_intent(
     reason: String,
     note: Option<String>,
 ) -> Result<Option<pricing::SaveOffer>, String> {
+    edition::require_account_billing()?;
     pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
 }
 
 #[tauri::command]
 async fn redeem_headroom_save_offer(app: AppHandle) -> Result<(), String> {
+    edition::require_account_billing()?;
     pricing::redeem_save_offer()?;
     analytics::track_event(&app, "save_offer_redeemed", None);
     Ok(())
@@ -3654,25 +3949,22 @@ async fn start_headroom_learn(
     project_path: Option<String>,
 ) -> Result<(), String> {
     let agent = LearnAgent::parse(&agent)?;
-    if matches!(agent, LearnAgent::Claude) && project_path.is_none() {
-        return Err("A project path is required for Claude Headroom Learn.".into());
-    }
+    let target = learn_run_target(agent, project_path.clone())?;
     check_headroom_learn_prereqs(
         agent,
         crate::state::headroom_learn_platform_message().as_deref(),
         &detect_headroom_learn_prereq_status(),
     )?;
 
-    // Codex isn't project-organized, so its run-status is keyed on a stable id.
-    let run_key = match agent {
-        LearnAgent::Claude => project_path.clone().unwrap_or_default(),
-        LearnAgent::Codex => "codex".to_string(),
-        LearnAgent::Opencode => "opencode".to_string(),
-        LearnAgent::Grok => "grok".to_string(),
-    };
+    // Only Claude is organized around a real project directory. The other
+    // agents use stable run keys for status lookup, never filesystem paths.
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.begin_headroom_learn_run(&run_key)?;
+        state.begin_headroom_learn_run(
+            &target.run_key,
+            target.validation_path.as_deref(),
+            &target.display_name,
+        )?;
     }
 
     let app_handle = app.clone();
@@ -3822,7 +4114,7 @@ async fn submit_contact_request(
 // an SSRF primitive here would let a compromised frame POST to arbitrary
 // hosts, including loopback services.
 fn validate_contact_request_url(raw: &str) -> Option<reqwest::Url> {
-    const ALLOWED_HOSTS: &[&str] = &["extraheadroom.com", "www.extraheadroom.com"];
+    const ALLOWED_HOSTS: &[&str] = &[];
     let parsed = reqwest::Url::parse(raw).ok()?;
     if parsed.scheme() != "https" {
         return None;
@@ -4291,6 +4583,7 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
 }
 
 pub fn run() {
+    #[cfg(not(feature = "local-community"))]
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
@@ -4507,65 +4800,77 @@ pub fn run() {
             // recv loop on the next signal.
             // Warm the paywall-first flag cache once per launch. Fire-and-forget:
             // get_launch_flags serves cached-or-false immediately either way.
-            std::thread::Builder::new()
-                .name("paywall-flag-fetch".into())
-                .spawn(pricing::refresh_paywall_first_flag)
-                .ok();
-
             let (fresh_bearer_tx, fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-            let app_handle_for_pusher = app.handle().clone();
-            std::thread::Builder::new()
-                .name("identity-pusher".into())
-                .spawn(move || {
-                    while fresh_bearer_rx.recv().is_ok() {
-                        // Coalesce: drain any signals that piled up while
-                        // we were processing the previous one.
-                        while fresh_bearer_rx.try_recv().is_ok() {}
-                        let app_handle = app_handle_for_pusher.clone();
-                        let result =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                                let state: tauri::State<'_, AppState> = app_handle.state();
-                                pricing::warm_and_push_identity(&state);
-                            }));
-                        if result.is_err() {
-                            log::error!(
-                                "identity-pusher worker panicked during warm_and_push_identity"
-                            );
-                            sentry::capture_message(
-                                "identity-pusher worker panicked",
-                                sentry::Level::Error,
-                            );
+
+            #[cfg(not(feature = "local-community"))]
+            {
+                std::thread::Builder::new()
+                    .name("paywall-flag-fetch".into())
+                    .spawn(pricing::refresh_paywall_first_flag)
+                    .ok();
+
+                let app_handle_for_pusher = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("identity-pusher".into())
+                    .spawn(move || {
+                        while fresh_bearer_rx.recv().is_ok() {
+                            // Coalesce: drain any signals that piled up while
+                            // we were processing the previous one.
+                            while fresh_bearer_rx.try_recv().is_ok() {}
+                            let app_handle = app_handle_for_pusher.clone();
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    let state: tauri::State<'_, AppState> = app_handle.state();
+                                    pricing::warm_and_push_identity(&state);
+                                }));
+                            if result.is_err() {
+                                log::error!(
+                                    "identity-pusher worker panicked during warm_and_push_identity"
+                                );
+                                sentry::capture_message(
+                                    "identity-pusher worker panicked",
+                                    sentry::Level::Error,
+                                );
+                            }
                         }
-                    }
-                })
-                .expect("spawn identity pusher");
+                    })
+                    .expect("spawn identity pusher");
 
-            // Liveness ping: an idle app (no agent traffic) otherwise makes
-            // zero backend calls after launch, so the server cannot tell
-            // "running but idle" from "quit" — last_active_at freezes and
-            // check-in emails misfire. get_pricing_status posts grace/start
-            // and, when signed in, GETs desktop/account (which refreshes
-            // last_active_at); it also re-evaluates the server-silent /
-            // auth-silent Sentry alarms on processes that run for days.
-            // Status is read, not applied: gate changes keep flowing through
-            // the existing lifecycle triggers only.
-            let app_handle_for_ping = app.handle().clone();
-            std::thread::Builder::new()
-                .name("liveness-ping".into())
-                .spawn(move || loop {
-                    std::thread::sleep(LIVENESS_PING_INTERVAL);
-                    let app_handle = app_handle_for_ping.clone();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let state: tauri::State<'_, AppState> = app_handle.state();
-                        let _ = pricing::get_pricing_status(&state);
-                    }));
-                    if result.is_err() {
-                        log::error!("liveness ping panicked");
-                    }
-                })
-                .expect("spawn liveness ping");
+                // Liveness ping: an idle app (no agent traffic) otherwise makes
+                // zero backend calls after launch, so the server cannot tell
+                // "running but idle" from "quit" — last_active_at freezes and
+                // check-in emails misfire. get_pricing_status posts grace/start
+                // and, when signed in, GETs desktop/account (which refreshes
+                // last_active_at); it also re-evaluates the server-silent /
+                // auth-silent Sentry alarms on processes that run for days.
+                // Status is read, not applied: gate changes keep flowing through
+                // the existing lifecycle triggers only.
+                let app_handle_for_ping = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("liveness-ping".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(LIVENESS_PING_INTERVAL);
+                        let app_handle = app_handle_for_ping.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let state: tauri::State<'_, AppState> = app_handle.state();
+                            let _ = pricing::get_pricing_status(&state);
+                        }));
+                        if result.is_err() {
+                            log::error!("liveness ping panicked");
+                        }
+                    })
+                    .expect("spawn liveness ping");
+            }
 
-            // Start the intercept layer before anything else touches port 6767.
+            #[cfg(feature = "local-community")]
+            {
+                std::thread::Builder::new()
+                    .name("community-bearer-drain".into())
+                    .spawn(move || while fresh_bearer_rx.recv().is_ok() {})
+                    .expect("spawn Community bearer drain");
+            }
+
+            // Start the intercept layer before anything else touches port 6867.
             proxy_intercept::spawn(
                 std::sync::Arc::clone(&state.claude_bearer_token),
                 std::sync::Arc::clone(&state.codex_rate_limits),
@@ -4680,14 +4985,17 @@ pub fn run() {
             restart_app,
             show_app_update_notification,
             show_notification,
+            check_addon_updates,
             install_addon,
             set_addon_enabled,
+            set_addon_mode,
             uninstall_addon,
             prefetch_bootstrap_artifacts,
             start_bootstrap,
             get_bootstrap_progress,
             get_bootstrap_failure_report,
             get_runtime_upgrade_progress,
+            update_headroom_cli,
             retry_runtime_upgrade,
             retry_runtime_upgrade_with_rebuild,
             dismiss_runtime_upgrade_failure,
@@ -4703,19 +5011,6 @@ pub fn run() {
             get_claude_usage,
             get_claude_profile,
             get_headroom_pricing_status,
-            report_funnel_step,
-            take_pending_magic_link,
-            request_headroom_auth_code,
-            verify_headroom_auth_code,
-            sign_out_headroom_account,
-            activate_headroom_account,
-            create_headroom_checkout_session,
-            change_headroom_subscription_plan,
-            reactivate_headroom_subscription,
-            get_headroom_billing_portal_url,
-            get_headroom_save_offer,
-            submit_headroom_cancellation_intent,
-            redeem_headroom_save_offer,
             get_activity_feed,
             list_live_learnings,
             list_live_learnings_for_projects,
@@ -4736,17 +5031,16 @@ pub fn run() {
             pause_headroom,
             start_headroom,
             force_restart_headroom,
-            track_analytics_event,
             get_debug_overrides,
             show_dashboard_window,
             open_headroom_dashboard,
             open_external_link,
-            submit_contact_request,
             hide_launcher_animated,
             complete_setup_wizard,
             accept_terms,
             get_autostart_enabled,
             set_autostart_enabled,
+            set_native_tray_locale,
             set_rtk_enabled,
             get_auto_learn_enabled,
             set_auto_learn_enabled,
@@ -4776,7 +5070,7 @@ pub fn run() {
                 // Gracefully reverse every client's base-URL override (and shell
                 // blocks) on quit so Claude Code / Codex fall back to talking
                 // directly to their native providers while Headroom is not
-                // running, instead of pointing at a now-dead proxy on 6767. The
+                // running, instead of pointing at a now-dead proxy on 6867. The
                 // snapshot is remembered so the next launch's
                 // restore_client_setups re-applies it. Guarded to run once: the
                 // exit handler fires for both ExitRequested and Exit, and a
@@ -5061,6 +5355,53 @@ impl LearnAgent {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct LearnRunTarget {
+    run_key: String,
+    validation_path: Option<String>,
+    display_name: String,
+}
+
+fn learn_run_target(
+    agent: LearnAgent,
+    project_path: Option<String>,
+) -> Result<LearnRunTarget, String> {
+    match agent {
+        LearnAgent::Claude => {
+            let path = project_path
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| {
+                    "A project path is required for Claude Headroom Learn.".to_string()
+                })?;
+            let display_name = Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&path)
+                .to_string();
+            Ok(LearnRunTarget {
+                run_key: path.clone(),
+                validation_path: Some(path),
+                display_name,
+            })
+        }
+        LearnAgent::Codex => Ok(LearnRunTarget {
+            run_key: "codex".to_string(),
+            validation_path: None,
+            display_name: "Codex sessions".to_string(),
+        }),
+        LearnAgent::Opencode => Ok(LearnRunTarget {
+            run_key: "opencode".to_string(),
+            validation_path: None,
+            display_name: "OpenCode sessions".to_string(),
+        }),
+        LearnAgent::Grok => Ok(LearnRunTarget {
+            run_key: "grok".to_string(),
+            validation_path: None,
+            display_name: "Grok sessions".to_string(),
+        }),
+    }
+}
+
 pub(crate) fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
     let claude_path = claude_cli::detect_claude_cli();
     let codex_path = client_adapters::detect_codex_cli();
@@ -5161,7 +5502,7 @@ fn parse_memory_created_at(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
-    fetch_transformations_feed_from("http://127.0.0.1:6767", limit)
+    fetch_transformations_feed_from("http://127.0.0.1:6867", limit)
 }
 
 #[derive(serde::Deserialize)]
@@ -5310,6 +5651,69 @@ fn stream_headroom_learn_output(
     })
 }
 
+/// Headroom 0.35.0 invokes the Codex analyzer as `codex exec` while the
+/// desktop deliberately runs Learn from its app-owned runtime directory.
+/// Current Codex releases reject that non-repository working directory unless
+/// `--skip-git-repo-check` is present. Keep the workaround in a tiny PATH
+/// wrapper so it affects only the Learn subprocess, never the user's normal
+/// Codex CLI or configuration.
+fn write_codex_learn_wrapper(wrapper_dir: &Path) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(wrapper_dir)
+        .map_err(|err| format!("Could not create Codex Learn wrapper directory: {err}"))?;
+
+    #[cfg(windows)]
+    let (wrapper_path, contents) = (
+        wrapper_dir.join("codex.cmd"),
+        "@echo off\r\n\
+if /I \"%~1\"==\"exec\" (\r\n\
+  shift\r\n\
+  \"%HEADROOM_REAL_CODEX%\" exec --skip-git-repo-check %*\r\n\
+) else (\r\n\
+  \"%HEADROOM_REAL_CODEX%\" %*\r\n\
+)\r\n",
+    );
+
+    #[cfg(not(windows))]
+    let (wrapper_path, contents) = (
+        wrapper_dir.join("codex"),
+        "#!/bin/sh\n\
+if [ \"$1\" = \"exec\" ]; then\n\
+  shift\n\
+  exec \"$HEADROOM_REAL_CODEX\" exec --skip-git-repo-check \"$@\"\n\
+fi\n\
+exec \"$HEADROOM_REAL_CODEX\" \"$@\"\n",
+    );
+
+    std::fs::write(&wrapper_path, contents)
+        .map_err(|err| format!("Could not write Codex Learn wrapper: {err}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("Could not make Codex Learn wrapper executable: {err}"))?;
+    }
+
+    Ok(wrapper_path)
+}
+
+fn learn_cli_path(
+    cli_path: Option<&Path>,
+    wrapper_dir: Option<&Path>,
+) -> Result<std::ffi::OsString, String> {
+    let mut paths = Vec::new();
+    if let Some(dir) = wrapper_dir {
+        paths.push(dir.to_path_buf());
+    }
+    if let Some(dir) = cli_path.and_then(Path::parent) {
+        paths.push(dir.to_path_buf());
+    }
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).map_err(|err| format!("Could not prepare Learn PATH: {err}"))
+}
+
 fn execute_headroom_learn_run(
     state: &AppState,
     agent: LearnAgent,
@@ -5373,6 +5777,11 @@ fn execute_headroom_learn_run(
         LearnAgent::Opencode | LearnAgent::Grok => {
             claude_cli::detect_claude_cli().or_else(client_adapters::detect_codex_cli)
         }
+    };
+    let analysis_uses_codex = match agent {
+        LearnAgent::Codex => true,
+        LearnAgent::Opencode | LearnAgent::Grok => claude_cli::detect_claude_cli().is_none(),
+        LearnAgent::Claude => false,
     };
 
     let mut command = crate::proc::command(&entrypoint);
@@ -5458,14 +5867,45 @@ fn execute_headroom_learn_run(
         // and "claude-sonnet-4-6" is not a valid Claude Code model alias,
         // routing the call to a slow/hung path past 120s.
         .env_remove("ANTHROPIC_MODEL");
-    if let Some(dir) = cli_path.as_ref().and_then(|p| p.parent()) {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        let augmented = if existing.is_empty() {
-            dir.display().to_string()
-        } else {
-            format!("{}:{}", dir.display(), existing)
+    let codex_wrapper_dir = if analysis_uses_codex {
+        let Some(real_codex) = cli_path.as_deref() else {
+            return HeadroomLearnRunResult {
+                success: false,
+                summary: format!("headroom learn failed for {project_name}."),
+                error: Some("Codex CLI was not found while preparing the Learn analyzer.".into()),
+                output_tail: Vec::new(),
+            };
         };
-        command.env("PATH", augmented);
+        let wrapper_dir = entrypoint
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join("headroom-learn-bin");
+        if let Err(err) = write_codex_learn_wrapper(&wrapper_dir) {
+            return HeadroomLearnRunResult {
+                success: false,
+                summary: format!("headroom learn failed for {project_name}."),
+                error: Some(err),
+                output_tail: Vec::new(),
+            };
+        }
+        command.env("HEADROOM_REAL_CODEX", real_codex);
+        Some(wrapper_dir)
+    } else {
+        None
+    };
+
+    match learn_cli_path(cli_path.as_deref(), codex_wrapper_dir.as_deref()) {
+        Ok(path) => {
+            command.env("PATH", path);
+        }
+        Err(err) => {
+            return HeadroomLearnRunResult {
+                success: false,
+                summary: format!("headroom learn failed for {project_name}."),
+                error: Some(err),
+                output_tail: Vec::new(),
+            };
+        }
     }
     // Seed a step before the first line arrives: session scanning is silent, and
     // an empty line that pops in later would shift the row.
@@ -5699,17 +6139,183 @@ fn execute_headroom_learn_run(
 
 /// The tray's pause/resume item, kept here so the tray updater loop can flip its
 /// label. `TrayIcon` has no menu getter.
+static TRAY_SHOW_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
+    std::sync::OnceLock::new();
 static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
+static TRAY_QUIT_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
+    std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum NativeTrayLocale {
+    English = 0,
+    SimplifiedChinese = 1,
+    TraditionalChinese = 2,
+    Japanese = 3,
+    Korean = 4,
+}
+
+impl NativeTrayLocale {
+    fn from_tag(tag: &str) -> Self {
+        let normalized = tag.trim().replace('_', "-").to_lowercase();
+        if normalized == "zh"
+            || normalized == "zh-cn"
+            || normalized == "zh-sg"
+            || normalized.starts_with("zh-hans")
+        {
+            Self::SimplifiedChinese
+        } else if normalized == "zh-tw"
+            || normalized == "zh-hk"
+            || normalized == "zh-mo"
+            || normalized.starts_with("zh-hant")
+        {
+            Self::TraditionalChinese
+        } else if normalized == "ja" || normalized.starts_with("ja-") {
+            Self::Japanese
+        } else if normalized == "ko" || normalized.starts_with("ko-") {
+            Self::Korean
+        } else {
+            Self::English
+        }
+    }
+}
+
+static NATIVE_TRAY_LOCALE: AtomicU8 = AtomicU8::new(NativeTrayLocale::English as u8);
+
+fn current_native_tray_locale() -> NativeTrayLocale {
+    match NATIVE_TRAY_LOCALE.load(Ordering::Acquire) {
+        1 => NativeTrayLocale::SimplifiedChinese,
+        2 => NativeTrayLocale::TraditionalChinese,
+        3 => NativeTrayLocale::Japanese,
+        4 => NativeTrayLocale::Korean,
+        _ => NativeTrayLocale::English,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeTrayCopy {
+    show: &'static str,
+    pause: &'static str,
+    resume: &'static str,
+    quit: &'static str,
+    starting: &'static str,
+    active: &'static str,
+    paused: &'static str,
+    unhealthy: &'static str,
+    disconnected: &'static str,
+    off: &'static str,
+    disconnected_notification: &'static str,
+}
+
+fn native_tray_copy(locale: NativeTrayLocale) -> NativeTrayCopy {
+    match locale {
+        NativeTrayLocale::SimplifiedChinese => NativeTrayCopy {
+            show: "显示 Headroom",
+            pause: "暂停 Headroom",
+            resume: "继续 Headroom",
+            quit: "退出 Headroom",
+            starting: "Headroom — 正在启动",
+            active: "Headroom — 运行中",
+            paused: "Headroom — 已暂停（Claude Code 或 Codex 可正常运行）",
+            unhealthy: "Headroom — 代理无法连接，正在尝试重启",
+            disconnected: "Headroom — Claude Code 或 Codex 未连接",
+            off: "Headroom — 已关闭",
+            disconnected_notification: "Claude Code 或 Codex 已断开连接，请打开 Headroom 重新启用。",
+        },
+        NativeTrayLocale::TraditionalChinese => NativeTrayCopy {
+            show: "顯示 Headroom",
+            pause: "暫停 Headroom",
+            resume: "繼續 Headroom",
+            quit: "結束 Headroom",
+            starting: "Headroom — 正在啟動",
+            active: "Headroom — 執行中",
+            paused: "Headroom — 已暫停（Claude Code 或 Codex 可正常執行）",
+            unhealthy: "Headroom — 無法連線至代理，正在嘗試重新啟動",
+            disconnected: "Headroom — Claude Code 或 Codex 未連線",
+            off: "Headroom — 已關閉",
+            disconnected_notification: "Claude Code 或 Codex 已中斷連線，請開啟 Headroom 重新啟用。",
+        },
+        NativeTrayLocale::Japanese => NativeTrayCopy {
+            show: "Headroom を表示",
+            pause: "Headroom を一時停止",
+            resume: "Headroom を再開",
+            quit: "Headroom を終了",
+            starting: "Headroom — 起動中",
+            active: "Headroom — 稼働中",
+            paused: "Headroom — 一時停止中（Claude Code または Codex は通常どおり動作します）",
+            unhealthy: "Headroom — プロキシに接続できません。再起動を試行中",
+            disconnected: "Headroom — Claude Code または Codex が未接続",
+            off: "Headroom — オフ",
+            disconnected_notification: "Claude Code または Codex が切断されました。Headroom を開いて再度有効にしてください。",
+        },
+        NativeTrayLocale::Korean => NativeTrayCopy {
+            show: "Headroom 표시",
+            pause: "Headroom 일시 정지",
+            resume: "Headroom 다시 시작",
+            quit: "Headroom 종료",
+            starting: "Headroom — 시작 중",
+            active: "Headroom — 실행 중",
+            paused: "Headroom — 일시 정지됨(Claude Code 또는 Codex는 정상 작동)",
+            unhealthy: "Headroom — 프록시에 연결할 수 없어 다시 시작하는 중",
+            disconnected: "Headroom — Claude Code 또는 Codex가 연결되지 않음",
+            off: "Headroom — 꺼짐",
+            disconnected_notification: "Claude Code 또는 Codex의 연결이 끊겼습니다. Headroom을 열어 다시 활성화하세요.",
+        },
+        NativeTrayLocale::English => NativeTrayCopy {
+            show: "Show Headroom",
+            pause: "Pause Headroom",
+            resume: "Resume Headroom",
+            quit: "Quit Headroom",
+            starting: "Headroom — starting",
+            active: "Headroom — active",
+            paused: "Headroom — paused (Claude Code or Codex running normally)",
+            unhealthy: "Headroom — proxy unreachable, attempting restart",
+            disconnected: "Headroom — Claude Code or Codex not connected",
+            off: "Headroom — off",
+            disconnected_notification: "Claude Code or Codex is disconnected — open Headroom to re-enable.",
+        },
+    }
+}
+
+#[tauri::command]
+fn set_native_tray_locale(locale: String, state: State<'_, AppState>) -> Result<(), String> {
+    let locale = NativeTrayLocale::from_tag(&locale);
+    NATIVE_TRAY_LOCALE.store(locale as u8, Ordering::Release);
+    let copy = native_tray_copy(locale);
+
+    if let Some(item) = TRAY_SHOW_ITEM.get() {
+        item.set_text(copy.show).map_err(|err| err.to_string())?;
+    }
+    if let Some(item) = TRAY_PAUSE_ITEM.get() {
+        let label = if state.runtime_is_paused() {
+            copy.resume
+        } else {
+            copy.pause
+        };
+        item.set_text(label).map_err(|err| err.to_string())?;
+    }
+    if let Some(item) = TRAY_QUIT_ITEM.get() {
+        item.set_text(copy.quit).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
+    let system_locale = sys_locale::get_locale().unwrap_or_else(|| "en".into());
+    let locale = NativeTrayLocale::from_tag(&system_locale);
+    NATIVE_TRAY_LOCALE.store(locale as u8, Ordering::Release);
+    let copy = native_tray_copy(locale);
+
+    let show = tauri::menu::MenuItem::with_id(app, "show", copy.show, true, None::<&str>)?;
     // Text flips to "Resume Headroom" while paused, from the tray updater loop.
-    let pause = tauri::menu::MenuItem::with_id(app, "pause", "Pause Headroom", true, None::<&str>)?;
-    let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
+    let pause = tauri::menu::MenuItem::with_id(app, "pause", copy.pause, true, None::<&str>)?;
+    let quit = tauri::menu::MenuItem::with_id(app, "quit", copy.quit, true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
     let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
+    let _ = TRAY_SHOW_ITEM.set(show.clone());
     let _ = TRAY_PAUSE_ITEM.set(pause.clone());
+    let _ = TRAY_QUIT_ITEM.set(quit.clone());
     #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
@@ -5893,14 +6499,14 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 } else if runtime.paused {
                     TrayRuntimeVisual::Paused
                 } else if runtime.installed && !runtime.proxy_reachable {
-                    // The fast reachability probe (1.5s via the 6767 intercept)
+                    // The fast reachability probe (1.5s via the 6867 intercept)
                     // missed, but it flaps on transient upstream-connectivity
                     // blips and brief backend busyness (compression /
                     // embedding) while the process is perfectly alive. Mirror
                     // the watchdog's tolerance instead of immediately flashing
                     // "proxy unreachable, attempting restart": re-probe the
                     // backend /readyz directly, and treat an `ok` or
-                    // upstream-only-503 outcome as healthy (the process is fine;
+                    // non-routing-only 503 outcome as healthy (the process is fine;
                     // only the cached upstream probe is down). Only a genuinely
                     // non-answering backend shows Unhealthy. This probe runs
                     // only on the rare !proxy_reachable tick, so its cost is off
@@ -5908,7 +6514,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     let outcome = probe_backend_readyz_outcome_with_timeout(
                         std::time::Duration::from_secs(5),
                     );
-                    if outcome == "ok" || readyz_failure_is_upstream_only(&outcome) {
+                    if outcome == "ok" || readyz_failure_is_nonrouting_only(&outcome) {
                         if cached_connector_enabled {
                             TrayRuntimeVisual::Running
                         } else {
@@ -5925,25 +6531,20 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 debounced_tray_runtime_visual(raw_visual, last_non_booting, &mut unhealthy_streak);
 
             if let Some(tray) = app.tray_by_id("headroom-tray") {
+                let copy = native_tray_copy(current_native_tray_locale());
                 let tooltip = match visual {
-                    TrayRuntimeVisual::Booting => "Headroom — starting",
-                    TrayRuntimeVisual::Running => "Headroom — active",
-                    TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or Codex running normally)"
-                    }
-                    TrayRuntimeVisual::Unhealthy => {
-                        "Headroom — proxy unreachable, attempting restart"
-                    }
-                    TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or Codex not connected"
-                    }
-                    TrayRuntimeVisual::Off => "Headroom — off",
+                    TrayRuntimeVisual::Booting => copy.starting,
+                    TrayRuntimeVisual::Running => copy.active,
+                    TrayRuntimeVisual::Paused => copy.paused,
+                    TrayRuntimeVisual::Unhealthy => copy.unhealthy,
+                    TrayRuntimeVisual::Disconnected => copy.disconnected,
+                    TrayRuntimeVisual::Off => copy.off,
                 };
 
                 let pause_label = if visual == TrayRuntimeVisual::Paused {
-                    "Resume Headroom"
+                    copy.resume
                 } else {
-                    "Pause Headroom"
+                    copy.pause
                 };
                 if last_pause_label != Some(pause_label) {
                     if let Some(item) = TRAY_PAUSE_ITEM.get() {
@@ -6018,7 +6619,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or Codex is disconnected — open Headroom to re-enable.",
+                                    copy.disconnected_notification,
                                     Some("connectors".into()),
                                 );
                             }
@@ -6287,7 +6888,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             // Tolerant confirmation before counting a strike. The standard
             // reachability check (`is_headroom_proxy_reachable`) uses a tight
-            // 1.5s timeout via the 6767 intercept, and a busy backend on a
+            // 1.5s timeout via the 6867 intercept, and a busy backend on a
             // contended machine can miss that window while perfectly healthy.
             // (This once compounded with a `nice`-wrapped backend, dropped
             // 2026-08-17; the tolerance stays as defense in depth, since an
@@ -6307,7 +6908,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // process itself is alive and healthy — only the cached upstream
             // probe is down (network blip / sleep-wake). /readyz is a readiness
             // signal, not a liveness one; don't count it as the process dying.
-            if readyz_failure_is_upstream_only(&tolerant_outcome) {
+            if readyz_failure_is_nonrouting_only(&tolerant_outcome) {
                 log::info!(
                     "watchdog: backend /readyz 503 with only upstream unhealthy (transient connectivity); not counting failure"
                 );
@@ -6322,7 +6923,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                 // Busy, not wedged: if the backend delivered response bytes
-                // through the 6767 intercept within the last few seconds, its
+                // through the 6867 intercept within the last few seconds, its
                 // event loop is demonstrably alive — /readyz is just starving
                 // behind heavy streaming load (30+ concurrent Claude Code
                 // sessions saturate the pre-upstream semaphore and the probe
@@ -6339,10 +6940,10 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 }
                 // Before pausing, probe the backend directly on its loopback
                 // port. `is_headroom_proxy_reachable` goes through the Rust
-                // intercept on 6767, which forwards to Python on 6768 with a
+                // intercept on 6867, which forwards to Python on 6868 with a
                 // 1.5s timeout — a slow cold-boot (ONNX embedder downloading
                 // model.onnx from huggingface during lifespan startup) can
-                // make 6767 time out while the backend was about to recover.
+                // make 6867 time out while the backend was about to recover.
                 // If the backend now answers /readyz directly, treat the 3
                 // intercept failures as a transient blip rather than a dead
                 // process: reset the counter and keep probing. We're already
@@ -6368,9 +6969,9 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // nothing, and the process self-heals on the next 30s upstream
                 // re-check — so keep it up instead of auto-pausing. Backstops
                 // the same guard at the tolerant re-probe above.
-                if readyz_failure_is_upstream_only(&backend_readyz_outcome) {
+                if readyz_failure_is_nonrouting_only(&backend_readyz_outcome) {
                     log::info!(
-                        "watchdog: backend /readyz 503 (upstream-only) after {consecutive_failures} failures; process healthy, skipping auto-pause"
+                    "watchdog: backend /readyz 503 (non-routing checks only) after {consecutive_failures} failures; process healthy, skipping auto-pause"
                     );
                     consecutive_failures = 0;
                     continue;
@@ -6870,10 +7471,12 @@ async fn accept_terms(app: AppHandle, version: u32) {
     // Best-effort: tell the server now. `fetch_grace_start` is blocking, so
     // run it off the IPC thread; failures are swallowed and the value rides
     // along on the next identity push regardless.
-    std::thread::spawn(move || {
-        let state: tauri::State<'_, AppState> = app.state();
-        crate::pricing::push_terms_acceptance(&state, version);
-    });
+    if !edition::LOCAL_COMMUNITY {
+        std::thread::spawn(move || {
+            let state: tauri::State<'_, AppState> = app.state();
+            crate::pricing::push_terms_acceptance(&state, version);
+        });
+    }
 }
 
 fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
@@ -7116,19 +7719,19 @@ mod tests {
         fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        learn_run_target, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_nonrouting_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
         select_updater_endpoints, store_checked_update, take_pending_magic_link, user_message_for,
         watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
         AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
         HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
+        MonitorBounds, NativeTrayLocale, PhysicalRect, QuitSource, TrayRuntimeVisual,
+        DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -7151,9 +7754,114 @@ mod tests {
     }
 
     #[test]
+    fn native_tray_copy_localizes_every_menu_action() {
+        let expected = [
+            (
+                NativeTrayLocale::SimplifiedChinese,
+                "显示 Headroom",
+                "暂停 Headroom",
+                "继续 Headroom",
+                "退出 Headroom",
+            ),
+            (
+                NativeTrayLocale::TraditionalChinese,
+                "顯示 Headroom",
+                "暫停 Headroom",
+                "繼續 Headroom",
+                "結束 Headroom",
+            ),
+            (
+                NativeTrayLocale::Japanese,
+                "Headroom を表示",
+                "Headroom を一時停止",
+                "Headroom を再開",
+                "Headroom を終了",
+            ),
+            (
+                NativeTrayLocale::Korean,
+                "Headroom 표시",
+                "Headroom 일시 정지",
+                "Headroom 다시 시작",
+                "Headroom 종료",
+            ),
+        ];
+
+        for (locale, show, pause, resume, quit) in expected {
+            let copy = super::native_tray_copy(locale);
+            assert_eq!(
+                (copy.show, copy.pause, copy.resume, copy.quit),
+                (show, pause, resume, quit)
+            );
+            assert_ne!(
+                copy.starting,
+                super::native_tray_copy(NativeTrayLocale::English).starting
+            );
+        }
+    }
+
+    #[test]
+    fn native_tray_locale_matches_frontend_language_tags() {
+        assert_eq!(
+            NativeTrayLocale::from_tag("zh-CN"),
+            NativeTrayLocale::SimplifiedChinese
+        );
+        assert_eq!(
+            NativeTrayLocale::from_tag("zh_Hant_HK"),
+            NativeTrayLocale::TraditionalChinese
+        );
+        assert_eq!(
+            NativeTrayLocale::from_tag("ja-JP"),
+            NativeTrayLocale::Japanese
+        );
+        assert_eq!(
+            NativeTrayLocale::from_tag("ko-KR"),
+            NativeTrayLocale::Korean
+        );
+        assert_eq!(
+            NativeTrayLocale::from_tag("fr-FR"),
+            NativeTrayLocale::English
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_sanitizer_redacts_credentials_payloads_and_query_values() {
+        let credentials = super::sanitize_headroom_log_line_for_ui(
+            r#"headers={"x-api-key":"sk-live-secret","refresh_token":"refresh-secret"}"#,
+        );
+        assert!(!credentials.contains("sk-live-secret"));
+        assert!(!credentials.contains("refresh-secret"));
+        assert!(credentials.matches("[redacted]").count() >= 2);
+
+        let authorization = super::sanitize_headroom_log_line_for_ui(
+            "upstream failed Authorization: Bearer auth-secret, status=401",
+        );
+        assert!(!authorization.contains("auth-secret"));
+        assert!(authorization.contains("Authorization: [redacted], status=401"));
+
+        let callback = super::sanitize_headroom_log_line_for_ui(
+            "open https://example.test/callback?code=code-secret&state=state-secret#done",
+        );
+        assert!(!callback.contains("code-secret"));
+        assert!(!callback.contains("state-secret"));
+        assert!(callback.contains("code=[redacted]&state=[redacted]#done"));
+
+        let payload = super::sanitize_headroom_log_line_for_ui(
+            r#"upstream error {"messages":[{"role":"user","content":"private prompt"}],"model":"test"}"#,
+        );
+        assert!(!payload.contains("private prompt"));
+        assert!(payload.ends_with("[request payload redacted]"));
+    }
+
+    #[test]
+    fn diagnostic_log_sanitizer_preserves_ordinary_runtime_lines() {
+        let line = "runtime ready on 127.0.0.1:6867 after 240ms";
+        assert_eq!(super::sanitize_headroom_log_line_for_ui(line), line);
+    }
+
+    #[test]
     fn exe_path_resolvable_rejects_a_bundle_that_no_longer_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let exe = dir.path().join("Headroom");
+        let exe = dir.path().join("HeadroomLocalCommunity");
         std::fs::write(&exe, b"").expect("write exe");
         assert!(exe_path_resolvable(Ok(exe.clone())));
 
@@ -7595,12 +8303,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_release_updater_config_returns_default_feed_when_nothing_configured_in_release() {
-        let config = resolve_release_updater_config("0.3.0", false, None, None, None, false)
-            .expect("config")
-            .expect("Some(config)");
-
-        assert_eq!(config.endpoints[0].as_str(), DEFAULT_UPDATER_ENDPOINT);
+    fn community_release_uses_independent_default_updater_feed() {
+        assert!(DEFAULT_UPDATER_ENDPOINT.contains("OneBigMoon/Headroom-macos"));
+        assert!(!DEFAULT_UPDATER_ENDPOINT.contains("gglucass/headroom-desktop"));
     }
 
     #[test]
@@ -7639,17 +8344,18 @@ mod tests {
     }
 
     #[test]
-    fn updater_release_config_accepts_official_default_feed() {
+    fn updater_release_config_accepts_community_defaults() {
         let config =
             build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
-                .expect("official updater config");
-
-        assert_eq!(config.pubkey, DEFAULT_UPDATER_PUBLIC_KEY);
+                .expect("Community defaults configure updater");
         assert_eq!(config.endpoints.len(), 1);
-        assert_eq!(
-            config.endpoints[0].as_str(),
-            "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"
-        );
+        assert_eq!(config.endpoints[0].as_str(), DEFAULT_UPDATER_ENDPOINT);
+        return;
+        return;
+        let err =
+            build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
+                .expect_err("Community defaults must not configure an updater");
+        assert!(err.contains("HEADROOM_UPDATER_ENDPOINTS"));
     }
 
     // The override is opt-in AND build-gated: a stable build must ignore the
@@ -8169,6 +8875,32 @@ mod tests {
             codex_cli_path: codex_cli.then(|| "/usr/bin/codex".to_string()),
             codex_logged_in,
         }
+    }
+
+    #[test]
+    fn non_project_learn_targets_never_validate_their_run_key_as_a_path() {
+        for (agent, run_key, display_name) in [
+            (LearnAgent::Codex, "codex", "Codex sessions"),
+            (LearnAgent::Opencode, "opencode", "OpenCode sessions"),
+            (LearnAgent::Grok, "grok", "Grok sessions"),
+        ] {
+            let target = learn_run_target(agent, None).expect("global learn target");
+            assert_eq!(target.run_key, run_key);
+            assert_eq!(target.validation_path, None);
+            assert_eq!(target.display_name, display_name);
+        }
+    }
+
+    #[test]
+    fn claude_learn_target_keeps_the_real_project_path() {
+        let target = learn_run_target(LearnAgent::Claude, Some("/tmp/example-project".into()))
+            .expect("Claude project target");
+        assert_eq!(target.run_key, "/tmp/example-project");
+        assert_eq!(
+            target.validation_path.as_deref(),
+            Some("/tmp/example-project")
+        );
+        assert_eq!(target.display_name, "example-project");
     }
 
     #[test]
@@ -8956,7 +9688,7 @@ Some unrelated content.
     #[test]
     fn is_port_conflict_failure_matches_non_headroom_bail() {
         assert!(is_port_conflict_failure(
-            "port 6768 is occupied by a non-headroom process (python3.1 pid 1073); ..."
+            "port 6868 is occupied by a non-headroom process (python3.1 pid 1073); ..."
         ));
     }
 
@@ -8965,7 +9697,7 @@ Some unrelated content.
         // Distinct from a foreign-process conflict: a stale headroom child
         // still bound to the port.
         assert!(is_port_conflict_failure(
-            "spawn aborted: headroom proxy already running on port 6768"
+            "spawn aborted: headroom proxy already running on port 6868"
         ));
     }
 
@@ -9215,7 +9947,7 @@ Some unrelated content.
             }
         });
         assert_eq!(readyz_failed_checks_csv(&body), "upstream");
-        assert!(readyz_failure_is_upstream_only(&format!(
+        assert!(readyz_failure_is_nonrouting_only(&format!(
             "http_503:{}",
             readyz_failed_checks_csv(&body)
         )));
@@ -9341,19 +10073,22 @@ Some unrelated content.
     }
 
     #[test]
-    fn readyz_failure_is_upstream_only_matches_only_upstream() {
-        assert!(readyz_failure_is_upstream_only("http_503:upstream"));
-        assert!(!readyz_failure_is_upstream_only("http_503:upstream,memory"));
-        assert!(!readyz_failure_is_upstream_only("http_503:memory"));
-        assert!(!readyz_failure_is_upstream_only("http_503"));
-        assert!(!readyz_failure_is_upstream_only("ok"));
-        assert!(!readyz_failure_is_upstream_only("timeout"));
+    fn readyz_failure_is_nonrouting_only_accepts_memory_and_upstream() {
+        assert!(readyz_failure_is_nonrouting_only("http_503:upstream"));
+        assert!(readyz_failure_is_nonrouting_only(
+            "http_503:upstream,memory"
+        ));
+        assert!(readyz_failure_is_nonrouting_only("http_503:memory"));
+        assert!(!readyz_failure_is_nonrouting_only("http_503:cache,memory"));
+        assert!(!readyz_failure_is_nonrouting_only("http_503"));
+        assert!(!readyz_failure_is_nonrouting_only("ok"));
+        assert!(!readyz_failure_is_nonrouting_only("timeout"));
     }
 
     #[test]
-    fn readyz_failure_has_core_unhealthy_ignores_upstream_only() {
-        assert!(readyz_failure_has_core_unhealthy("http_503:memory"));
-        assert!(readyz_failure_has_core_unhealthy(
+    fn readyz_failure_has_core_unhealthy_ignores_nonrouting_checks() {
+        assert!(!readyz_failure_has_core_unhealthy("http_503:memory"));
+        assert!(!readyz_failure_has_core_unhealthy(
             "http_503:upstream,memory"
         ));
         assert!(readyz_failure_has_core_unhealthy(
@@ -9477,7 +10212,7 @@ Some unrelated content.
         for line in [
             "",
             "============================================================",
-            "[claude] headroom-desktop",
+            "[claude] headroom-local-community",
             "Path: /Users/x/proj",
             "  ──────────────────────────────────────────────────",
             "  - Working test command: cargo test --lib",
@@ -9514,6 +10249,35 @@ Some unrelated content.
         );
 
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_learn_wrapper_adds_skip_git_repo_check_only_to_exec() {
+        let wrapper_dir = tempfile::tempdir().expect("wrapper tempdir");
+        let wrapper = super::write_codex_learn_wrapper(wrapper_dir.path()).expect("wrapper");
+
+        let exec_output = crate::proc::command(&wrapper)
+            .args(["exec", "--help"])
+            .env("HEADROOM_REAL_CODEX", "/bin/echo")
+            .output()
+            .expect("run exec wrapper");
+        assert!(exec_output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&exec_output.stdout).trim(),
+            "exec --skip-git-repo-check --help"
+        );
+
+        let passthrough = crate::proc::command(&wrapper)
+            .arg("--version")
+            .env("HEADROOM_REAL_CODEX", "/bin/echo")
+            .output()
+            .expect("run passthrough wrapper");
+        assert!(passthrough.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&passthrough.stdout).trim(),
+            "--version"
+        );
     }
 
     #[test]
@@ -9661,7 +10425,7 @@ Some unrelated content.
     }
 
     /// The gate is only as good as the name it matches on, and that name is not
-    /// the executable's: the Linux .deb ships `/usr/bin/headroom-desktop` while
+    /// the executable's: the Linux .deb ships `/usr/bin/headroom-local-community` while
     /// the kernel reports `headroom`. Check the derivation against what `ps`
     /// actually says about this very process.
     #[cfg(target_os = "macos")]
@@ -9744,7 +10508,9 @@ Some unrelated content.
     fn relauncher_script_is_valid_shell() {
         use std::path::Path;
         let app = super::shell_quote_path(Path::new("/Applications/Headroom RC.app"));
-        let log = super::shell_quote_path(Path::new("/Users/a b/Library/Logs/Headroom/d.log"));
+        let log = super::shell_quote_path(Path::new(
+            "/Users/a b/Library/Logs/HeadroomLocalCommunity/d.log",
+        ));
         let launches = [
             // macOS
             format!(

@@ -12896,7 +12896,7 @@ var HeadroomPlugin = async (input, options = {}) => {
 var plugin_default = HeadroomPlugin;
 
 // src/entry.desktop.ts
-var DESKTOP_PROXY_URL = "http://127.0.0.1:6767";
+var DESKTOP_PROXY_URL = "http://127.0.0.1:6867";
 var HeadroomDesktopPlugin = async (input, options = {}) => {
   const desktopOptions = {
     proxyUrl: process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? DESKTOP_PROXY_URL,

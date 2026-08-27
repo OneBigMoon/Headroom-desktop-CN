@@ -1,4 +1,4 @@
-export const PREVIEW_SUPPORT_EMAIL = "support@extraheadroom.com";
+export const PREVIEW_SUPPORT_EMAIL = "headroom-local-community@localhost.invalid";
 
 export function platformPreviewNoticeFor(
   platform: string | undefined,

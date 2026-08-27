@@ -16,12 +16,12 @@ use crate::models::{
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
 
-const HEADROOM_ACCOUNT_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.account";
+const HEADROOM_ACCOUNT_KEYCHAIN_SERVICE: &str = "org.headroomlocal.community.account";
 const HEADROOM_ACCOUNT_SESSION_ACCOUNT: &str = "session-token";
 #[cfg(debug_assertions)]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
-const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
+const DEFAULT_ACCOUNT_API_BASE_URL: &str = crate::edition::ACCOUNT_API_LOOPBACK_SINK;
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
 const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
 // Set to true in dev builds to skip sign-in requirement (indefinite trial)
@@ -310,12 +310,18 @@ pub fn push_terms_acceptance(state: &AppState, version: u32) {
 /// a detached thread so it never blocks the UI or gates the wizard; the server
 /// is first-write-wins, so repeats are harmless.
 pub fn report_funnel_step(state: &AppState, step: &str) {
+    if crate::edition::LOCAL_COMMUNITY {
+        return;
+    }
     spawn_funnel_step(IdentityPayload::for_state(state), step);
 }
 
 /// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
 /// intercept thread). Device identity alone keys the server's `TrialIdentity`.
 pub fn report_funnel_step_device_only(step: &str) {
+    if crate::edition::LOCAL_COMMUNITY {
+        return;
+    }
     spawn_funnel_step(IdentityPayload::device_only(), step);
 }
 
@@ -430,6 +436,9 @@ pub fn is_identity_complete(profile: &ClaudeAccountProfile) -> bool {
 /// push in this session, this is a no-op. On HTTP failure the fingerprint
 /// is not recorded, so the next bearer change retries.
 pub fn warm_and_push_identity(state: &AppState) {
+    if crate::edition::LOCAL_COMMUNITY {
+        return;
+    }
     const COMPLETE_FETCH_THROTTLE: std::time::Duration =
         std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -711,7 +720,105 @@ enum RemoteAccountSyncError {
     Other,
 }
 
+#[cfg(feature = "local-community")]
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
+    let now = Utc::now();
+    let claude = detect_claude_profile(state);
+    let codex = fetch_codex_usage(state, None, false).map(|mut usage| {
+        usage.optimization_allowed = true;
+        usage.should_nudge = false;
+        usage.nudge_level = 0;
+        usage.gate_reason = None;
+        usage.recommended_subscription_tier = None;
+        usage.gate_message = "Local optimization enabled.".into();
+        usage.effective_nudge_thresholds_percent.clear();
+        usage.effective_disable_threshold_percent = 0.0;
+        usage
+    });
+    Ok(HeadroomPricingStatus {
+        authenticated: false,
+        local_grace_started_at: now,
+        local_grace_ends_at: now + Duration::days(36_500),
+        local_grace_active: true,
+        account_sync_error: None,
+        needs_authentication: false,
+        optimization_allowed: true,
+        should_nudge: false,
+        nudge_level: 0,
+        gate_reason: None,
+        gate_message: "Local optimization enabled.".into(),
+        nudge_threshold_percent: None,
+        effective_nudge_thresholds_percent: None,
+        disable_threshold_percent: None,
+        effective_disable_threshold_percent: None,
+        recommended_subscription_tier: None,
+        tier_mismatch: None,
+        claude,
+        codex,
+        codex_plan_tier: Some(state.codex_plan_tier()),
+        account: None,
+        launch_discount_active: false,
+        active_percent_off: 0,
+        pricing_cohorts: Vec::new(),
+        intro_offer: None,
+        plan_prices: None,
+    })
+}
+
+#[cfg(not(feature = "local-community"))]
+pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
+    if crate::edition::LOCAL_COMMUNITY {
+        let now = Utc::now();
+        let claude = detect_claude_profile(state);
+        let mut status = evaluate_pricing_status_with_mismatch(
+            false,
+            now,
+            now + Duration::days(36_500),
+            true,
+            None,
+            None,
+            claude,
+            PricingPromo::default(),
+            state.last_known_good_plan_tier(),
+            None,
+        );
+        status.authenticated = false;
+        status.local_grace_active = true;
+        status.needs_authentication = false;
+        status.optimization_allowed = true;
+        status.should_nudge = false;
+        status.nudge_level = 0;
+        status.gate_reason = None;
+        status.gate_message =
+            "Headroom Local Community is enabled locally. No account or subscription is required."
+                .into();
+        status.nudge_threshold_percent = None;
+        status.effective_nudge_thresholds_percent = None;
+        status.disable_threshold_percent = None;
+        status.effective_disable_threshold_percent = None;
+        status.recommended_subscription_tier = None;
+        status.tier_mismatch = None;
+        status.account = None;
+        status.launch_discount_active = false;
+        status.active_percent_off = 0;
+        status.pricing_cohorts.clear();
+        status.intro_offer = None;
+        status.plan_prices = None;
+        status.codex = fetch_codex_usage(state, None, false).map(|mut usage| {
+            usage.optimization_allowed = true;
+            usage.should_nudge = false;
+            usage.nudge_level = 0;
+            usage.gate_reason = None;
+            usage.recommended_subscription_tier = None;
+            usage.gate_message = "Local community optimization is enabled.".into();
+            usage.effective_nudge_thresholds_percent.clear();
+            usage.effective_disable_threshold_percent = 0.0;
+            usage
+        });
+        status.codex_plan_tier = Some(state.codex_plan_tier());
+        return Ok(status);
+    }
+
     let mut local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
@@ -3215,6 +3322,9 @@ pub fn paywall_first_flag_or_refresh() -> bool {
 /// Called once from `setup()` on a background thread, and synchronously only
 /// when the frontend asks for launch flags before any cache exists.
 pub fn refresh_paywall_first_flag() {
+    if crate::edition::LOCAL_COMMUNITY {
+        return;
+    }
     let Some(config) = fetch_public_config() else {
         return;
     };
@@ -3488,6 +3598,10 @@ fn api_url(path: &str) -> String {
 }
 
 fn api_base_url() -> String {
+    if crate::edition::LOCAL_COMMUNITY {
+        return crate::edition::ACCOUNT_API_LOOPBACK_SINK.to_string();
+    }
+
     // Runtime override is only honored in debug builds. In release builds an
     // attacker with persistence on the user's machine (e.g. a launchd plist)
     // could otherwise redirect every billing/auth call to a rogue host.
@@ -3601,6 +3715,15 @@ mod tests {
         HeadroomAccountProfile, HeadroomPricingStatus, PricingGateReason, TierMismatch,
         TierRecommendationSource,
     };
+
+    #[test]
+    fn community_account_api_is_loopback_only() {
+        assert!(crate::edition::LOCAL_COMMUNITY);
+        assert_eq!(
+            super::api_base_url(),
+            crate::edition::ACCOUNT_API_LOOPBACK_SINK
+        );
+    }
 
     #[test]
     fn public_config_parses_with_and_without_paywall_first() {
@@ -4250,10 +4373,7 @@ mod tests {
     #[test]
     fn release_default_points_at_production_api() {
         #[cfg(not(debug_assertions))]
-        assert_eq!(
-            DEFAULT_ACCOUNT_API_BASE_URL,
-            "https://extraheadroom.com/api/v1"
-        );
+        assert_eq!(DEFAULT_ACCOUNT_API_BASE_URL, "http://127.0.0.1:9/api/v1");
     }
 
     fn empty_claude_profile(plan_tier: ClaudePlanTier) -> ClaudeAccountProfile {
@@ -5817,7 +5937,11 @@ mod tests {
             // would otherwise share and race one real file-backed secret store.
             std::env::set_var(
                 "HEADROOM_DATA_DIR",
-                scratch.path().join(".local").join("share").join("Headroom"),
+                scratch
+                    .path()
+                    .join(".local")
+                    .join("share")
+                    .join("HeadroomLocalCommunity"),
             );
             crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
                 .expect("ensure_data_dirs in scratch");
@@ -5965,7 +6089,11 @@ mod tests {
         // written by a parallel test process would otherwise be visible here.
         std::env::set_var(
             "HEADROOM_DATA_DIR",
-            scratch.path().join(".local").join("share").join("Headroom"),
+            scratch
+                .path()
+                .join(".local")
+                .join("share")
+                .join("HeadroomLocalCommunity"),
         );
         crate::storage::ensure_data_dirs(&crate::storage::app_data_dir()).unwrap();
         let (state, dir) = temp_app_state();

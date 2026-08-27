@@ -1,15 +1,12 @@
 import { useEffect, useState } from "react";
+import { useI18n, type TranslationKey } from "../lib/i18n";
 
 /** Rotated through during the long silent LLM call so the line keeps moving.
  * Index 0 of the cycle is the real step ("Analyzing with Claude Code"), so
  * the backend name resurfaces once per loop. */
-const LEARN_ANALYZING_PHRASES = [
-  "Reading your sessions",
-  "Finding recurring friction",
-  "Spotting repeated failures",
-  "Sorting signal from noise",
-  "Distilling durable patterns",
-  "Drafting memory updates"
+const LEARN_ANALYZING_KEYS: TranslationKey[] = [
+  "learn.scan.reading", "learn.scan.friction", "learn.scan.failures",
+  "learn.scan.signal", "learn.scan.patterns", "learn.scan.drafting"
 ];
 
 const TYPE_INTERVAL_MS = 18;
@@ -21,7 +18,7 @@ const ROTATE_INTERVAL_MS = 7000;
  * button and learning pills from reflowing on every typed character and every
  * phrase rotation. */
 const RESERVED_CH =
-  Math.max(...LEARN_ANALYZING_PHRASES.map((phrase) => phrase.length)) + 5;
+  34;
 
 /** Types `text` out character by character, restarting when `text` changes. */
 function useTypewriter(text: string): string {
@@ -59,6 +56,7 @@ export function LearnScanStatusLine({
   step?: string | null;
   elapsedSeconds?: number | null;
 }) {
+  const { t } = useI18n();
   const analyzing = step?.startsWith("Analyzing with") ?? false;
   const [variant, setVariant] = useState(0);
   useEffect(() => {
@@ -67,15 +65,19 @@ export function LearnScanStatusLine({
       return;
     }
     const id = window.setInterval(
-      () => setVariant((current) => (current + 1) % (LEARN_ANALYZING_PHRASES.length + 1)),
+      () => setVariant((current) => (current + 1) % (LEARN_ANALYZING_KEYS.length + 1)),
       ROTATE_INTERVAL_MS
     );
     return () => window.clearInterval(id);
   }, [analyzing]);
   const phrase =
     analyzing && variant > 0
-      ? LEARN_ANALYZING_PHRASES[variant - 1]
-      : step ?? "Scanning sessions";
+      ? t(LEARN_ANALYZING_KEYS[variant - 1])
+      : step?.startsWith("Analyzing with ")
+        ? t("learn.scan.analyzing", { name: step.slice("Analyzing with ".length) })
+        : step === "Reading sessions"
+          ? t("learn.scan.readingSessions")
+          : step ?? t("learn.scan.scanning");
   const typed = useTypewriter(phrase);
   return (
     <>
@@ -86,7 +88,7 @@ export function LearnScanStatusLine({
       >
         <span className="learn-scan-status__text">{typed}</span>
         {typeof elapsedSeconds === "number" ? (
-          <span className="learn-scan-status__timer">{elapsedSeconds}s</span>
+          <span className="learn-scan-status__timer">{t("learn.scan.seconds", { count: elapsedSeconds })}</span>
         ) : null}
       </span>
       <span className="visually-hidden">{phrase}</span>

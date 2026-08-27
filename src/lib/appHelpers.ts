@@ -715,7 +715,7 @@ export function buildSetupStallMailto(
     "---\n" +
     "Diagnostic info (please keep):\n" +
     diagnosticLines.join("\n");
-  return `mailto:support@extraheadroom.com?subject=${encodeURIComponent(
+  return `mailto:headroom-local-community@localhost.invalid?subject=${encodeURIComponent(
     subject
   )}&body=${encodeURIComponent(body)}`;
 }
@@ -748,7 +748,7 @@ export function buildInstallFailureMailto(context: {
     "---\n" +
     "Diagnostic info (please keep):\n" +
     diagnosticLines.join("\n");
-  return `mailto:support@extraheadroom.com?subject=${encodeURIComponent(
+  return `mailto:headroom-local-community@localhost.invalid?subject=${encodeURIComponent(
     subject
   )}&body=${encodeURIComponent(body)}`;
 }

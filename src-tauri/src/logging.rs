@@ -506,15 +506,15 @@ pub fn init() -> Result<PathBuf, SetLoggerError> {
 #[cfg(target_os = "macos")]
 pub(crate) fn log_path() -> PathBuf {
     dirs::home_dir()
-        .map(|h| h.join("Library/Logs/Headroom/headroom-desktop.log"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/headroom-desktop.log"))
+        .map(|h| h.join("Library/Logs/HeadroomLocalCommunity/headroom-local-community.log"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/headroom-local-community.log"))
 }
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn log_path() -> PathBuf {
     dirs::data_local_dir()
-        .map(|d| d.join("headroom/headroom-desktop.log"))
-        .unwrap_or_else(|| std::env::temp_dir().join("headroom-desktop.log"))
+        .map(|d| d.join("headroom/headroom-local-community.log"))
+        .unwrap_or_else(|| std::env::temp_dir().join("headroom-local-community.log"))
 }
 
 #[cfg(test)]
@@ -561,7 +561,7 @@ mod tests {
     fn skips_foreign_port_bind_retry_warns() {
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
-            "[proxy_intercept] port 6767 is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s (Address already in use (os error 48))"
+            "[proxy_intercept] port 6867 is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s (Address already in use (os error 48))"
         ));
         // Other bind/loop errors from proxy_intercept stay in Sentry.
         assert!(!skip_sentry(
@@ -869,7 +869,7 @@ mod tests {
         // The emit-site capture_message is the Sentry path for this event.
         assert!(skip_sentry(
             "headroom_desktop_lib::tool_manager",
-            "[backend_port] 6768 held by unknown process; falling back to 6770"
+            "[backend_port] 6868 held by unknown process; falling back to 6770"
         ));
         // Other tool_manager warnings still report.
         assert!(!skip_sentry(

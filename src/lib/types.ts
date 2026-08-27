@@ -10,6 +10,8 @@ export interface ManagedTool {
   status: ToolStatus;
   sourceUrl: string;
   version: string;
+  /** Version this Community build has validated for installation. */
+  supportedVersion?: string;
   checksum?: string | null;
   savingsLabel?: string | null;
   /** Installed, but the app pins a newer version. Drives the Update action. */
@@ -19,6 +21,10 @@ export interface ManagedTool {
   /** Set when this platform has no installable build. The card grays out and
    *  shows this sentence instead of an Install button that only ever errors. */
   unavailableReason?: string | null;
+  /** User-level default mode used by a newly created agent session. */
+  defaultMode?: string | null;
+  /** Default modes this locally managed add-on supports. */
+  supportedModes?: string[];
 }
 
 export interface PipelineStageMetric {

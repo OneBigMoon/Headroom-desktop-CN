@@ -25,6 +25,11 @@ pub struct ManagedTool {
     /// it is not. Never report the pin for an installed addon: the card would
     /// claim a version the user does not have the moment a release bumps a pin.
     pub version: String,
+    /// Version this Community build has pinned and validated for installation.
+    /// It may trail the latest upstream release until compatibility and binary
+    /// checksums have been reviewed in a newer Community build.
+    #[serde(default)]
+    pub supported_version: String,
     pub checksum: Option<String>,
     /// Short savings/usage line for the addon card chip ("12 docs converted").
     /// None when the addon has no measurable or citable figure.
@@ -43,6 +48,13 @@ pub struct ManagedTool {
     /// installable here.
     #[serde(default)]
     pub unavailable_reason: Option<String>,
+    /// User-level default mode for addons that expose a mode selector.
+    /// `None` for addons without selectable modes.
+    #[serde(default)]
+    pub default_mode: Option<String>,
+    /// Canonical modes this addon accepts. Empty for addons without a mode selector.
+    #[serde(default)]
+    pub supported_modes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

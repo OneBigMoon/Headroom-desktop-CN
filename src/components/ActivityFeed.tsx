@@ -3,6 +3,7 @@ import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
+import { useI18n, type TranslationKey } from "../lib/i18n";
 import type {
   ActivityFeedResponse,
   ActivityFeedSnapshot,
@@ -41,48 +42,48 @@ type TileKind = keyof ActivityFeedSnapshot;
 
 const EMPTY_TILE_COPY: Record<
   TileKind,
-  { badgeClass: string; badgeLabel: string; copy: string; itemModifier: string }
+  { badgeClass: string; badgeLabelKey: TranslationKey; copyKey: TranslationKey; itemModifier: string }
 > = {
   trainSuggestion: {
     badgeClass: "activity-feed__badge--train",
-    badgeLabel: "Optimize",
-    copy: "No scan nudge. Visit Optimize to scan any project for learnings.",
+    badgeLabelKey: "nav.optimize",
+    copyKey: "activity.empty.scan",
     itemModifier: "activity-feed__item--train"
   },
   transformation: {
     badgeClass: "activity-feed__badge--transformation",
-    badgeLabel: "Recent Large Compression",
-    copy: "No large compressions yet — send more messages through a connected coding agent.",
+    badgeLabelKey: "activity.badge.compression",
+    copyKey: "activity.empty.compression",
     itemModifier: "activity-feed__item--transformation"
   },
   rtkToday: {
     badgeClass: "activity-feed__badge--rtk",
-    badgeLabel: "RTK",
-    copy: "No RTK commands observed yet today.",
+    badgeLabelKey: "activity.badge.rtk",
+    copyKey: "activity.empty.rtk",
     itemModifier: "activity-feed__item--rtk"
   },
   serenaToday: {
     badgeClass: "activity-feed__badge--serena",
-    badgeLabel: "Serena",
-    copy: "No Serena tool calls observed yet today.",
+    badgeLabelKey: "activity.badge.serena",
+    copyKey: "activity.empty.serena",
     itemModifier: "activity-feed__item--serena"
   },
   record: {
     badgeClass: "activity-feed__badge--record",
-    badgeLabel: "Record",
-    copy: "No new records yet.",
+    badgeLabelKey: "activity.badge.record",
+    copyKey: "activity.empty.record",
     itemModifier: "activity-feed__item--record"
   },
   learningsMilestone: {
     badgeClass: "activity-feed__badge--learnings-milestone",
-    badgeLabel: "Learnings",
-    copy: "0 patterns identified today, 0 reminders and 0 learnings written to memory.",
+    badgeLabelKey: "activity.badge.learnings",
+    copyKey: "activity.empty.learnings",
     itemModifier: "activity-feed__item--learnings-milestone"
   },
   weeklyRecap: {
     badgeClass: "activity-feed__badge--weekly-recap",
-    badgeLabel: "Weekly recap",
-    copy: "No recap yet — posts at the end of the week.",
+    badgeLabelKey: "activity.badge.weekly",
+    copyKey: "activity.empty.weekly",
     itemModifier: "activity-feed__item--weekly-recap"
   }
 };
@@ -95,6 +96,7 @@ export function ActivityFeed({
   rtkInstalled = false,
   serenaInstalled = false
 }: ActivityFeedProps) {
+  const { t } = useI18n();
   const { tiles } = feed;
   // "Waiting for proxy" only fires when we've got nothing to show AND the
   // proxy isn't answering. If any slot is populated (persisted state from a
@@ -109,10 +111,10 @@ export function ActivityFeed({
             <span className="activity-card__title-icon" aria-hidden="true">
               <Bell weight="duotone" />
             </span>
-            <h1>Activity (beta)</h1>
+            <h1>{t("activity.title")}</h1>
           </div>
           <p className="activity-card__blurb">
-            Large Compressions, learnings, and daily records.
+            {t("activity.description")}
           </p>
         </header>
       </article>
@@ -129,9 +131,9 @@ export function ActivityFeed({
           <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
             <WifiSlash weight="duotone" />
           </div>
-          <p className="activity-feed__empty-title">Waiting for the Headroom proxy</p>
+          <p className="activity-feed__empty-title">{t("activity.waitingProxy")}</p>
           <p className="activity-feed__empty-body">
-            Headroom will reconnect as soon as the proxy is back online.
+            {t("activity.reconnect")}
           </p>
         </div>
       ) : (
@@ -183,7 +185,8 @@ function EmptyTile({
   kind: TileKind;
   onNavigateToOptimize?: () => void;
 }) {
-  const { badgeClass, badgeLabel, copy, itemModifier } = EMPTY_TILE_COPY[kind];
+  const { t } = useI18n();
+  const { badgeClass, badgeLabelKey, copyKey, itemModifier } = EMPTY_TILE_COPY[kind];
   const itemClass = `activity-feed__item activity-feed__item--empty ${itemModifier}`;
   const canNavigate = kind === "trainSuggestion" && typeof onNavigateToOptimize === "function";
   const handleActivate = () => {
@@ -208,10 +211,10 @@ function EmptyTile({
     >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className={`activity-feed__badge ${badgeClass} activity-feed__badge--empty`}>
-          {badgeLabel}
+          {t(badgeLabelKey)}
         </span>
       </div>
-      <p className="activity-feed__content activity-feed__content--empty">{copy}</p>
+      <p className="activity-feed__content activity-feed__content--empty">{t(copyKey)}</p>
     </li>
   );
 }
@@ -268,11 +271,26 @@ function ExpandableRow({
 }
 
 function TimeChip({ iso }: { iso: string | null | undefined }) {
+  const { resolvedLocale } = useI18n();
+  const relative = resolvedLocale === "en" ? formatRelativeTime(iso) : formatRelativeTimeForLocale(iso, resolvedLocale);
   return (
     <span className="activity-feed__time" title={formatDateTime(iso)}>
-      {formatRelativeTime(iso)}
+      {relative}
     </span>
   );
+}
+
+function formatRelativeTimeForLocale(iso: string | null | undefined, locale: string): string {
+  if (!iso) return "";
+  const timestamp = Date.parse(iso);
+  if (Number.isNaN(timestamp)) return "";
+  const deltaSeconds = Math.round((timestamp - Date.now()) / 1000);
+  const absoluteSeconds = Math.abs(deltaSeconds);
+  const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  if (absoluteSeconds < 60) return formatter.format(deltaSeconds, "second");
+  if (absoluteSeconds < 3600) return formatter.format(Math.round(deltaSeconds / 60), "minute");
+  if (absoluteSeconds < 86400) return formatter.format(Math.round(deltaSeconds / 3600), "hour");
+  return formatter.format(Math.round(deltaSeconds / 86400), "day");
 }
 
 function workspaceBasename(path: string | null | undefined): string | null {
@@ -416,6 +434,7 @@ function CompressionDiff({
   inputTokensOriginal?: number | null;
   inputTokensOptimized?: number | null;
 }) {
+  const { t } = useI18n();
   const original = formatRequestMessages(requestMessages);
   const compressed = formatRequestMessages(compressedMessages);
   const diff = diffLines(original, compressed);
@@ -423,11 +442,11 @@ function CompressionDiff({
     // Too large to diff — fall back to side-by-side dumps.
     return (
       <>
-        <dt>Request (original)</dt>
+        <dt>{t("activity.detail.requestOriginal")}</dt>
         <dd>
           <pre className="activity-feed__message-dump">{original}</pre>
         </dd>
-        <dt>Request (compressed)</dt>
+        <dt>{t("activity.detail.requestCompressed")}</dt>
         <dd>
           <pre className="activity-feed__message-dump">{compressed}</pre>
         </dd>
@@ -437,7 +456,7 @@ function CompressionDiff({
   return (
     <>
       <dt>
-        Compression diff
+        {t("activity.detail.compressionDiff")}
         {inputTokensOriginal != null && inputTokensOptimized != null
           ? ` (${inputTokensOriginal.toLocaleString()} → ${inputTokensOptimized.toLocaleString()} tokens)`
           : ""}
@@ -479,6 +498,7 @@ function isClampedTokenPair(
 }
 
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
+  const { t } = useI18n();
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
   const showPct = pct <= 100;
@@ -506,13 +526,13 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
     <dl className="activity-feed__detail-grid">
       {estimatedUsd != null ? (
         <>
-          <dt>Estimated cost saved</dt>
+          <dt>{t("activity.detail.estimatedSaved")}</dt>
           <dd>{formatEstimatedUsd(estimatedUsd)}</dd>
         </>
       ) : null}
       {hasExactTokens ? (
         <>
-          <dt>Tokens in → out</dt>
+          <dt>{t("activity.detail.tokensInOut")}</dt>
           <dd>
             {event.inputTokensOriginal!.toLocaleString()} →{" "}
             {event.inputTokensOptimized!.toLocaleString()}
@@ -521,12 +541,12 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
       ) : null}
       {groupsWithTargets.length > 0 ? (
         <>
-          <dt>What was touched</dt>
+          <dt>{t("activity.detail.touched")}</dt>
           <dd>
             <ul className="activity-feed__targets">
               {groupsWithTargets.map((grp) => (
                 <li key={grp.label} className="activity-feed__target">
-                  <span className="activity-feed__target-label">{grp.label}</span>
+                  <span className="activity-feed__target-label">{localizeTransformLabel(t, grp.label)}</span>
                   <span className="activity-feed__target-values">
                     {grp.targets.join(", ")}
                   </span>
@@ -538,13 +558,13 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
       ) : null}
       {event.workspace ? (
         <>
-          <dt>Workspace</dt>
+          <dt>{t("activity.detail.workspace")}</dt>
           <dd className="activity-feed__detail-mono">{event.workspace}</dd>
         </>
       ) : null}
       {hasRequestId ? (
         <>
-          <dt>Request ID</dt>
+          <dt>{t("activity.detail.requestId")}</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
         </>
       ) : null}
@@ -561,7 +581,7 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         // across sites before the upstream split) — we can't tell, so label
         // it neutrally and keep today's behaviour.
         <>
-          <dt>Request</dt>
+          <dt>{t("activity.detail.request")}</dt>
           <dd>
             <pre className="activity-feed__message-dump">
               {formatRequestMessages(event.requestMessages!)}
@@ -578,7 +598,7 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
     >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--transformation">
-          Recent large compression
+          {t("activity.badge.compression")}
         </span>
         <TimeChip iso={event.timestamp} />
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
@@ -610,9 +630,9 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
             <li
               key={grp.label}
               className="activity-feed__transform"
-              title={chipTitle(grp)}
+              title={chipTitle(t, { ...grp, label: localizeTransformLabel(t, grp.label), title: localizeTransformLabel(t, grp.title) })}
             >
-              {grp.count > 1 ? `${grp.label} × ${grp.count}` : grp.label}
+              {grp.count > 1 ? `${localizeTransformLabel(t, grp.label)} × ${grp.count}` : localizeTransformLabel(t, grp.label)}
             </li>
           ))}
         </ul>
@@ -621,12 +641,49 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   );
 }
 
-function chipTitle(grp: TransformGroup): string {
+function localizeTransformLabel(
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+  value: string,
+): string {
+  const exact: Record<string, TranslationKey> = {
+    "Stale Read": "activity.transform.staleRead",
+    "Superseded Read": "activity.transform.supersededRead",
+    "Tool result excluded": "activity.transform.toolExcluded",
+    "Cache aligned": "activity.transform.cacheAligned",
+    "file edited after read": "activity.transform.fileEdited",
+    "file re-read later": "activity.transform.fileReread",
+    "tool output dropped": "activity.transform.toolDropped",
+    "aligned to cache boundary": "activity.transform.cacheBoundary",
+    "Protected: user message": "activity.transform.protectedUser",
+    "Protected: system message": "activity.transform.protectedSystem",
+    "Protected: recent code": "activity.transform.protectedCode",
+    "Protected: analysis context": "activity.transform.protectedAnalysis",
+    "user message preserved": "activity.transform.userPreserved",
+    "system message preserved": "activity.transform.systemPreserved",
+    "recent code preserved": "activity.transform.codePreserved",
+    "analysis preserved": "activity.transform.analysisPreserved",
+    "semantic code search": "activity.transform.semanticSearch",
+    "tool outputs compacted": "activity.transform.outputsCompacted",
+  };
+  if (exact[value]) return t(exact[value]);
+  const crushed = value.match(/^Crushed (\d+) tools?$/);
+  if (crushed) return t("activity.transform.crushedTools", { count: crushed[1] });
+  const breakpoints = value.match(/^Inserted (\d+) cache breakpoints?$/);
+  if (breakpoints) return t("activity.transform.cacheBreakpoints", { count: breakpoints[1] });
+  return value;
+}
+
+function chipTitle(
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+  grp: TransformGroup,
+): string {
   const base = grp.count > 1 ? `${grp.title} (×${grp.count})` : grp.title;
   if (grp.targets.length === 0) return base;
   const preview = grp.targets.slice(0, 3).join(", ");
   const suffix =
-    grp.targets.length > 3 ? `${preview}, +${grp.targets.length - 3} more` : preview;
+    grp.targets.length > 3
+      ? `${preview}, ${t("activity.transform.more", { count: grp.targets.length - 3 })}`
+      : preview;
   return `${base} — ${suffix}`;
 }
 
@@ -817,6 +874,7 @@ function splitColonN(s: string, parts: number): string[] {
 }
 
 function RtkTodayRow({ event }: { event: RtkTodayStats }) {
+  const { t } = useI18n();
   return (
     <li className="activity-feed__item activity-feed__item--rtk">
       <div className="activity-feed__row activity-feed__row--meta">
@@ -824,10 +882,10 @@ function RtkTodayRow({ event }: { event: RtkTodayStats }) {
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          {event.savedTokens.toLocaleString()} tokens saved today
+          {t("activity.rtk.savedToday", { count: event.savedTokens.toLocaleString() })}
         </strong>
         <span className="activity-feed__delta">
-          {event.commands.toLocaleString()} command{event.commands === 1 ? "" : "s"}
+          {t("activity.rtk.commands", { count: event.commands.toLocaleString() })}
         </span>
       </div>
     </li>
@@ -835,9 +893,10 @@ function RtkTodayRow({ event }: { event: RtkTodayStats }) {
 }
 
 function SerenaTodayRow({ event }: { event: SerenaTodayStats }) {
+  const { t } = useI18n();
   // The backend guarantees at least one line; calls lead when present.
-  const strong = event.callsLine ?? event.tokensLine;
-  const delta = event.callsLine ? event.tokensLine : null;
+  const strong = localizeSerenaLine(event.callsLine ?? event.tokensLine, t);
+  const delta = event.callsLine ? localizeSerenaLine(event.tokensLine, t) : null;
   return (
     <li className="activity-feed__item activity-feed__item--serena">
       <div className="activity-feed__row activity-feed__row--meta">
@@ -851,15 +910,28 @@ function SerenaTodayRow({ event }: { event: SerenaTodayStats }) {
   );
 }
 
+function localizeSerenaLine(
+  line: string | null,
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+): string | null {
+  if (!line) return null;
+  const calls = line.match(/^([\d,.]+) tool calls today$/i);
+  if (calls) return t("activity.serena.callsToday", { count: calls[1] });
+  const tokens = line.match(/^~?([^ ]+) tokens returned in (.+)$/i);
+  if (tokens) return t("activity.serena.tokensReturned", { count: tokens[1], duration: tokens[2] });
+  return line;
+}
+
 const RECORD_TAG_ORDER: RecordTag[] = ["daily", "weekly", "allTime"];
 
-const RECORD_TAG_LABEL: Record<RecordTag, string> = {
-  daily: "Daily",
-  weekly: "Weekly",
-  allTime: "All-time"
+const RECORD_TAG_KEY: Record<RecordTag, TranslationKey> = {
+  daily: "activity.tag.daily",
+  weekly: "activity.tag.weekly",
+  allTime: "activity.tag.allTime"
 };
 
 function RecordRow({ event }: { event: RecordEvent }) {
+  const { t } = useI18n();
   const workspace = workspaceBasename(event.workspace);
   const pct = event.savingsPercent;
   const orderedTags = RECORD_TAG_ORDER.filter((tag) => event.tags.includes(tag));
@@ -886,13 +958,13 @@ function RecordRow({ event }: { event: RecordEvent }) {
     <dl className="activity-feed__detail-grid">
       {estimatedUsd != null ? (
         <>
-          <dt>Estimated cost saved</dt>
+          <dt>{t("activity.detail.estimatedSaved")}</dt>
           <dd>{formatEstimatedUsd(estimatedUsd)}</dd>
         </>
       ) : null}
       {hasExactTokens ? (
         <>
-          <dt>Tokens in → out</dt>
+          <dt>{t("activity.detail.tokensInOut")}</dt>
           <dd>
             {event.inputTokensOriginal!.toLocaleString()} →{" "}
             {event.inputTokensOptimized!.toLocaleString()}
@@ -901,7 +973,7 @@ function RecordRow({ event }: { event: RecordEvent }) {
       ) : null}
       {hasRequestId ? (
         <>
-          <dt>Request ID</dt>
+          <dt>{t("activity.detail.requestId")}</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
         </>
       ) : null}
@@ -914,7 +986,7 @@ function RecordRow({ event }: { event: RecordEvent }) {
         />
       ) : hasRequestMessages ? (
         <>
-          <dt>Request</dt>
+          <dt>{t("activity.detail.request")}</dt>
           <dd>
             <pre className="activity-feed__message-dump">
               {formatRequestMessages(event.requestMessages!)}
@@ -930,13 +1002,13 @@ function RecordRow({ event }: { event: RecordEvent }) {
       detail={detail}
     >
       <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--record">Record</span>
+        <span className="activity-feed__badge activity-feed__badge--record">{t("activity.badge.record")}</span>
         {orderedTags.map((tag) => (
           <span
             key={tag}
             className={`activity-feed__tag activity-feed__tag--${tag}`}
           >
-            {RECORD_TAG_LABEL[tag]}
+            {t(RECORD_TAG_KEY[tag])}
           </span>
         ))}
         <TimeChip iso={event.observedAt} />
@@ -945,12 +1017,12 @@ function RecordRow({ event }: { event: RecordEvent }) {
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          Saved {event.tokensSaved.toLocaleString()} tokens
+          {t("activity.record.saved", { count: event.tokensSaved.toLocaleString() })}
           {pct != null && pct <= 100 ? ` (${pct.toFixed(1)}%)` : ""}
         </strong>
         {event.previousRecord != null ? (
           <span className="activity-feed__delta">
-            previous record {event.previousRecord.toLocaleString()}
+            {t("activity.record.previous", { count: event.previousRecord.toLocaleString() })}
           </span>
         ) : null}
       </div>
@@ -965,11 +1037,12 @@ function TrainSuggestionRow({
   event: TrainSuggestionEvent;
   onNavigate?: () => void;
 }) {
+  const { t } = useI18n();
   const isNeverTrained = event.kind === "never_trained";
-  const badgeLabel = isNeverTrained ? "Try Optimize" : "Rescan";
+  const badgeLabel = isNeverTrained ? t("activity.train.tryOptimize") : t("activity.train.rescan");
   const copy = isNeverTrained
-    ? `${event.sessionCount} session${event.sessionCount === 1 ? "" : "s"} on ${event.projectDisplayName} and no Scan run yet. Extract learnings into CLAUDE.local.md and MEMORY.md.`
-    : `${event.activeDaysSinceLastLearn} active day${event.activeDaysSinceLastLearn === 1 ? "" : "s"} on ${event.projectDisplayName} since the last Scan run. Consider rerunning to pick up new patterns.`;
+    ? t("activity.train.never", { count: event.sessionCount, project: event.projectDisplayName })
+    : t("activity.train.stale", { count: event.activeDaysSinceLastLearn, project: event.projectDisplayName });
   const canNavigate = typeof onNavigate === "function";
   const handleActivate = () => {
     if (canNavigate) onNavigate?.();
@@ -1004,12 +1077,16 @@ function TrainSuggestionRow({
 }
 
 function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
+  const { resolvedLocale, t } = useI18n();
   const { patternsToday, remindersToday, learningsToday, projectDisplayName } = event;
+  const summary = resolvedLocale === "en"
+    ? `${patternsToday} pattern${patternsToday === 1 ? "" : "s"} identified today, ${remindersToday} reminder${remindersToday === 1 ? "" : "s"} and ${learningsToday} learning${learningsToday === 1 ? "" : "s"} written to memory.`
+    : t("activity.learnings.summary", { patterns: patternsToday, reminders: remindersToday, learnings: learningsToday });
   return (
     <li className="activity-feed__item activity-feed__item--learnings-milestone">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--learnings-milestone">
-          Learnings
+          {t("activity.badge.learnings")}
         </span>
         <TimeChip iso={event.observedAt} />
         {projectDisplayName ? (
@@ -1017,20 +1094,19 @@ function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
         ) : null}
       </div>
       <p className="activity-feed__content">
-        {patternsToday} pattern{patternsToday === 1 ? "" : "s"} identified today,{" "}
-        {remindersToday} reminder{remindersToday === 1 ? "" : "s"} and {learningsToday}{" "}
-        learning{learningsToday === 1 ? "" : "s"} written to memory.
+        {summary}
       </p>
     </li>
   );
 }
 
 function WeeklyRecapRow({ event }: { event: WeeklyRecapEvent }) {
+  const { t } = useI18n();
   return (
     <li className="activity-feed__item activity-feed__item--weekly-recap">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--weekly-recap">
-          Weekly recap
+          {t("activity.badge.weekly")}
         </span>
         <TimeChip iso={event.observedAt} />
         <span className="activity-feed__week-range">
@@ -1039,14 +1115,12 @@ function WeeklyRecapRow({ event }: { event: WeeklyRecapEvent }) {
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          {event.totalTokensSaved.toLocaleString()} tokens saved, $
-          {event.totalSavingsUsd.toFixed(2)}
+          {t("activity.weekly.saved", { tokens: event.totalTokensSaved.toLocaleString(), amount: `$${event.totalSavingsUsd.toFixed(2)}` })}
         </strong>
         <span className="activity-feed__delta">
-          {event.activeDays} active day{event.activeDays === 1 ? "" : "s"}
+          {t("activity.weekly.activeDays", { count: event.activeDays })}
         </span>
       </div>
     </li>
   );
 }
-

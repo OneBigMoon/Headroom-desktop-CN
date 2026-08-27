@@ -1,0 +1,186 @@
+/*
+ * Community keeps the upstream Headroom shell and interaction density.
+ * Product identity and paid/account surfaces remain edition-specific.
+ */
+html[data-edition="local-community"] .tray-shell {
+  grid-template-columns: minmax(72px, max-content) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+html[data-edition="local-community"] .tray-sidebar {
+  gap: 12px;
+  padding: 18px 6px 14px;
+  overflow: visible;
+  border-right: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.05);
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+html[data-edition="local-community"] .tray-sidebar__logo {
+  display: grid;
+  width: 100%;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  justify-content: stretch;
+  place-items: center;
+  margin-bottom: 6px;
+  padding: 0;
+}
+
+html[data-edition="local-community"] .tray-sidebar__logo::after,
+html[data-edition="local-community"] .tray-content::before {
+  content: none;
+}
+
+html[data-edition="local-community"] .tray-nav {
+  gap: 0;
+}
+
+html[data-edition="local-community"] .tray-nav__item {
+  display: grid;
+  min-height: 0;
+  grid-template-columns: none;
+  justify-items: center;
+  gap: 1px;
+  width: 100%;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #4a4540;
+  text-align: center;
+  box-shadow: none;
+}
+
+html[data-edition="local-community"] .tray-nav__item:hover,
+html[data-edition="local-community"] .tray-nav__item.is-active {
+  background: transparent;
+  color: #4a4540;
+  box-shadow: none;
+}
+
+html[data-edition="local-community"] .tray-nav__icon {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  place-items: center;
+  border-radius: 10px;
+  background: transparent;
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+
+html[data-edition="local-community"] .tray-nav__icon-svg {
+  width: 26px;
+  height: 26px;
+}
+
+html[data-edition="local-community"] .tray-nav__item:hover .tray-nav__icon {
+  background: var(--fill-hover);
+  box-shadow: 0 0 0 1px rgba(36, 31, 29, 0.2);
+}
+
+html[data-edition="local-community"] .tray-nav__item.is-active .tray-nav__icon {
+  background: rgba(36, 31, 29, 0.13);
+  box-shadow: inset 0 0 0 1px rgba(36, 31, 29, 0.08);
+}
+
+html[data-edition="local-community"] .tray-nav__item:hover.is-active .tray-nav__icon {
+  background: rgba(36, 31, 29, 0.16);
+}
+
+html[data-edition="local-community"] .tray-nav__text {
+  width: 100%;
+  font-size: var(--text-xxs);
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+html[data-edition="local-community"] .tray-sidebar__footer {
+  justify-items: center;
+}
+
+html[data-edition="local-community"] .tray-sidebar__footer::after {
+  margin: 0;
+  color: var(--text-muted);
+  content: "Community";
+  font-size: var(--text-xxs);
+}
+
+html[data-edition="local-community"] .tray-panel {
+  min-height: 0;
+  padding: 10px 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+html[data-edition="local-community"] .tray-content {
+  gap: 10px;
+  padding: 0;
+  overflow-x: hidden;
+  overflow-y: visible;
+}
+
+html[data-edition="local-community"] .tray-panel::-webkit-scrollbar {
+  width: 9px;
+}
+
+html[data-edition="local-community"] .tray-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+html[data-edition="local-community"] .tray-panel::-webkit-scrollbar-thumb {
+  min-height: 34px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.38);
+  background-clip: padding-box;
+}
+
+html[data-edition="local-community"] .soft-card,
+html[data-edition="local-community"] .panel-card,
+html[data-edition="local-community"] .stat-card,
+html[data-edition="local-community"] .connector-item {
+  border-color: var(--border-subtle);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: none;
+}
+
+html[data-edition="local-community"] .upgrade-pill,
+html[data-edition="local-community"] .tray-content--upgrade,
+html[data-edition="local-community"] .settings-account-card,
+html[data-edition="local-community"] .tier-mismatch-banner,
+html[data-edition="local-community"] .pricing-auth-card,
+html[data-edition="local-community"] .paywall {
+  display: none !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-edition="local-community"] .tray-nav__item,
+  html[data-edition="local-community"] .tray-nav__item:hover {
+    color: rgba(242, 237, 232, 0.6);
+  }
+
+  html[data-edition="local-community"] .tray-nav__item.is-active {
+    color: #f2ede8;
+  }
+
+  html[data-edition="local-community"] .tray-nav__item:hover .tray-nav__icon {
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
+  }
+
+  html[data-edition="local-community"] .tray-nav__item.is-active .tray-nav__icon {
+    background: rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  }
+
+  html[data-edition="local-community"] .tray-nav__item:hover.is-active .tray-nav__icon {
+    background: rgba(255, 255, 255, 0.16);
+  }
+}

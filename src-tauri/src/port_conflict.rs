@@ -1,4 +1,4 @@
-//! Tracking for "port 6768 is held by a non-headroom process". This is an
+//! Tracking for "port 6868 is held by a non-headroom process". This is an
 //! environmental issue (something on the user's machine, not our code), so
 //! we don't fire Sentry on every detection. Instead we persist a marker to
 //! disk and only escalate to Sentry once the same conflict has survived
@@ -64,14 +64,14 @@ fn clear_marker() -> Option<PortConflictMarker> {
 }
 
 /// True if the anyhow error chain string is the
-/// "port 6768 occupied by a non-headroom process" bail from
+/// "port 6868 occupied by a non-headroom process" bail from
 /// `tool_manager::start_headroom_background`.
 pub fn is_port_conflict(err_chain: &str) -> bool {
     err_chain.contains("is occupied by a non-headroom process")
 }
 
 /// Extracts `(cmd, pid)` from the parenthetical detail in the bail string.
-/// Bail format: `port 6768 is occupied by a non-headroom process (python3.1 pid 1073); ...`
+/// Bail format: `port 6868 is occupied by a non-headroom process (python3.1 pid 1073); ...`
 /// `lsof_listener` formats the detail as `"{cmd} pid {pid}"`. Returns
 /// `(None, None)` for the fallback `"unknown process"`.
 pub fn parse_occupant(err_chain: &str) -> (Option<String>, Option<u32>) {
@@ -205,7 +205,7 @@ fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
         || {
             sentry::capture_message(
                 &format!(
-                    "port_conflict_persistent: {} held port 6768 across {} launches",
+                    "port_conflict_persistent: {} held port 6868 across {} launches",
                     occupant, marker.consecutive_failed_launches
                 ),
                 sentry::Level::Warning,
@@ -273,16 +273,16 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
-    const SAMPLE_BAIL: &str = "port 6768 is occupied by a non-headroom process \
+    const SAMPLE_BAIL: &str = "port 6868 is occupied by a non-headroom process \
         (python3.1 pid 1073); cannot start proxy. \
-        Run `lsof -iTCP:6768 -sTCP:LISTEN` to identify it.";
+        Run `lsof -iTCP:6868 -sTCP:LISTEN` to identify it.";
 
     /// New bail shape emitted by `tool_manager::start_headroom_background`
-    /// when even the fallback range (6769-6790) is exhausted. The marker
+    /// when even the fallback range (6869-6890) is exhausted. The marker
     /// substring `"is occupied by a non-headroom process"` is preserved so
     /// `is_port_conflict` and `parse_occupant` continue to match.
-    const SAMPLE_BAIL_ALL_FOREIGN: &str = "port 6768 is occupied by a non-headroom process \
-        (rapportd pid 594) and fallback ports 6769-6790 are also unavailable; cannot start proxy. \
+    const SAMPLE_BAIL_ALL_FOREIGN: &str = "port 6868 is occupied by a non-headroom process \
+        (rapportd pid 594) and fallback ports 6869-6890 are also unavailable; cannot start proxy. \
         Reboot to clear stuck listeners, then relaunch Headroom.";
 
     #[test]
@@ -290,10 +290,10 @@ mod tests {
         assert!(is_port_conflict(SAMPLE_BAIL));
         assert!(is_port_conflict(SAMPLE_BAIL_ALL_FOREIGN));
         assert!(!is_port_conflict(
-            "headroom proxy already running on port 6768 (likely a stale process)"
+            "headroom proxy already running on port 6868 (likely a stale process)"
         ));
         assert!(!is_port_conflict(
-            "exited with status 1 before opening port 6768"
+            "exited with status 1 before opening port 6868"
         ));
     }
 
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn parse_occupant_handles_multi_word_cmd() {
         let raw =
-            "port 6768 is occupied by a non-headroom process (Google Chrome Helper pid 4242); ...";
+            "port 6868 is occupied by a non-headroom process (Google Chrome Helper pid 4242); ...";
         let (cmd, pid) = parse_occupant(raw);
         assert_eq!(cmd.as_deref(), Some("Google Chrome Helper"));
         assert_eq!(pid, Some(4242));
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn parse_occupant_returns_none_for_unknown_process() {
-        let raw = "port 6768 is occupied by a non-headroom process (unknown process); ...";
+        let raw = "port 6868 is occupied by a non-headroom process (unknown process); ...";
         let (cmd, pid) = parse_occupant(raw);
         assert!(cmd.is_none());
         assert!(pid.is_none());
@@ -372,7 +372,7 @@ mod tests {
         let path = dir.path().join("marker.json");
         record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
         record_failure_at(&path, SAMPLE_BAIL, true, ts(2000)).unwrap();
-        let other = "port 6768 is occupied by a non-headroom process (node pid 99); ...";
+        let other = "port 6868 is occupied by a non-headroom process (node pid 99); ...";
         let m = record_failure_at(&path, other, true, ts(3000)).unwrap();
         assert_eq!(m.consecutive_failed_launches, 1);
         assert_eq!(m.detected_at, ts(3000), "new conflict resets detected_at");

@@ -33,7 +33,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.35.0";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.36.5";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -65,23 +65,60 @@ const VENDOR_WHEELS_INDEX_URL: &str =
 /// markitdown/serena addons: their transitive sets are unpinned and unaudited,
 /// and a failed addon leaves a working Headroom behind.
 const PIP_ONLY_BINARY: &str = "--only-binary=:all:";
-// headroom binds on the backend port chosen at spawn time (default 6768);
-// the intercept layer on 6767 forwards to it. The backend port is dynamic
-// because something else on the machine (e.g. rapportd) can claim 6768 at
+// headroom binds on the backend port chosen at spawn time (default 6868);
+// the intercept layer on 6867 forwards to it. The backend port is dynamic
+// because something else on the machine (e.g. rapportd) can claim 6868 at
 // login — see `backend_port` for the selection logic.
 fn headroom_proxy_port() -> String {
     backend_port::get().to_string()
 }
-const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
+const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6867";
 const MCP_METHOD_CLAUDE_CLI: &str = "claude_cli";
 const MCP_METHOD_FALLBACK_JSON: &str = "fallback_json";
 const MCP_METHOD_DIRECT_CLAUDE_JSON: &str = "direct_claude_json";
+const MCP_METHOD_COMMUNITY_REGISTRY: &str = "community_registry";
+
+const COMMUNITY_MCP_INSTALL_HELPER: &str = r#"
+import sys
+from headroom.mcp_registry.base import ServerSpec
+from headroom.mcp_registry.install import get_all_registrars
+
+entrypoint, proxy_url, workspace_dir, config_dir = sys.argv[1:5]
+spec = ServerSpec(
+    name="headroom_local_community",
+    command=entrypoint,
+    args=("mcp", "serve"),
+    env={
+        "HEADROOM_PROXY_URL": proxy_url,
+        "HEADROOM_WORKSPACE_DIR": workspace_dir,
+        "HEADROOM_CONFIG_DIR": config_dir,
+        "HEADROOM_TELEMETRY": "off",
+        "HEADROOM_BEACON": "0",
+    },
+)
+
+attempted = 0
+failures = []
+for registrar in get_all_registrars():
+    if not registrar.detect():
+        continue
+    attempted += 1
+    result = registrar.register_server(spec, force=False)
+    if not result.ok:
+        failures.append(f"{registrar.name}: {result.status.value}: {result.detail or ''}")
+
+if failures:
+    raise SystemExit("; ".join(failures))
+if attempted == 0:
+    raise SystemExit("no supported MCP clients detected")
+"#;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum McpInstallMethod {
     ClaudeCli,
     FallbackJson,
     DirectClaudeJson,
+    CommunityRegistry,
 }
 
 impl McpInstallMethod {
@@ -90,6 +127,7 @@ impl McpInstallMethod {
             McpInstallMethod::ClaudeCli => MCP_METHOD_CLAUDE_CLI,
             McpInstallMethod::FallbackJson => MCP_METHOD_FALLBACK_JSON,
             McpInstallMethod::DirectClaudeJson => MCP_METHOD_DIRECT_CLAUDE_JSON,
+            McpInstallMethod::CommunityRegistry => MCP_METHOD_COMMUNITY_REGISTRY,
         }
     }
 }
@@ -253,7 +291,7 @@ regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
 Also ports four fixes owed upstream (remove each once a wheel ships it),
-gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
+gated on HEADROOM_SDK=headroom-local-community-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
 usage to the client, so Claude Code's proactive auto-compaction never
@@ -329,7 +367,7 @@ except Exception:
 
 import os as _hd_os
 
-if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-local-community-proxy":
     # Context-limit guard (upstream PR #2942; remove once a wheel ships it).
     # See the module docstring for the failure mode this breaks.
     try:
@@ -998,22 +1036,22 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.45.0";
+const RTK_VERSION: &str = "0.46.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.2";
+const CONTEXT7_PINNED_VERSION: &str = "4.0.3";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.10.3";
+const CODEBASE_MEMORY_VERSION: &str = "0.10.8";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "0ebf02328207d4c3d862c837b5e973de5bac808df92b0941737721d467287f7f";
+    "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "1107fea28285823e1436e4f38a4e00a0b472d8a43c379da7dfd200c914a4b9dd";
+    "2b193085410af3801634a522f4b17dcd6699695e015a068393c87817c1d260d4";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "967b9eababfdbd2ef1987c571d55bc7c028cd1db7f99279830634c58db311e32";
+    "e2804a20f5a6fc392af361525a232703e351b7d1aacb81b88eef806eec5959fa";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "74997fb0934e70a22f20c2e112fb4d883867dc1f01a7bcdc94cf86d13b5cbd31";
+    "e5cba4cad6ca8254a85f45041fc8a831908d7d5cb64f98fc3f8eb70a58671793";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1236,6 +1274,218 @@ static PLUGIN_ADDONS: [PluginAddon; 2] = [
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
 
+const PONYTAIL_SUPPORTED_MODES: &[&str] = &["lite", "full", "ultra"];
+const CAVEMAN_SUPPORTED_MODES: &[&str] = &[
+    "lite",
+    "full",
+    "ultra",
+    "wenyan-lite",
+    "wenyan-full",
+    "wenyan-ultra",
+];
+
+#[derive(Clone, Copy)]
+struct AddonModeSpec {
+    id: &'static str,
+    supported_modes: &'static [&'static str],
+}
+
+const ADDON_MODE_SPECS: &[AddonModeSpec] = &[
+    AddonModeSpec {
+        id: "ponytail",
+        supported_modes: PONYTAIL_SUPPORTED_MODES,
+    },
+    AddonModeSpec {
+        id: "caveman",
+        supported_modes: CAVEMAN_SUPPORTED_MODES,
+    },
+];
+
+fn addon_mode_spec(id: &str) -> Option<&'static AddonModeSpec> {
+    ADDON_MODE_SPECS.iter().find(|spec| spec.id == id)
+}
+
+fn canonical_addon_mode(spec: &AddonModeSpec, raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    spec.supported_modes
+        .iter()
+        .copied()
+        .find(|mode| *mode == normalized)
+}
+
+fn canonical_addon_mode_from_config(spec: &AddonModeSpec, raw: &str) -> Option<&'static str> {
+    if spec.id == "caveman" && raw.trim().eq_ignore_ascii_case("wenyan") {
+        return Some("wenyan-full");
+    }
+    canonical_addon_mode(spec, raw)
+}
+
+fn addon_home_from_environment(
+    home_from_env: Option<PathBuf>,
+    system_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    home_from_env
+        .filter(|home| !home.as_os_str().is_empty())
+        .or(system_home)
+}
+
+/// Resolves the user-level configuration path used by both plugins. This
+/// deliberately does not consider environment-variable or repository-local
+/// defaults, which take precedence inside the plugins themselves.
+fn addon_user_config_path(id: &str) -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        let _ = id;
+        // Unit tests must never inspect a developer's real plugin settings.
+        bail!("user-level addon configuration is unavailable in unit tests");
+    }
+
+    #[cfg(not(test))]
+    {
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+        let home = addon_home_from_environment(
+            std::env::var_os("HOME").map(PathBuf::from),
+            dirs::home_dir(),
+        );
+        addon_user_config_path_from(
+            id,
+            xdg_config_home.as_deref(),
+            app_data.as_deref(),
+            home.as_deref(),
+            cfg!(target_os = "windows"),
+        )
+    }
+}
+
+fn addon_user_config_path_from(
+    id: &str,
+    xdg_config_home: Option<&Path>,
+    app_data: Option<&Path>,
+    home: Option<&Path>,
+    is_windows: bool,
+) -> Result<PathBuf> {
+    let spec = addon_mode_spec(id).ok_or_else(|| anyhow!("unknown addon mode: {id}"))?;
+    let base =
+        if let Some(config_home) = xdg_config_home.filter(|path| !path.as_os_str().is_empty()) {
+            config_home.to_path_buf()
+        } else if is_windows {
+            app_data
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .or_else(|| {
+                    home.filter(|path| !path.as_os_str().is_empty())
+                        .map(|home| home.join("AppData").join("Roaming"))
+                })
+                .ok_or_else(|| anyhow!("cannot locate {id} config: APPDATA and HOME are unset"))?
+        } else {
+            home.filter(|path| !path.as_os_str().is_empty())
+                .map(|home| home.join(".config"))
+                .ok_or_else(|| anyhow!("cannot locate {id} config: HOME is unset"))?
+        };
+
+    Ok(base.join(spec.id).join("config.json"))
+}
+
+fn parse_addon_config_object(
+    bytes: &[u8],
+    config_path: &Path,
+    spec: &AddonModeSpec,
+) -> Result<serde_json::Map<String, Value>> {
+    let raw = std::str::from_utf8(bytes)
+        .with_context(|| format!("reading UTF-8 configuration {}", config_path.display()))?;
+    // Ponytail explicitly accepts a UTF-8 BOM, commonly added by Windows
+    // editors. Accept it here too so the dashboard reports the same mode.
+    let raw = if spec.id == "ponytail" {
+        raw.strip_prefix('\u{feff}').unwrap_or(raw)
+    } else {
+        raw
+    };
+    let config: Value = serde_json::from_str(raw)
+        .with_context(|| format!("parsing configuration {}", config_path.display()))?;
+    config.as_object().cloned().ok_or_else(|| {
+        anyhow!(
+            "configuration {} must be a JSON object",
+            config_path.display()
+        )
+    })
+}
+
+fn read_addon_default_mode_from_path(
+    config_path: &Path,
+    spec: &AddonModeSpec,
+) -> Result<Option<String>> {
+    let bytes = match std::fs::read(config_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading configuration {}", config_path.display()))
+        }
+    };
+    let config = parse_addon_config_object(&bytes, config_path, spec)?;
+    Ok(config
+        .get("defaultMode")
+        .and_then(Value::as_str)
+        .and_then(|mode| canonical_addon_mode_from_config(spec, mode))
+        .map(str::to_owned))
+}
+
+fn write_addon_default_mode_to_path(
+    config_path: &Path,
+    spec: &AddonModeSpec,
+    mode: &str,
+) -> Result<()> {
+    let mode = canonical_addon_mode(spec, mode).ok_or_else(|| {
+        anyhow!(
+            "unsupported {} default mode {mode:?}; supported modes: {}",
+            spec.id,
+            spec.supported_modes.join(", ")
+        )
+    })?;
+    let mut config = match std::fs::read(config_path) {
+        Ok(bytes) => parse_addon_config_object(&bytes, config_path, spec)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading configuration {}", config_path.display()))
+        }
+    };
+    config.insert("defaultMode".to_string(), Value::String(mode.to_string()));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating configuration directory {}", parent.display()))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(config))
+        .context("serializing addon configuration")?;
+    bytes.push(b'\n');
+    crate::client_adapters::atomic_write(config_path, &bytes)
+        .with_context(|| format!("writing configuration {}", config_path.display()))
+}
+
+fn addon_default_mode_or_full(config_path: &Path, spec: &AddonModeSpec) -> String {
+    read_addon_default_mode_from_path(config_path, spec)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "full".to_string())
+}
+
+fn addon_mode_fields(id: &str) -> (Option<String>, Vec<String>) {
+    let Some(spec) = addon_mode_spec(id) else {
+        return (None, Vec::new());
+    };
+    let default_mode = addon_user_config_path(spec.id)
+        .map(|path| addon_default_mode_or_full(&path, spec))
+        .unwrap_or_else(|_| "full".to_string());
+    let supported_modes = spec
+        .supported_modes
+        .iter()
+        .map(|mode| (*mode).to_string())
+        .collect();
+    (Some(default_mode), supported_modes)
+}
+
 fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
     PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
 }
@@ -1249,8 +1499,9 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
 /// prompt than a wrong one.
 ///
 /// `None` means no Update button: nothing installed, already at or past the
-/// pin, or an addon that maintains itself (headroom rides the runtime upgrade,
-/// rtk is refreshed at launch from its own pin).
+/// pin. Headroom uses the dedicated transactional runtime-upgrade action. RTK
+/// is also refreshed at launch, but remains user-updatable here so the Tools screen
+/// never reports an update without offering an action.
 fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Option<String> {
     let installed = installed?;
     match id {
@@ -1258,7 +1509,7 @@ fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Opti
         // signal for "newer exists" — the Update action is the check. It always
         // shows for an installed plugin, and the button says just "Update".
         _ if plugin_addon(id).is_some() => Some(String::new()),
-        "markitdown" | "serena" | "context7" | "codebase-memory" => {
+        "headroom" | "rtk" | "markitdown" | "serena" | "context7" | "codebase-memory" => {
             let on_disk = parse_major_minor_patch(installed)?;
             let target = parse_major_minor_patch(pinned)?;
             (on_disk < target).then(|| pinned.to_string())
@@ -1267,15 +1518,15 @@ fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Opti
     }
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "064151cfc2d50b24d810b06a0af2e41b9c945e83534e4c438c3d3eae607fc3f4";
+    "484e5dd2b4bfdbbb910727a0ba1e2d63b2e23efa922cfcc7300fd131bca3e10a";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "9ea02f889d5a2779e4fb700df4587824303c5a57cda22e903e30058079fca0ef";
+    "67eb651fa9cfc4a4ea65876242eb71b8837abdac40521d0dd363214ec1a068dd";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "80a746dd305ef944ff50ef011ae4ce3878dd5ba88dfe35d859d05498191637c3";
+    "e8c2e1787f46017ea7c5a711b2bc6a7f7cf61c7ad69385b4c1e4daff1135dcd1";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4";
+    "79aa5b89c69566bbfeceb66c8a27cfbe52237fc7ee3e683115f43745a3262d21";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "34cea9009a8099acdaf85147b971d95f65efabfa63fb3aea7d3e2b73e6f517c3";
+    "9bc5acd54d35a916e4a561435963e0acf2f1a0115cf43dcfe2b719f361c8a970";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -1478,10 +1729,10 @@ pub struct HeadroomLearnProjectSummary {
 /// name, so the two can drift apart without leaking.
 pub(crate) const KOMPRESS_HF_MODEL_DIR: &str = "models--chopratejas--kompress-v2-base";
 
-/// HuggingFace hub cache directory, resolved the way `huggingface_hub` itself
-/// resolves it. Precedence mirrors its `constants.py`: `HF_HUB_CACHE`, then the
-/// legacy `HUGGINGFACE_HUB_CACHE`, then `$HF_HOME/hub`, then
-/// `${XDG_CACHE_HOME:-~/.cache}/huggingface/hub`.
+/// HuggingFace hub cache directory for the current edition. Community must not
+/// inspect, reuse, or delete an inherited/shared HuggingFace cache; all model
+/// reads and cleanup stay below its workspace. Non-Community builds retain
+/// `huggingface_hub`'s normal cache-resolution precedence.
 ///
 /// Reading it from our own env is correct by construction: the bundled runtime
 /// is spawned as our child and inherits this env, so wherever we resolve to is
@@ -1494,6 +1745,14 @@ pub(crate) const KOMPRESS_HF_MODEL_DIR: &str = "models--chopratejas--kompress-v2
 /// are already broken upstream; falling back to the default beats guessing.
 /// ponytail: add expansion if anyone reports a `$`-containing value.
 pub(crate) fn hf_hub_cache_dir() -> Option<PathBuf> {
+    if crate::edition::LOCAL_COMMUNITY {
+        return Some(crate::edition::huggingface_hub_cache_dir());
+    }
+
+    hf_hub_cache_dir_from_env()
+}
+
+fn hf_hub_cache_dir_from_env() -> Option<PathBuf> {
     fn var(key: &str) -> Option<PathBuf> {
         std::env::var_os(key)
             .filter(|value| !value.is_empty())
@@ -1763,6 +2022,7 @@ impl ToolManager {
                     })
                     .flatten();
                 let update_available = pending.is_some();
+                let (default_mode, supported_modes) = addon_mode_fields(&manifest.id);
                 ManagedTool {
                     id: manifest.id.clone(),
                     name: manifest.name.clone(),
@@ -1773,11 +2033,14 @@ impl ToolManager {
                     status: self.detect_status(&manifest.id),
                     source_url: manifest.source_url.clone(),
                     version: installed.unwrap_or_else(|| manifest.version.clone()),
+                    supported_version: manifest.version.clone(),
                     checksum: manifest.checksum.clone(),
                     savings_label: self.tool_savings_label(&manifest.id),
                     update_available,
                     available_version: pending.filter(|version| !version.is_empty()),
                     unavailable_reason: addon_unavailable_reason(&manifest.id),
+                    default_mode,
+                    supported_modes,
                 }
             })
             .collect()
@@ -1996,8 +2259,8 @@ impl ToolManager {
     /// `available: false` until this baseline exists, so without it the
     /// dashboard would never show an output-reduction number. Heuristic-only
     /// (no `--llm-judge`), so it needs no API key or network, and writes the
-    /// baseline into `~/.headroom/output_savings.json` (the same `workspace_dir`
-    /// the proxy's recorder reads).
+    /// baseline into the Community workspace's `output_savings.json` (the same
+    /// `workspace_dir` the proxy's recorder reads).
     ///
     /// Targets a single transcript-rich project rather than `--all`: upstream's
     /// `_run_verbosity` writes the ledger *inside* its per-project loop
@@ -2120,10 +2383,10 @@ impl ToolManager {
 
     /// `reclaim_healthy_orphan`: forwarded to `reclaim_orphan_proxy` so an
     /// upgrade boot validation replaces even a still-healthy old proxy squatting
-    /// on 6768. Pass `false` for normal launch (leave a live backend alone).
+    /// on 6868. Pass `false` for normal launch (leave a live backend alone).
     pub fn start_headroom_background(&self, reclaim_healthy_orphan: bool) -> Result<Child> {
         // First backend start of this app process: we hold no Child handle, so
-        // a backend already on 6768 that `pid_is_headroom_backend` vouches for
+        // a backend already on 6868 that `pid_is_headroom_backend` vouches for
         // is an orphan from a previous instance -- classically the one the
         // Windows updater leaves running when it exits the old app with no
         // teardown at all. Take the port back even though the orphan answers
@@ -2149,8 +2412,8 @@ impl ToolManager {
             std::fs::create_dir_all(&logs_dir)
                 .with_context(|| format!("creating {}", logs_dir.display()))?;
 
-            // Pre-flight: 6768 may already be held. Three cases:
-            //   * Free → spawn on 6768.
+            // Pre-flight: 6868 may already be held. Three cases:
+            //   * Free → spawn on 6868.
             //   * HeadroomRunning → an orphaned proxy from a prior session is
             //     squatting on the port (a healthy one would have satisfied
             //     `is_headroom_proxy_reachable` upstream, so `ensure_headroom_running`
@@ -2158,7 +2421,7 @@ impl ToolManager {
             //     terminating it, then spawn the fresh runtime. Only bail if it
             //     turns out to be genuinely health-serving or we can't free it.
             //   * ForeignOccupant → try to fall back to a port in
-            //     6769..=6790. Only bail if every fallback is also taken.
+            //     6869..=6890. Only bail if every fallback is also taken.
             // The chosen port is stored in `backend_port` so the intercept,
             // health probes, and spawn args all pick it up.
             let initial_state = diagnose_proxy_port_settled(backend_port::DEFAULT_BACKEND_PORT);
@@ -2318,10 +2581,10 @@ impl ToolManager {
                 // its 300s static guess — recompact still works, just with
                 // the aggressive threshold.
                 let ttl_seed_path = self.runtime.root_dir.join("cache_ttl_seed.json");
-                let openai_ttl = dirs::home_dir()
-                    .map(|h| h.join(".headroom").join("cache_ttl_observations.jsonl"))
-                    .and_then(|p| learned_openai_ttl_seconds(&p))
-                    .unwrap_or(3600);
+                let openai_ttl = learned_openai_ttl_seconds(
+                    &crate::edition::workspace_dir().join("cache_ttl_observations.jsonl"),
+                )
+                .unwrap_or(3600);
                 if let Err(err) = crate::client_adapters::atomic_write(
                     &ttl_seed_path,
                     format!(r#"{{"openai": {{"ttl_seconds": {openai_ttl}}}}}"#).as_bytes(),
@@ -2347,6 +2610,7 @@ impl ToolManager {
                     c
                 };
                 command.current_dir(&self.runtime.root_dir);
+                crate::edition::apply_runtime_env(&mut command);
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::CommandExt;
@@ -2375,16 +2639,12 @@ impl ToolManager {
                     // reboots and runtime reinstalls; prefetch_tiktoken_encodings
                     // seeds it so boot never needs the network for vocab.
                     .env("TIKTOKEN_CACHE_DIR", self.tiktoken_cache_dir())
-                    .env("HEADROOM_SDK", "headroom-desktop-proxy")
-                    // Anonymous aggregate telemetry (opt-in in the package,
-                    // off by default). Desktop opts in on the user's behalf.
-                    // This is LOCAL collection only (feeds /stats); keep it on.
-                    .env("HEADROOM_TELEMETRY", "on")
-                    // headroom-ai 0.34.0 added an upstream phone-home beacon
-                    // (session summaries uploaded to Headroom Labs), on by
-                    // default. Desktop has its own telemetry; keep the
-                    // upstream upload off.
-                    .env("HEADROOM_BEACON", "off")
+                    .env("HEADROOM_SDK", "headroom-local-community-proxy")
+                    // Community keeps upstream collection disabled. Dashboard
+                    // stats come from the local interceptor, never a beacon.
+                    .env("HEADROOM_TELEMETRY", "off")
+                    // Explicitly disable headroom-ai's upstream session beacon.
+                    .env("HEADROOM_BEACON", "0")
                     .env("HEADROOM_HTTP2", "false")
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
@@ -2861,7 +3121,7 @@ impl ToolManager {
         // `headroom` root logger with `propagate = False` (see helpers.py:
         // `_setup_file_logging`). Proxy-logger INFO lines — including the
         // `Kompress: ENABLED/not installed/disabled` startup markers — go to
-        // `~/.headroom/logs/proxy.log` only, never to the stderr stream that
+        // the Community workspace's `logs/proxy.log` only, never to the stderr stream that
         // our Tauri-spawned log captures. Probe that file first; fall back to
         // the spawn-time tool log (covers older headroom versions that do
         // propagate to stderr).
@@ -2984,7 +3244,8 @@ impl ToolManager {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let status = crate::proc::command(python)
+        let mut command = crate::proc::command(python);
+        let status = crate::edition::apply_runtime_env(&mut command)
             .arg("-c")
             .arg(
                 "from headroom.transforms.kompress_compressor import KompressCompressor; \
@@ -3065,7 +3326,8 @@ impl ToolManager {
             .open(&log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let mut child = crate::proc::command(&python)
+        let mut command = crate::proc::command(&python);
+        let mut child = crate::edition::apply_runtime_env(&mut command)
             .arg("-c")
             // cl100k_base: the proxy's default/fallback encoding.
             // o200k_base: current OpenAI model family, loaded for codex traffic.
@@ -5198,7 +5460,9 @@ impl ToolManager {
         if self.headroom_mcp_configured() == Some(true)
             && matches!(
                 self.headroom_mcp_install_method().as_deref(),
-                Some(MCP_METHOD_CLAUDE_CLI) | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+                Some(MCP_METHOD_CLAUDE_CLI)
+                    | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+                    | Some(MCP_METHOD_COMMUNITY_REGISTRY)
             )
         {
             return Ok(());
@@ -5241,6 +5505,27 @@ impl ToolManager {
     fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
         let entrypoint = self.headroom_entrypoint();
         let detected_claude = crate::claude_cli::detect_claude_cli();
+
+        if crate::edition::LOCAL_COMMUNITY {
+            let entrypoint_arg = entrypoint.to_string_lossy().into_owned();
+            let workspace_arg = crate::edition::workspace_dir()
+                .to_string_lossy()
+                .into_owned();
+            let config_arg = crate::edition::config_dir().to_string_lossy().into_owned();
+            self.run_mcp_helper(&[
+                "-c",
+                COMMUNITY_MCP_INSTALL_HELPER,
+                &entrypoint_arg,
+                HEADROOM_PROXY_URL,
+                &workspace_arg,
+                &config_arg,
+            ])
+            .context("registering isolated Community MCP server")?;
+
+            let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
+            let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
+            return Ok(McpInstallMethod::CommunityRegistry);
+        }
 
         // GUI apps launched from Finder/Dock inherit a minimal PATH that
         // excludes /opt/homebrew/bin, /usr/local/bin, ~/.claude/local/bin,
@@ -5474,6 +5759,16 @@ impl ToolManager {
             std::fs::set_permissions(&staged, permissions)
                 .with_context(|| format!("chmod {}", staged.display()))?;
         }
+
+        // Prove the downloaded binary starts before replacing the working
+        // copy. A failed update must leave the existing RTK hook executable.
+        run_command_with_timeout(
+            &staged,
+            &["--version"],
+            &self.runtime.root_dir,
+            Duration::from_secs(15),
+        )
+        .context("RTK update failed its smoke test")?;
 
         std::fs::rename(&staged, &destination)
             .with_context(|| format!("renaming {} into place", staged.display()))?;
@@ -6018,16 +6313,18 @@ impl ToolManager {
             std::fs::set_permissions(&staged, permissions)
                 .with_context(|| format!("marking {} executable", staged.display()))?;
         }
-        std::fs::rename(&staged, &destination)
-            .with_context(|| format!("installing {}", destination.display()))?;
-
+        // Validate the staged binary first. If an upstream artifact is
+        // incompatible, the currently installed MCP executable stays intact.
         run_command_with_timeout(
-            &destination,
+            &staged,
             &["--version"],
             &self.runtime.root_dir,
             Duration::from_secs(15),
         )
-        .context("codebase-memory installed but failed its smoke test")?;
+        .context("codebase-memory update failed its smoke test")?;
+
+        std::fs::rename(&staged, &destination)
+            .with_context(|| format!("installing {}", destination.display()))?;
         std::fs::create_dir_all(self.codebase_memory_cache_dir())
             .with_context(|| format!("creating {}", self.codebase_memory_cache_dir().display()))?;
         self.register_codebase_memory_mcp()?;
@@ -6131,8 +6428,7 @@ impl ToolManager {
     /// one host (Claude Code or Codex) still has the plugin registered, so a
     /// user who removes it via `/plugin` doesn't leave the card stuck on
     /// "Enabled".
-    #[cfg(test)]
-    pub fn plugin_installed(&self, id: &str) -> bool {
+    fn plugin_installed(&self, id: &str) -> bool {
         let Some(plugin) = plugin_addon(id) else {
             return false;
         };
@@ -6140,6 +6436,29 @@ impl ToolManager {
             && PluginHost::ALL
                 .iter()
                 .any(|host| host.plugin_present(plugin))
+    }
+
+    /// Persists the user-level default only. Plugin environment variables and
+    /// repository-local configuration can still take precedence, and running
+    /// agent sessions keep the mode they already resolved.
+    pub fn set_addon_mode(&self, id: &str, mode: &str) -> Result<()> {
+        let spec = addon_mode_spec(id).ok_or_else(|| anyhow!("unknown addon mode: {id}"))?;
+        canonical_addon_mode(spec, mode).ok_or_else(|| {
+            anyhow!(
+                "unsupported {} default mode {mode:?}; supported modes: {}",
+                spec.id,
+                spec.supported_modes.join(", ")
+            )
+        })?;
+        if !self.plugin_installed(id) {
+            bail!("{id} plugin is not installed");
+        }
+        if !self.tool_enabled(id) {
+            bail!("{id} plugin is disabled");
+        }
+
+        let config_path = addon_user_config_path(id)?;
+        write_addon_default_mode_to_path(&config_path, spec, mode)
     }
 
     fn plugin_receipt_exists(&self, plugin: &PluginAddon) -> bool {
@@ -6853,13 +7172,13 @@ fn claude_code_has_headroom_mcp_server() -> bool {
     };
     value
         .get("mcpServers")
-        .and_then(|v| v.get("headroom"))
+        .and_then(|v| v.get(crate::edition::MCP_SERVER_NAME))
         .is_some()
 }
 
 /// Writes the headroom MCP server entry directly to `~/.claude.json`.
 /// Used when `claude mcp add` is unavailable (e.g. bare GUI PATH). Preserves
-/// all existing keys; only merges `mcpServers.headroom`.
+/// all existing keys; only merges `mcpServers.headroom_local_community`.
 fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<()> {
     let Some(home) = dirs::home_dir() else {
         anyhow::bail!("home directory not available");
@@ -6871,7 +7190,13 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
     let desired = json!({
         "command": entrypoint,
         "args": ["mcp", "serve"],
-        "env": { "HEADROOM_PROXY_URL": proxy_url },
+        "env": {
+            "HEADROOM_PROXY_URL": proxy_url,
+            "HEADROOM_WORKSPACE_DIR": crate::edition::workspace_dir(),
+            "HEADROOM_CONFIG_DIR": crate::edition::config_dir(),
+            "HEADROOM_TELEMETRY": "off",
+            "HEADROOM_BEACON": "0"
+        },
     });
 
     let modified_time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
@@ -6909,7 +7234,7 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
 
         if config
             .get("mcpServers")
-            .and_then(|servers| servers.get("headroom"))
+            .and_then(|servers| servers.get(crate::edition::MCP_SERVER_NAME))
             == Some(&desired)
         {
             return Ok(());
@@ -6923,14 +7248,14 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .context("~/.claude.json mcpServers is not a JSON object")?
-            .insert("headroom".into(), desired.clone());
+            .insert(crate::edition::MCP_SERVER_NAME.into(), desired.clone());
 
         let _ = crate::client_adapters::backup_if_exists(path)?;
 
         // Publish atomically (tmp + rename) so a crash mid-write can never
         // leave a truncated ~/.claude.json behind.
         let mut tmp = path.as_os_str().to_os_string();
-        tmp.push(".headroom-tmp");
+        tmp.push(".headroom-local-community-tmp");
         let tmp = PathBuf::from(tmp);
         std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
             .with_context(|| format!("writing {}", tmp.display()))?;
@@ -6948,7 +7273,7 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
 }
 
 fn is_local_proxy_reachable() -> bool {
-    // Check headroom's actual backend port, not the intercept port (6767),
+    // Check headroom's actual backend port, not the intercept port (6867),
     // because the intercept starts before headroom and would always be reachable.
     let address: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
@@ -6995,7 +7320,7 @@ fn diagnose_proxy_port(port: u16) -> PortState {
 /// left closing.
 ///
 /// An updater relaunch tears down the old backend and starts the new one
-/// immediately. For a few seconds the kernel still holds :6768 while nothing
+/// immediately. For a few seconds the kernel still holds :6868 while nothing
 /// accepts on it and no pid owns it -- a shape `diagnose_proxy_port` can only
 /// read as a foreign occupant, so the backend abandoned its default port for
 /// 6770 on every update (RUST-7F: one event per release, i.e. one per update,
@@ -7078,7 +7403,7 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
         };
         let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
         // A bare "headroom" substring also matches unrelated dev processes whose
-        // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
+        // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6868`).
         // Require the `proxy` subcommand as well: every version of the managed
         // backend runs as `... headroom proxy ...` (or `-m headroom.proxy.server`),
         // so this still recognizes old orphans the upgrade path must reclaim while
@@ -7206,7 +7531,7 @@ fn windows_listener(port: u16) -> Option<(String, u32)> {
 
 /// The pid LISTENING on `port` in `netstat -ano` output.
 ///
-/// Matches the port exactly rather than by suffix: `:16768` ends with `6768`,
+/// Matches the port exactly rather than by suffix: `:16868` ends with `6868`,
 /// and picking that row would point a kill at an unrelated process.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
@@ -7219,7 +7544,7 @@ fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
         if !fields[3].eq_ignore_ascii_case("LISTENING") {
             return None;
         }
-        // rsplit: IPv6 rows are `[::1]:6768`, so only the last colon separates
+        // rsplit: IPv6 rows are `[::1]:6868`, so only the last colon separates
         // the port.
         let (_, found) = fields[1].rsplit_once(':')?;
         (found.parse::<u16>().ok()? == port).then(|| fields[4].parse().ok())?
@@ -7346,12 +7671,12 @@ fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
 /// satisfied `is_headroom_proxy_reachable` and short-circuited
 /// `ensure_headroom_running`). Still, re-confirm health on the backend port
 /// directly before killing — if it answers 2xx the backend is live (e.g. the
-/// 6767 intercept is wedged while 6768 is fine) and we leave it alone. On any
+/// 6867 intercept is wedged while 6868 is fine) and we leave it alone. On any
 /// failure to reclaim (no pid, refuses to die, healthy) we fall back to the
 /// original bail so the caller's classification and user guidance are
 /// unchanged.
 ///
-/// `force_unhealthy_too`: during upgrade boot validation the orphan on 6768 is
+/// `force_unhealthy_too`: during upgrade boot validation the orphan on 6868 is
 /// the *old* version we are replacing — a still-healthy old worker (left when
 /// `stop_headroom`'s argv pattern-kill missed the real socket holder) must be
 /// killed anyway, or the new venv can't bind and the upgrade rolls back as
@@ -7423,7 +7748,7 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     Ok(())
 }
 
-/// Bail message when 6768 is foreign-held AND every port in the fallback
+/// Bail message when 6868 is foreign-held AND every port in the fallback
 /// range is also taken. Must contain `"is occupied by a non-headroom process"`
 /// so `port_conflict::is_port_conflict` continues to match, and the
 /// `(occupant)` parenthetical so `port_conflict::parse_occupant` can extract
@@ -7873,9 +8198,7 @@ fn headroom_learn_startup_args() -> Vec<String> {
 }
 
 fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home)
-        .join(".headroom")
+    let path = crate::edition::workspace_dir()
         .join("logs")
         .join("proxy.log");
     if path.exists() {
@@ -8024,24 +8347,24 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/b0/27/a67c70358769ff1844326e1b9695bfa9ed2f298aeb7001bb32e74c92c7d5/headroom_ai-0.35.0-cp310-abi3-macosx_11_0_arm64.whl",
-            "54dc9be2b8f7b0397f35d15b73f48db3eefdd3b3c613630bcaee695a4fbf509e",
+            "https://files.pythonhosted.org/packages/1b/99/410b64a578f36d249b76915d733873192537e986b2bc911373e6d72839e9/headroom_ai-0.36.5-cp310-abi3-macosx_11_0_arm64.whl",
+            "0190c55f022760d49f6268f3c0970438f9bdd5a72bc0288e2788ff7e8b8ce730",
         ),
         ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/af/7d/4f6199cf9ede6eec15df036ba06e52ce36025a82e23988397db6ff16d3a6/headroom_ai-0.35.0-cp310-abi3-macosx_10_12_x86_64.whl",
-            "ef8622df6230a6e63a44ca5d25a8aaca985d3573dbe83db9a74556286f4bee0f",
+            "https://files.pythonhosted.org/packages/3a/79/8db10dd06c45c942c2f293b3748d70c8ac53ba048b7796b947f78fcdf952/headroom_ai-0.36.5-cp310-abi3-macosx_10_12_x86_64.whl",
+            "c62f18e261909a3de43c32113ec76c9ad6580e8fac6dc83347a71403d66094bf",
         ),
         ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/7d/4f/972f50843a9c419967b443ef41121de4687bbdab91682ac1e4b800366c68/headroom_ai-0.35.0-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "ec261ca9c3a8599c4a1b8bc7b69301d39bd434448b64bd043b510fd5ee14d358",
+            "https://files.pythonhosted.org/packages/68/58/97538fcca4505a130e7f65e5a736e1672f3b339f34dde0b86f07a9220edc/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "378ac86ea3d188014be8c98e5af2d5b64b4ac6ad566bcdc95714dcdf02851932",
         ),
         ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/56/ea/b5f112b90ea2033276c35a7bddd4bdfd4429a1c011b2f109fa5a809bac14/headroom_ai-0.35.0-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "abdbbabc314b09e0f27b166f0be43dc386b8de338048a66fe804bc1d3cf2bff4",
+            "https://files.pythonhosted.org/packages/15/c9/650195df8133b0f2ae5156bd9780fd70e17d8cead361016983e72d629697/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "56954b76cd10b5312061725e7470575598a4bde3fa7f80f77d82a08a71fceae8",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/fc/8c/297b742144144c8411ca021436004a15318a6f5cce033093d9333f693089/headroom_ai-0.35.0-cp310-abi3-win_amd64.whl",
-            "c80533399c911761fb47f49ac02db35c33ef4eb628c6568c213d7d7f0b594bef",
+            "https://files.pythonhosted.org/packages/87/55/4f68afd415361200c9339ac98ee30ed2ceae573136d852b17f1b276e1c36/headroom_ai-0.36.5-cp310-abi3-win_amd64.whl",
+            "f842990c69e39d967982ef9bd1da20c12b9a7f39507e4f76d638b44f93114986",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -8216,7 +8539,10 @@ where
     }
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("headroom-desktop/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            "headroom-local-community/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(30 * 60))
         .tcp_keepalive(Duration::from_secs(60))
@@ -8817,6 +9143,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env("LANG", "C.UTF-8")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1");
+    crate::edition::apply_runtime_env(&mut command);
     command
 }
 
@@ -9639,7 +9966,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("headroom-purge-once-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let _guard = HomeGuard::new(&root);
-        let ledger = root.join(".headroom").join("output_savings.json");
+        let ledger = root
+            .join(".headroom-local-community")
+            .join("output_savings.json");
         std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
         let with_control =
             br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
@@ -9721,7 +10050,7 @@ mod tests {
         assert!(py.contains(r#"parsed.get("type") == "error""#));
         assert!(py.contains("HEADROOM_RESPONSE_CACHE_GUARD"));
         // Backend process only: it imports the proxy stack.
-        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-local-community-proxy""#));
     }
 
     /// Upstream PR #3106: /v1/responses HTTP outcomes derive optimized from
@@ -9904,7 +10233,7 @@ asyncio.run(verify())
         let py = super::SITECUSTOMIZE_PY;
         // The guard imports the full proxy stack; it must only run in the
         // backend process, never in markitdown or other venv Pythons.
-        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+        assert!(py.contains(r#"environ.get("HEADROOM_SDK") == "headroom-local-community-proxy""#));
         // All three seams are patched...
         assert!(
             py.contains("_hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response")
@@ -10068,7 +10397,7 @@ asyncio.run(verify())
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// An updater relaunch leaves :6768 held by nobody for a moment. Treating
+    /// An updater relaunch leaves :6868 held by nobody for a moment. Treating
     /// that as a foreign occupant moved the backend to 6770 on every update
     /// (RUST-7F), so the unowned shape is waited out before falling back.
     #[test]
@@ -10152,7 +10481,7 @@ asyncio.run(verify())
 
     #[test]
     fn redact_sensitive_passes_through_clean_lines() {
-        let line = "2026-05-03T20:31:34Z proxy started on 127.0.0.1:6767";
+        let line = "2026-05-03T20:31:34Z proxy started on 127.0.0.1:6867";
         assert_eq!(redact_sensitive(line), line);
     }
 
@@ -10757,8 +11086,8 @@ asyncio.run(verify())
             "nginx (pid 42)"
         );
         assert_eq!(
-            super::format_listener_identity("python3.12", 7, Some("  headroom proxy --port 6767 ")),
-            "python3.12 (pid 7): headroom proxy --port 6767"
+            super::format_listener_identity("python3.12", 7, Some("  headroom proxy --port 6867 ")),
+            "python3.12 (pid 7): headroom proxy --port 6867"
         );
         // A multibyte char straddling the cap must not panic the truncate.
         let argv = format!("{}é", "x".repeat(159));
@@ -10769,7 +11098,7 @@ asyncio.run(verify())
 
     #[test]
     fn proxy_argv_matches_when_all_expected_flags_present() {
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages \
+        let argv = "/Users/x/headroom proxy --port 6868 --log-messages \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
@@ -10779,21 +11108,21 @@ asyncio.run(verify())
         // Builds before 2026-08-17 spawned the backend under `nice`. Upgrading
         // users still have one of those running, and it must be recognized as
         // ours rather than treated as a foreign occupant of the port.
-        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 --log-messages \
+        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6868 --log-messages \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_matches_without_learn_flags_when_auto_learn_off() {
-        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages";
+        let argv = "/Users/x/headroom proxy --port 6868 --no-http2 --log-messages";
         assert!(proxy_argv_contains_expected_flags(argv, false));
     }
 
     #[test]
     fn proxy_argv_mismatch_when_learn_present_but_auto_learn_off() {
         // Leftover learn-enabled proxy from before the toggle flipped: restart.
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --learn \
+        let argv = "/Users/x/headroom proxy --port 6868 --log-messages --learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, false));
     }
@@ -10801,14 +11130,14 @@ asyncio.run(verify())
     #[test]
     fn proxy_argv_mismatch_when_log_messages_missing() {
         // The exact orphan-from-old-build case: a v0.2.x proxy still running
-        // with just `proxy --port 6768`.
-        let argv = "/Users/x/headroom proxy --port 6768";
+        // with just `proxy --port 6868`.
+        let argv = "/Users/x/headroom proxy --port 6868";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_mismatch_when_learn_missing() {
-        let argv = "headroom proxy --port 6768 --log-messages --no-memory-tools \
+        let argv = "headroom proxy --port 6868 --log-messages --no-memory-tools \
                     --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
@@ -10817,14 +11146,14 @@ asyncio.run(verify())
     fn proxy_argv_match_does_not_get_fooled_by_negated_flag_substring() {
         // `--no-learn` contains `--learn` as a substring; whitespace tokenizing
         // ensures we don't false-positive on it.
-        let argv = "headroom proxy --port 6768 --log-messages --no-learn \
+        let argv = "headroom proxy --port 6868 --log-messages --no-learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_match_works_for_python_module_invocation() {
-        let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
+        let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6868 \
                     --no-http2 --log-messages --learn --no-memory-tools --no-memory-context \
                     --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
@@ -10851,7 +11180,7 @@ asyncio.run(verify())
 
     #[test]
     fn sanitize_log_variant_keeps_short_safe_input_unchanged() {
-        let raw = "proxy---port-6768---log-messages---learn";
+        let raw = "proxy---port-6868---log-messages---learn";
         let cleaned = sanitize_log_variant(raw);
         assert_eq!(cleaned, raw);
     }
@@ -10986,7 +11315,7 @@ asyncio.run(verify())
         ));
         assert!(!exe_path_is_under(r"C:\Python312\python.exe", &runtime));
         assert!(!exe_path_is_under(
-            r"C:\Users\garm\AppData\Local\Headroom\headroom-desktop.exe",
+            r"C:\Users\garm\AppData\Local\Headroom\headroom-local-community.exe",
             &runtime
         ));
         // Pid already gone: PowerShell prints nothing. Never provably ours.
@@ -10999,25 +11328,25 @@ asyncio.run(verify())
     /// pass its identity gate.
     #[test]
     fn parse_netstat_listener_finds_the_listening_pid() {
-        let out = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1044\r\n  TCP    127.0.0.1:6768         0.0.0.0:0              LISTENING       9876\r\n  TCP    [::1]:6767             [::]:0                 LISTENING       4321\r\n";
-        assert_eq!(parse_netstat_listener(out, 6768), Some(9876));
-        // IPv6 rows are `[::1]:6767`; only the LAST colon separates the port.
-        assert_eq!(parse_netstat_listener(out, 6767), Some(4321));
+        let out = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1044\r\n  TCP    127.0.0.1:6868         0.0.0.0:0              LISTENING       9876\r\n  TCP    [::1]:6867             [::]:0                 LISTENING       4321\r\n";
+        assert_eq!(parse_netstat_listener(out, 6868), Some(9876));
+        // IPv6 rows are `[::1]:6867`; only the LAST colon separates the port.
+        assert_eq!(parse_netstat_listener(out, 6867), Some(4321));
         assert_eq!(parse_netstat_listener(out, 7000), None);
     }
 
-    /// Suffix matching would point a kill at whatever holds :16768.
+    /// Suffix matching would point a kill at whatever holds :16868.
     #[test]
     fn parse_netstat_listener_does_not_match_a_port_by_suffix() {
-        let out = "  TCP    127.0.0.1:16768        0.0.0.0:0              LISTENING       5555\r\n";
-        assert_eq!(parse_netstat_listener(out, 6768), None);
+        let out = "  TCP    127.0.0.1:16868        0.0.0.0:0              LISTENING       5555\r\n";
+        assert_eq!(parse_netstat_listener(out, 6868), None);
     }
 
     /// An ESTABLISHED row for the same port is a client, not the holder.
     #[test]
     fn parse_netstat_listener_ignores_non_listening_rows() {
-        let out = "  TCP    127.0.0.1:6768         127.0.0.1:52100        ESTABLISHED     7777\r\n";
-        assert_eq!(parse_netstat_listener(out, 6768), None);
+        let out = "  TCP    127.0.0.1:6868         127.0.0.1:52100        ESTABLISHED     7777\r\n";
+        assert_eq!(parse_netstat_listener(out, 6868), None);
     }
 
     #[test]
@@ -11034,7 +11363,7 @@ asyncio.run(verify())
     #[test]
     fn parse_lsof_listener_reads_the_row_below_the_header() {
         let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
-                   python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";
+                   python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6868 (LISTEN)\n";
         assert_eq!(parse_lsof_listener(out), Some(("python".into(), 12345)));
         // Header only: lsof found nothing, which is not a listener.
         assert_eq!(
@@ -11046,11 +11375,11 @@ asyncio.run(verify())
     #[test]
     fn parse_ss_listener_picks_the_row_for_the_requested_port() {
         let out = "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n\
-             LISTEN 0      4096       127.0.0.1:16768      0.0.0.0:*     users:((\"decoy\",pid=1,fd=3))\n\
-             LISTEN 0      4096       127.0.0.1:6768       0.0.0.0:*     users:((\"python\",pid=12345,fd=7))\n";
-        // :16768 must not satisfy a :6768 lookup.
-        assert_eq!(parse_ss_listener(out, 6768), Some(("python".into(), 12345)));
-        assert_eq!(parse_ss_listener(out, 16768), Some(("decoy".into(), 1)));
+             LISTEN 0      4096       127.0.0.1:16868      0.0.0.0:*     users:((\"decoy\",pid=1,fd=3))\n\
+             LISTEN 0      4096       127.0.0.1:6868       0.0.0.0:*     users:((\"python\",pid=12345,fd=7))\n";
+        // :16868 must not satisfy a :6868 lookup.
+        assert_eq!(parse_ss_listener(out, 6868), Some(("python".into(), 12345)));
+        assert_eq!(parse_ss_listener(out, 16868), Some(("decoy".into(), 1)));
         assert_eq!(parse_ss_listener(out, 9999), None);
     }
 
@@ -11059,8 +11388,8 @@ asyncio.run(verify())
         // ss omits `users:` for processes the caller does not own. Guessing a
         // pid here would point the kill path at the wrong process.
         let out = "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n\
-                   LISTEN 0      4096       0.0.0.0:6768       0.0.0.0:*\n";
-        assert_eq!(parse_ss_listener(out, 6768), None);
+                   LISTEN 0      4096       0.0.0.0:6868       0.0.0.0:*\n";
+        assert_eq!(parse_ss_listener(out, 6868), None);
     }
 
     #[test]
@@ -11082,7 +11411,7 @@ asyncio.run(verify())
     /// process name and pid).
     #[test]
     fn all_foreign_bail_round_trips_through_port_conflict_helpers() {
-        let bail = format_all_foreign_bail(6768, "rapportd pid 594", (6769, 6790));
+        let bail = format_all_foreign_bail(6868, "rapportd pid 594", (6869, 6890));
         assert!(
             port_conflict::is_port_conflict(&bail),
             "bail must match is_port_conflict so the marker keeps tracking; got: {bail}"
@@ -11097,7 +11426,7 @@ asyncio.run(verify())
     /// a fake cmd from "unknown process".
     #[test]
     fn all_foreign_bail_with_unknown_occupant_round_trips() {
-        let bail = format_all_foreign_bail(6768, "unknown process", (6769, 6790));
+        let bail = format_all_foreign_bail(6868, "unknown process", (6869, 6890));
         assert!(port_conflict::is_port_conflict(&bail));
         let (cmd, pid) = port_conflict::parse_occupant(&bail);
         assert!(cmd.is_none(), "got cmd: {cmd:?} from bail: {bail}");
@@ -11109,7 +11438,7 @@ asyncio.run(verify())
     /// fingerprints in Sentry. Verifies the boundary stays intact.
     #[test]
     fn already_running_bail_is_not_classified_as_foreign_conflict() {
-        let bail = format_already_running_bail(6768);
+        let bail = format_already_running_bail(6868);
         assert!(
             !port_conflict::is_port_conflict(&bail),
             "stale-proxy bail must not match foreign-port classifier; got: {bail}"
@@ -11437,16 +11766,16 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert_eq!(cc_switch_reconcile_for_runtime(None), "0");
         assert_eq!(cc_switch_reconcile_for_runtime(Some("garbage")), "0");
         assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36")), "0");
-        // The currently pinned wheel predates the fix, so this ships inert.
+        // The currently pinned wheel is in the affected 0.36.3+ range.
         assert_eq!(
             cc_switch_reconcile_for_runtime(Some(HEADROOM_PINNED_VERSION)),
-            "0"
+            "1"
         );
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
-    /// before pre-flight ran, so when fallback called `backend_port::set(6769)`
-    /// the variants still spawned with `--port 6768` and both failed with
+    /// before pre-flight ran, so when fallback called `backend_port::set(6869)`
+    /// the variants still spawned with `--port 6868` and both failed with
     /// EADDRINUSE. The arg helpers read the atomic at call time, so as long as
     /// the helpers are invoked AFTER fallback has updated the atomic, the
     /// chosen fallback port flows through.
@@ -11964,6 +12293,193 @@ after
         assert!(reason.contains("codebase-memory"), "{reason}");
     }
 
+    #[test]
+    fn addon_mode_specs_match_the_real_plugin_tiers() {
+        let ponytail = super::addon_mode_spec("ponytail").expect("ponytail mode spec");
+        assert_eq!(ponytail.supported_modes, ["lite", "full", "ultra"]);
+
+        let caveman = super::addon_mode_spec("caveman").expect("caveman mode spec");
+        assert_eq!(
+            caveman.supported_modes,
+            [
+                "lite",
+                "full",
+                "ultra",
+                "wenyan-lite",
+                "wenyan-full",
+                "wenyan-ultra",
+            ]
+        );
+        assert_eq!(
+            super::canonical_addon_mode(ponytail, " ULTRA "),
+            Some("ultra")
+        );
+        assert_eq!(
+            super::canonical_addon_mode_from_config(caveman, " Wenyan "),
+            Some("wenyan-full")
+        );
+        assert_eq!(super::canonical_addon_mode(ponytail, "wenyan"), None);
+        assert_eq!(super::canonical_addon_mode(caveman, "wenyan"), None);
+        assert_eq!(super::canonical_addon_mode(caveman, "off"), None);
+    }
+
+    #[test]
+    fn addon_mode_paths_follow_plugin_user_config_rules() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let xdg = root.path().join("xdg");
+        let app_data = root.path().join("app-data");
+        let home = root.path().join("home");
+
+        assert_eq!(
+            super::addon_user_config_path_from(
+                "ponytail",
+                Some(&xdg),
+                Some(&app_data),
+                Some(&home),
+                false,
+            )
+            .expect("XDG path"),
+            xdg.join("ponytail").join("config.json")
+        );
+        assert_eq!(
+            super::addon_user_config_path_from(
+                "caveman",
+                None,
+                Some(&app_data),
+                Some(&home),
+                true,
+            )
+            .expect("Windows APPDATA path"),
+            app_data.join("caveman").join("config.json")
+        );
+        assert_eq!(
+            super::addon_user_config_path_from("caveman", None, None, Some(&home), true)
+                .expect("Windows home fallback"),
+            home.join("AppData")
+                .join("Roaming")
+                .join("caveman")
+                .join("config.json")
+        );
+        assert_eq!(
+            super::addon_user_config_path_from("ponytail", None, None, Some(&home), false)
+                .expect("Unix home path"),
+            home.join(".config").join("ponytail").join("config.json")
+        );
+
+        let system_home = root.path().join("system-home");
+        for home_from_env in [None, Some(PathBuf::new())] {
+            let resolved_home =
+                super::addon_home_from_environment(home_from_env, Some(system_home.clone()))
+                    .expect("system home fallback");
+            assert_eq!(
+                super::addon_user_config_path_from(
+                    "ponytail",
+                    None,
+                    None,
+                    Some(&resolved_home),
+                    false,
+                )
+                .expect("fallback Unix path"),
+                system_home
+                    .join(".config")
+                    .join("ponytail")
+                    .join("config.json")
+            );
+        }
+    }
+
+    #[test]
+    fn addon_mode_config_read_write_is_normalized_and_preserves_fields() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ponytail = super::addon_mode_spec("ponytail").expect("ponytail mode spec");
+        let ponytail_config = root.path().join("ponytail").join("config.json");
+        fs::create_dir_all(ponytail_config.parent().expect("parent")).expect("create parent");
+        fs::write(
+            &ponytail_config,
+            b"\xEF\xBB\xBF{\"defaultMode\":\" ULTRA \",\"other\":{\"kept\":true}}",
+        )
+        .expect("write Ponytail config with BOM");
+
+        assert_eq!(
+            super::read_addon_default_mode_from_path(&ponytail_config, ponytail)
+                .expect("read Ponytail config"),
+            Some("ultra".to_string())
+        );
+        super::write_addon_default_mode_to_path(&ponytail_config, ponytail, " lite ")
+            .expect("write Ponytail mode");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ponytail_config).expect("read saved config"))
+                .expect("saved JSON");
+        assert_eq!(
+            saved.get("defaultMode").and_then(serde_json::Value::as_str),
+            Some("lite")
+        );
+        assert_eq!(saved["other"], serde_json::json!({ "kept": true }));
+
+        let caveman = super::addon_mode_spec("caveman").expect("caveman mode spec");
+        let caveman_config = root.path().join("caveman").join("config.json");
+        fs::create_dir_all(caveman_config.parent().expect("parent")).expect("create parent");
+        fs::write(&caveman_config, b"{\"defaultMode\":\" WENYAN \"}")
+            .expect("write legacy Caveman config");
+        assert_eq!(
+            super::read_addon_default_mode_from_path(&caveman_config, caveman)
+                .expect("read Caveman config"),
+            Some("wenyan-full".to_string())
+        );
+    }
+
+    #[test]
+    fn addon_mode_write_never_overwrites_invalid_or_non_object_config() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ponytail = super::addon_mode_spec("ponytail").expect("ponytail mode spec");
+        let invalid = root.path().join("invalid.json");
+        fs::write(&invalid, b"{not valid json").expect("write invalid config");
+        let original_invalid = fs::read(&invalid).expect("read invalid config");
+        let err = super::write_addon_default_mode_to_path(&invalid, ponytail, "lite")
+            .expect_err("invalid JSON must not be overwritten");
+        assert!(err.to_string().contains(&invalid.display().to_string()));
+        assert_eq!(
+            fs::read(&invalid).expect("read invalid config"),
+            original_invalid
+        );
+        assert_eq!(
+            super::addon_default_mode_or_full(&invalid, ponytail),
+            "full"
+        );
+
+        let non_object = root.path().join("array.json");
+        fs::write(&non_object, b"[]").expect("write array config");
+        let original_non_object = fs::read(&non_object).expect("read array config");
+        let err = super::write_addon_default_mode_to_path(&non_object, ponytail, "full")
+            .expect_err("non-object JSON must not be overwritten");
+        assert!(err.to_string().contains(&non_object.display().to_string()));
+        assert_eq!(
+            fs::read(&non_object).expect("read array config"),
+            original_non_object
+        );
+
+        let absent = root.path().join("new").join("config.json");
+        let err = super::write_addon_default_mode_to_path(&absent, ponytail, "wenyan")
+            .expect_err("unsupported Ponytail mode must be rejected");
+        assert!(err
+            .to_string()
+            .contains("unsupported ponytail default mode"));
+        assert!(
+            !absent.exists(),
+            "invalid mode must not create a config file"
+        );
+
+        let caveman = super::addon_mode_spec("caveman").expect("caveman mode spec");
+        let legacy_write = root.path().join("caveman").join("config.json");
+        let err = super::write_addon_default_mode_to_path(&legacy_write, caveman, "wenyan")
+            .expect_err("legacy Caveman alias must only be accepted while reading");
+        assert!(err.to_string().contains("unsupported caveman default mode"));
+        assert!(
+            !legacy_write.exists(),
+            "legacy alias must not create a config file"
+        );
+    }
+
     fn listed_tool(manager: &ToolManager, id: &str) -> ManagedTool {
         manager
             .list_tools()
@@ -12075,20 +12591,19 @@ after
             None
         );
 
-        // Self-maintaining: rtk is refreshed at launch, headroom rides the
-        // runtime upgrade. Neither gets an Update button, stale or not.
+        // Both runtime-managed tools stay manually actionable when stale.
         assert_eq!(
-            pending_addon_update("rtk", Some("0.1.0"), RTK_VERSION),
-            None
+            pending_addon_update("rtk", Some("0.1.0"), RTK_VERSION).as_deref(),
+            Some(RTK_VERSION)
         );
         assert_eq!(
             pending_addon_update("headroom", Some("0.1.0"), HEADROOM_PINNED_VERSION),
-            None
+            Some(HEADROOM_PINNED_VERSION.to_string())
         );
     }
 
     #[test]
-    fn rtk_is_refreshed_on_launch_so_it_never_advertises_a_manual_update() {
+    fn stale_rtk_is_both_launch_refreshable_and_manually_updatable() {
         let (_root, runtime, manager) = seed_test_runtime("addon-update-rtk");
         fs::create_dir_all(&runtime.bin_dir).expect("bin dir");
         fs::write(manager.rtk_entrypoint(), b"#!/bin/sh\n").expect("entrypoint");
@@ -12101,7 +12616,8 @@ after
         let rtk = listed_tool(&manager, "rtk");
         assert_eq!(rtk.version, "0.1.0");
         assert!(manager.rtk_needs_install());
-        assert!(!rtk.update_available);
+        assert!(rtk.update_available);
+        assert_eq!(rtk.available_version.as_deref(), Some(RTK_VERSION));
     }
 
     #[test]
@@ -12452,7 +12968,7 @@ after
             wheel_url: "https://new.example/headroom_ai-0.10.8.whl".into(),
             sha256: "newnewnew".into(),
         };
-        let mcp = serde_json::json!({ "configured": true, "proxyUrl": "http://127.0.0.1:6767" });
+        let mcp = serde_json::json!({ "configured": true, "proxyUrl": "http://127.0.0.1:6867" });
         manager
             .update_headroom_receipt_after_in_place_upgrade(&release, mcp.clone())
             .expect("receipt update ok");
@@ -12905,7 +13421,7 @@ after
 
     #[test]
     fn prepare_in_place_falls_back_to_atomic_when_receipt_predates_floor() {
-        // 0.8.2 (shipped in headroom-desktop 0.2.50-rc.1 and the fallback
+        // 0.8.2 (shipped in headroom-local-community 0.2.50-rc.1 and the fallback
         // version on every Sentry boot-validation stall observed for 0.3.6)
         // is below the 0.10.0 floor. Force the rebuild even when the lock
         // snapshot is takeable.
@@ -13007,14 +13523,14 @@ after
 
     #[test]
     #[serial_test::serial]
-    fn hf_hub_cache_dir_follows_huggingface_precedence() {
+    fn hf_hub_cache_dir_from_env_follows_huggingface_precedence() {
         let root = std::env::temp_dir().join("headroom-hf-precedence");
         let _home = HomeGuard::new(&root);
         let _hf = HfEnvGuard::new();
 
         // Default: ${XDG_CACHE_HOME:-$HOME/.cache}/huggingface/hub
         assert_eq!(
-            super::hf_hub_cache_dir(),
+            super::hf_hub_cache_dir_from_env(),
             Some(root.join(".cache").join("huggingface").join("hub"))
         );
 
@@ -13022,32 +13538,52 @@ after
         // relative path.
         std::env::set_var("HF_HUB_CACHE", "");
         assert_eq!(
-            super::hf_hub_cache_dir(),
+            super::hf_hub_cache_dir_from_env(),
             Some(root.join(".cache").join("huggingface").join("hub"))
         );
         std::env::remove_var("HF_HUB_CACHE");
 
         std::env::set_var("XDG_CACHE_HOME", "/x/xdg");
         assert_eq!(
-            super::hf_hub_cache_dir(),
+            super::hf_hub_cache_dir_from_env(),
             Some(PathBuf::from("/x/xdg/huggingface/hub"))
         );
 
         // $HF_HOME/hub beats XDG_CACHE_HOME.
         std::env::set_var("HF_HOME", "/x/hfhome");
         assert_eq!(
-            super::hf_hub_cache_dir(),
+            super::hf_hub_cache_dir_from_env(),
             Some(PathBuf::from("/x/hfhome/hub"))
         );
 
         // The legacy var beats HF_HOME and is itself the full hub path, no
         // `hub` suffix appended.
         std::env::set_var("HUGGINGFACE_HUB_CACHE", "/x/legacy");
-        assert_eq!(super::hf_hub_cache_dir(), Some(PathBuf::from("/x/legacy")));
+        assert_eq!(
+            super::hf_hub_cache_dir_from_env(),
+            Some(PathBuf::from("/x/legacy"))
+        );
 
         // HF_HUB_CACHE wins outright.
         std::env::set_var("HF_HUB_CACHE", "/x/win");
-        assert_eq!(super::hf_hub_cache_dir(), Some(PathBuf::from("/x/win")));
+        assert_eq!(
+            super::hf_hub_cache_dir_from_env(),
+            Some(PathBuf::from("/x/win"))
+        );
+    }
+
+    #[cfg(feature = "local-community")]
+    #[test]
+    #[serial_test::serial]
+    fn community_hf_hub_cache_is_workspace_scoped() {
+        let _hf = HfEnvGuard::new();
+        std::env::set_var("HF_HUB_CACHE", "/shared/huggingface/hub");
+        std::env::set_var("HF_HOME", "/shared/huggingface");
+
+        assert_eq!(
+            super::hf_hub_cache_dir(),
+            Some(crate::edition::huggingface_hub_cache_dir())
+        );
     }
 
     #[test]
@@ -13509,7 +14045,10 @@ exit 0
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(after["oauthAccount"]["id"], "abc");
         assert!(after["projects"]["/x"].is_object());
-        assert_eq!(after["mcpServers"]["headroom"]["command"], "/bin/headroom");
+        assert_eq!(
+            after["mcpServers"]["headroom_local_community"]["command"],
+            "/bin/headroom"
+        );
     }
 
     #[test]
@@ -13536,14 +14075,18 @@ exit 0
             .unwrap();
 
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(after["mcpServers"]["headroom"].is_object());
+        assert!(after["mcpServers"]["headroom_local_community"].is_object());
         // Backup taken, no tmp file left behind.
         let names: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(names.iter().any(|n| n.contains(".headroom-backup-")));
-        assert!(!names.iter().any(|n| n.ends_with(".headroom-tmp")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains(".headroom-local-community-backup-")));
+        assert!(!names
+            .iter()
+            .any(|n| n.ends_with(".headroom-local-community-tmp")));
     }
 
     fn pip_failure(stderr: &str) -> anyhow::Error {

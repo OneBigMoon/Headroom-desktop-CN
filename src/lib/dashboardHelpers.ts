@@ -641,7 +641,7 @@ export function connectorStatusLine(
   }
   if (connector.verification && !connector.verification.proxyReachable) {
     return {
-      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6767 yet.",
+      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.",
       tone: "reason"
     };
   }

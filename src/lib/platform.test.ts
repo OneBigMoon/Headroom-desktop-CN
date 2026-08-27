@@ -31,7 +31,7 @@ describe("platformPreviewSupportMailto", () => {
       appVersion: "0.8.4",
       headroomVersion: "0.35.1",
     });
-    expect(url.startsWith("mailto:support@extraheadroom.com?subject=")).toBe(true);
+    expect(url.startsWith("mailto:headroom-local-community@localhost.invalid?subject=")).toBe(true);
     const body = decodeURIComponent(url.split("&body=")[1]);
     expect(body).toContain("Platform: windows");
     expect(body).toContain("App version: 0.8.4");

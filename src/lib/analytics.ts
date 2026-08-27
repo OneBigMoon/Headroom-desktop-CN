@@ -1,5 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-
 export type AnalyticsProperties = Record<
   string,
   string | number | boolean | null | undefined
@@ -9,12 +7,10 @@ const installMilestonePrefix = "headroom.analytics.install.";
 const seenInstallMilestones = new Set<string>();
 
 export function trackAnalyticsEvent(
-  name: string,
-  properties?: AnalyticsProperties
+  _name: string,
+  _properties?: AnalyticsProperties
 ) {
-  void invoke("track_analytics_event", { name, properties }).catch(() => {
-    // Analytics should never interrupt product flows.
-  });
+  // Community builds do not send product analytics.
 }
 
 // Returns true only on the send that actually fired, so callers can piggyback

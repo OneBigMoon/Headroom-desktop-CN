@@ -43,7 +43,7 @@ describe("analytics helpers", () => {
     Reflect.deleteProperty(globalThis, "localStorage");
   });
 
-  it("tracks analytics events and swallows invoke failures", async () => {
+  it("does not transmit analytics events", async () => {
     invokeMock.mockReset();
     invokeMock.mockRejectedValueOnce(new Error("bridge offline"));
 
@@ -52,10 +52,7 @@ describe("analytics helpers", () => {
     trackAnalyticsEvent("dashboard_opened", { source: "tray", count: 2 });
     await Promise.resolve();
 
-    expect(invokeMock).toHaveBeenCalledWith("track_analytics_event", {
-      name: "dashboard_opened",
-      properties: { source: "tray", count: 2 },
-    });
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("records install milestones only once per name", async () => {
@@ -68,11 +65,7 @@ describe("analytics helpers", () => {
     trackInstallMilestoneOnce("desktop_setup_complete", { client: "claude_code" });
 
     expect(values.get("headroom.analytics.install.desktop_setup_complete")).toBe("1");
-    expect(invokeMock).toHaveBeenCalledTimes(1);
-    expect(invokeMock).toHaveBeenCalledWith("track_analytics_event", {
-      name: "desktop_setup_complete",
-      properties: { client: "claude_code" },
-    });
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("skips tracking milestones that were already persisted", async () => {
@@ -98,10 +91,6 @@ describe("analytics helpers", () => {
     trackInstallMilestoneOnce("runtime_bootstrap_started");
     trackInstallMilestoneOnce("runtime_bootstrap_started");
 
-    expect(invokeMock).toHaveBeenCalledTimes(1);
-    expect(invokeMock).toHaveBeenCalledWith("track_analytics_event", {
-      name: "runtime_bootstrap_started",
-      properties: undefined,
-    });
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

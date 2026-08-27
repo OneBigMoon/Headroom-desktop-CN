@@ -1,14 +1,14 @@
 //! Runtime-selected backend port for the Python proxy.
 //!
-//! `6767` (the intercept port) is fixed because clients are configured to point
-//! at it. `6768` (the internal port between intercept and Python proxy) is
+//! `6867` (the intercept port) is fixed because clients are configured to point
+//! at it. `6868` (the internal port between intercept and Python proxy) is
 //! purely internal and can move when something else on the machine has already
 //! grabbed it — most commonly Apple's `rapportd`, which gets a kernel-assigned
 //! port at login and registers it via Bonjour. On affected machines the only
-//! reliable way to free 6768 is a reboot, which is not a fix we can ship.
+//! reliable way to free 6868 is a reboot, which is not a fix we can ship.
 //!
-//! At proxy spawn time, [`select_available`] probes 6768 and falls back to
-//! 6769..=6790. The chosen port is stored in [`BACKEND_PORT`]; the intercept
+//! At proxy spawn time, [`select_available`] probes 6868 and falls back to
+//! 6869..=6890. The chosen port is stored in [`BACKEND_PORT`]; the intercept
 //! forwarder, spawn args, and health probes all read it through [`get`].
 //!
 //! Default value is [`DEFAULT_BACKEND_PORT`] so anything that reads the atomic
@@ -16,9 +16,9 @@
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
-pub const DEFAULT_BACKEND_PORT: u16 = 6768;
-pub const FALLBACK_RANGE_START: u16 = 6769;
-pub const FALLBACK_RANGE_END: u16 = 6790;
+pub const DEFAULT_BACKEND_PORT: u16 = 6868;
+pub const FALLBACK_RANGE_START: u16 = 6869;
+pub const FALLBACK_RANGE_END: u16 = 6890;
 
 static BACKEND_PORT: AtomicU16 = AtomicU16::new(DEFAULT_BACKEND_PORT);
 
@@ -48,7 +48,7 @@ pub struct SelectedFallback {
 
 /// All probed ports were foreign-held. Vanishingly rare in practice (rapportd
 /// only takes one port) but possible if the user has 23 unrelated daemons in
-/// the 6768-6790 range, so we surface a structured error instead of looping.
+/// the 6868-6890 range, so we surface a structured error instead of looping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllForeign {
     pub original_occupant: String,
@@ -87,7 +87,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_port_is_6768() {
+    fn default_port_is_6868() {
         reset_for_tests();
         assert_eq!(get(), DEFAULT_BACKEND_PORT);
     }
@@ -95,22 +95,22 @@ mod tests {
     #[test]
     fn set_then_get_round_trips() {
         reset_for_tests();
-        set(6770);
-        assert_eq!(get(), 6770);
+        set(FALLBACK_RANGE_START + 1);
+        assert_eq!(get(), FALLBACK_RANGE_START + 1);
         reset_for_tests();
     }
 
     #[test]
     fn select_fallback_returns_first_bindable_port() {
-        // 6769, 6770 fail; 6771 succeeds.
+        // The first two fallback ports fail; the third succeeds.
         let result = select_fallback("rapportd pid 594".to_string(), Some(594), |port: u16| {
-            port >= 6771
+            port >= FALLBACK_RANGE_START + 2
         })
         .expect("ok");
         assert_eq!(
             result,
             SelectedFallback {
-                port: 6771,
+                port: FALLBACK_RANGE_START + 2,
                 original_occupant: "rapportd pid 594".to_string(),
                 original_pid: Some(594),
             }
@@ -137,9 +137,11 @@ mod tests {
 
     #[test]
     fn select_fallback_preserves_unknown_occupant_pid() {
-        let result =
-            select_fallback("unknown process".to_string(), None, |port| port == 6770).expect("ok");
-        assert_eq!(result.port, 6770);
+        let result = select_fallback("unknown process".to_string(), None, |port| {
+            port == FALLBACK_RANGE_START + 1
+        })
+        .expect("ok");
+        assert_eq!(result.port, FALLBACK_RANGE_START + 1);
         assert_eq!(result.original_pid, None);
         assert_eq!(result.original_occupant, "unknown process");
     }

@@ -652,7 +652,7 @@ describe("buildSetupStallMailto", () => {
   it("addresses support and names the branch in the subject", () => {
     const url = buildSetupStallMailto("no_savings", context);
 
-    expect(url.startsWith("mailto:support@extraheadroom.com?subject=")).toBe(true);
+    expect(url.startsWith("mailto:headroom-local-community@localhost.invalid?subject=")).toBe(true);
     expect(decodeURIComponent(url.split("?subject=")[1].split("&body=")[0])).toBe(
       "Headroom is not saving anything (no_savings)"
     );
@@ -688,7 +688,7 @@ describe("buildInstallFailureMailto", () => {
       appVersion: "0.8.1",
       platform: "macos",
     });
-    expect(url.startsWith("mailto:support@extraheadroom.com?subject=")).toBe(true);
+    expect(url.startsWith("mailto:headroom-local-community@localhost.invalid?subject=")).toBe(true);
     const decoded = decodeURIComponent(url);
     expect(decoded).toContain("unsupported_pin");
     expect(decoded).toContain("onnxruntime==1.27.0");

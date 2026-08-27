@@ -17,7 +17,7 @@ The checks drive Grok with one-shot commands (`grok -p`), so they work from eith
 
 ```bash
 grep -q '# >>> headroom:grok_build_proxy >>>' ~/.grok/config.toml 2>/dev/null \
-  || grep -q 'base_url = "http://127.0.0.1:6767/v1"' ~/.grok/config.toml \
+  || grep -q 'base_url = "http://127.0.0.1:6867/v1"' ~/.grok/config.toml \
   && echo PASS || echo FAIL
 ```
 
@@ -53,7 +53,7 @@ Toggle Grok Build off, then `cat ~/.grok/config.toml`: the managed block must be
 ## Cross-cutting
 
 - **Banner badge**: the Grok logo badge shows gray = off, green = active, red only when the connector is enabled while the proxy is unreachable. Tooltip opens downward and instantly on hover.
-- **Gate interplay**: with only Grok Build enabled, the Python backend must stay up (it is gate-exempt). `curl -s http://127.0.0.1:6767/livez` returns 200 with Claude and Codex both disabled.
+- **Gate interplay**: with only Grok Build enabled, the Python backend must stay up (it is gate-exempt). `curl -s http://127.0.0.1:6867/livez` returns 200 with Claude and Codex both disabled.
 - **Sentry**: the morning after, check the triage output for new error classes - misattributed connector errors (grok traffic reported under codex fingerprints) would surface there first.
 
 ## When something fails

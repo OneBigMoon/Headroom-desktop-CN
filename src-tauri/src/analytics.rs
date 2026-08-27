@@ -12,7 +12,11 @@ use reqwest::Url;
 use serde_json::{json, Map, Value};
 use tauri::{webview_version, AppHandle, Manager};
 
-const HEADROOM_APTABASE_APP_KEY: Option<&str> = option_env!("HEADROOM_APTABASE_APP_KEY");
+// The upstream build may provide this at compile time. The local-community
+// feature hard-disables config resolution below, including environment
+// overrides, so a Community build cannot start an analytics dispatcher.
+#[cfg(not(feature = "local-community"))]
+const HEADROOM_APTABASE_APP_KEY: Option<&str> = None;
 
 // Allowlist to stay under the Aptabase free-plan event quota. Only version
 // visibility (app_started carries appVersion/headroom_ai_version), the billing
@@ -169,7 +173,7 @@ impl AnalyticsClient {
                 "engineName": self.system_props.engine_name,
                 "engineVersion": self.system_props.engine_version,
                 "appVersion": self.app_version,
-                "sdkVersion": "headroom-desktop"
+                "sdkVersion": "headroom-local-community"
             },
             "props": props_value
         });
@@ -219,6 +223,12 @@ impl TrackingSession {
 }
 
 impl AnalyticsConfig {
+    #[cfg(feature = "local-community")]
+    fn from_env() -> Option<Self> {
+        None
+    }
+
+    #[cfg(not(feature = "local-community"))]
     fn from_env() -> Option<Self> {
         let app_key = resolve_app_key()?;
         let mut parts = app_key.split('-');
@@ -244,6 +254,12 @@ impl AnalyticsConfig {
     }
 }
 
+#[cfg(feature = "local-community")]
+pub fn resolve_app_key() -> Option<String> {
+    None
+}
+
+#[cfg(not(feature = "local-community"))]
 pub fn resolve_app_key() -> Option<String> {
     std::env::var("HEADROOM_APTABASE_APP_KEY")
         .ok()
@@ -514,6 +530,7 @@ mod tests {
         assert!(sanitize_properties(Some(json!(["not", "an", "object"]))).is_none());
     }
 
+    #[cfg(not(feature = "local-community"))]
     #[test]
     fn analytics_config_parses_supported_regions() {
         std::env::set_var("HEADROOM_APTABASE_APP_KEY", "A-EU-123");
@@ -522,6 +539,16 @@ mod tests {
             config.ingest_api_url.as_str(),
             "https://eu.aptabase.com/api/v0/events"
         );
+        std::env::remove_var("HEADROOM_APTABASE_APP_KEY");
+    }
+
+    #[cfg(feature = "local-community")]
+    #[test]
+    #[serial_test::serial]
+    fn local_community_ignores_analytics_environment_override() {
+        std::env::set_var("HEADROOM_APTABASE_APP_KEY", "A-EU-123");
+        assert!(AnalyticsConfig::from_env().is_none());
+        assert!(super::resolve_app_key().is_none());
         std::env::remove_var("HEADROOM_APTABASE_APP_KEY");
     }
 

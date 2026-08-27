@@ -5,6 +5,7 @@ import {
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useI18n } from "../lib/i18n";
 import type { AppliedPatterns, AppliedSection } from "../lib/types";
 
 interface OptimizePanelProps {
@@ -33,6 +34,7 @@ export function OptimizePanel({
   onAppliedMutated,
   neverScanned = false,
 }: OptimizePanelProps) {
+  const { t } = useI18n();
   const hasPreloadedApplied = preloadedApplied !== undefined;
   const [applied, setApplied] = useState<AppliedPatterns | null>(
     hasPreloadedApplied ? preloadedApplied ?? null : null,
@@ -65,12 +67,12 @@ export function OptimizePanel({
       })
       .catch((err) => {
         if (!active) return;
-        setLoadError(err instanceof Error ? err.message : "Failed to load optimize data.");
+        setLoadError(err instanceof Error ? err.message : t("messages.localOperationFailed"));
       });
     return () => {
       active = false;
     };
-  }, [projectPath]);
+  }, [projectPath, t]);
 
   useEffect(() => {
     const cancel = refetch();
@@ -97,7 +99,7 @@ export function OptimizePanel({
         refetch();
       }
     } catch (err) {
-      setLoadError(err instanceof Error ? err.message : "Delete failed.");
+      setLoadError(err instanceof Error ? err.message : t("messages.localOperationFailed"));
     } finally {
       setBusyIds((prev) => {
         const next = new Set(prev);
@@ -116,7 +118,7 @@ export function OptimizePanel({
     return (
       <span className="optimize-panel__pills">
         <button type="button" className="optimize-panel__pill optimize-panel__pill--empty" disabled>
-          not scanned yet
+          {t("optimize.notScanned")}
         </button>
       </span>
     );
@@ -138,7 +140,7 @@ export function OptimizePanel({
           }}
           title={loadError}
         >
-          could not load learnings — retry
+          {t("optimize.loadRetry")}
         </button>
       </span>
     );
@@ -153,7 +155,7 @@ export function OptimizePanel({
           onClick={() => setModal("claude")}
           disabled={claudeDisabled}
         >
-          {claudeCount} learning{claudeCount === 1 ? "" : "s"} in CLAUDE.local.md
+          {t(claudeCount === 1 ? "optimize.learningCountOne" : "optimize.learningCount", { count: claudeCount })}
         </button>
         <button
           type="button"
@@ -161,19 +163,18 @@ export function OptimizePanel({
           onClick={() => setModal("memory")}
           disabled={memoryDisabled}
         >
-          {memoryCount} reminder{memoryCount === 1 ? "" : "s"} in MEMORY.md
+          {t(memoryCount === 1 ? "optimize.reminderCountOne" : "optimize.reminderCount", { count: memoryCount })}
         </button>
       </span>
 
       {modal === "claude" ? (
-        <Modal title="Learnings in CLAUDE.local.md" onClose={() => setModal(null)}>
+        <Modal title={t("optimize.claudeTitle")} onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
-            <p className="optimize-panel__empty">Loading…</p>
+            <p className="optimize-panel__empty">{t("settings.loading")}</p>
           ) : claudeCount === 0 ? (
             <p className="optimize-panel__empty">
-              No learnings in CLAUDE.local.md yet — run Learn or let live traffic
-              accumulate.
+              {t("optimize.noLearnings")}
             </p>
           ) : (
             <AppliedSections
@@ -187,14 +188,13 @@ export function OptimizePanel({
       ) : null}
 
       {modal === "memory" ? (
-        <Modal title="Reminders in MEMORY.md" onClose={() => setModal(null)}>
+        <Modal title={t("optimize.memoryTitle")} onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
-            <p className="optimize-panel__empty">Loading…</p>
+            <p className="optimize-panel__empty">{t("settings.loading")}</p>
           ) : memoryCount === 0 ? (
             <p className="optimize-panel__empty">
-              No reminders in MEMORY.md yet — run Learn or let live traffic
-              accumulate.
+              {t("optimize.noReminders")}
             </p>
           ) : (
             <AppliedSections
@@ -219,6 +219,7 @@ function Modal({
   onClose: () => void;
   children: React.ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <div
       className="modal-backdrop"
@@ -236,7 +237,7 @@ function Modal({
             type="button"
             className="optimize-panel__modal-close"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t("actions.close")}
           >
             ×
           </button>
@@ -295,6 +296,7 @@ function AppliedBullet({
   busy: boolean;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const canExpand = bullet.length > 140 || bullet.includes("\n");
   return (
@@ -316,7 +318,7 @@ function AppliedBullet({
             className="activity-feed__expand"
             onClick={() => setExpanded((prev) => !prev)}
           >
-            {expanded ? "Show less" : "Show more"}
+            {expanded ? t("actions.showLess") : t("actions.showMore")}
           </button>
         ) : null}
       </div>
@@ -326,7 +328,7 @@ function AppliedBullet({
         disabled={busy}
         onClick={onDelete}
       >
-        {busy ? "…" : "Delete"}
+        {busy ? "…" : t("actions.delete")}
       </button>
     </li>
   );

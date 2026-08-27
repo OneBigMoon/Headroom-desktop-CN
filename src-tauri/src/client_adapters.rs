@@ -14,10 +14,10 @@ use crate::models::{
 use crate::storage::{app_data_dir, config_file};
 
 // Raw proxy base — use provider-specific constants below when configuring client endpoints.
-const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
-const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6767";
-const HEADROOM_OPENAI_BASE_URL: &str = "http://127.0.0.1:6767/v1";
-const HEADROOM_GROK_PROXY_BASE_URL: &str = "http://127.0.0.1:6767/v1";
+const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6867";
+const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6867";
+const HEADROOM_OPENAI_BASE_URL: &str = "http://127.0.0.1:6867/v1";
+const HEADROOM_GROK_PROXY_BASE_URL: &str = "http://127.0.0.1:6867/v1";
 const ZSH_PROFILE_FILE: &str = ".zprofile";
 const ZSH_RC_FILE: &str = ".zshrc";
 const BASH_PROFILE_FILE: &str = ".bash_profile";
@@ -157,7 +157,7 @@ pub fn rtk_integration_status() -> Result<(bool, bool)> {
         "managed_rtk",
         "export PATH=",
     )?;
-    let hook_configured = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
+    let hook_configured = claude_settings_hook_matches("headroom-local-community-rtk-rewrite.sh")?
         && headroom_rtk_hook_path().exists();
     Ok((path_configured, hook_configured))
 }
@@ -271,7 +271,44 @@ fn shell_step_best_effort(
     }
 }
 
+fn official_headroom_routing_conflict() -> Option<PathBuf> {
+    let mut paths = all_shell_paths();
+    paths.extend(claude_settings_candidates());
+    paths.push(codex_config_toml_path());
+    paths.push(grok_config_toml_path());
+    paths.push(opencode_config_path());
+
+    paths.into_iter().find(|path| {
+        std::fs::read_to_string(path).ok().is_some_and(|text| {
+            text.contains("# >>> headroom:")
+                || text.contains("# <<< headroom:")
+                || text.contains("[model_providers.headroom]")
+                || text.contains("model_provider = \"headroom\"")
+                || text.contains("127.0.0.1:6767")
+                || text.contains("127.0.0.1:6768")
+                || text.contains("127.0.0.1:6769")
+                || text.contains("127.0.0.1:6790")
+        })
+    })
+}
+
 pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
+    if crate::edition::LOCAL_COMMUNITY {
+        // Enabling Codex is an explicit takeover action. Its renderer preserves
+        // the official provider table for rollback while replacing only the
+        // root routing block. Other connectors still refuse an implicit
+        // takeover because their configuration formats do not yet provide the
+        // same reversible migration.
+        let codex_takeover = normalized_setup_id(client_id) == "codex_cli";
+        if !codex_takeover {
+            if let Some(path) = official_headroom_routing_conflict() {
+                return Err(anyhow!(
+                    "Official Headroom routing is active in {}. Pause that connector in the paid app before enabling Headroom Local Community; Community will not overwrite or remove the official configuration.",
+                    path.display()
+                ));
+            }
+        }
+    }
     let first = apply_client_setup_once(client_id)?;
     if first.verification.verified {
         return Ok(first);
@@ -524,8 +561,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 shell_block_contains_text_in_files(&shell_targets, "managed_rtk", "export PATH=")?;
             let claude_settings_ok =
                 claude_settings_env_matches("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
-            let rtk_hook_ok = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
-                && headroom_rtk_hook_path().exists();
+            let rtk_hook_ok =
+                claude_settings_hook_matches("headroom-local-community-rtk-rewrite.sh")?
+                    && headroom_rtk_hook_path().exists();
 
             if shell_ok {
                 checks.push(
@@ -689,7 +727,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
     // attests only to "we wrote everything we needed to write".
     let proxy_reachable = is_headroom_proxy_reachable();
     if proxy_reachable {
-        checks.push("Headroom proxy is reachable on 127.0.0.1:6767.".into());
+        checks.push("Headroom proxy is reachable on 127.0.0.1:6867.".into());
     }
 
     Ok(ClientSetupVerification {
@@ -913,8 +951,8 @@ pub fn clear_client_setups() -> Result<()> {
 /// Fully uninstalls Headroom's on-disk footprint on a best-effort basis:
 /// reverses every client setup, strips Headroom's hook entry from Claude Code
 /// settings (both `settings.json` and `settings.local.json`), deletes the
-/// managed hook script, the Headroom application-support directory, the
-/// `~/.headroom` Python runtime, the macOS LaunchAgent plist, Preferences,
+/// managed hook script, the Community application-support directory, the
+/// `~/.headroom-local-community` workspace, the macOS LaunchAgent plist, Preferences,
 /// Caches, and keychain entries.
 ///
 /// Returns the list of paths that were successfully removed (useful for
@@ -1043,7 +1081,7 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     // disable_client_setup, but only after remove_shell_block succeeds (it runs
     // under `?` before them): a shell-rc failure there silently leaves both in
     // place, and each bricks Claude once the proxy is gone (stale base URL ->
-    // dead 127.0.0.1:6767; guard hook errors on every prompt). Do them
+    // dead 127.0.0.1:6867; guard hook errors on every prompt). Do them
     // unconditionally here. Idempotent: each only acts on Headroom's own value,
     // restoring any preserved pre-Headroom gateway URL.
     let preserved = load_setup_state()
@@ -1092,8 +1130,8 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     // reach, so this has to happen here rather than being left to `zap`.
     remove_known_keychain_entries();
 
-    // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
-    // siblings created by `backup_if_exists` for every file we ever mutated.
+    // Sweep `<basename>.headroom-local-community-backup-*` siblings created by
+    // `backup_if_exists` for every file we ever mutated.
     // Without this, stale backups remain in ~/.claude, ~/.claude/hooks,
     // ~/.codex, ~/Library/Application Support/Code/User, and the user's
     // shell rc directory after uninstall.
@@ -1117,8 +1155,9 @@ pub fn revert_external_mutations() -> Vec<String> {
 }
 
 /// Full uninstall: everything `revert_external_mutations` undoes, plus every
-/// directory Headroom owns (app data, `~/.headroom`, caches, logs, preferences,
-/// the Kompress model snapshot). Used by the in-app "uninstall and quit".
+/// Community-owned directory (app data, workspace, caches, logs, preferences).
+/// Shared model caches are deliberately preserved. Used by the in-app
+/// "uninstall and quit".
 ///
 /// The `--uninstall` CLI flag deliberately calls the narrower function instead:
 /// a Homebrew cask's `uninstall` must not delete user data, which is what `zap`
@@ -1147,7 +1186,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
-    let dot_headroom = home_dir().join(".headroom");
+    let dot_headroom = crate::edition::workspace_dir();
     if dot_headroom.exists() {
         match std::fs::remove_dir_all(&dot_headroom) {
             Ok(_) => removed.push(dot_headroom.display().to_string()),
@@ -1155,45 +1194,9 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
-    // Model snapshots the bundled runtime pulls into the shared HuggingFace hub
-    // cache. This used to remove only KOMPRESS_HF_MODEL_DIR, which orphaned every
-    // other model we fetch (~788MB measured: ModernBERT-base, two all-MiniLM-L6-v2
-    // variants, siglip-image-encoder-onnx, technique-router-onnx).
-    //
-    // Sweep by prefix instead of naming each one, so a new model added upstream
-    // does not silently start leaking. `chopratejas` is the author of the Python
-    // package we bundle, so `models--chopratejas--*` is unambiguously ours.
-    //
-    // Generic third-party models we also pull (answerdotai--ModernBERT-base,
-    // sentence-transformers--all-MiniLM-L6-v2, Qdrant--all-MiniLM-L6-v2-onnx) are
-    // deliberately left in place: another tool on this machine may share them, and
-    // re-pulling one is cheap next to breaking someone else's cache. Never the
-    // cache root either, for the same reason.
-    const HF_OWNED_MODEL_PREFIX: &str = "models--chopratejas--";
-    // Resolve the cache the way huggingface_hub does rather than assuming the
-    // default, so a relocated cache is still cleaned up.
-    let hf_hub = crate::tool_manager::hf_hub_cache_dir()
-        .unwrap_or_else(|| home_dir().join(".cache").join("huggingface").join("hub"));
-    // `.locks` holds a same-named sibling dir per model.
-    for parent in [hf_hub.clone(), hf_hub.join(".locks")] {
-        let Ok(entries) = std::fs::read_dir(&parent) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(HF_OWNED_MODEL_PREFIX)
-            {
-                continue;
-            }
-            let dir = entry.path();
-            match std::fs::remove_dir_all(&dir) {
-                Ok(_) => removed.push(dir.display().to_string()),
-                Err(err) => log::warn!("cleanup: removing {} failed: {err}", dir.display()),
-            }
-        }
-    }
+    // HuggingFace's cache is shared across applications. Even author-prefixed
+    // model snapshots may be in use by the paid Headroom app, so Community
+    // cleanup deliberately leaves the entire shared cache untouched.
 
     #[cfg(target_os = "macos")]
     {
@@ -1221,7 +1224,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
         // Windows app-data dirs not covered by app_data_dir() (which resolves
         // to %APPDATA%\Headroom already) and the huggingface cache (local).
         if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-            for candidate in [base.join("Headroom"), base.join("headroom")] {
+            for candidate in [base.join("HeadroomLocalCommunity")] {
                 if candidate.exists() {
                     match remove_dir_all_retry(&candidate) {
                         Ok(_) => removed.push(candidate.display().to_string()),
@@ -1237,8 +1240,8 @@ pub fn perform_full_cleanup() -> Vec<String> {
     removed
 }
 
-/// Every file Headroom has ever mutated, and therefore every file that may have
-/// a `.headroom-backup-*` / `.nommer-backup-*` sibling to sweep.
+/// Every file Community may mutate, and therefore every file that may have a
+/// `.headroom-local-community-backup-*` sibling to sweep.
 fn managed_backup_targets() -> Vec<PathBuf> {
     let mut targets: Vec<PathBuf> = claude_settings_candidates();
     targets.push(home_dir().join(".claude.json"));
@@ -1265,9 +1268,8 @@ fn managed_backup_targets() -> Vec<PathBuf> {
     targets
 }
 
-/// Remove sibling backup files that `backup_if_exists` (or its predecessor
-/// "nommer") created next to `target`. Filenames look like
-/// `<basename>.headroom-backup-<timestamp>` and `<basename>.nommer-backup-<timestamp>`.
+/// Remove sibling backup files created by this Community edition next to
+/// `target`. Legacy/paid-edition backup names are deliberately untouched.
 /// Returns the paths removed.
 fn sweep_managed_backups(target: &Path) -> Vec<String> {
     let mut removed = Vec::new();
@@ -1277,8 +1279,7 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
     let Some(file_name) = target.file_name().and_then(|n| n.to_str()) else {
         return removed;
     };
-    let headroom_prefix = format!("{}.headroom-backup-", file_name);
-    let nommer_prefix = format!("{}.nommer-backup-", file_name);
+    let headroom_prefix = format!("{}.headroom-local-community-backup-", file_name);
 
     let Ok(entries) = std::fs::read_dir(parent) else {
         return removed;
@@ -1287,7 +1288,7 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !name.starts_with(&headroom_prefix) && !name.starts_with(&nommer_prefix) {
+        if !name.starts_with(&headroom_prefix) {
             continue;
         }
         let path = entry.path();
@@ -1300,11 +1301,12 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
 }
 
 /// True when an MCP server command launches from inside Headroom's install
-/// footprint (the app-support dir or `~/.headroom`). Uninstall deletes both,
+/// footprint (the Community app-support or workspace directory). Uninstall
+/// deletes only those isolated locations,
 /// so a surviving entry could only ever spawn a failing server.
 fn mcp_command_in_headroom_footprint(command: &str) -> bool {
     let app_dir = format!("{}/", app_data_dir().display());
-    let dot_headroom = format!("{}/", home_dir().join(".headroom").display());
+    let dot_headroom = format!("{}/", crate::edition::workspace_dir().display());
     command.starts_with(&app_dir) || command.starts_with(&dot_headroom)
 }
 
@@ -1313,7 +1315,7 @@ fn mcp_command_in_headroom_footprint(command: &str) -> bool {
 /// resolves into Headroom's install footprint (serena, codebase-memory).
 /// `command` is a string in Claude's config and an array in OpenCode's.
 fn mcp_json_entry_is_headroom(name: &str, entry: &Value) -> bool {
-    if name == "headroom" {
+    if name == crate::edition::MCP_SERVER_NAME {
         return true;
     }
     let command = match entry.get("command") {
@@ -1418,7 +1420,7 @@ fn strip_headroom_mcp_from_opencode() -> Option<String> {
 
 /// Pure-text removal of Headroom-owned `[mcp_servers.*]` tables (including
 /// subtables) and the Python registrar's
-/// `# --- [end ]Headroom MCP server[: name] ---` marker comments from a
+/// `# --- [end ]Headroom Local Community MCP server[: name] ---` marker comments from a
 /// Codex-style TOML config. A table is ours when its name is `headroom` or
 /// its `command` launches from Headroom's install footprint; user-managed
 /// servers stay untouched.
@@ -1441,7 +1443,7 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
             current = mcp_table_name(line);
         }
         let Some(name) = current else { continue };
-        if name == "headroom" {
+        if name == crate::edition::MCP_SERVER_NAME {
             owned.insert(name.to_string());
         } else if line
             .split_once('=')
@@ -1461,8 +1463,8 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
     let mut dropping = false;
     for line in &lines {
         let trimmed = line.trim();
-        if trimmed.starts_with("# --- Headroom MCP server")
-            || trimmed.starts_with("# --- end Headroom MCP server")
+        if trimmed.starts_with("# --- Headroom Local Community MCP server")
+            || trimmed.starts_with("# --- end Headroom Local Community MCP server")
         {
             continue;
         }
@@ -1533,13 +1535,16 @@ fn claude_settings_candidates() -> Vec<PathBuf> {
     ]
 }
 
-/// Remove the PreToolUse entry pointing at `headroom-rtk-rewrite.sh`. Drops
+/// Remove the PreToolUse entry pointing at `headroom-local-community-rtk-rewrite.sh`. Drops
 /// the `PreToolUse` array if it becomes empty, and the `hooks` object if it
 /// has no remaining event arrays. Returns true if the file was modified.
 fn strip_headroom_hook_from_settings(settings_path: &Path) -> Result<bool> {
     remove_pre_tool_use_markers(
         settings_path,
-        &["headroom-rtk-rewrite.sh", "headroom-markitdown-read.sh"],
+        &[
+            "headroom-local-community-rtk-rewrite.sh",
+            "headroom-local-community-markitdown-read.sh",
+        ],
     )
 }
 
@@ -1608,8 +1613,11 @@ fn remove_macos_launch_agents() -> Vec<String> {
     let launch_agents_dir = home_dir().join("Library").join("LaunchAgents");
 
     // Bundle-id-style plist (tauri-plugin-autostart default) and the
-    // "Headroom.plist" name some older builds shipped. Either can exist.
-    let candidates = ["com.extraheadroom.headroom.plist", "Headroom.plist"];
+    // "HeadroomLocalCommunity.plist" name some older builds shipped. Either can exist.
+    let candidates = [
+        "org.headroomlocal.community.plist",
+        "HeadroomLocalCommunity.plist",
+    ];
 
     for name in candidates {
         let path = launch_agents_dir.join(name);
@@ -1641,7 +1649,10 @@ fn remove_linux_autostart_entries() -> Vec<String> {
 
     // Current product name, plus the binary name in case a build ever shipped
     // the plugin's `app_name` override. Either can exist.
-    for name in ["Headroom.desktop", "headroom-desktop.desktop"] {
+    for name in [
+        "HeadroomLocalCommunity.desktop",
+        "headroom-local-community.desktop",
+    ] {
         let path = autostart_dir.join(name);
         if !path.exists() {
             continue;
@@ -1666,7 +1677,7 @@ fn remove_macos_preferences() -> Vec<String> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !name.starts_with("com.extraheadroom.headroom") {
+        if !name.starts_with("org.headroomlocal.community") {
             continue;
         }
         let path = entry.path();
@@ -1689,7 +1700,7 @@ fn remove_macos_caches() -> Vec<String> {
     let caches_dir = home_dir()
         .join("Library")
         .join("Caches")
-        .join("com.extraheadroom.headroom");
+        .join("org.headroomlocal.community");
     if caches_dir.exists() {
         match std::fs::remove_dir_all(&caches_dir) {
             Ok(_) => removed.push(caches_dir.display().to_string()),
@@ -1702,7 +1713,10 @@ fn remove_macos_caches() -> Vec<String> {
 #[cfg(target_os = "macos")]
 fn remove_macos_logs() -> Vec<String> {
     let mut removed = Vec::new();
-    let logs_dir = home_dir().join("Library").join("Logs").join("Headroom");
+    let logs_dir = home_dir()
+        .join("Library")
+        .join("Logs")
+        .join("HeadroomLocalCommunity");
     if logs_dir.exists() {
         match std::fs::remove_dir_all(&logs_dir) {
             Ok(_) => removed.push(logs_dir.display().to_string()),
@@ -1720,12 +1734,12 @@ fn remove_macos_bundle_dirs() -> Vec<String> {
     let mut removed = Vec::new();
     let lib = home_dir().join("Library");
     let targets = [
-        lib.join("WebKit").join("com.extraheadroom.headroom"),
-        lib.join("HTTPStorages").join("com.extraheadroom.headroom"),
+        lib.join("WebKit").join("org.headroomlocal.community"),
+        lib.join("HTTPStorages").join("org.headroomlocal.community"),
         lib.join("HTTPStorages")
-            .join("com.extraheadroom.headroom.binarycookies"),
+            .join("org.headroomlocal.community.binarycookies"),
         lib.join("Saved Application State")
-            .join("com.extraheadroom.headroom.savedState"),
+            .join("org.headroomlocal.community.savedState"),
     ];
     for path in targets {
         if !path.exists() {
@@ -1748,11 +1762,11 @@ fn remove_macos_bundle_dirs() -> Vec<String> {
 /// captured alongside services because macOS keychain queries require both.
 fn remove_known_keychain_entries() {
     const ENTRIES: &[(&str, &str)] = &[
-        ("com.extraheadroom.headroom.account", "session-token"),
-        ("com.extraheadroom.headroom.device", "machine-id-digest"),
-        ("com.extraheadroom.headroom.headroom-learn", "openai"),
-        ("com.extraheadroom.headroom.headroom-learn", "anthropic"),
-        ("com.extraheadroom.headroom.headroom-learn", "gemini"),
+        ("org.headroomlocal.community.account", "session-token"),
+        ("org.headroomlocal.community.device", "machine-id-digest"),
+        ("org.headroomlocal.community.headroom-learn", "openai"),
+        ("org.headroomlocal.community.headroom-learn", "anthropic"),
+        ("org.headroomlocal.community.headroom-learn", "gemini"),
     ];
     for (service, account) in ENTRIES {
         if let Err(err) = crate::keychain::delete_secret(service, account) {
@@ -2074,8 +2088,11 @@ fn ensure_claude_code_rtk_hook(
         backup_files.push(path.display().to_string());
     }
 
-    let (settings_changed, settings_backups) =
-        ensure_claude_settings_hook(&hook_path, "Bash", "headroom-rtk-rewrite.sh")?;
+    let (settings_changed, settings_backups) = ensure_claude_settings_hook(
+        &hook_path,
+        "Bash",
+        "headroom-local-community-rtk-rewrite.sh",
+    )?;
     changed_files.extend(settings_changed);
     backup_files.extend(settings_backups);
 
@@ -2138,8 +2155,11 @@ pub fn enable_markitdown_integration(
             backup_files.push(path.display().to_string());
         }
 
-        let (settings_changed, settings_backups) =
-            ensure_claude_settings_hook(&hook_path, "Read", "headroom-markitdown-read.sh")?;
+        let (settings_changed, settings_backups) = ensure_claude_settings_hook(
+            &hook_path,
+            "Read",
+            "headroom-local-community-markitdown-read.sh",
+        )?;
         changed_files.extend(settings_changed);
         backup_files.extend(settings_backups);
 
@@ -2184,8 +2204,10 @@ pub fn enable_markitdown_integration(
 /// nudge), leaving any RTK hook untouched. Cleanup runs unconditionally so a
 /// client that was later disconnected is still scrubbed.
 pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
-    let mut changed =
-        remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"])?;
+    let mut changed = remove_pre_tool_use_markers(
+        &claude_settings_path(),
+        &["headroom-local-community-markitdown-read.sh"],
+    )?;
     let hook_path = headroom_markitdown_hook_path();
     if hook_path.exists() {
         let _ = std::fs::remove_file(&hook_path);
@@ -2678,7 +2700,7 @@ fn codex_config_toml_path() -> PathBuf {
 // values must be booleans), producing
 // `invalid type: string "headroom", expected a boolean in features`. The root
 // keys therefore go in a block at the *top* of the file (nothing above ⇒ root
-// scope), and the `[model_providers.headroom]` table goes in a block at the
+// scope), and the `[model_providers.headroom_local_community]` table goes in a block at the
 // *end*. `requires_openai_auth` is emitted only for ChatGPT-OAuth users: the
 // flag is what makes Codex render the account menu (profile/email/plan/usage),
 // but it also forces Codex to demand an OpenAI OAuth login (issue #406), which
@@ -2693,7 +2715,7 @@ const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
 // when Codex runs natively (provider `openai`) and vice-versa. To keep the menu
 // whole we retag threads to match whichever provider is currently active:
 // `openai -> headroom` on connect, `headroom -> openai` on disconnect/quit.
-const CODEX_HEADROOM_PROVIDER: &str = "headroom";
+const CODEX_HEADROOM_PROVIDER: &str = "headroom_local_community";
 const CODEX_NATIVE_PROVIDER: &str = "openai";
 
 /// Directories Codex is known to keep its state store in: the v148 GUI uses
@@ -2836,7 +2858,7 @@ pub fn retag_codex_threads_to_headroom() {
 
 fn codex_root_keys_body() -> String {
     format!(
-        "model_provider = \"headroom\"\n\
+        "model_provider = \"headroom_local_community\"\n\
          openai_base_url = \"{base}\"",
         base = HEADROOM_OPENAI_BASE_URL,
     )
@@ -2892,8 +2914,8 @@ fn codex_uses_chatgpt_auth() -> bool {
 
 fn codex_provider_table_body(requires_openai_auth: bool) -> String {
     let mut body = format!(
-        "[model_providers.headroom]\n\
-         name = \"Headroom persistent proxy\"\n\
+        "[model_providers.headroom_local_community]\n\
+         name = \"Headroom Local Community proxy\"\n\
          base_url = \"{base}\"\n\
          supports_websockets = false",
         base = HEADROOM_OPENAI_BASE_URL,
@@ -2905,7 +2927,7 @@ fn codex_provider_table_body(requires_openai_auth: bool) -> String {
 }
 
 fn codex_marker_block(block_id: &str, body: &str) -> String {
-    format!("# >>> headroom:{block_id} >>>\n{body}\n# <<< headroom:{block_id} <<<\n")
+    format!("# >>> headroom-local-community:{block_id} >>>\n{body}\n# <<< headroom-local-community:{block_id} <<<\n")
 }
 
 /// Remove every Headroom-managed artifact from Codex `config.toml` text: both
@@ -2921,19 +2943,23 @@ fn strip_codex_managed_toml(content: &str) -> String {
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            !(trimmed == "model_provider = \"headroom\""
+            !(trimmed == "model_provider = \"headroom_local_community\""
                 || (trimmed.starts_with(openai_orphan_prefix) && trimmed.ends_with("/v1\"")))
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Pure-text removal of every `# >>> headroom:<id> >>> ... <<<` block. Loops so
+/// Pure-text removal of every `# >>> headroom-local-community:<id> >>> ... <<<` block. Loops so
 /// a config that already holds duplicate managed blocks (interrupted write,
 /// older build) is fully cleaned, not left with one survivor that regenerates.
 fn strip_marker_block(content: &str, block_id: &str) -> String {
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
+    strip_namespaced_marker_block(content, "headroom-local-community", block_id)
+}
+
+fn strip_namespaced_marker_block(content: &str, namespace: &str, block_id: &str) -> String {
+    let start = format!("# >>> {namespace}:{block_id} >>>");
+    let end = format!("# <<< {namespace}:{block_id} <<<");
     let mut out = content.to_string();
     loop {
         let (Some(start_idx), Some(end_idx)) = (out.find(&start), out.find(&end)) else {
@@ -2976,7 +3002,7 @@ fn codex_foreign_model_provider(content: &str) -> Option<String> {
         if let Some((key, value)) = line.split_once('=') {
             if key.trim() == "model_provider" {
                 let name = value.trim().trim_matches('"');
-                if !name.is_empty() && name != "headroom" {
+                if !name.is_empty() && name != CODEX_HEADROOM_PROVIDER {
                     return Some(name.to_string());
                 }
             }
@@ -2986,7 +3012,7 @@ fn codex_foreign_model_provider(content: &str) -> Option<String> {
 }
 
 /// Drop any root-scope `model_provider = ...` line so the managed block's
-/// `model_provider = "headroom"` isn't a duplicate root key (which is invalid
+/// `model_provider = "headroom_local_community"` isn't a duplicate root key (which is invalid
 /// TOML and makes Codex refuse to load its config). A `model_provider` inside a
 /// table is left untouched.
 fn strip_codex_root_model_provider(content: &str) -> String {
@@ -3009,9 +3035,9 @@ fn strip_codex_root_model_provider(content: &str) -> String {
         .join("\n")
 }
 
-/// Drop an unmarked `[model_providers.headroom]` table so the managed block's
+/// Drop an unmarked `[model_providers.headroom_local_community]` table so the managed block's
 /// copy isn't a duplicate table key. This is the table-scope analog of
-/// [`strip_codex_root_model_provider`]: a second `[model_providers.headroom]`
+/// [`strip_codex_root_model_provider`]: a second `[model_providers.headroom_local_community]`
 /// makes Codex refuse to load its *entire* config, so one stale table breaks
 /// every `codex` invocation, not just our routing (Sentry RUST-6K).
 ///
@@ -3032,7 +3058,7 @@ fn strip_codex_headroom_provider_table(content: &str) -> String {
             if line.starts_with('[') && line.ends_with(']') {
                 // A new table header always ends any drop; it starts one only
                 // for our own provider name.
-                dropping = line == "[model_providers.headroom]";
+                dropping = line == "[model_providers.headroom_local_community]";
                 return !dropping;
             }
             !dropping
@@ -3074,10 +3100,14 @@ fn restore_codex_model_provider(provider: &str) -> Result<()> {
 /// the provider table appended at the end, around the user's other content.
 fn render_codex_config(existing: &str) -> String {
     let mid = strip_codex_managed_toml(existing);
+    // Official Headroom writes the active Codex root route in this block. Drop
+    // only that block during an explicit Community takeover; keep its provider
+    // table so disabling Community can restore `model_provider = "headroom"`.
+    let mid = strip_namespaced_marker_block(&mid, "headroom", CODEX_ROOT_BLOCK_ID);
     // Drop a foreign root model_provider too, else our managed
-    // `model_provider = "headroom"` collides with it as a duplicate root key.
+    // `model_provider = "headroom_local_community"` collides with it as a duplicate root key.
     let mid = strip_codex_root_model_provider(&mid);
-    // Same collision one scope down: an unmarked `[model_providers.headroom]`
+    // Same collision one scope down: an unmarked `[model_providers.headroom_local_community]`
     // table would duplicate the one in the managed block below.
     let mid = strip_codex_headroom_provider_table(&mid);
     let mid = mid.trim();
@@ -3128,7 +3158,7 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<
     Ok((vec![path.display().to_string()], backup_files, preserved))
 }
 
-/// Rewrite the `command` of the `[mcp_servers.headroom]` table in
+/// Rewrite the `command` of the `[mcp_servers.headroom_local_community]` table in
 /// `~/.codex/config.toml` to the absolute `entrypoint`. The upstream Python
 /// registrar writes a bare `command = "headroom"` that relies on PATH; when
 /// the managed runtime relocates, `~/.local/bin/headroom` dangles and Codex
@@ -3169,7 +3199,7 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
         }
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_headroom_table = trimmed == "[mcp_servers.headroom]";
+            in_headroom_table = trimmed == "[mcp_servers.headroom_local_community]";
             out.push(line.to_string());
             continue;
         }
@@ -3450,7 +3480,7 @@ fn disable_grok_build() -> Result<()> {
 /// Both OpenCode @ai-sdk transports append their endpoint to a `/v1` base
 /// (`/messages`, `/responses`), so anthropic and openai share one proxy URL.
 /// Verified against opencode 1.18.5.
-const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
+const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6867/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
 
 fn opencode_config_dir() -> PathBuf {
@@ -3517,10 +3547,10 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
                 })?;
             // Same contract as parse_json_object's JSON5 fallback: writers
             // re-serialize with serde_json (comment-free), the byte-for-byte
-            // .headroom-backup keeps the original. Local info only - expected,
+            // .headroom-local-community-backup keeps the original. Local info only - expected,
             // benign behavior (RUST-61 was setup refusing valid .jsonc files).
             log::info!(
-                "{} contains JSONC syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON - the original is kept as a .headroom-backup file",
+                "{} contains JSONC syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON - the original is kept as a .headroom-local-community-backup file",
                 path.display()
             );
             value
@@ -3682,7 +3712,7 @@ fn write_opencode_config(path: &Path, config: &serde_json::Value) -> Result<()> 
 
 /// Self-contained OpenCode transport plugin (all-provider routing via
 /// `x-headroom-base-url`), vendored from headroom-ai's `plugins/opencode`
-/// built with the desktop wrapper entry (proxy default 127.0.0.1:6767).
+/// built with the desktop wrapper entry (proxy default 127.0.0.1:6867).
 /// Regenerate: `npx tsup --config tsup.desktop.config.ts` in the plugin dir,
 /// copy `dist-desktop/entry.opencode.js` here. Replace with the wheel-shipped
 /// bundle once upstream PR headroomlabs-ai/headroom#2601 lands in a release.
@@ -3787,7 +3817,7 @@ fn configure_opencode_provider_block(
 
     // Transport plugin: routes every other provider (Google, custom
     // gateways, ...) through the proxy via x-headroom-base-url. The bundle
-    // defaults to 6767, so no env vars are needed.
+    // defaults to 6867, so no env vars are needed.
     let plugin_path = ensure_opencode_plugin_file()?;
     let plugin_entry = plugin_path.display().to_string();
     if !opencode_plugin_array_contains(&config, &plugin_entry) {
@@ -3930,7 +3960,7 @@ fn opencode_user_state_exists() -> bool {
     data.join("auth.json").exists() || data.join("storage").exists()
 }
 
-/// Rewrite the `command` of the `[mcp_servers.headroom]` table in
+/// Rewrite the `command` of the `[mcp_servers.headroom_local_community]` table in
 /// `~/.grok/config.toml` to the absolute `entrypoint`. Mirrors
 /// [`pin_codex_mcp_command`]: the upstream Python registrar writes a bare
 /// `command = "headroom"` that relies on PATH, which dangles when the managed
@@ -3954,7 +3984,7 @@ pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_headroom_table = trimmed == "[mcp_servers.headroom]";
+            in_headroom_table = trimmed == "[mcp_servers.headroom_local_community]";
             out.push(line.to_string());
             continue;
         }
@@ -4002,7 +4032,7 @@ fn codex_provider_block_matches() -> Result<bool> {
     let root_ok = marker_block_contains(
         &content,
         CODEX_ROOT_BLOCK_ID,
-        "model_provider = \"headroom\"",
+        "model_provider = \"headroom_local_community\"",
     ) && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
     let table_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, &base_url)
         && marker_block_contains(
@@ -4014,8 +4044,8 @@ fn codex_provider_block_matches() -> Result<bool> {
 }
 
 fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
+    let start = format!("# >>> headroom-local-community:{block_id} >>>");
+    let end = format!("# <<< headroom-local-community:{block_id} <<<");
     match (content.find(&start), content.find(&end)) {
         (Some(start_idx), Some(end_idx)) if start_idx < end_idx => {
             content[start_idx..end_idx].contains(needle)
@@ -4089,7 +4119,9 @@ fn codex_hooks_json_path() -> PathBuf {
 }
 
 fn codex_guard_hook_path() -> PathBuf {
-    codex_home().join("hooks").join("headroom-codex-guard.py")
+    codex_home()
+        .join("hooks")
+        .join("headroom-local-community-codex-guard.py")
 }
 
 /// Interpreter used by the Claude/Codex session-start guard hooks. On macOS
@@ -4174,7 +4206,7 @@ BASE_URL = "{base}"
 READYZ = "{readyz}"
 # stderr fires every invocation; the macOS notification is rate-limited so an
 # app restart doesn't produce a storm of alerts.
-DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
+DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-local-community-guard-notified")
 DEBOUNCE_SECONDS = 600
 
 
@@ -4264,10 +4296,10 @@ def main():
         issues.append("~/.codex/config.toml is missing or unreadable")
     else:
         provider_name = config.get("model_provider")
-        if provider_name != "headroom":
-            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom"); Codex is not being optimized by Headroom')
+        if provider_name != "headroom_local_community":
+            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom_local_community"); Codex is not being optimized by Headroom')
         else:
-            provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
+            provider = (config.get("model_providers") or {{}}).get("headroom_local_community") or {{}}
             base = provider.get("base_url")
             if base != BASE_URL:
                 issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
@@ -4290,7 +4322,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "##,
         base = HEADROOM_OPENAI_BASE_URL,
-        readyz = "http://127.0.0.1:6767/readyz",
+        readyz = "http://127.0.0.1:6867/readyz",
     )
 }
 
@@ -4532,7 +4564,7 @@ fn claude_guard_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
         .join("hooks")
-        .join("headroom-claude-guard.py")
+        .join("headroom-local-community-claude-guard.py")
 }
 
 fn claude_guard_command() -> String {
@@ -4542,7 +4574,7 @@ fn claude_guard_command() -> String {
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
 /// exit 2 there surfaces a warning but cannot block, whereas on UserPromptSubmit
 /// it blocks every prompt -- which broke Claude Desktop / Cowork VM sessions
-/// that share `~/.claude/settings.json` but can never reach 127.0.0.1:6767).
+/// that share `~/.claude/settings.json` but can never reach 127.0.0.1:6867).
 /// Because the hook inherits Claude's environment, it checks the *effective*
 /// routing -- `ANTHROPIC_BASE_URL` as Claude actually sees it -- rather than a
 /// config file, plus that the desktop app is reachable. Pure stdlib so it runs
@@ -4565,7 +4597,7 @@ BASE_URL = "{base}"
 READYZ = "{readyz}"
 # stderr fires every invocation; the macOS notification is rate-limited so an
 # app restart doesn't produce a storm of alerts.
-DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
+DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-local-community-guard-notified")
 DEBOUNCE_SECONDS = 600
 
 
@@ -4656,7 +4688,7 @@ def main():
     if route_issue:
         issues.append(route_issue)
     if not reachable():
-        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6867 -- it may be restarting; open the app if it isn't")
 
     if issues:
         notify("; ".join(issues))
@@ -4671,7 +4703,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "##,
         base = HEADROOM_ANTHROPIC_BASE_URL,
-        readyz = "http://127.0.0.1:6767/readyz",
+        readyz = "http://127.0.0.1:6867/readyz",
     )
 }
 
@@ -4680,7 +4712,7 @@ if __name__ == "__main__":
 ///
 /// Never UserPromptSubmit: exit 2 there blocks the prompt, and Claude Desktop /
 /// Cowork VM sessions read the same settings.json but can never reach
-/// 127.0.0.1:6767 from inside the VM, so the guard bricked every prompt in the
+/// 127.0.0.1:6867 from inside the VM, so the guard bricked every prompt in the
 /// Claude desktop app while the routing it verifies didn't even apply there.
 fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
     let script_path = claude_guard_hook_path();
@@ -4811,8 +4843,8 @@ fn upsert_managed_block(
         String::new()
     };
 
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
+    let start = format!("# >>> headroom-local-community:{block_id} >>>");
+    let end = format!("# <<< headroom-local-community:{block_id} <<<");
     let block = format!("{start}\n{block_body}\n{end}\n");
     let updated = match (existing.find(&start), existing.find(&end)) {
         // Only rewrite in place when the markers are well-ordered. A stray or
@@ -4926,8 +4958,8 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
         );
         return Ok(false);
     };
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
+    let start = format!("# >>> headroom-local-community:{block_id} >>>");
+    let end = format!("# <<< headroom-local-community:{block_id} <<<");
 
     let (Some(start_idx), Some(end_idx)) = (existing.find(&start), existing.find(&end)) else {
         return Ok(false);
@@ -4956,7 +4988,11 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
     }
 
     let stamp = Utc::now().format("%Y%m%d%H%M%S");
-    let backup_path = PathBuf::from(format!("{}.headroom-backup-{}", path.display(), stamp));
+    let backup_path = PathBuf::from(format!(
+        "{}.headroom-local-community-backup-{}",
+        path.display(),
+        stamp
+    ));
     std::fs::copy(path, &backup_path)
         .with_context(|| format!("creating backup {}", backup_path.display()))?;
 
@@ -4965,8 +5001,7 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let headroom_prefix = format!("{}.headroom-backup-", file_name);
-    let nommer_prefix = format!("{}.nommer-backup-", file_name);
+    let headroom_prefix = format!("{}.headroom-local-community-backup-", file_name);
     if let Some(dir) = path.parent() {
         if let Ok(entries) = std::fs::read_dir(dir) {
             let mut backups: Vec<PathBuf> = entries
@@ -4975,7 +5010,7 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with(&headroom_prefix) || n.starts_with(&nommer_prefix))
+                        .map(|n| n.starts_with(&headroom_prefix))
                         .unwrap_or(false)
                 })
                 .collect();
@@ -5011,8 +5046,8 @@ fn shell_block_contains_in_files(
             continue;
         }
         let content = read_to_string_lossy(file)?;
-        let start = format!("# >>> headroom:{block_id} >>>");
-        let end = format!("# <<< headroom:{block_id} <<<");
+        let start = format!("# >>> headroom-local-community:{block_id} >>>");
+        let end = format!("# <<< headroom-local-community:{block_id} <<<");
 
         if let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) {
             let block = &content[start_idx..end_idx];
@@ -5037,8 +5072,8 @@ fn shell_block_contains_text_in_files(
         }
 
         let content = read_to_string_lossy(file)?;
-        let start = format!("# >>> headroom:{block_id} >>>");
-        let end = format!("# <<< headroom:{block_id} <<<");
+        let start = format!("# >>> headroom-local-community:{block_id} >>>");
+        let end = format!("# <<< headroom-local-community:{block_id} <<<");
 
         if let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) {
             if content[start_idx..end_idx].contains(expected_text) {
@@ -5098,7 +5133,7 @@ fn is_headroom_proxy_reachable() -> bool {
 
     ["127.0.0.1", "localhost"].iter().any(|host| {
         client
-            .get(format!("http://{host}:6767/readyz"))
+            .get(format!("http://{host}:6867/readyz"))
             .send()
             // 404 = an older proxy build without the /readyz route, still up and
             // serving -- count it as reachable (Sentry RUST-2X).
@@ -5125,7 +5160,7 @@ fn oss_remnant_warnings(
     if port_8787_listening {
         warnings.push(
             "An open-source Headroom proxy is listening on :8787. It conflicts with the paid \
-             desktop proxy (:6767/:6768) and Cursor MCP OAuth callbacks. Stop it and remove the \
+             desktop proxy (:6867/:6868) and Cursor MCP OAuth callbacks. Stop it and remove the \
              open-source install."
                 .into(),
         );
@@ -5626,8 +5661,8 @@ fn file_has_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
     }
 
     let content = read_to_string_lossy(file_path)?;
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
+    let start = format!("# >>> headroom-local-community:{block_id} >>>");
+    let end = format!("# <<< headroom-local-community:{block_id} <<<");
     Ok(content.contains(&start) && content.contains(&end))
 }
 
@@ -5742,14 +5777,14 @@ fn headroom_rtk_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
         .join("hooks")
-        .join("headroom-rtk-rewrite.sh")
+        .join("headroom-local-community-rtk-rewrite.sh")
 }
 
 fn headroom_markitdown_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
         .join("hooks")
-        .join("headroom-markitdown-read.sh")
+        .join("headroom-local-community-markitdown-read.sh")
 }
 
 /// PreToolUse(Read) hook: when Claude reads a PDF, convert it to Markdown via
@@ -6272,12 +6307,12 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
             })?;
             // Writers re-serialize with serde_json, which strips the
             // comments/relaxed syntax that forced the JSON5 fallback. Log it
-            // locally so the .headroom-backup is discoverable, but do NOT
+            // locally so the .headroom-local-community-backup is discoverable, but do NOT
             // capture to Sentry: this is expected, benign behavior (user keeps
             // comments in their settings), and the capture just inflated
             // RUST-4R with 120+ no-action events. Local info only.
             log::info!(
-                "{} contains JSON5 syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON — the original is kept as a .headroom-backup file",
+                "{} contains JSON5 syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON — the original is kept as a .headroom-local-community-backup file",
                 path.display()
             );
             value
@@ -6376,15 +6411,15 @@ mod tests {
         let content = format!(
             "model = \"gpt-5\"\n\
              \n\
-             # --- Headroom MCP server ---\n\
-             [mcp_servers.headroom]\n\
+             # --- Headroom Local Community MCP server ---\n\
+             [mcp_servers.headroom_local_community]\n\
              command = \"{app_dir}/runtime/venv/bin/headroom\"\n\
              args = [\"mcp\", \"serve\"]\n\
              \n\
-             [mcp_servers.headroom.env]\n\
-             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n\
-             # --- end Headroom MCP server ---\n\
-             # --- Headroom MCP server: serena ---\n\
+             [mcp_servers.headroom_local_community.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6867\"\n\
+             # --- end Headroom Local Community MCP server ---\n\
+             # --- Headroom Local Community MCP server: serena ---\n\
              [mcp_servers.serena]\n\
              command = \"{app_dir}/serena-venv/bin/serena\"\n\
              \n\
@@ -6395,9 +6430,9 @@ mod tests {
              command = \"/Applications/ChatGPT.app/bin/node_repl\"\n"
         );
         let stripped = super::strip_headroom_mcp_toml(&content);
-        assert!(!stripped.contains("mcp_servers.headroom"));
+        assert!(!stripped.contains("mcp_servers.headroom_local_community"));
         assert!(!stripped.contains("serena"));
-        assert!(!stripped.contains("Headroom MCP server"));
+        assert!(!stripped.contains("Headroom Local Community MCP server"));
         assert!(stripped.contains("[mcp_servers.context7]"));
         assert!(stripped.contains("command = \"npx\""));
         assert!(stripped.contains("[mcp_servers.node_repl]"));
@@ -6430,7 +6465,7 @@ mod tests {
         });
         let map = servers.as_object_mut().unwrap();
         assert!(super::remove_headroom_mcp_json_entries(map));
-        assert!(map.get("headroom").is_none());
+        assert!(map.get("headroom_local_community").is_none());
         assert!(map.get("serena").is_none());
         assert!(map.get("codebase-memory").is_none());
         assert!(map.get("context7").is_some());
@@ -6466,8 +6501,9 @@ mod tests {
     #[test]
     fn is_no_space_matches_only_disk_full_codes() {
         for &code in NO_SPACE_OS_ERRORS {
-            let full = anyhow::Error::new(std::io::Error::from_raw_os_error(code))
-                .context("creating backup /Users/x/.claude/settings.json.headroom-backup");
+            let full = anyhow::Error::new(std::io::Error::from_raw_os_error(code)).context(
+                "creating backup /Users/x/.claude/settings.json.headroom-local-community-backup",
+            );
             assert!(is_no_space(&full));
         }
 
@@ -6683,8 +6719,8 @@ mod tests {
             serde_json::to_string_pretty(&json!({
                 "hooks": {
                     "PreToolUse": [
-                        { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/h/headroom-rtk-rewrite.sh" }] },
-                        { "matcher": "Read", "hooks": [{ "type": "command", "command": "/h/headroom-markitdown-read.sh" }] }
+                        { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/h/headroom-local-community-rtk-rewrite.sh" }] },
+                        { "matcher": "Read", "hooks": [{ "type": "command", "command": "/h/headroom-local-community-markitdown-read.sh" }] }
                     ]
                 }
             }))
@@ -6692,15 +6728,21 @@ mod tests {
         )
         .expect("write settings");
 
-        let changed = remove_pre_tool_use_markers(&settings, &["headroom-markitdown-read.sh"])
-            .expect("strip");
+        let changed = remove_pre_tool_use_markers(
+            &settings,
+            &["headroom-local-community-markitdown-read.sh"],
+        )
+        .expect("strip");
         assert!(changed);
 
         let after: serde_json::Value =
             serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
         let entries = after["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(entry_contains_hook(&entries[0], "headroom-rtk-rewrite.sh"));
+        assert!(entry_contains_hook(
+            &entries[0],
+            "headroom-local-community-rtk-rewrite.sh"
+        ));
     }
 
     #[test]
@@ -6722,7 +6764,7 @@ mod tests {
 
     #[test]
     fn hook_detection_finds_nested_hook_commands() {
-        let hook_path = "/Users/test/.claude/hooks/headroom-rtk-rewrite.sh";
+        let hook_path = "/Users/test/.claude/hooks/headroom-local-community-rtk-rewrite.sh";
         let content = json!({
             "hooks": {
                 "PreToolUse": [
@@ -6739,11 +6781,11 @@ mod tests {
         assert!(claude_hook_present_in_value(&content, hook_path));
         assert!(entry_contains_hook(
             &content["hooks"]["PreToolUse"][0],
-            "headroom-rtk-rewrite.sh"
+            "headroom-local-community-rtk-rewrite.sh"
         ));
         assert!(!entry_contains_hook(
             &json!({ "hooks": [] }),
-            "headroom-rtk-rewrite.sh"
+            "headroom-local-community-rtk-rewrite.sh"
         ));
     }
 
@@ -6838,7 +6880,7 @@ mod tests {
         let first = upsert_managed_block(
             &path,
             "claude_code",
-            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6867",
         )
         .expect("insert managed block");
         assert!(first.0);
@@ -6847,14 +6889,19 @@ mod tests {
         upsert_managed_block(
             &path,
             "claude_code",
-            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767\nexport HEADROOM=1",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6867\nexport HEADROOM_LOCAL_COMMUNITY=1",
         )
         .expect("replace managed block");
 
         let content = fs::read_to_string(&path).expect("read updated shell file");
-        assert_eq!(content.matches("# >>> headroom:claude_code >>>").count(), 1);
+        assert_eq!(
+            content
+                .matches("# >>> headroom-local-community:claude_code >>>")
+                .count(),
+            1
+        );
         assert!(content.contains("export PATH=/usr/bin"));
-        assert!(content.contains("export HEADROOM=1"));
+        assert!(content.contains("export HEADROOM_LOCAL_COMMUNITY=1"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -6870,14 +6917,14 @@ mod tests {
         let path = root.join(".zshrc");
         fs::write(
             &path,
-            "# <<< headroom:claude_code <<<\nstray old body\n# >>> headroom:claude_code >>>\n",
+            "# <<< headroom-local-community:claude_code <<<\nstray old body\n# >>> headroom-local-community:claude_code >>>\n",
         )
         .expect("write malformed shell file");
 
         upsert_managed_block(
             &path,
             "claude_code",
-            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6867",
         )
         .expect("upsert over malformed block");
 
@@ -6886,16 +6933,16 @@ mod tests {
         // last closing marker, and the file ends on the closing marker (not on a
         // dangling opener as the buggy slice produced).
         let last_start = content
-            .rfind("# >>> headroom:claude_code >>>")
+            .rfind("# >>> headroom-local-community:claude_code >>>")
             .expect("start marker present");
         let last_end = content
-            .rfind("# <<< headroom:claude_code <<<")
+            .rfind("# <<< headroom-local-community:claude_code <<<")
             .expect("end marker present");
         assert!(last_start < last_end, "tail block must be well-ordered");
         assert!(content
             .trim_end()
-            .ends_with("# <<< headroom:claude_code <<<"));
-        assert!(content.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6767"));
+            .ends_with("# <<< headroom-local-community:claude_code <<<"));
+        assert!(content.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6867"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -6907,7 +6954,7 @@ mod tests {
         let path = root.join(".zprofile");
         fs::write(
             &path,
-            "export PATH=/usr/bin\n# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\n# <<< headroom:claude_code <<<\nexport EDITOR=vim\n",
+            "export PATH=/usr/bin\n# >>> headroom-local-community:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6867\n# <<< headroom-local-community:claude_code <<<\nexport EDITOR=vim\n",
         )
         .expect("write shell file");
 
@@ -6929,7 +6976,7 @@ mod tests {
         let path = root.join(".bashrc");
         fs::write(
             &path,
-            "export ANTHROPIC_BASE_URL=https://example.com\n# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\nexport PATH=/tmp/headroom:$PATH\n# <<< headroom:claude_code <<<\n",
+            "export ANTHROPIC_BASE_URL=https://example.com\n# >>> headroom-local-community:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6867\nexport PATH=/tmp/headroom:$PATH\n# <<< headroom-local-community:claude_code <<<\n",
         )
         .expect("write shell file");
 
@@ -6937,7 +6984,7 @@ mod tests {
             &[path.clone()],
             "claude_code",
             "ANTHROPIC_BASE_URL",
-            "http://127.0.0.1:6767",
+            "http://127.0.0.1:6867",
         )
         .expect("detect managed export"));
         assert!(
@@ -6948,7 +6995,7 @@ mod tests {
             &[path],
             "managed_rtk",
             "ANTHROPIC_BASE_URL",
-            "http://127.0.0.1:6767",
+            "http://127.0.0.1:6867",
         )
         .expect("ignore other block ids"));
 
@@ -6959,7 +7006,7 @@ mod tests {
     fn write_file_if_changed_skips_backups_when_content_is_unchanged() {
         let root = unique_temp_dir("headroom-write-file");
         fs::create_dir_all(&root).expect("create root");
-        let path = root.join("headroom-rtk-rewrite.sh");
+        let path = root.join("headroom-local-community-rtk-rewrite.sh");
         fs::write(&path, "#!/bin/sh\necho headroom\n").expect("write hook file");
 
         let changed = write_file_if_changed(&path, "#!/bin/sh\necho headroom\n", false)
@@ -6999,7 +7046,7 @@ export PATH="$BUN_INSTALL/bin:$PATH"
         upsert_managed_block(
             &path,
             "claude_code",
-            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6867",
         )
         .expect("add claude block");
 
@@ -7019,13 +7066,13 @@ export PATH="$BUN_INSTALL/bin:$PATH"
         let path = root.join(".zprofile");
         let original = r#"eval "$(/opt/homebrew/bin/brew shellenv)"
 
-# >>> headroom:managed_rtk >>>
+# >>> headroom-local-community:managed_rtk >>>
 export PATH="/old/headroom/bin:$PATH"
-# <<< headroom:managed_rtk <<<
+# <<< headroom-local-community:managed_rtk <<<
 
-# >>> headroom:claude_code >>>
-export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
-# <<< headroom:claude_code <<<
+# >>> headroom-local-community:claude_code >>>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
+# <<< headroom-local-community:claude_code <<<
 
 eval "$(/opt/homebrew/bin/rbenv init - zsh)"
 "#;
@@ -7042,9 +7089,19 @@ eval "$(/opt/homebrew/bin/rbenv init - zsh)"
         assert!(updated.contains("eval \"$(/opt/homebrew/bin/brew shellenv)\""));
         assert!(updated.contains("eval \"$(/opt/homebrew/bin/rbenv init - zsh)\""));
         assert!(updated.contains("export PATH=\"/new/headroom/bin:$PATH\""));
-        assert!(updated.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6767"));
-        assert_eq!(updated.matches("# >>> headroom:managed_rtk >>>").count(), 1);
-        assert_eq!(updated.matches("# >>> headroom:claude_code >>>").count(), 1);
+        assert!(updated.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6867"));
+        assert_eq!(
+            updated
+                .matches("# >>> headroom-local-community:managed_rtk >>>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            updated
+                .matches("# >>> headroom-local-community:claude_code >>>")
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7059,13 +7116,13 @@ eval "$(/opt/homebrew/bin/rbenv init - zsh)"
             r#"export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 
-# >>> headroom:managed_rtk >>>
+# >>> headroom-local-community:managed_rtk >>>
 export PATH="/tmp/headroom/bin:$PATH"
-# <<< headroom:managed_rtk <<<
+# <<< headroom-local-community:managed_rtk <<<
 
-# >>> headroom:claude_code >>>
-export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
-# <<< headroom:claude_code <<<
+# >>> headroom-local-community:claude_code >>>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
+# <<< headroom-local-community:claude_code <<<
 "#,
         )
         .expect("write zshrc");
@@ -7075,9 +7132,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let updated = fs::read_to_string(&path).expect("read cleaned zshrc");
         assert!(updated.contains("export NVM_DIR=\"$HOME/.nvm\""));
         assert!(updated.contains("[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\""));
-        assert!(updated.contains("# >>> headroom:managed_rtk >>>"));
+        assert!(updated.contains("# >>> headroom-local-community:managed_rtk >>>"));
         assert!(updated.contains("export PATH=\"/tmp/headroom/bin:$PATH\""));
-        assert!(!updated.contains("# >>> headroom:claude_code >>>"));
+        assert!(!updated.contains("# >>> headroom-local-community:claude_code >>>"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7173,7 +7230,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "/Users/test/.claude/hooks/headroom-rtk-rewrite.sh"
+                                "command": "/Users/test/.claude/hooks/headroom-local-community-rtk-rewrite.sh"
                             }
                         ]
                     }
@@ -7220,7 +7277,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "/path/to/headroom-rtk-rewrite.sh"
+                                "command": "/path/to/headroom-local-community-rtk-rewrite.sh"
                             }
                         ]
                     }
@@ -7752,7 +7809,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             // serialize that sharing across processes.
             std::env::set_var(
                 "HEADROOM_DATA_DIR",
-                home.join(".local").join("share").join("Headroom"),
+                home.join(".local")
+                    .join("share")
+                    .join("HeadroomLocalCommunity"),
             );
             // Pin XDG_CONFIG_HOME into the temp home and clear the opencode /
             // grok override vars: a dev machine with any of these set would
@@ -7911,10 +7970,30 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
-            Some("http://127.0.0.1:6767")
+            Some("http://127.0.0.1:6867")
         );
         // Verification reads the same profiles and must not blow up either.
         super::verify_client_setup("claude_code").expect("verification tolerates bad profile");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn community_refuses_to_overwrite_official_headroom_routing() {
+        let home = TestHome::new();
+        let zshrc = home.path().join(".zshrc");
+        let original = "# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\n# <<< headroom:claude_code <<<\n";
+        fs::write(&zshrc, original).unwrap();
+
+        let err = super::apply_client_setup("claude_code").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Official Headroom routing is active"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), original);
+        assert!(!fs::read_to_string(&zshrc)
+            .unwrap()
+            .contains("headroom-local-community:claude_code"));
     }
 
     #[test]
@@ -7942,7 +8021,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude")
             .join("hooks")
-            .join("headroom-rtk-rewrite.sh");
+            .join("headroom-local-community-rtk-rewrite.sh");
         assert!(hook_path.exists(), "hook script written to disk");
         let hook_contents = fs::read_to_string(&hook_path).unwrap();
         assert!(
@@ -7953,7 +8032,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
-            Some("http://127.0.0.1:6767"),
+            Some("http://127.0.0.1:6867"),
             "claude settings.json points env at headroom proxy"
         );
         let pre_tool_use = &settings["hooks"]["PreToolUse"];
@@ -7968,7 +8047,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
+            combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6867"),
             "ANTHROPIC_BASE_URL exported from a managed shell block, got:\n{combined}"
         );
 
@@ -8018,7 +8097,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude")
             .join("hooks")
-            .join("headroom-claude-guard.py");
+            .join("headroom-local-community-claude-guard.py");
         assert!(script.exists(), "guard script written");
         #[cfg(unix)]
         {
@@ -8073,7 +8152,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let after = read_settings_json(&settings_path);
         let after_str = serde_json::to_string(&after).unwrap();
         assert!(
-            !after_str.contains("headroom-claude-guard.py"),
+            !after_str.contains("headroom-local-community-claude-guard.py"),
             "guard stripped from settings.json, got:\n{after:#}"
         );
         assert!(
@@ -8098,7 +8177,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude")
             .join("hooks")
-            .join("headroom-claude-guard.py");
+            .join("headroom-local-community-claude-guard.py");
         // Build via serde_json so the script path is JSON-escaped: raw format!
         // interpolation of a Windows path writes lone backslashes that json5
         // parsing silently eats, leaving a command the strip can never match.
@@ -8122,7 +8201,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
         let ups = serde_json::to_string(&settings["hooks"]["UserPromptSubmit"]).unwrap();
         assert!(
-            !ups.contains("headroom-claude-guard.py"),
+            !ups.contains("headroom-local-community-claude-guard.py"),
             "guard stripped from UserPromptSubmit, got:\n{settings:#}"
         );
         assert!(
@@ -8131,7 +8210,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         let ss = serde_json::to_string(&settings["hooks"]["SessionStart"]).unwrap();
         assert!(
-            ss.contains("headroom-claude-guard.py"),
+            ss.contains("headroom-local-community-claude-guard.py"),
             "guard still registered on SessionStart, got:\n{settings:#}"
         );
     }
@@ -8160,18 +8239,23 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let app_dir = super::app_data_dir();
         fs::create_dir_all(&app_dir).unwrap();
         fs::write(app_dir.join("memory.db"), b"user data").unwrap();
-        let dot_headroom = home.path().join(".headroom");
-        fs::create_dir_all(&dot_headroom).unwrap();
-        fs::write(dot_headroom.join("keep.json"), b"user data").unwrap();
+        let community_workspace = home.path().join(".headroom-local-community");
+        fs::create_dir_all(&community_workspace).unwrap();
+        fs::write(community_workspace.join("keep.json"), b"user data").unwrap();
+        let paid_workspace = home.path().join(".headroom");
+        fs::create_dir_all(&paid_workspace).unwrap();
+        fs::write(paid_workspace.join("paid.json"), b"paid app data").unwrap();
 
         // An external mutation and a stray backup file, both of which the
         // narrow function is responsible for.
         let settings_path = home.path().join(".claude").join("settings.json");
-        let stray_backup = home.path().join(".zshrc.headroom-backup-20260101000000");
+        let stray_backup = home
+            .path()
+            .join(".zshrc.headroom-local-community-backup-20260101000000");
         fs::write(&stray_backup, "# old\n").unwrap();
         assert_eq!(
             read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].as_str(),
-            Some("http://127.0.0.1:6767"),
+            Some("http://127.0.0.1:6867"),
             "precondition: base url wired"
         );
 
@@ -8190,8 +8274,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "revert must NOT delete Headroom's app data — that belongs to `brew zap`"
         );
         assert!(
-            dot_headroom.join("keep.json").exists(),
-            "revert must NOT delete ~/.headroom — that belongs to `brew zap`"
+            community_workspace.join("keep.json").exists(),
+            "revert must preserve Community user data until full cleanup"
         );
 
         super::perform_full_cleanup();
@@ -8201,22 +8285,25 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "full cleanup should remove Headroom's app data"
         );
         assert!(
-            !dot_headroom.exists(),
-            "full cleanup should remove ~/.headroom"
+            !community_workspace.exists(),
+            "full cleanup should remove only the Community workspace"
+        );
+        assert!(
+            paid_workspace.join("paid.json").exists(),
+            "Community cleanup must never remove the paid app's ~/.headroom workspace"
         );
     }
 
     #[test]
     #[serial_test::serial]
-    fn full_cleanup_sweeps_our_hf_models_but_spares_shared_ones() {
-        // Regression: this used to remove only models--chopratejas--kompress-v2-base
-        // and orphaned every other model the runtime pulls (~788MB measured on a
-        // real install). Sweep by `models--chopratejas--*` so a newly added upstream
-        // model cannot silently start leaking.
+    fn full_cleanup_spares_all_shared_hf_models() {
+        // Community and paid editions may use the same HuggingFace cache. No
+        // author prefix is sufficient proof that a snapshot belongs exclusively
+        // to Community, so uninstall leaves every model and lock directory alone.
         let home = TestHome::new();
         let hub = home.path().join(".cache").join("huggingface").join("hub");
 
-        // Ours: author prefix of the bundled Python package.
+        // Author-prefixed models may also be used by the paid app.
         let ours = [
             "models--chopratejas--kompress-v2-base",
             "models--chopratejas--technique-router-onnx",
@@ -8239,20 +8326,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         super::perform_full_cleanup();
 
-        for name in ours {
-            assert!(
-                !hub.join(name).exists(),
-                "{name} is ours and should be removed"
-            );
-            assert!(
-                !hub.join(".locks").join(name).exists(),
-                "{name} lock dir should be removed"
-            );
-        }
-        for name in shared {
+        for name in ours.iter().chain(shared.iter()) {
             assert!(
                 hub.join(name).join("blob").exists(),
-                "{name} is shared with other tools and must survive uninstall"
+                "{name} may be shared and must survive Community uninstall"
             );
             assert!(
                 hub.join(".locks").join(name).exists(),
@@ -8290,10 +8367,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude")
             .join("hooks")
-            .join("headroom-claude-guard.py");
+            .join("headroom-local-community-claude-guard.py");
         assert_eq!(
             read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].as_str(),
-            Some("http://127.0.0.1:6767"),
+            Some("http://127.0.0.1:6867"),
             "precondition: base url wired"
         );
         assert!(guard_script.exists(), "precondition: guard script written");
@@ -8316,7 +8393,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             !serde_json::to_string(&after["hooks"])
                 .unwrap()
-                .contains("headroom-claude-guard.py"),
+                .contains("headroom-local-community-claude-guard.py"),
             "guard hook stripped despite shell-block failure, got:\n{after:#}"
         );
         assert!(!guard_script.exists(), "guard script deleted");
@@ -8412,7 +8489,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude")
             .join("hooks")
-            .join("headroom-rtk-rewrite.sh");
+            .join("headroom-local-community-rtk-rewrite.sh");
         assert!(!hook_path.exists(), "RTK hook removed when RTK disabled");
 
         // Routing config is still present, so Claude Code must verify green
@@ -8540,7 +8617,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             home.path()
                 .join(".claude")
                 .join("hooks")
-                .join("headroom-rtk-rewrite.sh"),
+                .join("headroom-local-community-rtk-rewrite.sh"),
         )
         .unwrap();
 
@@ -8553,7 +8630,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             home.path()
                 .join(".claude")
                 .join("hooks")
-                .join("headroom-rtk-rewrite.sh"),
+                .join("headroom-local-community-rtk-rewrite.sh"),
         )
         .unwrap();
 
@@ -8574,11 +8651,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // Sanity: each managed block still appears exactly once.
         let combined = format!("{zshrc_after_second}\n{zshenv_after_second}");
         assert_eq!(
-            combined.matches("# >>> headroom:claude_code >>>").count(),
+            combined
+                .matches("# >>> headroom-local-community:claude_code >>>")
+                .count(),
             1
         );
         assert_eq!(
-            combined.matches("# >>> headroom:managed_rtk >>>").count(),
+            combined
+                .matches("# >>> headroom-local-community:managed_rtk >>>")
+                .count(),
             1
         );
     }
@@ -8596,7 +8677,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude")
             .join("hooks")
-            .join("headroom-rtk-rewrite.sh");
+            .join("headroom-local-community-rtk-rewrite.sh");
         assert!(hook_path.exists(), "hook present after apply");
 
         super::disable_client_setup("claude_code").expect("disable");
@@ -8609,7 +8690,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            !combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
+            !combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6867"),
             "ANTHROPIC_BASE_URL export removed, got:\n{combined}"
         );
 
@@ -8621,7 +8702,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "ANTHROPIC_BASE_URL stripped from settings.json env, got: {settings}"
         );
         let still_has_headroom_hook =
-            claude_hook_present_in_value(&settings, "headroom-rtk-rewrite.sh");
+            claude_hook_present_in_value(&settings, "headroom-local-community-rtk-rewrite.sh");
         assert!(
             !still_has_headroom_hook,
             "Headroom hook entry stripped from settings.json, got: {settings}"
@@ -8737,15 +8818,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let config_toml = home.path().join(".codex").join("config.toml");
         let toml = fs::read_to_string(&config_toml).expect("codex config.toml written");
         assert!(
-            toml.contains("# >>> headroom:codex_cli >>>"),
+            toml.contains("# >>> headroom-local-community:codex_cli >>>"),
             "managed marker present, got:\n{toml}"
         );
         assert!(
-            toml.contains("model_provider = \"headroom\""),
+            toml.contains("model_provider = \"headroom_local_community\""),
             "model_provider set, got:\n{toml}"
         );
         assert!(
-            toml.contains("base_url = \"http://127.0.0.1:6767/v1\""),
+            toml.contains("base_url = \"http://127.0.0.1:6867/v1\""),
             "provider base_url points at proxy, got:\n{toml}"
         );
         assert!(
@@ -8764,7 +8845,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            combined.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
+            combined.contains("OPENAI_BASE_URL=http://127.0.0.1:6867/v1"),
             "OPENAI_BASE_URL exported from a managed shell block, got:\n{combined}"
         );
 
@@ -8790,7 +8871,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::disable_client_setup("codex").expect("disable_client_setup succeeds");
         let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
         assert!(
-            !toml_after.contains("# >>> headroom:codex_cli >>>"),
+            !toml_after.contains("# >>> headroom-local-community:codex_cli >>>"),
             "managed block removed on disable, got:\n{toml_after}"
         );
         let combined_after = format!(
@@ -8799,7 +8880,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             fs::read_to_string(home.path().join(".zshenv")).unwrap(),
         );
         assert!(
-            !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
+            !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6867/v1"),
             "shell export removed on disable, got:\n{combined_after}"
         );
     }
@@ -8822,7 +8903,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         for provider in ["anthropic", "openai"] {
             assert_eq!(
                 config["provider"][provider]["options"]["baseURL"],
-                serde_json::json!("http://127.0.0.1:6767/v1"),
+                serde_json::json!("http://127.0.0.1:6867/v1"),
                 "{provider} routed through proxy, got:\n{config:#}"
             );
         }
@@ -8880,7 +8961,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         assert_eq!(
             config["provider"]["anthropic"]["options"]["baseURL"],
-            serde_json::json!("http://127.0.0.1:6767/v1")
+            serde_json::json!("http://127.0.0.1:6867/v1")
         );
 
         super::disable_client_setup("opencode").expect("disable succeeds");
@@ -8925,12 +9006,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
-            config["provider"].get("headroom").is_none(),
+            config["provider"].get("headroom_local_community").is_none(),
             "stale wrap provider removed, got:\n{config:#}"
         );
         assert_eq!(
             config["provider"]["anthropic"]["options"]["baseURL"],
-            serde_json::json!("http://127.0.0.1:6767/v1")
+            serde_json::json!("http://127.0.0.1:6867/v1")
         );
         assert_eq!(config["theme"], serde_json::json!("tokyonight"));
 
@@ -9055,7 +9136,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .unwrap();
         assert_eq!(
             jsonc["provider"]["anthropic"]["options"]["baseURL"],
-            serde_json::json!("http://127.0.0.1:6767/v1"),
+            serde_json::json!("http://127.0.0.1:6867/v1"),
             "jsonc file managed when it is the active config"
         );
         assert!(
@@ -9111,7 +9192,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         assert!(
             toml.contains(
-                "base_url = \"http://127.0.0.1:6767/v1\"  # was: http://127.0.0.1:8787/v1"
+                "base_url = \"http://127.0.0.1:6867/v1\"  # was: http://127.0.0.1:8787/v1"
             ),
             "base_url redirected in place, got:\n{toml}"
         );
@@ -9150,11 +9231,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let config_toml = home.path().join(".grok").join("config.toml");
         let toml = fs::read_to_string(&config_toml).expect("grok config.toml written");
         assert!(
-            toml.contains("# >>> headroom:grok_build_proxy >>>"),
+            toml.contains("# >>> headroom-local-community:grok_build_proxy >>>"),
             "managed marker present, got:\n{toml}"
         );
         assert!(
-            toml.contains("base_url = \"http://127.0.0.1:6767/v1\""),
+            toml.contains("base_url = \"http://127.0.0.1:6867/v1\""),
             "proxy base_url set, got:\n{toml}"
         );
 
@@ -9162,7 +9243,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            combined.contains("GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:6767/v1"),
+            combined.contains("GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:6867/v1"),
             "GROK_CLI_CHAT_PROXY_BASE_URL exported, got:\n{combined}"
         );
 
@@ -9177,7 +9258,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
         let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
         assert!(
-            !toml_after.contains("# >>> headroom:grok_build_proxy >>>"),
+            !toml_after.contains("# >>> headroom-local-community:grok_build_proxy >>>"),
             "managed block removed on disable, got:\n{toml_after}"
         );
     }
@@ -9201,7 +9282,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(toml_first, toml_second, "config.toml byte-stable");
         assert_eq!(zshenv_first, zshenv_second, "zshenv byte-stable");
         assert_eq!(
-            toml_second.matches("# >>> headroom:codex_cli >>>").count(),
+            toml_second
+                .matches("# >>> headroom-local-community:codex_cli >>>")
+                .count(),
             1,
             "managed block appears exactly once"
         );
@@ -9220,7 +9303,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".codex")
             .join("hooks")
-            .join("headroom-codex-guard.py");
+            .join("headroom-local-community-codex-guard.py");
         assert!(script.exists(), "guard script written");
         #[cfg(unix)]
         {
@@ -9256,7 +9339,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             !hooks["hooks"]["UserPromptSubmit"]
                 .to_string()
-                .contains("headroom-codex-guard.py"),
+                .contains("headroom-local-community-codex-guard.py"),
             "guard must not register on UserPromptSubmit, got:\n{hooks:#}"
         );
         assert_eq!(
@@ -9276,16 +9359,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn hook_command_is_the_bare_script_path_on_unix() {
-        let path = PathBuf::from("/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
+        let path = PathBuf::from("/home/g/.claude/hooks/headroom-local-community-rtk-rewrite.sh");
         let cmd = super::hook_shell_command(&path).expect("hook command");
         if cfg!(target_os = "windows") {
             // Same PowerShell contract as the guard: call operator, quoted
             // interpreter, quoted script.
             assert!(cmd.starts_with("& "), "{cmd}");
-            assert!(cmd.ends_with("\"/home/g/.claude/hooks/headroom-rtk-rewrite.sh\""));
+            assert!(
+                cmd.ends_with("\"/home/g/.claude/hooks/headroom-local-community-rtk-rewrite.sh\"")
+            );
             assert!(cmd.contains("bash"), "{cmd}");
         } else {
-            assert_eq!(cmd, "/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
+            assert_eq!(
+                cmd,
+                "/home/g/.claude/hooks/headroom-local-community-rtk-rewrite.sh"
+            );
         }
     }
 
@@ -9301,7 +9389,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn windows_guard_command_is_powershell_callable() {
         let cmd = super::join_guard_command(
             "\"C:\\Users\\garm\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe\"",
-            "C:\\Users\\garm space\\.claude\\hooks\\headroom-claude-guard.py",
+            "C:\\Users\\garm space\\.claude\\hooks\\headroom-local-community-claude-guard.py",
             true,
         );
         assert!(
@@ -9309,7 +9397,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "PowerShell needs the call operator before a quoted path, got: {cmd}"
         );
         assert!(
-            cmd.ends_with("headroom-claude-guard.py\""),
+            cmd.ends_with("headroom-local-community-claude-guard.py\""),
             "script path must be quoted so spaces survive, got: {cmd}"
         );
         // Backslashes stay single: PowerShell escapes with a backtick, so
@@ -9370,7 +9458,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 entry["hooks"].as_array().unwrap().iter().any(|h| {
                     h["command"]
                         .as_str()
-                        .map(|c| c.contains("headroom-codex-guard.py"))
+                        .map(|c| c.contains("headroom-local-community-codex-guard.py"))
                         .unwrap_or(false)
                 })
             })
@@ -9383,7 +9471,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // there survives untouched.
         let user_prompt = hooks["hooks"]["UserPromptSubmit"].to_string();
         assert!(
-            !user_prompt.contains("headroom-codex-guard.py"),
+            !user_prompt.contains("headroom-local-community-codex-guard.py"),
             "guard must not register on UserPromptSubmit, got:\n{hooks:#}"
         );
         assert!(
@@ -9397,12 +9485,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".codex")
             .join("hooks")
-            .join("headroom-codex-guard.py");
+            .join("headroom-local-community-codex-guard.py");
         assert!(!script.exists(), "guard script removed on disable");
         let after = read_settings_json(&hooks_path);
         let after_str = serde_json::to_string(&after).unwrap();
         assert!(
-            !after_str.contains("headroom-codex-guard.py"),
+            !after_str.contains("headroom-local-community-codex-guard.py"),
             "guard stripped from hooks.json, got:\n{after:#}"
         );
         assert!(
@@ -9418,7 +9506,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // still be stripped -- otherwise deleting the script leaves a dangling hook.
         let home = TestHome::new();
         let hooks_path = home.path().join("hooks.json");
-        let script = "/Users/x/.codex/hooks/headroom-codex-guard.py";
+        let script = "/Users/x/.codex/hooks/headroom-local-community-codex-guard.py";
         fs::write(
             &hooks_path,
             format!(
@@ -9436,7 +9524,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let after = read_settings_json(&hooks_path);
         let after_str = serde_json::to_string(&after).unwrap();
         assert!(
-            !after_str.contains("headroom-codex-guard.py"),
+            !after_str.contains("headroom-local-community-codex-guard.py"),
             "stale guard forms stripped, got:\n{after:#}"
         );
         assert!(
@@ -9469,7 +9557,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "/usr/bin/python3 {}",
             codex_dir
                 .join("hooks")
-                .join("headroom-codex-guard.py")
+                .join("headroom-local-community-codex-guard.py")
                 .display()
         );
         // Old install: guard registered on both SessionStart and UserPromptSubmit.
@@ -9488,13 +9576,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             !after["hooks"]["UserPromptSubmit"]
                 .to_string()
-                .contains("headroom-codex-guard.py"),
+                .contains("headroom-local-community-codex-guard.py"),
             "guard stripped from UserPromptSubmit, got:\n{dump}"
         );
         assert!(
             after["hooks"]["SessionStart"]
                 .to_string()
-                .contains("headroom-codex-guard.py"),
+                .contains("headroom-local-community-codex-guard.py"),
             "guard kept on SessionStart, got:\n{dump}"
         );
     }
@@ -9655,7 +9743,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("headroom_local_community"),
             "model_provider must resolve at root scope, got:\n{raw}"
         );
         assert!(
@@ -9668,7 +9756,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(
             parsed
                 .get("model_providers")
-                .and_then(|m| m.get("headroom"))
+                .and_then(|m| m.get("headroom_local_community"))
                 .and_then(|h| h.get("base_url"))
                 .and_then(|v| v.as_str()),
             Some(super::HEADROOM_OPENAI_BASE_URL),
@@ -9709,22 +9797,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn render_codex_config_collapses_duplicate_managed_blocks() {
         // Regression: a config left with TWO managed provider blocks (interrupted
         // write / older build) used to keep one survivor that regenerated forever,
-        // surfacing as a duplicate [model_providers.headroom] the user deleted by
+        // surfacing as a duplicate [model_providers.headroom_local_community] the user deleted by
         // hand. render must collapse all duplicates down to exactly one.
-        let dup = "# >>> headroom:codex_cli_provider >>>\n\
-                   [model_providers.headroom]\n\
+        let dup = "# >>> headroom-local-community:codex_cli_provider >>>\n\
+                   [model_providers.headroom_local_community]\n\
                    base_url = \"http://stale/v1\"\n\
-                   # <<< headroom:codex_cli_provider <<<\n\
+                   # <<< headroom-local-community:codex_cli_provider <<<\n\
                    model = \"gpt-5.4\"\n\
-                   # >>> headroom:codex_cli_provider >>>\n\
-                   [model_providers.headroom]\n\
+                   # >>> headroom-local-community:codex_cli_provider >>>\n\
+                   [model_providers.headroom_local_community]\n\
                    base_url = \"http://stale2/v1\"\n\
-                   # <<< headroom:codex_cli_provider <<<\n";
+                   # <<< headroom-local-community:codex_cli_provider <<<\n";
 
         let rendered = render_codex_config(dup);
 
         assert_eq!(
-            rendered.matches("[model_providers.headroom]").count(),
+            rendered
+                .matches("[model_providers.headroom_local_community]")
+                .count(),
             1,
             "exactly one managed provider table after render, got:\n{rendered}"
         );
@@ -9742,13 +9832,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn render_codex_config_drops_an_unmarked_headroom_provider_table() {
         // Regression for Sentry RUST-6K: an OSS `pip install headroom` (or a
         // hand-added table from before marker blocks) leaves an UNMARKED
-        // [model_providers.headroom]. Adding our marked copy alongside it made
+        // [model_providers.headroom_local_community]. Adding our marked copy alongside it made
         // the whole config invalid TOML ("duplicate key"), and Codex then
         // refused to load ANY of it -- breaking every `codex` invocation, not
         // just our routing.
         let existing = "model = \"gpt-5.4\"\n\
                         \n\
-                        [model_providers.headroom]\n\
+                        [model_providers.headroom_local_community]\n\
                         name = \"Headroom (old oss install)\"\n\
                         base_url = \"http://127.0.0.1:8787/v1\"\n\
                         \n\
@@ -9758,7 +9848,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let rendered = render_codex_config(existing);
 
         assert_eq!(
-            rendered.matches("[model_providers.headroom]").count(),
+            rendered
+                .matches("[model_providers.headroom_local_community]")
+                .count(),
             1,
             "exactly one headroom provider table after render, got:\n{rendered}"
         );
@@ -9789,7 +9881,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         // Our own managed value is not "foreign".
         assert_eq!(
-            super::codex_foreign_model_provider("model_provider = \"headroom\"\n"),
+            super::codex_foreign_model_provider("model_provider = \"headroom_local_community\"\n"),
             None,
         );
         // A model_provider inside a table belongs to that table, not the route.
@@ -9803,7 +9895,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     fn render_codex_config_does_not_duplicate_a_foreign_root_model_provider() {
         // Regression: a pre-existing root model_provider used to survive into the
-        // rendered body, colliding with the managed `model_provider = "headroom"`
+        // rendered body, colliding with the managed `model_provider = "headroom_local_community"`
         // as a duplicate root key -> invalid TOML, Codex refuses to load config.
         let existing = "model_provider = \"gateway\"\n\
                         [model_providers.gateway]\n\
@@ -9814,7 +9906,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .unwrap_or_else(|e| panic!("rendered config is valid toml: {e}\n{rendered}"));
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("headroom_local_community"),
             "managed provider wins at root, got:\n{rendered}"
         );
         assert_eq!(
@@ -9826,6 +9918,32 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             rendered.contains("[model_providers.gateway]"),
             "user provider table preserved, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_codex_config_migrates_official_root_route_and_keeps_rollback_table() {
+        let existing = "# >>> headroom:codex_cli >>>\n\
+                        model_provider = \"headroom\"\n\
+                        openai_base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        # <<< headroom:codex_cli <<<\n\
+                        model = \"gpt-5.6-terra\"\n\
+                        [model_providers.headroom]\n\
+                        base_url = \"http://127.0.0.1:6767/v1\"\n";
+
+        let rendered = render_codex_config(existing);
+        let parsed: toml::Value = rendered
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after takeover: {e}\n{rendered}"));
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom_local_community")
+        );
+        assert!(!rendered.contains("# >>> headroom:codex_cli >>>"));
+        assert!(
+            rendered.contains("[model_providers.headroom]")
+                && rendered.contains("http://127.0.0.1:6767/v1"),
+            "official provider table is retained for rollback, got:\n{rendered}"
         );
     }
 
@@ -9851,7 +9969,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .unwrap_or_else(|e| panic!("valid toml after apply: {e}\n{after_apply}"));
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("headroom_local_community"),
             "Headroom takes over routing while enabled, got:\n{after_apply}"
         );
 
@@ -9877,6 +9995,49 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn apply_then_disable_codex_can_take_over_and_restore_official_headroom() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "# >>> headroom:codex_cli >>>\n\
+             model_provider = \"headroom\"\n\
+             openai_base_url = \"http://127.0.0.1:6767/v1\"\n\
+             # <<< headroom:codex_cli <<<\n\
+             [model_providers.headroom]\n\
+             base_url = \"http://127.0.0.1:6767/v1\"\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("explicit Codex takeover succeeds");
+        let after_apply = fs::read_to_string(&config_toml).unwrap();
+        assert_eq!(
+            after_apply
+                .parse::<toml::Value>()
+                .unwrap()
+                .get("model_provider")
+                .and_then(|v| v.as_str()),
+            Some("headroom_local_community")
+        );
+
+        super::disable_client_setup("codex").expect("disable restores official route");
+        let after_disable = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_disable.parse().unwrap();
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom")
+        );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|m| m.get("headroom"))
+            .is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_codex_repairs_a_previously_corrupted_features_block() {
         // A machine upgraded mid-bug: the old single block sits at end-of-file,
         // its root keys absorbed into [features]. Re-applying must repair it so
@@ -9889,14 +10050,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::write(
             &config_toml,
             "[features]\njs_repl = false\n\
-             # >>> headroom:codex_cli >>>\n\
-             model_provider = \"headroom\"\n\
-             openai_base_url = \"http://127.0.0.1:6767/v1\"\n\n\
-             [model_providers.headroom]\n\
-             name = \"Headroom persistent proxy\"\n\
-             base_url = \"http://127.0.0.1:6767/v1\"\n\
+             # >>> headroom-local-community:codex_cli >>>\n\
+             model_provider = \"headroom_local_community\"\n\
+             openai_base_url = \"http://127.0.0.1:6867/v1\"\n\n\
+             [model_providers.headroom_local_community]\n\
+             name = \"Headroom Local Community proxy\"\n\
+             base_url = \"http://127.0.0.1:6867/v1\"\n\
              supports_websockets = true\n\
-             # <<< headroom:codex_cli <<<\n",
+             # <<< headroom-local-community:codex_cli <<<\n",
         )
         .unwrap();
 
@@ -9908,7 +10069,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .get("features")
                 .and_then(|f| f.get("model_provider"))
                 .and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("headroom_local_community"),
             "precondition: corruption present"
         );
 
@@ -9917,7 +10078,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let after: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
         assert_eq!(
             after.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom")
+            Some("headroom_local_community")
         );
         assert!(after
             .get("features")
@@ -9926,21 +10087,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
-    fn sweep_managed_backups_removes_headroom_and_nommer_siblings_only() {
+    fn sweep_managed_backups_removes_only_community_siblings() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let target = tmp.path().join("settings.json");
         fs::write(&target, "{}").unwrap();
 
         let headroom_backup = tmp
             .path()
-            .join("settings.json.headroom-backup-20260101000000");
+            .join("settings.json.headroom-local-community-backup-20260101000000");
         let nommer_backup = tmp
             .path()
             .join("settings.json.nommer-backup-20250101000000");
         let unrelated = tmp.path().join("settings.json.bak");
         let other_target_backup = tmp
             .path()
-            .join("config.toml.headroom-backup-20260101000000");
+            .join("config.toml.headroom-local-community-backup-20260101000000");
         fs::write(&headroom_backup, "old").unwrap();
         fs::write(&nommer_backup, "older").unwrap();
         fs::write(&unrelated, "user-owned").unwrap();
@@ -9948,9 +10109,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let removed = super::sweep_managed_backups(&target);
 
-        assert_eq!(removed.len(), 2, "removed: {removed:?}");
+        assert_eq!(removed.len(), 1, "removed: {removed:?}");
         assert!(!headroom_backup.exists(), "headroom backup should be gone");
-        assert!(!nommer_backup.exists(), "nommer backup should be gone");
+        assert!(
+            nommer_backup.exists(),
+            "legacy/paid-edition backup must be preserved"
+        );
         assert!(unrelated.exists(), "unrelated .bak should survive");
         assert!(
             other_target_backup.exists(),
@@ -10274,7 +10438,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         retag_codex_threads_to_headroom();
 
-        assert_eq!(provider_count(&db, "headroom"), 2);
+        assert_eq!(provider_count(&db, "headroom_local_community"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         // Third-party threads are untouched.
         assert_eq!(provider_count(&db, "anthropic"), 1);
@@ -10305,13 +10469,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let config = codex.join("config.toml");
         std::fs::write(
             &config,
-            "# --- Headroom MCP server ---\n\
-             [mcp_servers.headroom]\n\
+            "# --- Headroom Local Community MCP server ---\n\
+             [mcp_servers.headroom_local_community]\n\
              command = \"headroom\"\n\
              args = [\"mcp\", \"serve\"]\n\
              \n\
-             [mcp_servers.headroom.env]\n\
-             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n\
+             [mcp_servers.headroom_local_community.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6867\"\n\
              \n\
              [mcp_servers.node_repl]\n\
              command = \"/Applications/Codex.app/node_repl\"\n",
@@ -10328,7 +10492,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // backslashes on write, so the raw file never contains `abs` verbatim.
         let parsed: toml::Value = toml::from_str(&after).expect("rewritten config parses");
         assert_eq!(
-            parsed["mcp_servers"]["headroom"]["command"].as_str(),
+            parsed["mcp_servers"]["headroom_local_community"]["command"].as_str(),
             Some(abs.as_str()),
             "headroom command pinned to absolute path, got:\n{after}"
         );
@@ -10353,12 +10517,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let config = codex.join("config.toml");
         std::fs::write(
             &config,
-            "[mcp_servers.headroom]\n\
+            "[mcp_servers.headroom_local_community]\n\
              command = \"/somewhere/venv/bin/python3\"\n\
              args = [\"-m\", \"headroom.cli\", \"mcp\", \"serve\"]\n\
              \n\
-             [mcp_servers.headroom.env]\n\
-             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+             [mcp_servers.headroom_local_community.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6867\"\n",
         )
         .unwrap();
 
@@ -10382,12 +10546,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let config = codex.join("config.toml");
         std::fs::write(
             &config,
-            "[mcp_servers.headroom]\n\
+            "[mcp_servers.headroom_local_community]\n\
              command = \"/somewhere/venv/bin/python3\"\n\
              args = [\n  \"-m\",\n  \"headroom.cli\",\n  \"mcp\",\n  \"serve\",\n]\n\
              \n\
-             [mcp_servers.headroom.env]\n\
-             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+             [mcp_servers.headroom_local_community.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6867\"\n",
         )
         .unwrap();
 
@@ -10398,13 +10562,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // No orphaned continuation lines — the rebuilt file must parse.
         let parsed: toml::Value = toml::from_str(&after).expect("rebuilt config parses");
         assert_eq!(
-            parsed["mcp_servers"]["headroom"]["args"]
+            parsed["mcp_servers"]["headroom_local_community"]["args"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
-        assert!(after.contains("[mcp_servers.headroom.env]"));
+        assert!(after.contains("[mcp_servers.headroom_local_community.env]"));
         assert!(!after.contains("headroom.cli"));
     }
 
@@ -10449,7 +10613,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         retag_codex_threads_to_headroom();
 
-        assert_eq!(provider_count(&db, "headroom"), 2);
+        assert_eq!(provider_count(&db, "headroom_local_community"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "anthropic"), 1);
     }
@@ -10471,7 +10635,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         retag_codex_threads_to_headroom();
 
-        assert_eq!(provider_count(&db, "headroom"), 2);
+        assert_eq!(provider_count(&db, "headroom_local_community"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "anthropic"), 1);
     }
@@ -10502,7 +10666,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!script.contains("return response.status < 500"));
         assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
         // Messages include the actual found value, not just "is not headroom".
-        assert!(script.contains("(expected \"headroom\")"));
+        assert!(script.contains("(expected \"headroom_local_community\")"));
         assert!(script.contains("(expected \" + BASE_URL + \")"));
         assert!(script.contains("DEBOUNCE_PATH.touch()"));
         assert!(script.contains("time.sleep(2)\n    return probe()"));
@@ -10585,7 +10749,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::create_dir_all(home.path().join(".claude")).unwrap();
         fs::write(
             home.path().join(".claude/settings.json"),
-            json!({ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:6767" } }).to_string(),
+            json!({ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:6867" } }).to_string(),
         )
         .unwrap();
         fs::create_dir_all(home.path().join(".local/bin")).unwrap();

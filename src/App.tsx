@@ -47,6 +47,17 @@ import {
 } from "recharts";
 import headroomLogo from "./assets/headroom-logo.svg";
 import packageJson from "../package.json";
+import { LOCAL_COMMUNITY_EDITION } from "./lib/localEdition";
+import {
+  clearAddonOperationMessage,
+  setAddonOperationMessage,
+  type AddonOperationMessages,
+} from "./lib/addonOperationState";
+import {
+  applyAddonUpdateChecks,
+  type AddonUpdateCheck,
+} from "./lib/addonUpdates";
+import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import {
   formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
@@ -212,15 +223,15 @@ import type {
 
 interface NavItem {
   id: TrayView;
-  label: string;
+  labelKey: TranslationKey;
   icon: ElementType;
 }
 
 const navItems: NavItem[] = [
-  { id: "home", label: "Home", icon: House },
-  { id: "optimization", label: "Optimize", icon: Sliders },
-  { id: "notifications", label: "Activity", icon: Bell },
-  { id: "addons", label: "Addons", icon: PuzzlePiece },
+  { id: "home", labelKey: "nav.overview", icon: House },
+  { id: "optimization", labelKey: "nav.optimize", icon: Sliders },
+  { id: "notifications", labelKey: "nav.activity", icon: Bell },
+  { id: "addons", labelKey: "nav.tools", icon: PuzzlePiece },
 ];
 
 interface AddonCopy {
@@ -322,6 +333,71 @@ const connectorSetupDetails: Record<string, string> = {
   opencode:
     "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project."
 };
+
+const CONNECTOR_SETUP_KEYS: Record<string, TranslationKey> = {
+  claude_code: "connections.details.claude",
+  codex: "connections.details.codex",
+  grok_build: "connections.details.grok",
+  opencode: "connections.details.opencode",
+};
+
+function localizeLearnStatus(t: Translate, value: string): string {
+  if (value === "never scan") return t("learn.status.never");
+  if (value === "last scan: today") return t("learn.status.today");
+  if (value === "last scan: yesterday") return t("learn.status.yesterday");
+  const days = value.match(/^last scan: (\d+) days ago$/);
+  return days ? t("learn.status.daysAgo", { count: days[1] }) : value;
+}
+
+function localizeUiText(t: Translate, value: string): string {
+  if (!value) return value;
+  const restart = value.match(/^Quit and reopen (.+) if it was running when you enabled this\.$/);
+  if (restart) return t("connections.restartAfterEnable", { name: restart[1] });
+  const notDetected = value.match(/^(.+) was not detected\. Install (.+) and restart Headroom\.$/);
+  if (notDetected) return t("connections.notDetectedInstall", { name: notDetected[1] });
+  const exact: Record<string, TranslationKey> = {
+    "Setup is incomplete - open the info panel for the exact checks.": "connections.setupIncomplete",
+    "Setup could not be verified - open the info panel and re-check.": "connections.setupUnverified",
+    "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.": "connections.configuredProxyOffline",
+    "Headroom Learn is unavailable on this platform.": "learn.unsupported",
+    "Off": "connections.status.off",
+    "Not installed": "tools.status.notInstalled",
+    "Proxy unreachable": "status.issue.proxyUnreachable",
+    "Verifying": "connections.status.verifying",
+    "Restart needed": "connections.status.restartNeeded",
+    "Active": "connections.status.active",
+    "Connector is unavailable because this client is not detected on this machine.": "connections.genericUnavailable",
+  };
+  return exact[value] ? t(exact[value]) : value;
+}
+
+function localizeAppUpdateCopy(t: Translate, value: string | null): string | null {
+  if (!value) return value;
+  const exact: Record<string, TranslationKey> = {
+    "Checking for a new Headroom release…": "update.checking",
+    "Update checks are not configured in this build yet.": "update.notConfigured",
+    "Up to date.": "update.upToDate",
+    "Could not check for updates.": "update.checkFailed",
+    "Could not load app update settings.": "update.settingsFailed",
+  };
+  if (exact[value]) return t(exact[value]);
+  const available = value.match(/^Update available: (.+)\.$/);
+  if (available) return t("update.available", { version: available[1] });
+  const downloading = value.match(/^Downloading Headroom (.+)…$/);
+  if (downloading) return t("update.downloading", { version: downloading[1] });
+  const installing = value.match(/^Installing Headroom (.+)…$/);
+  if (installing) return t("update.installing", { version: installing[1] });
+  const progressTotal = value.match(/^Downloading Headroom (.+): ([\d.]+) MB of ([\d.]+) MB \((\d+)%\)…$/);
+  if (progressTotal) {
+    return t("update.downloadProgressTotal", {
+      version: progressTotal[1], downloaded: progressTotal[2], total: progressTotal[3], percent: progressTotal[4],
+    });
+  }
+  const progress = value.match(/^Downloading Headroom (.+): ([\d.]+) MB…$/);
+  return progress
+    ? t("update.downloadProgress", { version: progress[1], downloaded: progress[2] })
+    : value;
+}
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
 // Headroom cannot reach. Headroom routes Claude Code by pointing it at a local
@@ -490,9 +566,6 @@ const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
 // Concrete first prompt for the post-install checklist: blank-page paralysis
 // is a real drop-off cause between "agent connected" and "first prompt sent",
 // so hand the user something they can paste that works in any repo.
-const STARTER_PROMPT =
-  "Read this project's main source file and its README in full, then explain what it does and one thing worth improving.";
-
 // Live first-savings checklist. Rendered on the launcher's post-install stage
 // AND as a Home card in the tray window: the launcher hides on click-away and
 // the menu bar icon reopens the tray window, so without the Home card there
@@ -504,6 +577,8 @@ function FirstSavingsChecklist({
   dashboard: DashboardState;
   onReopenSetup: () => void;
 }) {
+  const { t } = useI18n();
+  const starterPrompt = t("onboarding.starterPrompt");
   const [copied, setCopied] = useState(false);
   // A step stuck gray usually means traffic isn't reaching Headroom, not that
   // the user hasn't acted yet. Offer a setup re-check, but only after a grace
@@ -523,9 +598,9 @@ function FirstSavingsChecklist({
             aria-hidden="true"
           />
           <div>
-            <strong>Coding agent connected</strong>
+            <strong>{t("onboarding.agentConnected")}</strong>
             {dashboard.lifetimeRequests <= 0 && (
-              <p>Open a terminal and start your agent — Headroom picks it up automatically.</p>
+              <p>{t("onboarding.agentConnectedHelp")}</p>
             )}
           </div>
         </li>
@@ -535,35 +610,35 @@ function FirstSavingsChecklist({
             aria-hidden="true"
           />
           <div>
-            <strong>First prompt sent</strong>
+            <strong>{t("onboarding.firstPrompt")}</strong>
             {!dashboard.firstPromptRequestSeen && (
-              <p>Ask it anything, or paste the starter prompt below.</p>
+              <p>{t("onboarding.firstPromptHelp")}</p>
             )}
           </div>
         </li>
         <li className="post-install__step">
           <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
           <div>
-            <strong>First savings recorded</strong>
-            <p>Use your AI coding agent as normal or paste the starter prompt below.</p>
+            <strong>{t("onboarding.firstSavings")}</strong>
+            <p>{t("onboarding.firstSavingsHelp")}</p>
           </div>
         </li>
       </ol>
       {dashboard.lifetimeEstimatedTokensSaved <= 0 &&
         dashboard.lifetimeEstimatedSavingsUsd <= 0 && (
         <div className="post-install__starter">
-          <code>{STARTER_PROMPT}</code>
+          <code>{starterPrompt}</code>
           <button
             className="secondary-button"
             onClick={() => {
-              void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
+              void navigator.clipboard?.writeText(starterPrompt).then(() => {
                 setCopied(true);
                 window.setTimeout(() => setCopied(false), 2000);
               });
             }}
             type="button"
           >
-            {copied ? "Copied" : "Copy prompt"}
+            {copied ? t("actions.copied") : t("actions.copyPrompt")}
           </button>
         </div>
       )}
@@ -573,7 +648,7 @@ function FirstSavingsChecklist({
           className="post-install__troubleshoot"
           onClick={onReopenSetup}
         >
-          Not turning green? Re-check setup.
+          {t("onboarding.troubleshoot")}
         </button>
       )}
     </div>
@@ -645,6 +720,7 @@ function SavingsChartTooltip({
   payload?: ReadonlyArray<{ payload?: SavingsChartDatum }>;
   chartMode: SavingsChartMode;
 }) {
+  const { t } = useI18n();
   const point = payload?.[0]?.payload;
   if (!active || !point) {
     return null;
@@ -680,8 +756,8 @@ function SavingsChartTooltip({
                     dimension), so an unqualified "Saved" here would read as the
                     connector's whole contribution. */}
                 {chartMode === "usd"
-                  ? `Input saved ${currencyExact(provider.estimatedSavingsUsd)}`
-                  : `Input saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
+                  ? t("chart.inputSaved", { value: currencyExact(provider.estimatedSavingsUsd) })
+                  : t("chart.inputSavedTokens", { value: compactNumber(provider.estimatedTokensSaved) })}
               </span>
               <span className="savings-chart__tooltip-item">
                 <i
@@ -693,8 +769,8 @@ function SavingsChartTooltip({
                 {/* "Spent" for brevity; the figure is the compressible slice,
                     matching the bar and the chip's denominator. */}
                 {chartMode === "usd"
-                  ? `Spent ${currencyExact(provider.actualCostUsd * costScale)}`
-                  : `Spent ${compactNumber(provider.totalTokensSent * tokenScale)} tokens`}
+                  ? t("chart.spent", { value: currencyExact(provider.actualCostUsd * costScale) })
+                  : t("chart.spentTokens", { value: compactNumber(provider.totalTokensSent * tokenScale) })}
               </span>
             </div>
           ))
@@ -702,38 +778,38 @@ function SavingsChartTooltip({
           // dimension: fall back to the aggregate bucket total.
         chartMode === "usd" ? (
           <div className="savings-chart__tooltip-group">
-            <span className="savings-chart__tooltip-label">Dollars</span>
+            <span className="savings-chart__tooltip-label">{t("chart.dollars")}</span>
             <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
               />
-              Input saved {currencyExact(point.estimatedSavingsUsd)}
+              {t("chart.inputSaved", { value: currencyExact(point.estimatedSavingsUsd) })}
             </span>
             <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
               />
-              Spent {currencyExact(point.compressibleCostUsd)}
+              {t("chart.spent", { value: currencyExact(point.compressibleCostUsd) })}
             </span>
           </div>
         ) : (
           <div className="savings-chart__tooltip-group">
-            <span className="savings-chart__tooltip-label">Tokens</span>
+            <span className="savings-chart__tooltip-label">{t("chart.tokens")}</span>
             <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
               />
-              Input saved {compactNumber(point.estimatedTokensSaved)} tokens
+              {t("chart.inputSavedTokens", { value: compactNumber(point.estimatedTokensSaved) })}
             </span>
             <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
                 className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
               />
-              Spent {compactNumber(point.compressibleTokensSent)} tokens
+              {t("chart.spentTokens", { value: compactNumber(point.compressibleTokensSent) })}
             </span>
           </div>
         )}
@@ -741,7 +817,7 @@ function SavingsChartTooltip({
           single bucket-level row under whichever branch ran above. */}
       {(chartMode === "usd" ? point.outputSavingsUsd : point.outputTokensSaved) > 0 && (
         <div className="savings-chart__tooltip-group">
-          <span className="savings-chart__tooltip-label">Output shaping</span>
+          <span className="savings-chart__tooltip-label">{t("chart.outputShaping")}</span>
           <span className="savings-chart__tooltip-item">
             <i
               aria-hidden="true"
@@ -750,8 +826,8 @@ function SavingsChartTooltip({
               } savings-chart__tooltip-dot--output`}
             />
             {chartMode === "usd"
-              ? `Saved ${currencyExact(point.outputSavingsUsd)}`
-              : `Saved ${compactNumber(point.outputTokensSaved)} tokens`}
+              ? t("chart.saved", { value: currencyExact(point.outputSavingsUsd) })
+              : t("chart.savedTokens", { value: compactNumber(point.outputTokensSaved) })}
           </span>
         </div>
       )}
@@ -795,6 +871,7 @@ function WindowRateChip({
   note: string;
   popSide?: "right" | "left";
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -818,9 +895,9 @@ function WindowRateChip({
     <div className="output-chip" ref={ref}>
       <button
         type="button"
-        className={`output-chip__button${badge === "estimated" ? " output-chip__button--estimated" : ""}${open ? " is-open" : ""}`}
+        className={`output-chip__button${dot === "output" ? " output-chip__button--estimated" : ""}${open ? " is-open" : ""}`}
         aria-expanded={open}
-        aria-label={`${title} details`}
+        aria-label={t("chart.detailsFor", { title })}
         onClick={(e) => {
           e.stopPropagation();
           setOpen((v) => !v);
@@ -839,7 +916,7 @@ function WindowRateChip({
         <div
           className={`output-chip__popover${popSide === "left" ? " output-chip__popover--flip" : ""}`}
           role="dialog"
-          aria-label={`${title} details`}
+          aria-label={t("chart.detailsFor", { title })}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="output-chip__pop-head">
@@ -874,6 +951,7 @@ function OutputReductionChip({
    * all-time number read as that period's. */
   allTimeFallback?: boolean;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const isMeasured = reduction.method === "measured";
@@ -900,7 +978,7 @@ function OutputReductionChip({
         type="button"
         className={`output-chip__button${isMeasured ? "" : " output-chip__button--estimated"}${open ? " is-open" : ""}`}
         aria-expanded={open}
-        aria-label="Output token reduction details"
+        aria-label={t("outputReduction.details")}
         onClick={(e) => {
           e.stopPropagation();
           setOpen((v) => !v);
@@ -908,20 +986,20 @@ function OutputReductionChip({
         onKeyDown={(e) => e.stopPropagation()}
       >
         <span className="output-chip__dot" aria-hidden="true" />
-        Output −{percent1(reduction.reductionPercent)}%
+        {t("outputReduction.short", { value: percent1(reduction.reductionPercent) })}
       </button>
       {open ? (
         <div
           className={`output-chip__popover${flip ? " output-chip__popover--flip" : ""}`}
           role="dialog"
-          aria-label="Output reduction details"
+          aria-label={t("outputReduction.details")}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="output-chip__pop-head">
             <span className="output-chip__pop-title">
-              Output token reduction{allTimeFallback ? " · all-time" : ""}
+              {t("outputReduction.title")}{allTimeFallback ? ` · ${t("cacheInfo.allTime")}` : ""}
             </span>
-            <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
+            <span className="output-chip__pop-badge">{isMeasured ? t("outputReduction.measured") : t("outputReduction.estimated")}</span>
           </div>
           <div className="output-chip__pop-value">{percent1(reduction.reductionPercent)}%</div>
           <dl className="output-chip__pop-stats">
@@ -932,15 +1010,15 @@ function OutputReductionChip({
               </dd>
             </div>
             <div>
-              <dt>Requests</dt>
+              <dt>{t("outputReduction.requests")}</dt>
               <dd>{compactNumber(reduction.requests)}</dd>
             </div>
           </dl>
           <p className="output-chip__pop-note">
-            {allTimeFallback ? "No output samples landed in this window, so this is the all-time figure, not this period's. " : ""}
+            {allTimeFallback ? t("outputReduction.fallback") : ""}
             {isMeasured
-              ? "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down — measured against an unshaped A/B holdout."
-              : "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down. Output savings are counterfactual, so this is an estimate vs a learned baseline."}
+              ? t("outputReduction.measuredNote")
+              : t("outputReduction.estimatedNote")}
           </p>
         </div>
       ) : null}
@@ -963,6 +1041,7 @@ function DailySavingsChart({
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
 }) {
+  const { t } = useI18n();
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
   const [visibleMonth, setVisibleMonth] = useState(() => currentMonth);
@@ -1032,44 +1111,44 @@ function DailySavingsChart({
   return (
     <div className="savings-chart">
       <section
-        aria-label={view === "month" ? `Monthly history for ${label}` : `Hourly history for ${label}`}
+        aria-label={t(view === "month" ? "chart.monthlyHistory" : "chart.hourlyHistory", { label })}
         className="savings-chart__panel"
       >
         <div className="savings-chart__panel-header">
           <div className="savings-chart__title-row">
-            <strong>History</strong>
-            <div className="savings-chart__toggle" aria-label="Metric">
+            <strong>{t("chart.history")}</strong>
+            <div className="savings-chart__toggle" aria-label={t("chart.metric")}>
               <button
                 className={`savings-chart__toggle-button${chartMode === "usd" ? " is-active" : ""}`}
                 onClick={() => setChartMode("usd")}
                 type="button"
               >
-                $ costs
+                {t("chart.costs")}
               </button>
               <button
                 className={`savings-chart__toggle-button${chartMode === "tokens" ? " is-active" : ""}`}
                 onClick={() => setChartMode("tokens")}
                 type="button"
               >
-                tokens
+                {t("chart.tokens")}
               </button>
             </div>
           </div>
           <div className="savings-chart__nav">
-            <div className="savings-chart__toggle" aria-label="History view">
+            <div className="savings-chart__toggle" aria-label={t("chart.historyView")}>
               <button
                 className={`savings-chart__toggle-button${view === "month" ? " is-active" : ""}`}
                 onClick={() => setView("month")}
                 type="button"
               >
-                month
+                {t("chart.month")}
               </button>
               <button
                 className={`savings-chart__toggle-button${view === "day" ? " is-active" : ""}`}
                 onClick={() => setView("day")}
                 type="button"
               >
-                day
+                {t("chart.day")}
               </button>
             </div>
             <button
@@ -1085,7 +1164,7 @@ function DailySavingsChart({
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path d="M10 3L5 8l5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              Prev
+              {t("chart.previous")}
             </button>
             <span className="savings-chart__range-label">{label}</span>
             <button
@@ -1098,7 +1177,7 @@ function DailySavingsChart({
               }
               type="button"
             >
-              Next
+              {t("chart.next")}
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path d="M6 3l5 5-5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
@@ -1111,43 +1190,43 @@ function DailySavingsChart({
               {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
             </span>
             <span className="savings-chart__overlay-label">
-              {view === "day" ? "saved today" : "saved this month"}
+              {t(view === "day" ? "chart.savedToday" : "chart.savedMonth")}
             </span>
             {compressibleRate !== null || windowOutput !== null || outputReduction ? (
               <span className="savings-chart__overlay-chips">
                 {compressibleRate !== null && (
                   <WindowRateChip
                     dot="input"
-                    label={`Input −${Math.round(compressibleRate.pct)}%`}
-                    title="Input compression"
-                    badge="measured"
+                    label={t("chart.inputLabel", { value: Math.round(compressibleRate.pct) })}
+                    title={t("chart.inputTitle")}
+                    badge={t("chart.measured")}
                     value={`${Math.round(compressibleRate.pct)}%`}
                     rows={[
-                      { dt: "Removed", dd: currency(compressibleRate.saved) },
+                      { dt: t("chart.removed"), dd: currency(compressibleRate.saved) },
                       {
-                        dt: "Compressible input",
+                        dt: t("chart.compressibleInput"),
                         dd: currency(compressibleRate.saved + compressibleRate.remaining)
                       }
                     ]}
-                    note="Excludes cache reads."
+                    note={t("chart.excludesCacheReads")}
                   />
                 )}
                 {windowOutput !== null ? (
                   <WindowRateChip
                     dot="output"
                     popSide="left"
-                    label={`Output −${Math.round(windowOutput.pct)}%`}
-                    title="Output token reduction"
-                    badge="estimated"
+                    label={t("chart.outputLabel", { value: Math.round(windowOutput.pct) })}
+                    title={t("chart.outputTitle")}
+                    badge={t("chart.estimated")}
                     value={`${Math.round(windowOutput.pct)}%`}
                     rows={[
-                      { dt: "Avoided", dd: compactNumber(windowOutput.savedTokens) },
-                      { dt: "Baseline", dd: compactNumber(windowOutput.baselineTokens) },
+                      { dt: t("chart.avoided"), dd: compactNumber(windowOutput.savedTokens) },
+                      { dt: t("chart.baseline"), dd: compactNumber(windowOutput.baselineTokens) },
                       ...(outputReduction
-                        ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
+                        ? [{ dt: t("chart.allTime"), dd: `${percent1(outputReduction.reductionPercent)}%` }]
                         : [])
                     ]}
-                    note="Estimate vs the shaper's learned baseline, sampled while the app runs."
+                    note={t("chart.learnedBaselineNote")}
                   />
                 ) : outputReduction ? (
                   <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
@@ -1319,6 +1398,7 @@ function AddonClientChips({
   connectors: ClientConnectorStatus[];
   savings?: string | null;
 }) {
+  const { t } = useI18n();
   const clients = sortClientConnectors(aggregateClientConnectors(connectors));
   if (clients.length === 0 && !savings) {
     return null;
@@ -1331,19 +1411,19 @@ function AddonClientChips({
           <span
             className="callout-banner__chip"
             key={connector.clientId}
-            title={status.label}
+            title={localizeUiText(t, status.label)}
           >
             <span
               className={`callout-banner__chip-dot callout-banner__chip-dot--${status.tone}`}
               aria-hidden="true"
             />
             <span className="callout-banner__chip-name">{connector.name}</span>
-            <span className="visually-hidden">{status.label}</span>
+            <span className="visually-hidden">{localizeUiText(t, status.label)}</span>
           </span>
         );
       })}
       {savings ? (
-        <span className="callout-banner__chip" title="Savings">
+        <span className="callout-banner__chip" title={t("metrics.savingsLabel")}>
           <span
             className="callout-banner__chip-dot callout-banner__chip-dot--active"
             aria-hidden="true"
@@ -1360,6 +1440,7 @@ function formatAddonVersion(version: string): string {
 }
 
 function AddonCard({
+  toolId,
   name,
   version,
   installed,
@@ -1371,6 +1452,11 @@ function AddonCard({
   busy,
   busyLabel,
   resultMessage,
+  errorMessage,
+  upstreamVersion,
+  upstreamUpdateAvailable,
+  updateRequiresAppUpdate,
+  supportedVersion,
   onDismissResult,
   sourceUrl,
   onOpenSource,
@@ -1387,6 +1473,7 @@ function AddonCard({
   unavailableReason,
   children
 }: {
+  toolId: string;
   name: string;
   version?: string | null;
   installed: boolean;
@@ -1398,6 +1485,11 @@ function AddonCard({
   busy: boolean;
   busyLabel: string | null;
   resultMessage: string | null;
+  errorMessage: string | null;
+  upstreamVersion?: string | null;
+  upstreamUpdateAvailable?: boolean;
+  updateRequiresAppUpdate?: boolean;
+  supportedVersion?: string | null;
   onDismissResult: () => void;
   sourceUrl: string;
   onOpenSource: () => void;
@@ -1415,6 +1507,8 @@ function AddonCard({
   unavailableReason?: string | null;
   children?: ReactNode;
 }) {
+  const { t } = useI18n();
+  const infoKey = ADDON_INFO_KEYS[toolId];
   return (
     <li className={`addon-card${unavailableReason ? " addon-card--unavailable" : ""}`}>
       <div className="addon-card__body">
@@ -1427,7 +1521,7 @@ function AddonCard({
             <button
               type="button"
               className="addon-card__info"
-              aria-label={`What ${name} does`}
+              aria-label={t("addons.whatItDoes", { name })}
               aria-expanded={infoOpen}
               onClick={onToggleInfo}
             >
@@ -1438,12 +1532,12 @@ function AddonCard({
             <span
               className={`addon-card__badge addon-card__badge--${enabled ? "on" : "off"}`}
             >
-              {enabled ? "Enabled" : "Disabled"}
+              {t(enabled ? "addons.enabledBadge" : "addons.disabledBadge")}
             </span>
           ) : null}
         </div>
         {infoOpen && copy ? (
-          <p className="addon-card__info-text">{copy.whatItDoes}</p>
+          <p className="addon-card__info-text">{infoKey ? t(infoKey) : copy.whatItDoes}</p>
         ) : null}
         <p className="addon-card__description">{description}</p>
         {showClients ? (
@@ -1453,17 +1547,32 @@ function AddonCard({
           {sourceUrl}
         </button>
         {unavailableReason ? (
-          <p className="addon-card__notice">{unavailableReason}</p>
+          <p className="addon-card__notice">{localizeUiText(t, unavailableReason)}</p>
+        ) : null}
+        {updateRequiresAppUpdate && upstreamVersion ? (
+          <p className="addon-card__notice addon-card__notice--update">
+            {t("addons.upstreamRequiresAppUpdate", {
+              latest: formatAddonVersion(upstreamVersion),
+              supported: supportedVersion ? formatAddonVersion(supportedVersion) : "—",
+            })}
+          </p>
+        ) : null}
+        {upstreamUpdateAvailable && !updateAvailable && !updateRequiresAppUpdate && upstreamVersion ? (
+          <p className="addon-card__notice addon-card__notice--update">
+            {t("addons.enableBeforeUpdate", { latest: formatAddonVersion(upstreamVersion) })}
+          </p>
         ) : null}
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
+        ) : errorMessage ? (
+          <p className="addons__error addon-card__error">{errorMessage}</p>
         ) : resultMessage ? (
           <p className="addon-card__result">
             {resultMessage}
             <button
               type="button"
               className="addon-card__result-dismiss"
-              aria-label="Dismiss"
+              aria-label={t("actions.dismiss")}
               onClick={onDismissResult}
             >
               ×
@@ -1475,7 +1584,7 @@ function AddonCard({
       <div className="addon-card__actions">
         {unavailableReason ? (
           <button type="button" className="addon-card__action" disabled>
-            Unavailable
+            {t("tools.status.unavailable")}
           </button>
         ) : !installed ? (
           <button
@@ -1484,7 +1593,7 @@ function AddonCard({
             disabled={actionsDisabled}
             onClick={onInstall}
           >
-            Install
+            {t("tools.install")}
           </button>
         ) : (
           <>
@@ -1498,8 +1607,8 @@ function AddonCard({
                 onClick={onUpdate}
               >
                 {availableVersion
-                  ? `Update to ${formatAddonVersion(availableVersion)}`
-                  : "Update"}
+                  ? t("addons.updateTo", { version: formatAddonVersion(availableVersion) })
+                  : t("addons.update")}
               </button>
             ) : null}
             <button
@@ -1508,7 +1617,7 @@ function AddonCard({
               disabled={actionsDisabled}
               onClick={onToggleEnabled}
             >
-              {enabled ? "Disable" : "Enable"}
+              {enabled ? t("tools.disable") : t("tools.enable")}
             </button>
             <button
               type="button"
@@ -1516,7 +1625,7 @@ function AddonCard({
               disabled={actionsDisabled}
               onClick={onUninstall}
             >
-              Uninstall
+              {t("addons.uninstall")}
             </button>
           </>
         )}
@@ -1524,6 +1633,26 @@ function AddonCard({
     </li>
   );
 }
+
+const ADDON_INFO_KEYS: Record<string, TranslationKey> = {
+  rtk: "addons.description.rtk",
+  markitdown: "addons.description.markitdown",
+  ponytail: "addons.description.ponytail",
+  caveman: "addons.description.caveman",
+  serena: "addons.description.serena",
+  "codebase-memory": "addons.description.codebaseMemory",
+  context7: "addons.description.context7",
+};
+
+const ADDON_DESCRIPTION_KEYS: Record<string, TranslationKey> = {
+  rtk: "addons.description.rtk",
+  markitdown: "addons.description.markitdown",
+  ponytail: "addons.description.ponytail",
+  caveman: "addons.description.caveman",
+  serena: "addons.description.serena",
+  "codebase-memory": "addons.description.codebaseMemory",
+  context7: "addons.description.context7",
+};
 
 const ADDON_DISPLAY_ORDER = [
   "ponytail",
@@ -1545,7 +1674,7 @@ function buildAddonRequestMailto(): string {
   const body =
     "Which addon would you like to see in Headroom?\n\n\n" +
     "What would it do for you / which tool does it wrap?\n\n\n";
-  return `mailto:product@extraheadroom.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return `mailto:headroom-local-community@localhost.invalid?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
 function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
@@ -1570,7 +1699,7 @@ function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
     "---\n" +
     "Diagnostic info (please keep):\n" +
     diagnosticLines.join("\n");
-  return `mailto:support@extraheadroom.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return `mailto:headroom-local-community@localhost.invalid?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
 interface ProxyVerificationRow {
@@ -1582,17 +1711,22 @@ interface ProxyVerificationRow {
 
 
 export default function App() {
+  const { locale, resolvedLocale, setLocale, t } = useI18n();
   const [dashboard, setDashboard] = useState<DashboardState>(mockDashboard);
-  const [addonBusyId, setAddonBusyId] = useState<string | null>(null);
-  const [addonBusyLabel, setAddonBusyLabel] = useState<string | null>(null);
+  const [addonBusyById, setAddonBusyById] = useState<AddonOperationMessages>({});
   const [addonInfoId, setAddonInfoId] = useState<string | null>(null);
-  const [addonResult, setAddonResult] = useState<{ id: string; message: string } | null>(null);
-  const [addonError, setAddonError] = useState<string | null>(null);
+  const [addonResultById, setAddonResultById] = useState<AddonOperationMessages>({});
+  const [addonErrorById, setAddonErrorById] = useState<AddonOperationMessages>({});
+  const [addonUpdateChecks, setAddonUpdateChecks] = useState<AddonUpdateCheck[]>([]);
+  const [addonUpdateBusy, setAddonUpdateBusy] = useState(false);
+  const [addonUpdatesChecked, setAddonUpdatesChecked] = useState(false);
+  const [addonUpdateCheckFailed, setAddonUpdateCheckFailed] = useState(false);
   const [bootstrapping, setBootstrapping] = useState(false);
   const [bootstrapProgress, setBootstrapProgress] =
     useState<BootstrapProgress>(idleBootstrapProgress);
   const [runtimeUpgradeProgress, setRuntimeUpgradeProgress] =
     useState<RuntimeUpgradeProgress>(idleRuntimeUpgradeProgress);
+  const [cliUpdateError, setCliUpdateError] = useState<string | null>(null);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [windowLabel, setWindowLabel] = useState<"main" | "launcher" | null>(null);
   const [startupPhase, setStartupPhase] = useState<StartupPhase>("window");
@@ -1600,6 +1734,14 @@ export default function App() {
   const [startupCopy, setStartupCopy] = useState("Opening launch window…");
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
+
+  useEffect(() => {
+    if (!LOCAL_COMMUNITY_EDITION) return;
+    void invoke("set_native_tray_locale", { locale: resolvedLocale }).catch((error) => {
+      console.error("Failed to update native tray language", error);
+    });
+  }, [resolvedLocale]);
+
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
   // Annual first: it is the cheaper per-month number and the tab the "Save 25%"
   // badge points at. A subscriber's own period overrides this once it loads.
@@ -1652,7 +1794,7 @@ export default function App() {
   // trial. The old paywall-first checkout gate has been retired, so this no
   // longer depends on the launch flag.
   const paywallFirstFlow = runtimeStatus?.installed === false;
-  // Verify against the always-up 6767 intercept (which counts passthrough
+  // Verify against the always-up 6867 intercept (which counts passthrough
   // traffic) instead of the backend whenever the backend won't be optimizing:
   // pre-install, or when the pricing gate has bypassed it (e.g. ended trial).
   // Otherwise proxy_verify waits forever on a backend that never comes up.
@@ -2339,6 +2481,9 @@ export default function App() {
       void invoke<RuntimeStatus>("get_runtime_status")
         .then((status) => applyRuntimeStatusIfChanged(status))
         .catch(() => {});
+      void loadDashboard()
+        .then((next) => applyDashboardIfChanged(next))
+        .catch(() => {});
     }, 2500);
     return () => window.clearTimeout(timeout);
   }, [runtimeUpgradeProgress.complete, runtimeUpgradeProgress.failed, windowLabel]);
@@ -2354,7 +2499,7 @@ export default function App() {
   // soon as the first proxied request lands, and so a completed checkout
   // (deep link or the 5-minute checkout poll) flips subscriptionActive here.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "paywall") {
+    if (LOCAL_COMMUNITY_EDITION || windowLabel !== "launcher" || launcherStage !== "paywall") {
       return;
     }
     trackAnalyticsEvent("paywall_shown", {});
@@ -2422,11 +2567,11 @@ export default function App() {
             const startupError = interceptOnlyVerify ? null : runtime?.startupError;
             setProxyVerificationHint(
               interceptOnlyVerify
-                ? { text: "Waiting for setup traffic. Send a test message from your coding tool.", tone: "info" }
+                ? { text: t("launcher.waitingSetupTraffic"), tone: "info" }
                 : startupError
-                ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
+                ? { text: t("launcher.startFailed", { error: startupError }), tone: "error" }
                 : {
-                    text: "Finishing setup - first launch downloads models and can take a minute.",
+                    text: t("launcher.finishingSetup"),
                     tone: "info"
                   }
             );
@@ -2456,13 +2601,13 @@ export default function App() {
               const now = counts[agentKey] ?? 0;
               const base = anchor[agentKey] ?? 0;
               return now > base
-                ? { ...row, state: "verified", message: "Request received" }
+                ? { ...row, state: "verified", message: t("launcher.requestReceived") }
                 : row;
             })
           );
         } catch {
           if (active) {
-            setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
+            setProxyVerificationHint({ text: t("launcher.waitingActivity"), tone: "info" });
           }
         }
       })();
@@ -2474,7 +2619,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, launcherStage, interceptOnlyVerify]);
+  }, [windowLabel, launcherStage, interceptOnlyVerify, t]);
 
   // Warm the bootstrap download cache while the user is still signing up.
   // Download-only: nothing is installed until they consent on the install
@@ -2809,6 +2954,17 @@ export default function App() {
   }, [appUpdateInstallBusy]);
 
   useEffect(() => {
+    if (
+      (activeView !== "addons" && activeView !== "settings") ||
+      addonUpdatesChecked ||
+      addonUpdateBusy
+    ) {
+      return;
+    }
+    void refreshAddonUpdates();
+  }, [activeView, addonUpdatesChecked, addonUpdateBusy]);
+
+  useEffect(() => {
     if (activeView !== "settings") {
       return;
     }
@@ -2851,10 +3007,11 @@ export default function App() {
   const learnerProgress = dashboard.learnerProgress;
   const autoLearnMeta =
     learnerProgress && learnerProgress.pendingPatterns > 0
-      ? `Learning from live traffic. ${learnerProgress.pendingPatterns} pattern${
-          learnerProgress.pendingPatterns === 1 ? "" : "s"
-        } detected; these are saved once detected ${learnerProgress.minEvidence} times.`
-      : `Learns from live traffic. First learnings may take a few sessions to appear.`;
+      ? t("learn.autoProgress", {
+          patterns: learnerProgress.pendingPatterns,
+          evidence: learnerProgress.minEvidence,
+        })
+      : t("learn.autoDescription");
 
   async function handleAutostartToggle(nextEnabled: boolean) {
     setAutostartBusy(true);
@@ -2869,25 +3026,64 @@ export default function App() {
   }
 
   async function handleRtkToggle(nextEnabled: boolean) {
-    const copy = addonCopy.rtk;
+    const id = "rtk";
     setRtkBusy(true);
-    setAddonBusyId("rtk");
-    setAddonBusyLabel((nextEnabled ? copy?.enabling : copy?.disabling) ?? null);
-    setAddonResult(null);
+    setAddonBusyById((current) =>
+      setAddonOperationMessage(
+        current,
+        id,
+        t(nextEnabled ? "addons.enabling" : "addons.disabling", { name: "RTK" })
+      )
+    );
+    setAddonResultById((current) => clearAddonOperationMessage(current, id));
+    setAddonErrorById((current) => clearAddonOperationMessage(current, id));
     try {
       await invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled });
       await refreshRuntimeStatus();
-      const message = nextEnabled ? undefined : copy?.disabled;
+      const message = nextEnabled ? undefined : t("addons.disabled", { name: "RTK" });
       if (message) {
-        setAddonResult({ id: "rtk", message });
+        setAddonResultById((current) => setAddonOperationMessage(current, id, message));
       }
     } catch (error) {
       console.error("Failed to update RTK", error);
-      setAddonError("RTK could not be updated.");
+      setAddonErrorById((current) =>
+        setAddonOperationMessage(
+          current,
+          id,
+          describeInvokeError(error, t("messages.localOperationFailed"))
+        )
+      );
     } finally {
       setRtkBusy(false);
-      setAddonBusyId(null);
-      setAddonBusyLabel(null);
+      setAddonBusyById((current) => clearAddonOperationMessage(current, id));
+    }
+  }
+
+  async function refreshAddonUpdates() {
+    setAddonUpdateBusy(true);
+    setAddonUpdateCheckFailed(false);
+    try {
+      const checks = await invoke<AddonUpdateCheck[]>("check_addon_updates");
+      if (!Array.isArray(checks)) {
+        throw new Error("invalid addon update response");
+      }
+      setAddonUpdateChecks(checks);
+      setAddonUpdateCheckFailed(checks.every((check) => Boolean(check.error)));
+    } catch (error) {
+      console.error("Failed to check addon updates", error);
+      setAddonUpdateCheckFailed(true);
+    } finally {
+      setAddonUpdatesChecked(true);
+      setAddonUpdateBusy(false);
+    }
+  }
+
+  async function handleHeadroomCliUpdate() {
+    setCliUpdateError(null);
+    try {
+      await invoke("update_headroom_cli");
+    } catch (error) {
+      setCliUpdateError(describeInvokeError(error, t("messages.localOperationFailed")));
     }
   }
 
@@ -3191,12 +3387,12 @@ export default function App() {
     Number(grokLearnEnabled);
   const learnBlurb =
     learnAgentCount > 1
-      ? "Headroom learns from your coding agents' sessions. When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
+      ? t("learn.blurb.multiple")
       : codexLearnEnabled
-        ? "Headroom learns from your Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
+        ? t("learn.blurb.codex")
         : opencodeLearnEnabled || grokLearnEnabled
-          ? "Headroom learns from your agent's sessions. When it repeats a mistake, Headroom updates the agent's memory so it doesn't happen again."
-          : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.local.md.";
+          ? t("learn.blurb.agent")
+          : t("learn.blurb.claude");
   useEffect(() => {
     // connectors === [] means get_client_connectors hasn't returned yet (the
     // Rust side always lists every managed client). Don't treat that launch
@@ -3358,7 +3554,7 @@ export default function App() {
   // healthy when it ticks past the anchor we captured on the first reachable
   // poll. The previous implementation scanned the python proxy log for
   // /v1/messages lines, but Claude Code traffic actually flows through the
-  // Rust front proxy on 6767 — the python log only sees background activity,
+  // Rust front proxy on 6867 — the python log only sees background activity,
   // so the regex match could hang forever even while requests were being
   // optimized normally.
   useEffect(() => {
@@ -3500,13 +3696,13 @@ export default function App() {
 
   function etaCopy(seconds: number, progress: BootstrapProgress) {
     if (!showInstallProgress) {
-      return "ETA: starts after install";
+      return t("launcher.etaAfterInstall");
     }
     if (progress.complete) {
-      return "ETA: complete";
+      return t("launcher.etaComplete");
     }
     if (progress.failed) {
-      return "ETA: unavailable";
+      return t("launcher.etaUnavailable");
     }
 
     const elapsedSeconds = stepStartedAtMs
@@ -3516,17 +3712,17 @@ export default function App() {
     const remainingSeconds = Math.max(0, baselineEta - elapsedSeconds);
 
     if (remainingSeconds <= 0 && progress.running) {
-      return "ETA: finishing up";
+      return t("launcher.etaFinishing");
     }
     if (remainingSeconds <= 0) {
-      return "ETA: --";
+      return t("launcher.etaUnknown");
     }
     if (remainingSeconds < 60) {
-      return `ETA: ${remainingSeconds}s`;
+      return t("launcher.etaSeconds", { seconds: remainingSeconds });
     }
     const mins = Math.floor(remainingSeconds / 60);
     const secs = remainingSeconds % 60;
-    return `ETA: ${mins}m ${secs}s`;
+    return t("launcher.etaMinutesSeconds", { minutes: mins, seconds: secs });
   }
 
   function getConnectorUnavailableReason(connector: ClientConnectorStatus) {
@@ -3601,7 +3797,7 @@ export default function App() {
       setShowAppUpdateDialog(patch.showDialog ?? false);
     }
     if (Object.prototype.hasOwnProperty.call(patch, "statusCopy")) {
-      setAppUpdateStatusCopy(patch.statusCopy ?? null);
+      setAppUpdateStatusCopy(localizeAppUpdateCopy(t, patch.statusCopy ?? null));
     }
   }
 
@@ -3636,7 +3832,7 @@ export default function App() {
 
     setAppUpdateBusy(true);
     if (!background) {
-      setAppUpdateStatusCopy("Checking for a new Headroom release…");
+      setAppUpdateStatusCopy(t("update.checking"));
     }
 
     try {
@@ -3674,7 +3870,7 @@ export default function App() {
     setAppUpdateInstallBusy(true);
     const installStatusCopy = getAppUpdateInstallStatusCopy(appUpdateAvailable);
     if (installStatusCopy) {
-      setAppUpdateStatusCopy(installStatusCopy);
+      setAppUpdateStatusCopy(localizeAppUpdateCopy(t, installStatusCopy));
     }
 
     try {
@@ -3683,7 +3879,7 @@ export default function App() {
         await runAppUpdateInstall({
           availableUpdate: appUpdateAvailable,
           onProgress: (progress) => {
-            setAppUpdateStatusCopy(formatAppUpdateProgressCopy(versionForCopy, progress));
+            setAppUpdateStatusCopy(localizeAppUpdateCopy(t, formatAppUpdateProgressCopy(versionForCopy, progress)));
           },
         })
       );
@@ -4024,19 +4220,18 @@ export default function App() {
     // An update reuses install_addon, so only the wording differs.
     updateLabels?: { busy: string; done: string }
   ) {
-    const copy = addonCopy[id];
+    const toolName = dashboard.tools.find((tool) => tool.id === id)?.name ?? id;
     const busyLabel =
       command === "install_addon"
-        ? (updateLabels?.busy ?? copy?.installing)
+        ? (updateLabels?.busy ?? t("addons.installing", { name: toolName }))
         : command === "uninstall_addon"
-          ? copy?.uninstalling
+          ? t("addons.uninstalling", { name: toolName })
           : enabled
-            ? copy?.enabling
-            : copy?.disabling;
-    setAddonBusyId(id);
-    setAddonBusyLabel(busyLabel ?? null);
-    setAddonError(null);
-    setAddonResult(null);
+            ? t("addons.enabling", { name: toolName })
+            : t("addons.disabling", { name: toolName });
+    setAddonBusyById((current) => setAddonOperationMessage(current, id, busyLabel));
+    setAddonErrorById((current) => clearAddonOperationMessage(current, id));
+    setAddonResultById((current) => clearAddonOperationMessage(current, id));
     try {
       const next = await invoke<DashboardState>(command, { id, enabled });
       setDashboard(next);
@@ -4045,22 +4240,25 @@ export default function App() {
       }
       const message =
         command === "install_addon"
-          ? (updateLabels?.done ?? copy?.installed)
+          ? (updateLabels?.done ?? t("addons.installed", { name: toolName }))
           : command === "uninstall_addon"
-            ? copy?.uninstalled
+            ? t("addons.uninstalled", { name: toolName })
             : enabled
               ? undefined
-              : copy?.disabled;
+              : t("addons.disabled", { name: toolName });
       if (message) {
-        setAddonResult({ id, message });
+        setAddonResultById((current) => setAddonOperationMessage(current, id, message));
       }
     } catch (error) {
-      setAddonError(
-        describeInvokeError(error, "The addon action could not be completed.")
+      setAddonErrorById((current) =>
+        setAddonOperationMessage(
+          current,
+          id,
+          describeInvokeError(error, t("messages.localOperationFailed"))
+        )
       );
     } finally {
-      setAddonBusyId(null);
-      setAddonBusyLabel(null);
+      setAddonBusyById((current) => clearAddonOperationMessage(current, id));
     }
   }
 
@@ -4159,7 +4357,7 @@ export default function App() {
   // in where nobody could see it. The deep-link handler shows the launcher
   // before parking the credentials, so it is the window on screen.
   useEffect(() => {
-    if (windowLabel !== "launcher") {
+    if (LOCAL_COMMUNITY_EDITION || windowLabel !== "launcher") {
       return;
     }
     let cancelled = false;
@@ -4614,8 +4812,11 @@ export default function App() {
     }, 400);
   }
 
-  const headroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
-  const headroomVersion = headroomTool?.version ?? "Unknown";
+  const rawHeadroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
+  const headroomTool = rawHeadroomTool
+    ? applyAddonUpdateChecks([rawHeadroomTool], addonUpdateChecks)[0]
+    : undefined;
+  const headroomVersion = headroomTool?.version ?? t("settings.unknown");
   const lifetimeTotalTokensSent = dashboard.dailySavings.reduce(
     (sum, point) => sum + point.totalTokensSent,
     0
@@ -4661,8 +4862,17 @@ export default function App() {
       : null;
   const rtkSavingsChip =
     runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalSaved ?? 0) > 0
-      ? `~${compactNumber(runtimeStatus.rtk.totalSaved ?? 0)} tokens saved`
+      ? t("addons.tokensSaved", { count: compactNumber(runtimeStatus.rtk.totalSaved ?? 0) })
       : null;
+  const checkedTools = applyAddonUpdateChecks(dashboard.tools, addonUpdateChecks);
+  const checkedRtkTool = checkedTools.find((tool) => tool.id === "rtk");
+  const addonUpdateFailureCount = addonUpdateChecks.filter((check) => Boolean(check.error)).length;
+  const addonUpdatesFound = checkedTools.filter(
+    (tool) =>
+      !tool.required &&
+      tool.status !== "not_installed" &&
+      (tool.updateAvailable || tool.upstreamUpdateAvailable)
+  ).length;
   const lifetimeDataDays = new Set(
     dashboard.dailySavings
       .map((point) => point.date)
@@ -4670,8 +4880,8 @@ export default function App() {
   ).size;
   const lifetimeDataDaysLabel =
     lifetimeDataDays > 0
-      ? `Based on ${lifetimeDataDays} day${lifetimeDataDays === 1 ? "" : "s"} of data`
-      : "No historical savings data yet";
+      ? t("onboarding.basedOnDays", { count: lifetimeDataDays })
+      : t("onboarding.noHistory");
 
   useEffect(() => {
     window.dispatchEvent(
@@ -4733,6 +4943,7 @@ export default function App() {
   // who may never see the launcher — hit it in the main window. Bumping the
   // backend's REQUIRED_TERMS_VERSION re-triggers it on the next launch.
   if (
+    !LOCAL_COMMUNITY_EDITION &&
     needsTermsAcceptance(
       dashboard.requiredTermsVersion,
       dashboard.acceptedTermsVersion
@@ -5044,16 +5255,16 @@ export default function App() {
     const renderPercent = animatedOverallPercent(bootstrapProgress);
     const installComplete = bootstrapProgress.complete || dashboard.bootstrapComplete;
     const failedInstallUpdateLabel = appUpdateRestartBusy
-      ? "Restarting…"
+      ? t("actions.restarting")
       : appUpdateInstallBusy
-        ? "Installing…"
+        ? t("launcher.installingHeadroom")
         : appUpdateBusy
-          ? "Checking…"
+          ? t("settings.checking")
           : appUpdateReadyToRestart
-            ? "Restart now"
+            ? t("update.restartNow")
             : appUpdateAvailable
-              ? `Install ${appUpdateAvailable.version}`
-              : "Check for updates";
+              ? t("update.installVersion", { version: appUpdateAvailable.version })
+              : t("settings.checkForUpdates");
 
     const statusCopy = !showInstallProgress
       ? ""
@@ -5063,7 +5274,7 @@ export default function App() {
           bootstrapProgress.currentStep
         : `${bootstrapProgress.message} ${
             bootstrapProgress.running && !bootstrapProgress.complete
-              ? `(${stepProgress}% of this step)`
+              ? `(${t("launcher.stepProgress", { percent: stepProgress })})`
               : ""
           }`.trim();
 
@@ -5077,11 +5288,8 @@ export default function App() {
         showSpinner={bootstrapping}
       >
         <div>
-        <h1>
-          Headroom cuts AI coding agents&apos; costs
-           ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
-        </h1>
-        <div className="intro-shell__agents" aria-label="Supported coding agents">
+        <h1>{t("launcher.headlineBefore")} <span className="headline-highlight">50%</span> {t("launcher.headlineAfter")}</h1>
+        <div className="intro-shell__agents" aria-label={t("aria.supportedAgents")}>
           {[
             ["claude_code", "Claude Code"],
             ["codex", "Codex"],
@@ -5097,24 +5305,16 @@ export default function App() {
         </div>
         <div className="intro-shell__checklist">
           <article>
-            <strong>Privacy first</strong>
-            <p>
-              Your prompts never touch our servers. Everything runs locally on your machine.
-            </p>
+            <strong>{t("launcher.privacyTitle")}</strong>
+            <p>{t("launcher.privacyDescription")}</p>
           </article>
           <article>
-            <strong>Self-contained</strong>
-            <p>
-              Keeps your runtime clean, never interfering with packages your
-              projects depend on.
-            </p>
+            <strong>{t("launcher.selfContainedTitle")}</strong>
+            <p>{t("launcher.selfContainedDescription")}</p>
           </article>
           <article>
-            <strong>Less tokens, no impact</strong>
-            <p>
-              Smart optimization cuts noise before your coding tool sees it, with
-              no impact on the output.
-            </p>
+            <strong>{t("launcher.lessTokensTitle")}</strong>
+            <p>{t("launcher.lessTokensDescription")}</p>
           </article>
         </div>
         {installComplete ? (
@@ -5122,24 +5322,24 @@ export default function App() {
             {bootstrapProgress.running ||
             (runtimeStatus?.running !== true && runtimeStatus?.bypassed !== true) ? (
               <>
-                <p className="launcher-install-notice">Starting Headroom for the first time (this can take 1-2 minutes)…</p>
+                <p className="launcher-install-notice">{t("launcher.startingFirstTime")}</p>
                 <button
                   className="primary-button primary-button--large primary-button--install launcher-step1-continue"
                   disabled
                   type="button"
                 >
-                  Starting Headroom…
+                  {t("launcher.starting")}
                 </button>
               </>
             ) : (
               <>
-                <p className="launcher-install-notice">Headroom installation present</p>
+                <p className="launcher-install-notice">{t("launcher.installed")}</p>
                 <button
                   className="primary-button primary-button--large primary-button--success launcher-step1-continue"
                   onClick={() => void handleFirstLaunchContinue()}
                   type="button"
                 >
-                  Continue
+                  {t("actions.continue")}
                 </button>
               </>
             )}
@@ -5148,8 +5348,7 @@ export default function App() {
           <>
             {!bootstrapping && (
               <p className="install-pre-notice">
-                Takes 2-3 minutes to install all tools and configure your installed coding
-                agents to work with Headroom.
+                {t("launcher.installNotice")}
               </p>
             )}
             <button
@@ -5159,10 +5358,10 @@ export default function App() {
               type="button"
             >
               {bootstrapping
-                ? "Installing Headroom…"
+                ? t("launcher.installingHeadroom")
                 : bootstrapProgress.failed
-                  ? "Try again"
-                  : "Install Headroom"}
+                  ? t("launcher.tryAgain")
+                  : t("launcher.installHeadroom")}
             </button>
           </>
         )}
@@ -5204,12 +5403,12 @@ export default function App() {
                     onClick={() => void handleFailedInstallSupportMail()}
                     type="button"
                   >
-                    Contact support
+                    {t("launcher.contactSupport")}
                   </button>
                 </div>
               ) : null}
               {appUpdateStatusCopy && bootstrapProgress.failed ? (
-                <p className="install-progress__update-status">{appUpdateStatusCopy}</p>
+                <p className="install-progress__update-status">{localizeAppUpdateCopy(t, appUpdateStatusCopy)}</p>
               ) : null}
             </div>
           ) : null}
@@ -5242,15 +5441,16 @@ export default function App() {
         version={appSemver}
       >
         <div className="post-install__lead">
-          <h1>Connect your coding tools</h1>
-          <p>Toggle each tool to automatically route it through Headroom.</p>
+          <h1>{t("launcher.connectTitle")}</h1>
+          <p>{t("launcher.connectDescription")}</p>
           <div className="connector-list">
             {availableConnectors.map((connector) => {
               const unavailableReason = getConnectorUnavailableReason(connector);
               const detectionWarning = getConnectorDetectionWarning(connector);
               const supportWarning = getConnectorSupportWarning(connector);
               const statusLine = connectorStatusLine(connector);
-              const gateBlocksEnable = connectorGateBlocksEnable(connector);
+              const gateBlocksEnable =
+                !LOCAL_COMMUNITY_EDITION && connectorGateBlocksEnable(connector);
               return (
                 <article className="connector-item" key={connector.clientId}>
                   <div>
@@ -5268,7 +5468,7 @@ export default function App() {
                             )
                           }
                           type="button"
-                          aria-label={`Show warning for ${connector.name}`}
+                          aria-label={t("aria.showWarning", { name: connector.name })}
                           aria-expanded={openConnectorWarningId === connector.clientId}
                         >
                           !
@@ -5282,7 +5482,7 @@ export default function App() {
                           )
                         }
                         type="button"
-                        aria-label={`Show setup details for ${connector.name}`}
+                        aria-label={t("connections.showDetails", { name: connector.name })}
                         aria-expanded={openConnectorHelpId === connector.clientId}
                       >
                         i
@@ -5290,8 +5490,9 @@ export default function App() {
                     </h3>
                     {openConnectorHelpId === connector.clientId ? (
                       <p className="connector-tooltip">
-                        {connectorSetupDetails[connector.clientId] ??
-                          "Headroom applies local connector configuration."}
+                        {CONNECTOR_SETUP_KEYS[connector.clientId]
+                          ? t(CONNECTOR_SETUP_KEYS[connector.clientId])
+                          : t("connections.localConfiguration")}
                       </p>
                     ) : null}
                     {openConnectorWarningId === connector.clientId && supportWarning ? (
@@ -5300,11 +5501,11 @@ export default function App() {
                       </p>
                     ) : null}
                     {statusLine ? (
-                      <p className={`connector-item__${statusLine.tone}`}>{statusLine.text}</p>
+                      <p className={`connector-item__${statusLine.tone}`}>{localizeUiText(t, statusLine.text)}</p>
                     ) : null}
                     {(detectionWarning ?? unavailableReason) ? (
                       <p className="connector-item__reason">
-                        {detectionWarning ?? unavailableReason}
+                        {localizeUiText(t, detectionWarning ?? unavailableReason ?? "")}
                       </p>
                     ) : null}
                     {gateBlocksEnable ? (
@@ -5323,14 +5524,17 @@ export default function App() {
                   <div className="connector-item__controls">
                     <button
                       aria-checked={connector.enabled}
-                      aria-label={`${connector.enabled ? "Disable" : "Enable"} ${connector.name} connector`}
+                      aria-label={t(
+                        connector.enabled ? "connections.disableConnector" : "connections.enableConnector",
+                        { name: connector.name }
+                      )}
                       className={`connector-switch${connector.enabled ? " is-on" : ""}`}
                       disabled={connectorsBusy || gateBlocksEnable}
                       onClick={() =>
                         void toggleConnector(connector, !connector.enabled)
                       }
                       role="switch"
-                      title={unavailableReason ?? undefined}
+                      title={unavailableReason ? localizeUiText(t, unavailableReason) : undefined}
                       type="button"
                     >
                       <span className="connector-switch__thumb" />
@@ -5342,7 +5546,7 @@ export default function App() {
           </div>
           {unavailableConnectors.length > 0 ? (
             <div className="connector-list connector-list--unavailable">
-              <p className="connector-list__section-label">Not detected on this machine</p>
+              <p className="connector-list__section-label">{t("connections.notInstalled")}</p>
               {unavailableConnectors.map((connector) => {
                 const unavailableReason = getConnectorUnavailableReason(connector);
                 const supportWarning = getConnectorSupportWarning(connector);
@@ -5363,7 +5567,7 @@ export default function App() {
                               )
                             }
                             type="button"
-                            aria-label={`Show warning for ${connector.name}`}
+                          aria-label={t("aria.showWarning", { name: connector.name })}
                             aria-expanded={openConnectorWarningId === connector.clientId}
                           >
                             !
@@ -5376,7 +5580,7 @@ export default function App() {
                         </p>
                       ) : null}
                       {unavailableReason ? (
-                        <p className="connector-item__reason">{unavailableReason}</p>
+                        <p className="connector-item__reason">{localizeUiText(t, unavailableReason)}</p>
                       ) : null}
                     </div>
                   </article>
@@ -5399,7 +5603,7 @@ export default function App() {
             }}
             type="button"
           >
-            Back
+            {t("actions.back")}
           </button>
           <button
             className="primary-button primary-button--large primary-button--success"
@@ -5409,7 +5613,7 @@ export default function App() {
             }}
             type="button"
           >
-            Continue
+            {t("actions.continue")}
           </button>
         </div>
       </LauncherShell>
@@ -5439,13 +5643,8 @@ export default function App() {
         version={appSemver}
       >
         <div className="post-install__lead">
-          <h1>Test your setup</h1>
-          <p>
-            Restart each tool below, then send it any message - "Say hi" is
-            enough. Tools only pick up Headroom's setting when they launch, so
-            the restart is usually the missing step. This screen ticks over by
-            itself as each one checks in.
-          </p>
+          <h1>{t("launcher.testTitle")}</h1>
+          <p>{t("launcher.testDescription")}</p>
           {hasEnabledApps ? (
             <div className="connector-list">
               {proxyVerificationRows.map((row) => (
@@ -5460,7 +5659,7 @@ export default function App() {
                     <div className="proxy-verify-item__message">
                       <span>{row.message}</span>
                       {row.state === "verified" ? (
-                        <span className="proxy-verified-pill">verified</span>
+                        <span className="proxy-verified-pill">{t("launcher.verified")}</span>
                       ) : null}
                     </div>
                   </div>
@@ -5469,7 +5668,7 @@ export default function App() {
             </div>
           ) : (
             <p className="launcher-restart-hint">
-              No tools are enabled yet. Go back to the previous step to enable one.
+              {t("launcher.noTools")}
             </p>
           )}
           {proxyVerificationHint ? (
@@ -5486,8 +5685,8 @@ export default function App() {
           {!allVerified && proxyVerifySkipArmed ? (
             <p className="install-progress__notice">
               {hasEnabledApps
-                ? `We have not detected any ${unverifiedNames} activity flowing through our savings pipeline yet. You can skip and continue for now, but Headroom can only compress requests it sees, so your savings are likely to stay at zero. Restart ${unverifiedNames} to fix this.`
-                : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
+                ? t("launcher.skipWarningWithAgents", { names: unverifiedNames })
+                : t("launcher.skipWarningNoAgents")}
             </p>
           ) : null}
         </div>
@@ -5499,7 +5698,7 @@ export default function App() {
             }}
             type="button"
           >
-            Back
+            {t("actions.back")}
           </button>
           {allVerified ? (
             <button
@@ -5507,7 +5706,7 @@ export default function App() {
               onClick={finishSetup}
               type="button"
             >
-              Continue
+              {t("actions.continue")}
             </button>
           ) : (
             // Deliberately not a primary button: leaving without a single
@@ -5524,7 +5723,7 @@ export default function App() {
               }}
               type="button"
             >
-              {proxyVerifySkipArmed ? "Skip anyway" : "Skip for now"}
+              {t(proxyVerifySkipArmed ? "launcher.skipAnyway" : "launcher.skipForNow")}
             </button>
           )}
         </div>
@@ -5649,7 +5848,7 @@ export default function App() {
           <p className="paywall__footnote">
             <button
               className="link-button"
-              onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/features" })}
+              onClick={() => void invoke("open_external_link", { url: "https://github.com/" })}
               type="button"
             >
               See all Headroom features
@@ -5694,9 +5893,7 @@ export default function App() {
       >
         <div className="post-install__lead">
           <h1>
-            Headroom is now running
-            <br />
-            in the background
+            {t("onboarding.runningBackground")}
           </h1>
           {awaitingFirstSavings ? (
             <FirstSavingsChecklist
@@ -5707,14 +5904,14 @@ export default function App() {
             <>
               <p>
                 {dashboard.launchExperience === "first_run"
-                  ? "That prompt went through Headroom — your first savings are in."
-                  : "It will trim prompt bloat whenever you use a connected coding agent."}
+                  ? t("onboarding.firstSavingsIn")
+                  : t("onboarding.backgroundDescription")}
               </p>
               <div className="post-install__metrics">
                 <article className="soft-card stat-card">
                   <span className="stat-card__label">
                     <CurrencyDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold" />
-                    Savings all-time
+                    {t("onboarding.savingsAllTime")}
                   </span>
                   <strong className="stat-value--green">{currency(dashboard.lifetimeEstimatedSavingsUsd)}</strong>
                   <p>{lifetimeDataDaysLabel}</p>
@@ -5722,11 +5919,13 @@ export default function App() {
                 <article className="soft-card stat-card">
                   <span className="stat-card__label">
                     <Cpu aria-hidden="true" className="stat-card__icon" size={15} weight="bold" />
-                    Tokens saved all-time
+                    {t("onboarding.tokensAllTime")}
                   </span>
                   <strong className="stat-value--blue">{compactNumber(dashboard.lifetimeEstimatedTokensSaved)}</strong>
                   <p>
-                    Across {lifetimeDataDays > 0 ? `${lifetimeDataDays} tracked day${lifetimeDataDays === 1 ? "" : "s"}` : "all recorded usage"}
+                    {lifetimeDataDays > 0
+                      ? t("onboarding.acrossTrackedDays", { count: lifetimeDataDays })
+                      : t("onboarding.acrossRecordedUsage")}
                   </p>
                 </article>
               </div>
@@ -5741,7 +5940,7 @@ export default function App() {
             }}
             type="button"
           >
-            Back
+            {t("actions.back")}
           </button>
           <button
             className="primary-button primary-button--large primary-button--success"
@@ -5750,9 +5949,9 @@ export default function App() {
             onClick={() => triggerHide()}
             type="button"
           >
-            Get started
+            {t("actions.getStarted")}
           </button>
-          <p>Headroom stays active in your menu bar while you work.</p>
+          <p>{t("launcher.menuBarNote")}</p>
         </div>
       </LauncherShell>
     );
@@ -5772,23 +5971,23 @@ export default function App() {
 
   const runtimeIssues: string[] = [];
   if (runtimeStatus?.installed === false) {
-    runtimeIssues.push("runtime not installed");
+    runtimeIssues.push(t("status.issue.runtimeNotInstalled"));
   }
   if (runtimeStatus?.running === false) {
     runtimeIssues.push(
       runtimeStatus.startupErrorHint ??
         runtimeStatus.startupError ??
-        "runtime offline"
+        t("status.issue.runtimeOffline")
     );
   }
   if (runtimeStatus?.proxyReachable === false) {
-    runtimeIssues.push("proxy unreachable");
+    runtimeIssues.push(t("status.issue.proxyUnreachable"));
   }
   if (runtimeStatus?.mcpConfigured === false) {
-    runtimeIssues.push("MCP not configured");
+    runtimeIssues.push(t("status.issue.mcpNotConfigured"));
   }
   if (runtimeStatus?.kompressEnabled === false && !kompressWarming) {
-    runtimeIssues.push("Kompress disabled");
+    runtimeIssues.push(t("status.issue.kompressDisabled"));
   }
 
   const runtimeHealthy = Boolean(
@@ -5805,13 +6004,13 @@ export default function App() {
   const headroomLearnSupported = runtimeStatus?.headroomLearnSupported !== false;
   const headroomLearnDisabledReason =
     runtimeStatus?.headroomLearnDisabledReason ??
-    "Headroom Learn is unavailable on this platform.";
+    t("learn.unsupported");
 
   const calloutBanner = (() => {
     if (!runtimeStatus) {
       return {
         tone: "disconnected",
-        title: "Headroom status is unavailable."
+        title: t("status.unavailable")
       } as const;
     }
 
@@ -5819,19 +6018,19 @@ export default function App() {
       if (runtimeStatus.autoPaused) {
         return {
           tone: "auto-paused",
-          title: "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
+          title: t("status.stoppedUnexpectedly")
         } as const;
       }
       return {
         tone: "paused",
-        title: "Headroom is paused."
+        title: t("status.paused")
       } as const;
     }
 
     if (runtimeStatus.starting) {
       return {
         tone: "starting",
-        title: "Headroom is starting up."
+        title: t("status.starting")
       } as const;
     }
 
@@ -5877,24 +6076,24 @@ export default function App() {
       if (connectorPhase === "disabled") {
         return {
           tone: "disabled",
-          title: "No coding tools connected — Headroom isn't reducing costs."
+          title: t("status.noTools")
         } as const;
       }
       if (connectorPhase === "verifying") {
         return {
           tone: "starting",
-          title: "Send a message in a connected tool to verify the connection is working. You may need to restart it first."
+          title: t("status.verifyConnection")
         } as const;
       }
       if (kompressWarming) {
         return {
           tone: "healthy",
-          title: "Headroom is running while finishing setup."
+          title: t("status.finishingSetup")
         } as const;
       }
       return {
         tone: "healthy",
-        title: "Headroom is running and trimming prompt bloat."
+        title: t("status.healthy")
       } as const;
     }
 
@@ -5903,11 +6102,11 @@ export default function App() {
       tone: disconnected ? "disconnected" : "degraded",
       title: disconnected
         ? runtimeIssues.length > 0
-          ? `Headroom is not hooked up right now: ${runtimeIssues.join(", ")}.`
-          : "Headroom is not hooked up right now."
+          ? t("status.disconnectedWithIssues", { issues: runtimeIssues.join(t("punctuation.listSeparator")) })
+          : t("status.disconnected")
         : runtimeIssues.length > 0
-          ? `Headroom needs attention: ${runtimeIssues.join(", ")}.`
-          : "Headroom is running, but something needs attention."
+          ? t("status.attentionWithIssues", { issues: runtimeIssues.join(t("punctuation.listSeparator")) })
+          : t("status.attention")
     } as const;
   })();
 
@@ -5920,9 +6119,9 @@ export default function App() {
             return calloutBanner.title;
           }
           if (calloutBanner.tone === "disconnected") {
-            return `Headroom is not hooked up right now: ${primaryIssue}.`;
+            return t("status.disconnectedWithIssues", { issues: primaryIssue });
           }
-          return `Headroom needs attention: ${primaryIssue}.`;
+          return t("status.attentionWithIssues", { issues: primaryIssue });
         })();
   const tierMismatch = pricingStatus?.tierMismatch ?? null;
   // Products the clamp actually limits (per-product scope). Falls back to the
@@ -6221,9 +6420,9 @@ export default function App() {
           </div>
           <p className="pricing-auth-card__legal">
             {"By signing in, you agree to our "}
-            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/terms" })} type="button">Terms of Service</button>
+            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://opensource.org/license/mit" })} type="button">Terms of Service</button>
             {" and "}
-            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/privacy" })} type="button">Privacy Policy</button>
+            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://opensource.org/license/mit" })} type="button">Privacy Policy</button>
             {"."}
           </p>
         </>
@@ -6302,7 +6501,7 @@ export default function App() {
         <div className="tray-sidebar__logo">
           <img src={headroomLogo} alt="Headroom" />
         </div>
-        <nav className="tray-nav" aria-label="Tray navigation">
+        <nav className="tray-nav" aria-label={t("aria.trayNavigation")}>
           {navItems.map((item) => (
             <button
               key={item.id}
@@ -6314,19 +6513,21 @@ export default function App() {
                 <item.icon className="tray-nav__icon-svg" size={26} weight={activeView === item.id ? "fill" : "regular"} />
               </span>
               <span className="tray-nav__text">
-                <strong>{item.label}</strong>
+                <strong>{t(item.labelKey)}</strong>
               </span>
             </button>
           ))}
         </nav>
         <div className="tray-sidebar__footer">
-          <button
-            className={`upgrade-pill${activeView === "upgrade" || activeView === "upgradeAuth" ? " is-active" : ""}`}
-            onMouseDown={() => setActiveView("upgrade")}
-            type="button"
-          >
-            Upgrade
-          </button>
+          {!LOCAL_COMMUNITY_EDITION ? (
+            <button
+              className={`upgrade-pill${activeView === "upgrade" || activeView === "upgradeAuth" ? " is-active" : ""}`}
+              onMouseDown={() => setActiveView("upgrade")}
+              type="button"
+            >
+              Upgrade
+            </button>
+          ) : null}
           <button
             className={`tray-nav__item${activeView === "settings" ? " is-active" : ""}`}
             onMouseDown={() => setActiveView("settings")}
@@ -6336,7 +6537,7 @@ export default function App() {
               <GearSix className="tray-nav__icon-svg" size={26} weight={activeView === "settings" ? "fill" : "regular"} />
             </span>
             <span className="tray-nav__text">
-              <strong>Settings</strong>
+              <strong>{t("nav.settings")}</strong>
             </span>
           </button>
         </div>
@@ -6344,7 +6545,7 @@ export default function App() {
 
       <section className="tray-panel">
         <div className="tray-content" hidden={activeView !== "home"}>
-            {tierMismatch ? (
+            {!LOCAL_COMMUNITY_EDITION && tierMismatch ? (
               <section className="tier-mismatch-banner" role="alert">
                 <div className="tier-mismatch-banner__body">
                   <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
@@ -6422,7 +6623,7 @@ export default function App() {
                     // reassuring "check back later" below would be a lie.
                     <p className="callout-banner__subtitle">{stallBannerLine}</p>
                   ) : (
-                    <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>
+                    <p className="callout-banner__subtitle">{t("home.checkBack")}</p>
                   )
                 )}
                 {(calloutBanner.tone === "auto-paused" || calloutBanner.tone === "paused") && (
@@ -6433,7 +6634,7 @@ export default function App() {
                       onClick={() => void handleResumeRuntime()}
                       disabled={resuming}
                     >
-                      {resuming ? "Restarting…" : "Resume"}
+                      {resuming ? t("actions.restarting") : t("actions.resume")}
                     </button>
                     {resumeError ? (
                       <p className="callout-banner__subtitle callout-banner__error" role="status">
@@ -6459,7 +6660,7 @@ export default function App() {
                         <span
                           className={`callout-banner__badge callout-banner__badge--${status.tone}`}
                           key={connector.clientId}
-                          data-tip={`${connector.name}: ${status.label}`}
+                          data-tip={`${connector.name}: ${localizeUiText(t, status.label)}`}
                         >
                           {hasConnectorIcon(connector.clientId) ? (
                             <ConnectorIcon clientId={connector.clientId} />
@@ -6468,7 +6669,7 @@ export default function App() {
                               {connectorMonograms[connector.clientId] ?? connector.name.slice(0, 2)}
                             </span>
                           )}
-                          <span className="visually-hidden">{`${connector.name}: ${status.label}`}</span>
+                          <span className="visually-hidden">{`${connector.name}: ${localizeUiText(t, status.label)}`}</span>
                         </span>
                       );
                     })}
@@ -6487,12 +6688,12 @@ export default function App() {
               >
                 <span className="stat-card__label">
                   <CurrencyCircleDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Total costs saved
+                  {t("home.totalCostsSaved")}
                   <button
                     className="stat-card__info-button"
                     onClick={(e) => { e.stopPropagation(); setShowSavingsInfo(true); }}
                     type="button"
-                    aria-label="How savings are calculated"
+                    aria-label={t("savingsInfo.title")}
                   >
                     <Info size={13} weight="bold" />
                   </button>
@@ -6508,12 +6709,12 @@ export default function App() {
               >
                 <span className="stat-card__label">
                   <Cpu aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Total input tokens saved
+                  {t("home.totalTokensSaved")}
                   <button
                     className="stat-card__info-button"
                     onClick={(e) => { e.stopPropagation(); setShowCacheInfo(true); }}
                     type="button"
-                    aria-label="Cache hits and compression by period"
+                    aria-label={t("cacheInfo.title")}
                   >
                     <Info size={13} weight="bold" />
                   </button>
@@ -6537,7 +6738,7 @@ export default function App() {
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
-                <p className="loading-copy">Loading savings history…</p>
+                <p className="loading-copy">{t("home.loadingHistory")}</p>
               </div>
             )}
 
@@ -6550,24 +6751,24 @@ export default function App() {
                   <span className="optimize-card__title-icon" aria-hidden="true">
                     <Brain weight="duotone" />
                   </span>
-                  <h1>Project learnings</h1>
+                  <h1>{t("learn.appliedHeading")}</h1>
                 </div>
                 <p className="optimize-card__blurb">{learnBlurb}</p>
                 {headroomLearnSupported ? (
                   <div className="optimize-card__auto-learn">
                     <div className="optimize-card__auto-learn-text">
                       <span className="optimize-card__auto-learn-label">
-                        Auto-learning
+                        {t("learn.autoLearning")}
                       </span>
                       <span className="optimize-card__auto-learn-meta">
                         {autoLearnEnabled === false
-                          ? "Off — only manual scans add learnings."
+                          ? t("learn.manualOnly")
                           : autoLearnMeta}
                       </span>
                     </div>
                     <button
                       aria-checked={autoLearnEnabled ?? true}
-                      aria-label={`${autoLearnEnabled === false ? "Enable" : "Disable"} auto-learning`}
+                      aria-label={t(autoLearnEnabled === false ? "learn.enableAuto" : "learn.disableAuto")}
                       className={`connector-switch${autoLearnEnabled === false ? "" : " is-on"}`}
                       disabled={autoLearnEnabled === null || autoLearnBusy}
                       onClick={() =>
@@ -6590,14 +6791,14 @@ export default function App() {
                   </div>
                 ) : !claudeLearnEnabled && !codexLearnEnabled ? (
                   <p className="loading-copy">
-                    Enable a coding-agent connector to scan sessions for learnings.
+                    {t("learn.enableConnector")}
                   </p>
                 ) : (
                   <div className="optimize-minimal">
                     {claudeLearnEnabled && claudeProjectsBusy && claudeProjects.length === 0 ? (
-                      <p className="loading-copy">Loading projects…</p>
+                      <p className="loading-copy">{t("settings.loading")}</p>
                     ) : claudeLearnEnabled && claudeProjects.length === 0 ? (
-                      <p className="loading-copy">No Claude Code projects found in <code>~/.claude/projects</code>.</p>
+                      <p className="loading-copy">{t("learn.noProjects")}</p>
                     ) : claudeLearnEnabled ? (
                       <>
                     {!headroomLearnPrereq.claudeCliAvailable ? (
@@ -6608,11 +6809,10 @@ export default function App() {
                           </span>
                           <div className="install-prompt__head-text">
                             <h2 className="install-prompt__title">
-                              Install the Claude Code CLI
+                              {t("learn.installClaudeTitle")}
                             </h2>
                             <p className="install-prompt__body">
-                              Headroom Learn uses the <code>claude</code> CLI to analyze
-                              your sessions.
+                              {t("learn.usesClaudeCli")}
                             </p>
                           </div>
                         </header>
@@ -6625,7 +6825,7 @@ export default function App() {
                             type="button"
                             onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
                           >
-                            Copy
+                            {t("actions.copy")}
                           </button>
                         </div>
                         <div className="install-prompt__foot">
@@ -6634,7 +6834,7 @@ export default function App() {
                             type="button"
                             onClick={() => void openLearnInstallDocsLink()}
                           >
-                            Open install docs
+                            {t("actions.openDocs")}
                           </button>
                           <span className="install-prompt__foot-sep" aria-hidden="true">·</span>
                           <button
@@ -6643,7 +6843,7 @@ export default function App() {
                             onClick={() => void refreshHeadroomLearnPrereq(true)}
                           >
                             <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
-                            Re-check
+                            {t("actions.recheck")}
                           </button>
                           {learnInstallCopyNotice ? (
                             <span className="install-prompt__notice">
@@ -6665,10 +6865,10 @@ export default function App() {
                           headroomLearnBusy ||
                           claudeProjectsBusy ||
                           (headroomLearnStatus.running && !isRunning);
-                        const learnMeta = formatLearnStatus(project);
+                        const learnMeta = localizeLearnStatus(t, formatLearnStatus(project));
                         const refreshLabel = isRunning
-                          ? "Scanning…"
-                          : "Scan now";
+                          ? t("actions.scanning")
+                          : t("actions.scanNow");
                         const showInlineResult =
                           isLatestLearnProject &&
                           !headroomLearnStatus.running &&
@@ -6733,7 +6933,7 @@ export default function App() {
                               <div className="optimize-project-row__actions">
                                 {showInlineResult ? (
                                   <span className="optimize-project-row__status optimize-minimal__result--failure">
-                                    Last run failed
+                                    {t("actions.lastRunFailed")}
                                   </span>
                                 ) : null}
                               </div>
@@ -6753,7 +6953,7 @@ export default function App() {
                         onClick={() => setShowAllClaudeProjects((current) => !current)}
                         type="button"
                       >
-                        {showAllClaudeProjects ? "fewer projects" : "more projects"}
+                        {showAllClaudeProjects ? t("actions.fewerProjects") : t("actions.moreProjects")}
                       </button>
                     ) : null}
                       </>
@@ -6789,14 +6989,14 @@ export default function App() {
                                   <div className="install-prompt__head-text">
                                     <h2 className="install-prompt__title">
                                       {headroomLearnPrereq.codexCliAvailable
-                                        ? "Sign in to the Codex CLI"
-                                        : "Install the Codex CLI"}
+                                        ? t("learn.codexSignInTitle")
+                                        : t("learn.codexInstallTitle")}
                                     </h2>
                                     <p className="install-prompt__body">
-                                      Headroom Learn analyzes your Codex sessions with the{" "}
-                                      <code>codex</code> CLI on your ChatGPT subscription.
+                                      {t("learn.codexAnalyzerPrefix")} {" "}
+                                      <code>codex</code> CLI {t("learn.codexAnalyzerSuffix")}
                                       {headroomLearnPrereq.codexCliAvailable
-                                        ? " Sign in to continue."
+                                        ? ` ${t("learn.signInToContinue")}`
                                         : ""}
                                     </p>
                                   </div>
@@ -6808,7 +7008,7 @@ export default function App() {
                                     type="button"
                                     onClick={() => void copyLearnInstallCommand(codexCmd)}
                                   >
-                                    Copy
+                                    {t("actions.copy")}
                                   </button>
                                 </div>
                                 <div className="install-prompt__foot">
@@ -6817,7 +7017,7 @@ export default function App() {
                                     type="button"
                                     onClick={() => void openExternalLink(CODEX_INSTALL_DOCS_URL)}
                                   >
-                                    Open install docs
+                                    {t("actions.openDocs")}
                                   </button>
                                   <span className="install-prompt__foot-sep" aria-hidden="true">
                                     ·
@@ -6828,7 +7028,7 @@ export default function App() {
                                     onClick={() => void refreshHeadroomLearnPrereq(true)}
                                   >
                                     <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
-                                    Re-check
+                                    {t("actions.recheck")}
                                   </button>
                                   {learnInstallCopyNotice ? (
                                     <span className="install-prompt__notice">
@@ -6846,7 +7046,7 @@ export default function App() {
                               >
                                 <div className="optimize-project-row__main">
                                   <span className="optimize-project-row__name">
-                                    <strong>Codex sessions</strong>
+                                    <strong>{t("learn.codexSessions")}</strong>
                                     <small>
                                       <span
                                         className="optimize-project-row__training"
@@ -6858,15 +7058,15 @@ export default function App() {
                                             elapsedSeconds={headroomLearnStatus.elapsedSeconds}
                                           />
                                         ) : (
-                                          "Scans ~/.codex/sessions into AGENTS.md"
+                                          t("learn.codexScans")
                                         )}
                                         <button
                                           type="button"
                                           className={`optimize-project-row__refresh${codexRunning ? " is-spinning" : ""}`}
                                           onClick={() => void handleRunHeadroomLearn("codex")}
                                           disabled={codexDisable}
-                                          aria-label={codexRunning ? "Scanning…" : "Scan now"}
-                                          title={codexRunning ? "Scanning…" : "Scan now"}
+                                          aria-label={codexRunning ? t("actions.scanning") : t("actions.scanNow")}
+                                          title={codexRunning ? t("actions.scanning") : t("actions.scanNow")}
                                         >
                                           <ArrowClockwise
                                             weight="bold"
@@ -6880,7 +7080,7 @@ export default function App() {
                                   <div className="optimize-project-row__actions">
                                     {codexShowResult ? (
                                       <span className="optimize-project-row__status optimize-minimal__result--failure">
-                                        Last run failed
+                                        {t("actions.lastRunFailed")}
                                       </span>
                                     ) : null}
                                   </div>
@@ -6901,14 +7101,14 @@ export default function App() {
                       {
                         key: "opencode" as const,
                         enabled: opencodeLearnEnabled,
-                        title: "OpenCode sessions",
-                        subtitle: "Scans OpenCode's session database into agent memory"
+                        title: t("learn.agent.opencode"),
+                        subtitle: t("learn.agent.opencodeDescription")
                       },
                       {
                         key: "grok" as const,
                         enabled: grokLearnEnabled,
-                        title: "Grok sessions",
-                        subtitle: "Scans ~/.grok/sessions into agent memory"
+                        title: t("learn.agent.grok"),
+                        subtitle: t("learn.agent.grokDescription")
                       }
                     ].map((row) => {
                       if (!row.enabled) {
@@ -6949,14 +7149,14 @@ export default function App() {
                                       />
                                     ) : ready
                                       ? row.subtitle
-                                      : "Needs the Claude Code or a signed-in Codex CLI for analysis"}
+                                      : t("learn.needsAnalyzer")}
                                     <button
                                       type="button"
                                       className={`optimize-project-row__refresh${running ? " is-spinning" : ""}`}
                                       onClick={() => void handleRunHeadroomLearn(row.key)}
                                       disabled={disable}
-                                      aria-label={running ? "Scanning…" : "Scan now"}
-                                      title={running ? "Scanning…" : "Scan now"}
+                                      aria-label={running ? t("actions.scanning") : t("actions.scanNow")}
+                                      title={running ? t("actions.scanning") : t("actions.scanNow")}
                                     >
                                       <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
                                     </button>
@@ -6966,7 +7166,7 @@ export default function App() {
                               <div className="optimize-project-row__actions">
                                 {showResult ? (
                                   <span className="optimize-project-row__status optimize-minimal__result--failure">
-                                    Last run failed
+                                    {t("actions.lastRunFailed")}
                                   </span>
                                 ) : null}
                               </div>
@@ -7017,24 +7217,47 @@ export default function App() {
                 <span className="addons-card__title-icon" aria-hidden="true">
                   <PuzzlePiece weight="duotone" />
                 </span>
-                <h1>Addons</h1>
+                <h1>{t("nav.tools")}</h1>
               </div>
               <p className="addons-card__blurb">
-                Additional tools that reduce token usage. Missing an addon you
-                want?{" "}
+                {t("tools.description")} {" "}
                 <button
                   type="button"
                   className="addon-card__link"
                   onClick={() => void openExternalLink(buildAddonRequestMailto())}
                 >
-                  Request an addon
+                  {t("tools.requestAddon")}
                 </button>
               </p>
+              <div className="addons-card__updates" aria-live="polite">
+                <button
+                  type="button"
+                  className="secondary-button addons-card__update-button"
+                  disabled={addonUpdateBusy}
+                  onClick={() => void refreshAddonUpdates()}
+                >
+                  <ArrowClockwise aria-hidden="true" size={14} />
+                  {addonUpdateBusy ? t("addons.checkingUpdates") : t("addons.checkUpdates")}
+                </button>
+                {addonUpdatesChecked && !addonUpdateBusy ? (
+                  <span className={addonUpdateCheckFailed ? "addons-card__update-error" : undefined}>
+                    {addonUpdateCheckFailed
+                      ? t("addons.updateCheckFailed")
+                      : addonUpdateFailureCount > 0
+                        ? t("addons.updateCheckPartial", {
+                            count: addonUpdateFailureCount,
+                            updates: addonUpdatesFound,
+                          })
+                        : addonUpdatesFound > 0
+                          ? t("addons.updatesFound", { count: addonUpdatesFound })
+                          : t("addons.allUpToDate")}
+                  </span>
+                ) : null}
+              </div>
             </header>
           </article>
-          {addonError ? <p className="addons__error">{addonError}</p> : null}
           <ul className="addons__list">
-              {dashboard.tools
+              {checkedTools
                 .filter((tool) => !tool.required && tool.id !== "rtk")
                 .sort((a, b) => addonDisplayRank(a.id) - addonDisplayRank(b.id))
                 .map((tool) => {
@@ -7042,35 +7265,43 @@ export default function App() {
                   return (
                     <AddonCard
                       key={tool.id}
+                      toolId={tool.id}
                       name={tool.name}
                       version={tool.version}
                       installed={installed}
                       enabled={tool.enabled}
-                      description={tool.description}
+                      description={ADDON_DESCRIPTION_KEYS[tool.id] ? t(ADDON_DESCRIPTION_KEYS[tool.id]) : tool.description}
                       copy={addonCopy[tool.id]}
                       infoOpen={addonInfoId === tool.id}
                       onToggleInfo={() =>
                         setAddonInfoId(addonInfoId === tool.id ? null : tool.id)
                       }
-                      busy={addonBusyId === tool.id}
-                      busyLabel={addonBusyLabel}
-                      resultMessage={
-                        addonResult?.id === tool.id ? addonResult.message : null
+                      busy={tool.id in addonBusyById}
+                      busyLabel={addonBusyById[tool.id] ?? null}
+                      resultMessage={addonResultById[tool.id] ?? null}
+                      errorMessage={addonErrorById[tool.id] ?? null}
+                      upstreamVersion={tool.upstreamVersion ?? null}
+                      upstreamUpdateAvailable={tool.upstreamUpdateAvailable ?? false}
+                      updateRequiresAppUpdate={tool.updateRequiresAppUpdate ?? false}
+                      supportedVersion={tool.supportedVersion ?? null}
+                      onDismissResult={() =>
+                        setAddonResultById((current) =>
+                          clearAddonOperationMessage(current, tool.id)
+                        )
                       }
-                      onDismissResult={() => setAddonResult(null)}
                       sourceUrl={tool.sourceUrl}
                       onOpenSource={() => void openExternalLink(tool.sourceUrl)}
                       connectors={connectors}
                       showClients={installed && tool.enabled}
                       savings={tool.savingsLabel ?? null}
-                      actionsDisabled={addonBusyId === tool.id}
+                      actionsDisabled={tool.id in addonBusyById}
                       updateAvailable={tool.updateAvailable ?? false}
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
                       onUpdate={() =>
                         void runAddonAction("install_addon", tool.id, undefined, {
-                          busy: `Updating ${tool.name}...`,
-                          done: `${tool.name} updated.`
+                          busy: t("addons.updating", { name: tool.name }),
+                          done: t("addons.updated", { name: tool.name })
                         })
                       }
                       onInstall={() => void runAddonAction("install_addon", tool.id)}
@@ -7083,25 +7314,35 @@ export default function App() {
                 })}
               <AddonCard
                 key="rtk"
+                toolId="rtk"
                 name="RTK"
                 version={runtimeStatus?.rtk.version}
                 installed={runtimeStatus?.rtk.installed === true}
                 enabled={runtimeStatus?.rtk.enabled === true}
                 description={
                   <>
-                    Token-optimizing proxy that auto-rewrites your agent's bash commands.
+                    {t("tools.rtkDescription")}
                     {rtkAvgSavingsPct !== null
-                      ? ` ${percent1(rtkAvgSavingsPct)}% avg savings.`
+                      ? ` ${t("addons.avgSavings", { value: percent1(rtkAvgSavingsPct) })}`
                       : ""}
                   </>
                 }
                 copy={addonCopy.rtk}
                 infoOpen={addonInfoId === "rtk"}
                 onToggleInfo={() => setAddonInfoId(addonInfoId === "rtk" ? null : "rtk")}
-                busy={addonBusyId === "rtk"}
-                busyLabel={addonBusyLabel}
-                resultMessage={addonResult?.id === "rtk" ? addonResult.message : null}
-                onDismissResult={() => setAddonResult(null)}
+                busy={"rtk" in addonBusyById}
+                busyLabel={addonBusyById.rtk ?? null}
+                resultMessage={addonResultById.rtk ?? null}
+                errorMessage={addonErrorById.rtk ?? null}
+                upstreamVersion={checkedRtkTool?.upstreamVersion ?? null}
+                upstreamUpdateAvailable={checkedRtkTool?.upstreamUpdateAvailable ?? false}
+                updateRequiresAppUpdate={checkedRtkTool?.updateRequiresAppUpdate ?? false}
+                supportedVersion={checkedRtkTool?.supportedVersion ?? null}
+                onDismissResult={() =>
+                  setAddonResultById((current) =>
+                    clearAddonOperationMessage(current, "rtk")
+                  )
+                }
                 sourceUrl={
                   dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??
                   "https://github.com/rtk-ai/rtk"
@@ -7117,10 +7358,18 @@ export default function App() {
                   runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
                 }
                 savings={rtkSavingsChip}
-                actionsDisabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                actionsDisabled={rtkBusy || "rtk" in addonBusyById || !runtimeStatus}
+                updateAvailable={checkedRtkTool?.updateAvailable ?? false}
+                availableVersion={checkedRtkTool?.availableVersion ?? null}
                 unavailableReason={
-                  dashboard.tools.find((tool) => tool.id === "rtk")?.unavailableReason ??
+                  checkedRtkTool?.unavailableReason ??
                   null
+                }
+                onUpdate={() =>
+                  void runAddonAction("install_addon", "rtk", undefined, {
+                    busy: t("addons.updating", { name: "RTK" }),
+                    done: t("addons.updated", { name: "RTK" })
+                  })
                 }
                 onInstall={() => void runAddonAction("install_addon", "rtk")}
                 onToggleEnabled={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
@@ -7144,11 +7393,11 @@ export default function App() {
                         }
                       }}
                     >
-                      {showRtkDetails ? "Hide RTK activity" : "Show RTK activity"}
+                      {showRtkDetails ? t("settings.hideLogs") : t("settings.showLogs")}
                     </button>
                     {showRtkDetails ? (
                       <pre className="runtime-log" ref={rtkActivityRef}>
-                        {rtkActivityLines.length > 0 ? rtkActivityLines.join("\n") : "No RTK activity yet."}
+                        {rtkActivityLines.length > 0 ? rtkActivityLines.join("\n") : t("settings.noLogs")}
                       </pre>
                     ) : null}
                   </>
@@ -7157,6 +7406,8 @@ export default function App() {
             </ul>
         </div>
 
+        {!LOCAL_COMMUNITY_EDITION ? (
+          <>
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
           <section className="upgrade-hero">
             <h1>Plans based on your AI subscription</h1>
@@ -7455,10 +7706,13 @@ export default function App() {
             {pricingAuthCard}
           </section>
         </div>
+          </>
+        ) : null}
 
         <div className="tray-content" hidden={activeView !== "settings"}>
             <section className="panel-stack">
-              <article className="soft-card panel-card settings-account-card">
+              {!LOCAL_COMMUNITY_EDITION ? (
+                <article className="soft-card panel-card settings-account-card">
                 <div className="settings-account-row">
                   <p className="settings-account-copy">
                     Headroom account:{" "}
@@ -7494,23 +7748,48 @@ export default function App() {
                     {pricingStatus.claude.profileFetchError}
                   </p>
                 ) : null}
+                </article>
+              ) : null}
+
+              <article className="soft-card panel-card">
+                <div className="panel-card__header">
+                  <div>
+                    <h3>{t("settings.language")}</h3>
+                    <p>{t("settings.description")}</p>
+                  </div>
+                  <select
+                    aria-label={t("settings.language")}
+                    className="community-language-select"
+                    onChange={(event) => setLocale(event.target.value as Locale)}
+                    value={locale}
+                  >
+                    {localeOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {t(option.labelKey)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </article>
 
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
-                  <div />
+                  <div>
+                    <h3>{t("settings.connections")}</h3>
+                  </div>
                 </div>
                 <div className="connector-list">
                   {sortClientConnectors(aggregateClientConnectors(connectors)).map((connector) => {
                     const connectorLabel =
                       connector.clientId === "claude_code"
-                        ? "Claude Code connection"
+                        ? t("connections.claudeConnection")
                         : connector.clientId === "codex"
-                          ? "Codex connection"
+                          ? t("connections.codexConnection")
                           : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
-                    const gateBlocksEnable = connectorGateBlocksEnable(connector);
+                    const gateBlocksEnable =
+                      !LOCAL_COMMUNITY_EDITION && connectorGateBlocksEnable(connector);
                     const statusLine = connectorStatusLine(connector);
                     const toggleDisabled =
                       connectorsBusy ||
@@ -7532,7 +7811,7 @@ export default function App() {
                                 )
                               }
                               type="button"
-                              aria-label={`Show setup details for ${connector.name}`}
+                              aria-label={t("connections.showDetails", { name: connector.name })}
                               aria-expanded={openConnectorHelpId === connector.clientId}
                             >
                               i
@@ -7541,12 +7820,13 @@ export default function App() {
                           {openConnectorHelpId === connector.clientId ? (
                             <div className="connector-tooltip">
                               <p>
-                                {connectorSetupDetails[connector.clientId] ??
-                                  "Headroom applies local connector configuration."}
+                                {CONNECTOR_SETUP_KEYS[connector.clientId]
+                                  ? t(CONNECTOR_SETUP_KEYS[connector.clientId])
+                                  : t("connections.localConfiguration")}
                               </p>
                               {connector.enabled ? (
                                 <div className="connector-diagnostics">
-                                  <strong>Connection checks</strong>
+                                  <strong>{t("connections.checks")}</strong>
                                   {connector.verification ? (
                                     <ul>
                                       {connector.verification.checks.map((check) => (
@@ -7561,12 +7841,12 @@ export default function App() {
                                       ))}
                                       {!connector.verification.proxyReachable ? (
                                         <li className="is-waiting">
-                                          … Headroom proxy is not answering on 127.0.0.1:6767.
+                                          … {t("connections.proxyNotAnswering")}
                                         </li>
                                       ) : null}
                                     </ul>
                                   ) : (
-                                    <p>Verification details are not available yet.</p>
+                                    <p>{t("connections.noVerificationDetails")}</p>
                                   )}
                                   <button
                                     className="addon-card__link connector-diagnostics__refresh"
@@ -7574,7 +7854,7 @@ export default function App() {
                                     onClick={() => void refreshConnectors()}
                                     type="button"
                                   >
-                                    {connectorsBusy ? "Checking…" : "Re-check"}
+                                    {connectorsBusy ? t("settings.checking") : t("actions.recheck")}
                                   </button>
                                 </div>
                               ) : null}
@@ -7582,12 +7862,12 @@ export default function App() {
                           ) : null}
                           {statusLine ? (
                             <p className={`connector-item__${statusLine.tone}`}>
-                              {statusLine.text}
+                              {localizeUiText(t, statusLine.text)}
                             </p>
                           ) : null}
                           {(detectionWarning ?? unavailableReason) ? (
                             <p className="connector-item__reason">
-                              {detectionWarning ?? unavailableReason}
+                              {localizeUiText(t, detectionWarning ?? unavailableReason ?? "")}
                             </p>
                           ) : null}
                           {gateBlocksEnable ? (
@@ -7606,7 +7886,7 @@ export default function App() {
                         <div className="connector-item__controls">
                           <button
                             aria-checked={connector.enabled}
-                            aria-label={`${connector.enabled ? "Disable" : "Enable"} ${connector.name} connector`}
+                            aria-label={t(connector.enabled ? "connections.disableConnector" : "connections.enableConnector", { name: connector.name })}
                             className={`connector-switch${connector.enabled ? " is-on" : ""}`}
                             disabled={toggleDisabled}
                             onClick={() =>
@@ -7634,15 +7914,15 @@ export default function App() {
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
-                    <h3>Tools status</h3>
+                    <h3>{t("settings.toolsStatus")}</h3>
                   </div>
                 </div>
                 <div className="runtime-status">
                   <div className="runtime-status__topline">
                     <span className="runtime-status__section-title">
-                      Headroom app ({appSemver})
+                    {t("settings.headroomApp")} ({appSemver})
                       {appUpdateConfig?.betaChannelEnabled ? (
-                        <span className="runtime-status__channel-pill">beta channel</span>
+                        <span className="runtime-status__channel-pill">{t("settings.betaChannel")}</span>
                       ) : null}
                     </span>
                   </div>
@@ -7653,36 +7933,68 @@ export default function App() {
                       onClick={() => void checkForAppUpdate()}
                       type="button"
                     >
-                      {appUpdateBusy ? "Checking…" : "Check for updates"}
+                      {appUpdateBusy ? t("settings.checking") : t("settings.checkForUpdates")}
                     </button>
                     {appUpdateStatusCopy ? (
                       <p className="app-update-card__summary runtime-status__summary">
-                        {appUpdateStatusCopy}
+                        {localizeAppUpdateCopy(t, appUpdateStatusCopy)}
                       </p>
                     ) : null}
                   </div>
-                  <div className="runtime-status__meta">
-                    <span className="runtime-status__section-title">
-                      Headroom CLI ({headroomVersion})
+            <div className="runtime-status__meta">
+              <span className="runtime-status__section-title">
+                {t("settings.headroomCli")} ({headroomVersion})
                       {(compressionOfRestPct ?? headroomLifetimeSavingsPct) !== null ? (
                         <span className="runtime-status__section-context">
                           {" "}
-                          ({percent1((compressionOfRestPct ?? headroomLifetimeSavingsPct)!)}% of
-                          billable input removed all-time)
+                          ({t("settings.inputRemovedAllTime", { value: percent1((compressionOfRestPct ?? headroomLifetimeSavingsPct)!) })})
                         </span>
                       ) : null}
-                    </span>
-                  </div>
-                  <div className="runtime-status__grid runtime-status__grid--4">
+              </span>
+            </div>
+            {headroomTool?.updateAvailable ? (
+              <div className="runtime-status__section-action-row">
+                <button
+                  className="secondary-button secondary-button--small"
+                  disabled={runtimeUpgradeProgress.running}
+                  onClick={() => void handleHeadroomCliUpdate()}
+                  type="button"
+                >
+                  {runtimeUpgradeProgress.running
+                    ? t("addons.updating", { name: t("settings.headroomCli") })
+                    : t("addons.updateTo", {
+                        version: formatAddonVersion(
+                          headroomTool.availableVersion ?? headroomTool.supportedVersion ?? "",
+                        ),
+                      })}
+                </button>
+                {cliUpdateError ? (
+                  <p className="app-update-card__summary runtime-status__summary app-update-card__summary--error">
+                    {cliUpdateError}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            {headroomTool?.updateRequiresAppUpdate && headroomTool.upstreamVersion ? (
+              <p className="app-update-card__summary runtime-status__summary">
+                {t("addons.upstreamRequiresAppUpdate", {
+                  latest: formatAddonVersion(headroomTool.upstreamVersion),
+                  supported: formatAddonVersion(
+                    headroomTool.supportedVersion ?? headroomVersion,
+                  ),
+                })}
+              </p>
+            ) : null}
+            <div className="runtime-status__grid runtime-status__grid--4">
                     {([
                       {
-                        name: "Runtime",
+                        name: t("settings.runtime"),
                         ok: runtimeStatus?.running === true,
                       },
                       {
-                        name: "Proxy",
+                        name: t("settings.proxy"),
                         ok: runtimeStatus?.proxyReachable === true,
-                        suffix: "6767",
+                        suffix: "6867",
                         onClick: () => void invoke("open_headroom_dashboard"),
                       },
                       {
@@ -7703,7 +8015,7 @@ export default function App() {
                             : runtimeStatus?.kompressEnabled === false
                               ? false
                               : null,
-                        suffix: kompressWarming ? "warming up" : undefined,
+                        suffix: kompressWarming ? t("settings.warmingUp") : undefined,
                       },
                     ] as { name: string; ok: boolean | null; suffix?: string; onClick?: () => void }[]).map((s) => {
                       const indicatorClass =
@@ -7718,7 +8030,7 @@ export default function App() {
                           key={s.name}
                           className={`runtime-status__item${s.onClick ? " runtime-status__item--clickable" : ""}`}
                           onClick={s.onClick}
-                          title={s.ok === null ? `${s.name} status unknown` : undefined}
+                          title={s.ok === null ? t("settings.statusUnknown", { name: s.name }) : undefined}
                         >
                           <span className="runtime-status__label">{s.name}:</span>
                           <span className={`runtime-status__indicator ${indicatorClass}`}>
@@ -7745,11 +8057,11 @@ export default function App() {
                     }}
                     type="button"
                   >
-                    {showHeadroomDetails ? "Hide headroom logs" : "Show headroom logs"}
+                    {showHeadroomDetails ? t("settings.hideLogs") : t("settings.showLogs")}
                   </button>
                   {showHeadroomDetails ? (
                     <pre className="runtime-log" ref={headroomLogRef}>
-                      {headroomLogLines.length > 0 ? headroomLogLines.join("\n") : "No log output yet."}
+                      {headroomLogLines.length > 0 ? headroomLogLines.join("\n") : t("settings.noLogs")}
                     </pre>
                   ) : null}
                 </div>
@@ -7757,17 +8069,17 @@ export default function App() {
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
-                    <h3>Open on login</h3>
+                    <h3>{t("settings.autostart")}</h3>
                   </div>
                   <div>
                     <p>
-                      Automatically launch Headroom whenever you login or restart.
+                      {t("settings.startupDescription")}
                     </p>
                   </div>
                   <div className="connector-item__controls">
                     <button
                       aria-checked={autostartEnabled === true}
-                      aria-label={`${autostartEnabled ? "Disable" : "Enable"} open on login`}
+                      aria-label={t("settings.autostart")}
                       className={`connector-switch${autostartEnabled ? " is-on" : ""}`}
                       disabled={autostartBusy || autostartEnabled === null}
                       onClick={() => void handleAutostartToggle(!autostartEnabled)}
@@ -7783,12 +8095,11 @@ export default function App() {
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
-                    <h3>Uninstall</h3>
+                    <h3>{t("settings.uninstall")}</h3>
                   </div>
                 </div>
                 <p>
-                  Removes Headroom and everything it changed: the runtime, its addons, your
-                  coding agent configs, and the app itself. You will see the full list first.
+                  {t("settings.uninstallDescription")}
                 </p>
                 <button
                   className="secondary-button secondary-button--small"
@@ -7798,23 +8109,62 @@ export default function App() {
                   }}
                   type="button"
                 >
-                  Uninstall Headroom
+                  {t("settings.uninstallAction")}
                 </button>
-              </article>
+            </article>
 
-              <button
-                className="contact-link"
-                onClick={() => void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
-                type="button"
-              >
-                Contact us
-              </button>
+            <article className="soft-card panel-card">
+              <div className="panel-card__header">
+                <div>
+                  <h3>{t("settings.creditsTitle")}</h3>
+                </div>
+              </div>
+              <p>{t("settings.creditsBody")}</p>
+              <p className="credits-license-note">{t("settings.creditsLicenseNote")}</p>
+              <div className="credits-list">
+                <button
+                  className="link-button"
+                  onClick={() =>
+                    void openExternalLink("https://github.com/gglucass/headroom-desktop")
+                  }
+                  type="button"
+                >
+                  {t("settings.creditsOriginalDesktop")}
+                </button>
+                <button
+                  className="link-button"
+                  onClick={() =>
+                    void openExternalLink("https://github.com/headroomlabs-ai/headroom")
+                  }
+                  type="button"
+                >
+                  {t("settings.creditsHeadroomCore")}
+                </button>
+                <button
+                  className="link-button"
+                  onClick={() => void openExternalLink("https://github.com/rtk-ai/rtk")}
+                  type="button"
+                >
+                  {t("settings.creditsRtk")}
+                </button>
+                <button
+                  className="link-button"
+                  onClick={() =>
+                    void openExternalLink("https://github.com/microsoft/markitdown")
+                  }
+                  type="button"
+                >
+                  {t("settings.creditsMarkitdown")}
+                </button>
+              </div>
+            </article>
+
 <button
-                className="quit-button"
+              className="quit-button"
                 onClick={() => void invoke("quit_headroom")}
                 type="button"
               >
-                Quit Headroom
+                {t("settings.quit")}
               </button>
             </section>
           </div>
@@ -7848,19 +8198,19 @@ export default function App() {
               onClick={() => setShowSavingsInfo(false)}
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
-                <p>Savings = tokens removed &times; API token prices.</p>
+                <h3>{t("savingsInfo.title")}</h3>
+                <p>{t("savingsInfo.description")}</p>
+                <p>{t("savingsInfo.formula")}</p>
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
                     <div className="savings-breakdown__row">
-                      <span>Input compression (Headroom)</span>
+                      <span>{t("savingsInfo.inputCompression")}</span>
                       <strong>{currency(dashboard.savingsBreakdown.compressionSavingsUsd)}</strong>
                     </div>
                     {dashboard.savingsBreakdown.outputSavingsUsd >= 0.005 ? (
                       <>
                         <div className="savings-breakdown__row">
-                          <span>Output shaping (Headroom)</span>
+                          <span>{t("savingsInfo.outputShaping")}</span>
                           <strong>{currency(dashboard.savingsBreakdown.outputSavingsUsd)}</strong>
                         </div>
                         {/* Lifetime figure, recomputed from the shaper's ledger
@@ -7872,54 +8222,45 @@ export default function App() {
                             than scored against a global mean. */}
                         <p className="savings-breakdown__note">
                           {dashboard.outputReduction?.method === "measured"
-                            ? `Output savings are measured: a small share of conversations run unshaped as a control group, and Headroom compares your shaped replies against them across ${compactNumber(dashboard.outputReduction.requests)} requests.`
-                            : `Output savings are counterfactual: Headroom compares each reply against a baseline learned from your past replies${
-                                dashboard.outputReduction
-                                  ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
-                                  : ""
-                              }.`}
+                            ? t("savingsInfo.outputMeasured", { count: compactNumber(dashboard.outputReduction.requests) })
+                            : t("savingsInfo.outputEstimated", { count: dashboard.outputReduction ? compactNumber(dashboard.outputReduction.requests) : "—" })}
                         </p>
                       </>
                     ) : null}
                     {(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0) > 0 ? (
                       <>
                         <div className="savings-breakdown__row">
-                          <span>Tool schemas deferred (Headroom)</span>
+                          <span>{t("savingsInfo.toolSchemas")}</span>
                           <strong>{currencyExact(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
                         </div>
                         {/* Priced at the cache-read rate, not the input rate --
                             see tool_schema_savings_usd in state.rs. */}
                         <p className="savings-breakdown__note">
-                          {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
-                          of tool definitions Headroom kept out of your requests until they were
-                          needed. These sit at the front of the cached prefix, so they are priced at
-                          the provider's cache-read rate rather than the full input rate.
+                          {t("savingsInfo.toolSchemasNote", { count: compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0) })}
                         </p>
                       </>
                     ) : null}
                     {dashboard.savingsBreakdown.cacheSavingsUsd >= 0.005 ? (
                       <>
                         <div className="savings-breakdown__row savings-breakdown__row--context">
-                          <span>Prompt caching (your AI client)</span>
+                          <span>{t("savingsInfo.promptCaching")}</span>
                           <strong>{currency(dashboard.savingsBreakdown.cacheSavingsUsd)}</strong>
                         </div>
                         <p className="savings-breakdown__note">
-                          Cache discounts are earned by your coding agent's own prompt caching. Headroom
-                          never counts them as its savings. Headroom compression is cache-aligned:
-                          it only touches content outside the cache.
+                          {t("savingsInfo.promptCachingNote")}
                         </p>
                       </>
                     ) : null}
                     {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 1 ? (
                       <details className="savings-breakdown__models">
-                        <summary>Compression rate by model</summary>
+                        <summary>{t("savingsInfo.byModel")}</summary>
                         <div className="savings-breakdown__models-body">
                           {dashboard.savingsBreakdown.modelRates?.map((row) => (
                             <div className="savings-breakdown__row" key={row.model}>
                               <span>
                                 {row.model}{" "}
                                 <span className="savings-breakdown__sample">
-                                  {compactNumber(row.requests)} requests
+                                  {t("savingsInfo.requests", { count: compactNumber(row.requests) })}
                                 </span>
                               </span>
                               <strong>{percent1(row.savingsPercent)}%</strong>
@@ -7929,11 +8270,7 @@ export default function App() {
                               history, so its dollars would not add up to the rows
                               above. See ModelSavingsRate in models.rs. */}
                           <p className="savings-breakdown__note">
-                            How much of each model's input Headroom removed. The spread is mostly
-                            workload, not model: long tool output and logs compress far better than
-                            prose, so the blended figure tracks whichever models you use most rather
-                            than how hard Headroom is working. Models with under 100 requests are
-                            left out.
+                            {t("savingsInfo.byModelNote")}
                           </p>
                         </div>
                       </details>
@@ -7946,7 +8283,7 @@ export default function App() {
                     onClick={() => setShowSavingsInfo(false)}
                     type="button"
                   >
-                    Got it
+                    {t("actions.gotIt")}
                   </button>
                 </div>
               </div>
@@ -7961,36 +8298,26 @@ export default function App() {
               onClick={() => setShowCacheInfo(false)}
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                <h3>Cache hits &amp; compression</h3>
-                <p>
-                  Most of your input is re-sent conversation history that your AI client serves
-                  from the provider&apos;s prompt cache at ~10% of the input price. Headroom
-                  deliberately leaves that cached prefix untouched (compressing it would break the
-                  discount), so its compression works on the rest. A healthier cache makes blended
-                  savings rates look smaller while your actual bill shrinks.
-                </p>
+                <h3>{t("cacheInfo.title")}</h3>
+                <p>{t("cacheInfo.description")}</p>
                 <div className="savings-breakdown">
                   {[
-                    { label: "Today", pair: cachePairToday },
-                    { label: "This month", pair: cachePairMonth },
-                    { label: "All time", pair: cachePairAllTime }
+                    { label: t("cacheInfo.today"), pair: cachePairToday },
+                    { label: t("cacheInfo.month"), pair: cachePairMonth },
+                    { label: t("cacheInfo.allTime"), pair: cachePairAllTime }
                   ].map(({ label, pair }) => (
                     <div className="savings-breakdown__row" key={label}>
                       <span>{label}</span>
                       <strong>
                         {pair
-                          ? `${Math.round(pair.hitPct)}% cache hits · ${Math.round(
-                              pair.compressedPct
-                            )}% of the rest compressed`
-                          : "No cache data"}
+                          ? t("cacheInfo.rate", { hits: Math.round(pair.hitPct), compressed: Math.round(pair.compressedPct) })
+                          : t("cacheInfo.noData")}
                       </strong>
                     </div>
                   ))}
                 </div>
                 <p className="savings-breakdown__note">
-                  Today and this month cover the part of the period with cache data (the backend
-                  keeps a limited history of cache checkpoints). Output shaping is a separate
-                  layer and is not part of these rates.
+                  {t("cacheInfo.note")}
                 </p>
                 <div className="modal-actions">
                   <button
@@ -7998,7 +8325,7 @@ export default function App() {
                     onClick={() => setShowCacheInfo(false)}
                     type="button"
                   >
-                    Got it
+                    {t("actions.gotIt")}
                   </button>
                 </div>
               </div>
@@ -8017,31 +8344,27 @@ export default function App() {
               }}
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                <h3>Uninstall Headroom?</h3>
-                <p>This will:</p>
+                <h3>{t("uninstall.title")}</h3>
+                <p>{t("uninstall.will")}</p>
                 <ul className="api-key-guide">
                   <li>
-                    Restore the original routing config for every agent Headroom set
-                    up (Claude Code, Codex, Grok Build, OpenCode) and remove the export
-                    block from your shell profile
+                    {t("uninstall.restoreRouting")}
                   </li>
                   <li>
-                    Remove Headroom's addons and MCP servers (ponytail, caveman, serena,
-                    context7, codebase-memory, MarkItDown)
+                    {t("uninstall.removeAddons")}
                   </li>
                   <li>
-                    Delete Headroom's data: logs, caches, setup state, the Python runtime,
-                    and saved credentials
+                    {t("uninstall.deleteData")}
                   </li>
-                  <li>Disable the login item</li>
-                  <li>Remove the app itself</li>
+                  <li>{t("uninstall.disableLogin")}</li>
+                  <li>{t("uninstall.removeApp")}</li>
                 </ul>
                 <p className="uninstall-note">
-                  Terminals you already have open keep{" "}
-                  <code>ANTHROPIC_BASE_URL</code> until you restart them, or run{" "}
+                  {t("uninstall.terminalPrefix")} {" "}
+                  <code>ANTHROPIC_BASE_URL</code> {t("uninstall.terminalMiddle")} {" "}
                   <code>unset ANTHROPIC_BASE_URL</code>.
                 </p>
-                <p>You can reinstall at any time by launching Headroom again.</p>
+                <p>{t("uninstall.reinstall")}</p>
                 {uninstallError ? (
                   <p className="install-progress__error">{uninstallError}</p>
                 ) : null}
@@ -8052,7 +8375,7 @@ export default function App() {
                     onClick={() => setShowUninstallDialog(false)}
                     type="button"
                   >
-                    Cancel
+                    {t("actions.cancel")}
                   </button>
                   <button
                     className="primary-button"
@@ -8060,7 +8383,7 @@ export default function App() {
                     onClick={() => void handleUninstall()}
                     type="button"
                   >
-                    {uninstallBusy ? "Uninstalling…" : "Uninstall and quit"}
+                    {uninstallBusy ? t("uninstall.busy") : t("uninstall.action")}
                   </button>
                 </div>
               </div>
@@ -8337,29 +8660,29 @@ export default function App() {
               <div className="modal-card">
                 <h3>
                   {appUpdateReadyToRestart
-                    ? `Restart to finish updating to ${appUpdateAvailable.version}`
-                    : `Headroom ${appUpdateAvailable.version} is available`}
+                    ? t("update.restartTitle", { version: appUpdateAvailable.version })
+                    : t("update.availableTitle", { version: appUpdateAvailable.version })}
                 </h3>
                 <p>
                   {appUpdateReadyToRestart
-                    ? "The new version has been installed. Restart Headroom when you're ready to switch over."
-                    : "Headroom found a new release in the background. Nothing will install until you confirm it here."}
+                    ? t("update.restartDescription")
+                    : t("update.availableDescription")}
                 </p>
                 <ul className="api-key-guide">
-                  <li>Current version: {appUpdateAvailable.currentVersion}</li>
-                  <li>New version: {appUpdateAvailable.version}</li>
+                  <li>{t("update.currentVersion")}: {appUpdateAvailable.currentVersion}</li>
+                  <li>{t("update.newVersion")}: {appUpdateAvailable.version}</li>
                   <li>
-                    Published: {formatDateTime(appUpdateAvailable.publishedAt ?? null)}
+                    {t("update.published")}: {formatDateTime(appUpdateAvailable.publishedAt ?? null)}
                   </li>
                 </ul>
                 {appUpdateAvailable.notes && appUpdateAvailable.notes.trim() ? (
                   <div className="release-notes">
-                    <h4>What&apos;s new</h4>
+                    <h4>{t("update.whatsNew")}</h4>
                     <pre>{appUpdateAvailable.notes.trim()}</pre>
                   </div>
                 ) : null}
                 {appUpdateStatusCopy ? (
-                  <p className="app-update-card__summary">{appUpdateStatusCopy}</p>
+                  <p className="app-update-card__summary">{localizeAppUpdateCopy(t, appUpdateStatusCopy)}</p>
                 ) : null}
                 <div className="modal-actions">
                   <button
@@ -8368,7 +8691,7 @@ export default function App() {
                     onClick={() => setShowAppUpdateDialog(false)}
                     type="button"
                   >
-                    Later
+                    {t("update.later")}
                   </button>
                   <button
                     className="primary-button"
@@ -8381,12 +8704,12 @@ export default function App() {
                     type="button"
                   >
                     {appUpdateRestartBusy
-                      ? "Restarting…"
+                      ? t("actions.restarting")
                       : appUpdateInstallBusy
-                        ? "Installing…"
+                        ? t("addons.installing", { name: "Headroom" })
                         : appUpdateReadyToRestart
-                          ? "Restart now"
-                          : `Install ${appUpdateAvailable.version}`}
+                          ? t("update.restartNow")
+                          : t("update.installVersion", { version: appUpdateAvailable.version })}
                   </button>
                 </div>
               </div>

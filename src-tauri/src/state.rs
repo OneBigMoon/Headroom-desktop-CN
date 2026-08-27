@@ -46,7 +46,7 @@ pub const MAX_UPGRADE_AUTO_RETRIES: u32 = 2;
 pub const REQUIRED_TERMS_VERSION: u32 = 1;
 
 /// Canonical Terms-of-Service URL opened from the acceptance gate.
-pub const TERMS_URL: &str = "https://extraheadroom.com/terms";
+pub const TERMS_URL: &str = "https://opensource.org/license/mit";
 
 /// Absolute maximum time we'll wait for the new proxy to come up during
 /// boot validation, regardless of observed activity. Bounded so an
@@ -122,9 +122,9 @@ pub fn runtime_upgrade_disabled_by_env() -> bool {
 }
 
 /// One-shot probe of the new proxy. Hits `/livez` on the backend port
-/// directly first (bypasses the intercept layer on 6767). Falls back to
+/// directly first (bypasses the intercept layer on 6867). Falls back to
 /// `/health` for older headroom-ai versions that don't expose `/livez`, then
-/// through the intercept layer on 6767 as a last resort — which also succeeds
+/// through the intercept layer on 6867 as a last resort — which also succeeds
 /// if the proxy is alive but too CPU-saturated to answer a direct probe
 /// quickly, since the intercept has its own retry + longer timeout path.
 fn probe_proxy_livez(client: &reqwest::blocking::Client) -> bool {
@@ -132,8 +132,8 @@ fn probe_proxy_livez(client: &reqwest::blocking::Client) -> bool {
     let urls = [
         format!("http://127.0.0.1:{backend}/livez"),
         format!("http://127.0.0.1:{backend}/health"),
-        "http://127.0.0.1:6767/livez".to_string(),
-        "http://127.0.0.1:6767/health".to_string(),
+        "http://127.0.0.1:6867/livez".to_string(),
+        "http://127.0.0.1:6867/health".to_string(),
     ];
     for url in &urls {
         if client
@@ -242,7 +242,7 @@ fn tcp_port_accepts_connection(addr: std::net::SocketAddr, timeout: std::time::D
 
 /// Probe the proxy's loopback port with a 1s timeout. See
 /// [`tcp_port_accepts_connection`] for semantics. The backend port is
-/// normally 6768 but may have been switched to a fallback by `backend_port`.
+/// normally 6868 but may have been switched to a fallback by `backend_port`.
 pub(crate) fn proxy_port_accepts_connection() -> bool {
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], crate::backend_port::get()).into();
     tcp_port_accepts_connection(addr, std::time::Duration::from_secs(1))
@@ -292,7 +292,7 @@ pub(crate) fn tracked_process_cpu_time_secs(pid: u32) -> Option<u64> {
 /// the previous observation. Catches the "alive but silent" case —
 /// e.g. ONNX graph compile, model load, any synchronous CPU-bound
 /// work in the proxy's lifespan startup that produces no log writes,
-/// no HF cache growth, and doesn't yet bind :6768. Treats the first
+/// no HF cache growth, and doesn't yet bind :6868. Treats the first
 /// observation (None → Some(>0)) as growth so a process that's
 /// already burned cycles before we started polling counts as active;
 /// None → Some(0) is "just spawned, not yet doing work" and is NOT
@@ -431,7 +431,7 @@ pub enum BootValidationOutcome {
     /// Hit the absolute max without reachability or obvious failure.
     TimedOut,
     /// `ensure_headroom_running` short-circuited or errored — there is no
-    /// tracked child to wait on AND no externally-reachable proxy on :6768.
+    /// tracked child to wait on AND no externally-reachable proxy on :6868.
     /// Reported instead of `Stalled` so we don't burn ~120s waiting for a
     /// process that was never going to start.
     NotStarted,
@@ -501,12 +501,12 @@ pub struct AppState {
     /// the proxy intercept (`proxy_intercept::decode_codex_plan_tier`). Read by
     /// `pricing::fetch_codex_usage` to pick the recommended upgrade tier.
     pub codex_plan_tier: Arc<Mutex<Option<crate::models::CodexPlanTier>>>,
-    /// Why the always-on intercept is not listening on 6767, written by
+    /// Why the always-on intercept is not listening on 6867, written by
     /// `proxy_intercept::spawn`. Separate from `last_startup_error` (which the
     /// Python runtime's start path clears) because the two fail independently.
     pub intercept_bind_error: crate::proxy_intercept::BindErrorSlot,
-    /// When true, the Rust intercept on :6767 forwards traffic directly to
-    /// api.anthropic.com instead of the Python proxy on :6768. Flipped on by
+    /// When true, the Rust intercept on :6867 forwards traffic directly to
+    /// api.anthropic.com instead of the Python proxy on :6868. Flipped on by
     /// `enforce_pricing_gate` once a Pro/Max user crosses the disable threshold
     /// without a Headroom subscription, so existing CC sessions stay alive
     /// while optimization is genuinely off.
@@ -835,7 +835,7 @@ impl AppState {
         }
 
         // Hold `starting` until the probe `runtime_status()` uses
-        // (`is_headroom_proxy_reachable` → 6767/readyz) actually returns true.
+        // (`is_headroom_proxy_reachable` → 6867/readyz) actually returns true.
         // `wait_for_boot_validation` accepts /livez, which can flip green
         // before /readyz does; clearing `starting` on livez alone opens a
         // window where the UI poller sees !running && !starting and fires
@@ -954,7 +954,6 @@ impl AppState {
 
         // User-facing from/to are the app versions — headroom-ai versions are
         // an implementation detail tracked in the failure record only.
-        let previous_app_version = self.launch_profile.lock().last_launched_app_version.clone();
 
         // Snapshot the newest proxy log mtime BEFORE we stop the old proxy and
         // install the new one. At failure time we compare against this to tell
@@ -994,10 +993,10 @@ impl AppState {
             p.complete = false;
             p.failed = false;
             p.current_step = "Preparing update".into();
-            p.message = "Wrapping up the Headroom update.".into();
+            p.message = "Updating the local Headroom CLI runtime.".into();
             p.overall_percent = 0;
-            p.from_version = previous_app_version.clone();
-            p.to_version = Some(current_app_version.clone());
+            p.from_version = installed_version.clone();
+            p.to_version = Some(target_version.clone());
         });
         emit_runtime_upgrade_progress(app, self);
 
@@ -1191,7 +1190,7 @@ impl AppState {
         );
 
         let outcome = if !post_spawn.tracked_child && !post_spawn.proxy_reachable {
-            // No child to wait on AND nothing already listening on :6768.
+            // No child to wait on AND nothing already listening on :6868.
             // wait_for_boot_validation would burn ~120s of grace+silence
             // here for nothing — bail with a distinct outcome so the
             // failure path knows it's a non-start, not a hang.
@@ -1240,7 +1239,7 @@ impl AppState {
                 p.current_step = "Done".into();
                 p.message = match maintenance_kind {
                     RuntimeMaintenanceKind::Upgrade => {
-                        format!("Headroom updated to {}.", current_app_version)
+                        format!("Headroom CLI updated to {target_version}.")
                     }
                     RuntimeMaintenanceKind::RequirementsRepair => {
                         "Headroom runtime repair completed.".into()
@@ -1488,6 +1487,28 @@ impl AppState {
     /// in-place attempt and runs atomic rebuild from scratch. Use when the
     /// previous attempt installed cleanly but the proxy never booted (the
     /// ABI-mismatch failure mode).
+    /// Starts the existing transactional runtime-upgrade path from Settings,
+    /// even when the desktop app version itself has not changed.
+    pub fn request_runtime_upgrade(&self, app: &tauri::AppHandle) -> Result<(), String> {
+        if runtime_upgrade_disabled_by_env() {
+            return Err("Headroom CLI updates are disabled by this environment.".into());
+        }
+        if self.runtime_upgrade_in_progress() {
+            return Err("A Headroom CLI update is already running.".into());
+        }
+        if self.tool_manager.check_headroom_upgrade().is_none() {
+            return Err("Headroom CLI is already up to date.".into());
+        }
+
+        {
+            let mut profile = self.launch_profile.lock();
+            profile.last_launched_app_version = None;
+            persist_launch_profile(&self.launch_profile_path, &profile);
+        }
+        self.run_upgrade_with_ui(app, false);
+        Ok(())
+    }
+
     pub fn retry_runtime_upgrade(&self, app: &tauri::AppHandle, force_rebuild: bool) {
         {
             let mut profile = self.launch_profile.lock();
@@ -1552,7 +1573,7 @@ impl AppState {
     }
 
     /// Adaptive boot validation loop. Probes `/livez` on the backend port
-    /// (default 6768; may be a fallback in 6769..=6790) until the proxy
+    /// (default 6868; may be a fallback in 6869..=6890) until the proxy
     /// responds, the proxy process exits, the log goes silent past the
     /// stall threshold, or `RUNTIME_UPGRADE_BOOT_MAX_SECS` elapses. On each
     /// pass through the loop, emits a progress update via `on_progress`.
@@ -1671,7 +1692,7 @@ impl AppState {
             }
 
             // Refresh TCP-bound observation. If the kernel accepts a
-            // connection on :6768, the python process is alive and
+            // connection on :6868, the python process is alive and
             // listening — even if the asyncio loop is currently held
             // by an in-flight forwarded request and no HTTP endpoint
             // answers. This is the load-bearing signal that keeps a
@@ -2713,8 +2734,13 @@ impl AppState {
         Ok(projects)
     }
 
-    pub fn begin_headroom_learn_run(&self, project_path: &str) -> Result<(), String> {
-        if project_path.trim().is_empty() {
+    pub fn begin_headroom_learn_run(
+        &self,
+        run_key: &str,
+        project_path: Option<&str>,
+        display_name: &str,
+    ) -> Result<(), String> {
+        if run_key.trim().is_empty() {
             return Err("Select a project before running headroom learn.".into());
         }
         if !self.tool_manager.python_runtime_installed() {
@@ -2723,18 +2749,20 @@ impl AppState {
         if !self.tool_manager.headroom_entrypoint().exists() {
             return Err("Headroom runtime is not available yet.".into());
         }
-        let project = Path::new(project_path);
-        if !project.exists() {
-            return Err(format!(
-                "Project path does not exist: {}",
-                project.display()
-            ));
-        }
-        if !project.is_dir() {
-            return Err(format!(
-                "Project path is not a directory: {}",
-                project.display()
-            ));
+        if let Some(project_path) = project_path {
+            let project = Path::new(project_path);
+            if !project.exists() {
+                return Err(format!(
+                    "Project path does not exist: {}",
+                    project.display()
+                ));
+            }
+            if !project.is_dir() {
+                return Err(format!(
+                    "Project path is not a directory: {}",
+                    project.display()
+                ));
+            }
         }
 
         let mut state = self.headroom_learn_state.lock();
@@ -2743,17 +2771,11 @@ impl AppState {
         }
 
         state.running = true;
-        state.project_path = Some(project_path.to_string());
+        state.project_path = Some(run_key.to_string());
         state.started_at = Some(Utc::now());
         state.finished_at = None;
         state.success = None;
-        state.summary = format!(
-            "Running headroom learn for {}.",
-            project
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(project_path)
-        );
+        state.summary = format!("Running headroom learn for {display_name}.");
         state.error = None;
         state.output_tail = Vec::new();
         state.current_step = None;
@@ -2933,7 +2955,7 @@ impl AppState {
         // configuration (`disable_client_setup`/`clear_client_setups`) is
         // mutated by whoever asserted the gate, so Claude Code is already
         // pointed direct-to-Anthropic regardless of whether Python is
-        // bound on :6768. After validation, `run_upgrade_with_ui` calls
+        // bound on :6868. After validation, `run_upgrade_with_ui` calls
         // `stop_headroom()` if a gate is still active so we don't leave
         // the validation Python running where the user expected it down.
         let in_upgrade_validation = *self.runtime_upgrade_in_progress.lock();
@@ -3043,7 +3065,7 @@ impl AppState {
         } // release lock before the blocking start
 
         self.set_runtime_starting(true);
-        // During upgrade boot validation, reclaim 6768 even from a still-healthy
+        // During upgrade boot validation, reclaim 6868 even from a still-healthy
         // old proxy — we're replacing it, so leaving it alone would strand the
         // new venv unable to bind and roll the upgrade back as `not_started`.
         let reclaim_healthy_orphan = *self.runtime_upgrade_in_progress.lock();
@@ -3137,7 +3159,7 @@ impl AppState {
 
         let startup_error = self.last_startup_error.lock().clone();
         // A failed intercept bind outranks any backend startup error: every
-        // client is hard-configured to 127.0.0.1:6767, so nothing routes no
+        // client is hard-configured to 127.0.0.1:6867, so nothing routes no
         // matter how healthy the Python runtime is, and the backend's own
         // error (if any) is downstream noise. Without this the banner reports
         // "runtime offline, proxy unreachable" and points the user at the
@@ -3329,7 +3351,7 @@ impl AppState {
         // Also clean up detached/orphaned Headroom-managed headroom proxies
         // so quitting the UI cannot leave the background listener behind.
         // We deliberately drop the port number from the match pattern: the
-        // proxy may have fallen back to 6769..=6790 if 6768 was foreign-held,
+        // proxy may have fallen back to 6869..=6890 if 6868 was foreign-held,
         // and the python module path / entrypoint subcommand is unique enough
         // to identify our proxies regardless of port.
         let managed_python = self.tool_manager.managed_python();
@@ -3636,7 +3658,7 @@ impl AppState {
             self.claude_only_bypass.store(false, Release);
             // Flip bypass FIRST so the intercept passes new requests straight
             // through while we tear Python down — otherwise there's a window
-            // where 6767 → 6768 connect fails and Claude Code sees 502.
+            // where 6867 → 6868 connect fails and Claude Code sees 502.
             if !self.proxy_bypass.swap(true, AcqRel) {
                 self.stop_headroom();
             }
@@ -3919,6 +3941,12 @@ fn decode_project_folder_name(folder_name: &str) -> String {
 }
 
 fn project_display_name(project_path: &str) -> String {
+    match project_path {
+        "codex" => return "Codex sessions".to_string(),
+        "opencode" => return "OpenCode sessions".to_string(),
+        "grok" => return "Grok sessions".to_string(),
+        _ => {}
+    }
     Path::new(project_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -5639,7 +5667,7 @@ impl HeadroomSavingsHistoryResponse {
 /// unthrottled warn would flood it.
 /// The window DOUBLES per consecutive warn up to `STATS_FETCH_WARN_MAX_INTERVAL`,
 /// because some causes are permanent and unfixable by any release we ship:
-/// RUST-87 is a single mac whose 6767 belongs to another app, and the flat
+/// RUST-87 is a single mac whose 6867 belongs to another app, and the flat
 /// 15-minute window sent 96 identical events a day from that one host with no
 /// end state. A first failure still speaks immediately; only the repeats decay.
 /// A successful fetch clears the streak, so a condition that heals and comes
@@ -5664,7 +5692,7 @@ fn stats_fetch_warn_interval(streak: u32) -> Duration {
 /// lines by message text, so a timeout and an HTTP 404 landed in one
 /// un-resolvable grab-bag (RUST-6V: 53 timeouts + 47 404s under one issue).
 /// They are different bugs -- a timeout is a starved backend, a 404 is a
-/// foreign or ancient server answering on 6767 -- and each needs its own
+/// foreign or ancient server answering on 6867 -- and each needs its own
 /// lifecycle. Statuses stay separate from each other for the same reason.
 fn stats_fetch_failure_category(reason: &str) -> String {
     if reason.starts_with("timed out") {
@@ -5697,15 +5725,15 @@ fn warn_stats_fetch_failed(reason: &str) {
     *last = Some((Instant::now(), streak));
     drop(last);
     let category = stats_fetch_failure_category(reason);
-    // A 4xx means SOMETHING answered 6767 without the backend's routes, and
+    // A 4xx means SOMETHING answered 6867 without the backend's routes, and
     // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
     // there deliberately counts as reachable). The listener's identity is the
     // one fact that splits "foreign squatter" from "orphaned old Headroom" --
     // RUST-87 shipped three unattributable 404s before this. Throttled to one
     // lookup per 15-minute warn window, so the lsof subprocess is free here.
     let held_by = if category.starts_with("http-4") {
-        crate::tool_manager::listener_identity(6767)
-            .map(|who| format!("; port 6767 is held by {who}"))
+        crate::tool_manager::listener_identity(6867)
+            .map(|who| format!("; port 6867 is held by {who}"))
             .unwrap_or_default()
     } else {
         String::new()
@@ -5751,7 +5779,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     let mut last_failure: Option<String> = None;
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats?cached=1");
+        let url = format!("http://{host}:6867/stats?cached=1");
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
@@ -5804,7 +5832,7 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
     let hosts = ["127.0.0.1", "localhost"];
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats-history");
+        let url = format!("http://{host}:6867/stats-history");
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
             _ => continue,
@@ -6978,7 +7006,7 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     }
     if raw.contains("is occupied by a non-headroom process") {
         // Only reaches here when even the fallback port range was unavailable
-        // (`tool_manager` scans 6768..=6790 before bailing). At that point the
+        // (`tool_manager` scans 6868..=6890 before bailing). At that point the
         // user has 23 unrelated daemons in that range — a reboot is the only
         // realistic remediation, since common offenders like rapportd reset
         // their port at login.
@@ -7069,7 +7097,7 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
 
     ["127.0.0.1", "localhost"].iter().any(|host| {
         client
-            .get(format!("http://{host}:6767/readyz"))
+            .get(format!("http://{host}:6867/readyz"))
             .send()
             .map(proxy_readyz_response_is_reachable)
             .unwrap_or(false)
@@ -7083,7 +7111,7 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
 /// and answering, and the upstream-connectivity probe is cached 30s and
 /// self-heals on the next refresh. Counting it as down flaps the UI banner
 /// "crashed" on every transient network blip even though nothing restarted
-/// (mirrors the watchdog's `readyz_failure_is_upstream_only`). Any other 503 /
+/// (mirrors the watchdog's `readyz_failure_is_nonrouting_only`). Any other 503 /
 /// 5xx stays not-reachable so the watchdog keeps waiting / restarting.
 fn proxy_readyz_response_is_reachable(response: reqwest::blocking::Response) -> bool {
     let status = response.status();
@@ -7093,7 +7121,7 @@ fn proxy_readyz_response_is_reachable(response: reqwest::blocking::Response) -> 
     if status.as_u16() == 503 {
         return response
             .text()
-            .map(|body| proxy_readyz_503_body_is_upstream_only(&body))
+            .map(|body| proxy_readyz_503_body_is_nonrouting_only(&body))
             .unwrap_or(false);
     }
     false
@@ -7106,7 +7134,7 @@ fn proxy_readyz_response_is_reachable(response: reqwest::blocking::Response) -> 
 /// so it must count as reachable or the watchdog auto-pauses a working proxy
 /// (Sentry RUST-2X). A 503 is inconclusive from the status line alone --
 /// `proxy_readyz_response_is_reachable` inspects the body to tell an
-/// upstream-only blip from a wedged core; every other 5xx stays not-reachable.
+/// non-routing readiness failure from a wedged core; every other 5xx stays not-reachable.
 fn proxy_readyz_status_is_reachable(status: reqwest::StatusCode) -> bool {
     status.is_success() || status == reqwest::StatusCode::NOT_FOUND
 }
@@ -7115,9 +7143,14 @@ fn proxy_readyz_status_is_reachable(status: reqwest::StatusCode) -> bool {
 /// Reuses the watchdog's per-check parser so both paths agree on what a
 /// healthy-but-upstream-blipped process looks like. False when the body can't be
 /// parsed (a bare 503 under load) -- conservative, matching the status-only path.
-fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
+fn proxy_readyz_503_body_is_nonrouting_only(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
-        .map(|json| crate::readyz_failed_checks_csv(&json) == "upstream")
+        .map(|json| {
+            matches!(
+                crate::readyz_failed_checks_csv(&json).as_str(),
+                "memory" | "upstream" | "memory,upstream"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -7609,7 +7642,7 @@ mod tests {
         assert_eq!(cat("payload had no recognised savings fields"), "payload");
         assert_eq!(cat("no local host answered"), "unreachable");
         assert_eq!(
-            cat("error sending request for url (http://127.0.0.1:6767/stats)"),
+            cat("error sending request for url (http://127.0.0.1:6867/stats)"),
             "transport"
         );
     }
@@ -7632,7 +7665,7 @@ mod tests {
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
-        proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
+        proxy_readyz_503_body_is_nonrouting_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible,
         stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
         tool_schema_savings_usd, total_dir_size_bytes, warn_stats_fetch_failed, AppState,
@@ -7807,24 +7840,31 @@ mod tests {
     }
 
     #[test]
-    fn readyz_503_upstream_only_body_counts_as_reachable() {
+    fn readyz_503_nonrouting_body_counts_as_reachable() {
         // Only the cached upstream probe is down: process alive and serving, so
         // don't flap the UI banner "crashed" on a transient network blip.
         let upstream_only = r#"{"checks":{"startup":{"ready":true},"upstream":{"ready":false}}}"#;
-        assert!(proxy_readyz_503_body_is_upstream_only(upstream_only));
+        assert!(proxy_readyz_503_body_is_nonrouting_only(upstream_only));
+        let memory_only = r#"{"checks":{"memory":{"ready":false}}}"#;
+        assert!(proxy_readyz_503_body_is_nonrouting_only(memory_only));
+        let memory_and_upstream =
+            r#"{"checks":{"memory":{"ready":false},"upstream":{"ready":false}}}"#;
+        assert!(proxy_readyz_503_body_is_nonrouting_only(
+            memory_and_upstream
+        ));
         // A core component down is a real readiness failure: stay unreachable.
         let core_down = r#"{"checks":{"cache":{"ready":false},"upstream":{"ready":false}}}"#;
-        assert!(!proxy_readyz_503_body_is_upstream_only(core_down));
+        assert!(!proxy_readyz_503_body_is_nonrouting_only(core_down));
         // Bare / unparseable 503 body (body read starved under load): conservative.
-        assert!(!proxy_readyz_503_body_is_upstream_only("not json"));
+        assert!(!proxy_readyz_503_body_is_nonrouting_only("not json"));
         // Nothing unhealthy (shouldn't be a 503, but be safe): not upstream-only.
         let all_ready = r#"{"checks":{"upstream":{"ready":true}}}"#;
-        assert!(!proxy_readyz_503_body_is_upstream_only(all_ready));
+        assert!(!proxy_readyz_503_body_is_nonrouting_only(all_ready));
         // RUST-5E: a never-loaded kompress model tagged along on every
         // sleep-wake blip and made the process look crashed. Soft check, ignore.
         let with_kompress =
             r#"{"checks":{"upstream":{"ready":false},"kompress":{"ready":false,"optional":true}}}"#;
-        assert!(proxy_readyz_503_body_is_upstream_only(with_kompress));
+        assert!(proxy_readyz_503_body_is_nonrouting_only(with_kompress));
     }
 
     #[test]
@@ -8133,8 +8173,8 @@ mod tests {
     #[test]
     fn classify_startup_error_port_timeout() {
         let raw = "unable to keep headroom running in background (prior attempts: \
-            /Users/x/venv/bin/headroom proxy --port 6768 never opened port 6768 within 60000ms): \
-            /Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 --no-http2 never opened port 6768 within 60000ms";
+            /Users/x/venv/bin/headroom proxy --port 6868 never opened port 6868 within 60000ms): \
+            /Users/x/venv/bin/python3 -m headroom.proxy.server --port 6868 --no-http2 never opened port 6868 within 60000ms";
         let hint = classify_startup_error(raw).expect("timeout should classify");
         assert!(hint.contains("Gatekeeper"), "got: {hint}");
         assert!(hint.contains("Retry"));
@@ -8143,8 +8183,8 @@ mod tests {
     #[test]
     fn classify_startup_error_python_crash() {
         let raw = "unable to keep headroom running in background (prior attempts: \
-            /home/h/venv/bin/headroom proxy --port 6768 exited with status exit status: 1 before opening port 6768): \
-            /home/h/venv/bin/python3 -m headroom.proxy.server --port 6768 --no-http2 exited with status exit status: 1 before opening port 6768";
+            /home/h/venv/bin/headroom proxy --port 6868 exited with status exit status: 1 before opening port 6868): \
+            /home/h/venv/bin/python3 -m headroom.proxy.server --port 6868 --no-http2 exited with status exit status: 1 before opening port 6868";
         let hint = classify_startup_error(raw).expect("crash should classify");
         assert!(hint.contains("crashed at startup"), "got: {hint}");
         assert!(hint.contains("logs"));
@@ -8155,8 +8195,8 @@ mod tests {
         // RUST-3Y: corrupted/incomplete install -- a headroom.* module is gone.
         // The full err chain carries the proxy log tail with the traceback.
         let raw = "unable to keep headroom running in background: \
-            /h/venv/bin/python3 -m headroom.proxy.server --port 6768 exited with status exit status: 1 \
-            before opening port 6768\n--- log tail ---\nTraceback (most recent call last):\n  \
+            /h/venv/bin/python3 -m headroom.proxy.server --port 6868 exited with status exit status: 1 \
+            before opening port 6868\n--- log tail ---\nTraceback (most recent call last):\n  \
             File registry.py, line 11\n    from headroom.providers.claude import DEFAULT_API_URL\n\
             ModuleNotFoundError: No module named 'headroom.providers.claude'\n--- end log ---";
         let hint = classify_startup_error(raw).expect("missing module should classify");
@@ -8172,12 +8212,12 @@ mod tests {
     #[test]
     fn classify_startup_error_foreign_port() {
         let raw =
-            "port 6768 is occupied by a non-headroom process (pid 1234 node); cannot start proxy.";
+            "port 6868 is occupied by a non-headroom process (pid 1234 node); cannot start proxy.";
         let hint = classify_startup_error(raw).expect("foreign port should classify");
         assert!(hint.contains("Reboot"), "got: {hint}");
     }
 
-    /// Regression (Sentry RUST-7D, RUST-7B, RUST-64): WSAEADDRINUSE on 6767
+    /// Regression (Sentry RUST-7D, RUST-7B, RUST-64): WSAEADDRINUSE on 6867
     /// leaves the app dead to every client, so the banner must name the port
     /// rather than blaming the Python runtime -- which in that state is running
     /// fine on a port of its own. The hint must hand over the command that
@@ -8188,7 +8228,7 @@ mod tests {
             "Only one usage of each socket address (protocol/network address/port) is \
              normally permitted. (os error 10048)",
         );
-        assert!(hint.contains("6767"), "{hint}");
+        assert!(hint.contains("6867"), "{hint}");
         assert!(hint.contains("Get-NetTCPConnection"), "{hint}");
         // Must not assert a single cause: winnat is not running on every
         // affected machine, and `net stop winnat` fails outright there.
@@ -8205,7 +8245,7 @@ mod tests {
     #[test]
     fn classify_startup_error_foreign_port_with_fallback_exhausted() {
         let raw =
-            "port 6768 is occupied by a non-headroom process (rapportd pid 594) and fallback ports 6769-6790 are also unavailable; cannot start proxy. Reboot to clear stuck listeners, then relaunch Headroom.";
+            "port 6868 is occupied by a non-headroom process (rapportd pid 594) and fallback ports 6869-6890 are also unavailable; cannot start proxy. Reboot to clear stuck listeners, then relaunch Headroom.";
         let hint = classify_startup_error(raw).expect("all-foreign should classify");
         assert!(hint.contains("Reboot"), "got: {hint}");
     }
@@ -8213,7 +8253,7 @@ mod tests {
     #[test]
     fn classify_startup_error_endpoint_protection_signal_kill() {
         let raw = "unable to keep headroom running in background (prior attempts: \
-                   /Users/x/venv/bin/headroom proxy --port 6768 exited with signal=9): \
+                   /Users/x/venv/bin/headroom proxy --port 6868 exited with signal=9): \
                    /Users/x/venv/bin/python3 -m headroom.proxy.server exited with signal=9";
         let hint = classify_startup_error(raw).expect("SIGKILL should classify");
         assert!(
@@ -8242,7 +8282,7 @@ mod tests {
         // the actual root cause; otherwise the user spends time on a
         // network/firewall red herring.
         let raw = "unable to keep headroom running in background (prior attempts: \
-                   /venv/bin/headroom proxy --port 6768 never opened port 6768 within 60000ms: \
+                   /venv/bin/headroom proxy --port 6868 never opened port 6868 within 60000ms: \
                    Killed: 9)";
         let hint = classify_startup_error(raw).expect("should classify");
         assert!(
@@ -8258,7 +8298,7 @@ mod tests {
     #[test]
     fn classify_startup_error_handles_every_tool_manager_bail_format() {
         // 1. all-foreign exhaustion
-        let raw = "port 6768 is occupied by a non-headroom process (rapportd pid 594) and fallback ports 6769-6790 are also unavailable; cannot start proxy. \
+        let raw = "port 6868 is occupied by a non-headroom process (rapportd pid 594) and fallback ports 6869-6890 are also unavailable; cannot start proxy. \
                    Reboot to clear stuck listeners, then relaunch Headroom.";
         assert!(
             classify_startup_error(raw).is_some(),
@@ -8266,8 +8306,8 @@ mod tests {
         );
 
         // 2. stale headroom proxy
-        let raw = "headroom proxy already running on port 6768 (likely a stale process from a prior session). \
-                   Run `lsof -iTCP:6768 -sTCP:LISTEN` to find and kill it, then retry.";
+        let raw = "headroom proxy already running on port 6868 (likely a stale process from a prior session). \
+                   Run `lsof -iTCP:6868 -sTCP:LISTEN` to find and kill it, then retry.";
         assert!(
             classify_startup_error(raw).is_some(),
             "stale proxy bail must classify"
@@ -8291,7 +8331,7 @@ mod tests {
 
     #[test]
     fn classify_startup_error_stale_headroom() {
-        let raw = "headroom proxy already running on port 6768 (likely a stale process from a prior session).";
+        let raw = "headroom proxy already running on port 6868 (likely a stale process from a prior session).";
         let hint = classify_startup_error(raw).expect("stale should classify");
         assert!(hint.contains("relaunch"), "got: {hint}");
     }
@@ -8977,6 +9017,13 @@ mod tests {
         assert_eq!(state.headroom_learn_status(None).current_step, None);
 
         let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn global_learn_run_keys_have_agent_session_display_names() {
+        assert_eq!(super::project_display_name("codex"), "Codex sessions");
+        assert_eq!(super::project_display_name("opencode"), "OpenCode sessions");
+        assert_eq!(super::project_display_name("grok"), "Grok sessions");
     }
 
     #[test]
@@ -10077,7 +10124,7 @@ mod tests {
 
     #[test]
     fn stats_fetch_warn_interval_backs_off_and_caps() {
-        // RUST-87: one host whose 6767 is owned by another app warned 96x/day
+        // RUST-87: one host whose 6867 is owned by another app warned 96x/day
         // under a flat window. Backoff turns an unfixable cause into ~8/day.
         assert_eq!(stats_fetch_warn_interval(1), STATS_FETCH_WARN_INTERVAL);
         assert_eq!(stats_fetch_warn_interval(2), STATS_FETCH_WARN_INTERVAL * 2);
