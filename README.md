@@ -79,9 +79,9 @@ license details.
 
 ## 致谢与开源声明
 
-感谢原始桌面端作者 [`gglucass`](https://github.com/gglucass/headroom-desktop)，以及 `headroomlabs-ai/headroom`、`rtk-ai/rtk`、Microsoft `MarkItDown` 和各可选开源工具的作者与贡献者。
+感谢 `headroomlabs-ai/headroom`、`rtk-ai/rtk`、Microsoft `MarkItDown` 和各可选开源工具的作者与贡献者。
 
-本 Community 版本的代码复用、工具集成、修改和再分发全部以相应项目的开源许可证为依据。该致谢不表示原作者提供商业授权、官方背书、签名证书、付费服务或维护承诺。完整来源与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本 Community 版本的代码复用、工具集成、修改和再分发全部以相应项目的开源许可证为依据。该致谢不表示相关项目提供商业授权、官方背书、签名证书、付费服务或维护承诺。完整来源与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 macOS DMG 安装、ad-hoc 签名、quarantine 处理、Gatekeeper 验证及自动更新密钥说明见 [macOS 安装、签名与自动更新说明](docs/macos-install-and-signing.zh-CN.md)。
 

@@ -8125,15 +8125,6 @@ export default function App() {
                 <button
                   className="link-button"
                   onClick={() =>
-                    void openExternalLink("https://github.com/gglucass/headroom-desktop")
-                  }
-                  type="button"
-                >
-                  {t("settings.creditsOriginalDesktop")}
-                </button>
-                <button
-                  className="link-button"
-                  onClick={() =>
                     void openExternalLink("https://github.com/headroomlabs-ai/headroom")
                   }
                   type="button"

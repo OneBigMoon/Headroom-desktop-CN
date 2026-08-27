@@ -82,7 +82,7 @@ jobs:
             - 纯本地运行，不需要 Headroom 账户或付费后端。
             - 更新包使用 Community 独立签名密钥验证。
             - 全部代码复用与工具集成均依据相应开源许可证。
-            - 感谢 Headroom Desktop 原作者及所有集成工具作者和贡献者。
+            - 感谢 headroomlabs-ai/headroom、rtk-ai/rtk、Microsoft MarkItDown 和各可选开源工具的作者与贡献者。
 
             安装和签名问题请阅读 `docs/macos-install-and-signing.zh-CN.md`。
           releaseDraft: false

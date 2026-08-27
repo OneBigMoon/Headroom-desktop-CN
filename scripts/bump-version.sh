@@ -72,7 +72,7 @@ node -e "
   const path = '${REPO_ROOT}/src-tauri/Cargo.toml';
   const current = fs.readFileSync(path, 'utf8');
   const updated = current.replace(
-    /(\\[package\\]\\s+name = \"headroom-desktop\"\\s+version = \")[^\"]+\"/,
+    /(\\[package\\]\\s+name = \"headroom-local-community\"\\s+version = \")[^\"]+\"/,
     (_, prefix) => prefix + '${VERSION}' + '\"'
   );
   if (updated === current) {
@@ -88,7 +88,7 @@ node -e "
   if (fs.existsSync(path)) {
     const current = fs.readFileSync(path, 'utf8');
     const updated = current.replace(
-      /(name = \"headroom-desktop\"\nversion = \")[^\"]+\"/,
+      /(name = \"headroom-local-community\"\nversion = \")[^\"]+\"/,
       (_, prefix) => prefix + '${VERSION}' + '\"'
     );
     if (updated === current) {

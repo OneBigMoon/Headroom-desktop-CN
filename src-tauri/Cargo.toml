@@ -1,6 +1,6 @@
 [package]
 name = "headroom-local-community"
-version = "0.8.8"
+version = "0.8.9"
 description = "Unofficial local-only community desktop for open-source Headroom tooling"
 authors = ["Headroom Local Community contributors"]
 license = "MIT"

@@ -5,12 +5,15 @@ Community edition is based on the applicable open-source license of each
 project. Attribution does not imply commercial authorization, endorsement,
 official support, or access to any paid service.
 
-Special thanks to:
+Open-source acknowledgements:
 
-- `gglucass/headroom-desktop` and its author/contributors — original MIT-licensed desktop shell.
 - `headroomlabs-ai/headroom` contributors — Apache-2.0 Headroom core runtime.
 - `rtk-ai/rtk` contributors — Apache-2.0 RTK command-output optimizer.
 - `microsoft/markitdown` contributors — MIT-licensed document conversion tooling.
+
+Required source and license attribution:
+
+- `gglucass/headroom-desktop` — MIT-licensed source basis for the desktop shell.
 
 Headroom Local Community is an unofficial community fork. It preserves the
 upstream copyright notices and uses the upstream desktop shell under the MIT
