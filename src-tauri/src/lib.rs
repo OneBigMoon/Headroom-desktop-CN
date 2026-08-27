@@ -8350,12 +8350,6 @@ mod tests {
                 .expect("Community defaults configure updater");
         assert_eq!(config.endpoints.len(), 1);
         assert_eq!(config.endpoints[0].as_str(), DEFAULT_UPDATER_ENDPOINT);
-        return;
-        return;
-        let err =
-            build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
-                .expect_err("Community defaults must not configure an updater");
-        assert!(err.contains("HEADROOM_UPDATER_ENDPOINTS"));
     }
 
     // The override is opt-in AND build-gated: a stable build must ignore the
