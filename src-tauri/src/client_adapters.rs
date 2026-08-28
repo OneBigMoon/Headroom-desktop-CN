@@ -1124,6 +1124,9 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     // that provably launches from Headroom's install dirs (plus the
     // `headroom` server itself), or every new agent session would spawn a
     // failing MCP server against the deleted entrypoint.
+    if let Err(err) = disable_serena_integration() {
+        log::warn!("cleanup: removing Serena instruction blocks failed: {err}");
+    }
     removed.extend(remove_headroom_mcp_entries());
 
     // Credentials live in the login keychain, which no Homebrew cask stanza can
@@ -2129,6 +2132,81 @@ fn build_markitdown_codex_nudge(shim_path: &Path) -> String {
          `{bin} <path>` in the shell and use the Markdown it prints, rather than\n\
          opening the raw file. This keeps large documents cheap to read."
     )
+}
+
+fn build_serena_usage_nudge() -> &'static str {
+    "## Semantic code tools (Headroom Serena)\n\
+     For non-trivial coding tasks, use Serena when its tools are available. Call\n\
+     `initial_instructions` once before code exploration, then call `activate_project`\n\
+     with the actual repository when no project is active or the current project is\n\
+     wrong. Prefer Serena's symbol, reference, and pattern tools over whole-file reads.\n\
+     Skip Serena for non-code tasks and trivial exact edits; do not run onboarding or\n\
+     write Serena memories unless the task requires it or the user asks."
+}
+
+fn serena_claude_target_exists() -> bool {
+    let home = home_dir();
+    is_claude_code_enabled()
+        || home.join(".claude").is_dir()
+        || home.join(".claude.json").is_file()
+        || detect_claude_code_client(false).installed
+}
+
+fn serena_codex_target_exists() -> bool {
+    is_codex_enabled() || codex_home().is_dir()
+}
+
+/// Add an independently-managed Serena usage nudge to every detected coding
+/// client. Serena MCP registration is independent of Headroom proxy routing,
+/// so an installed-but-unconnected client still needs the usage hint.
+pub fn enable_serena_integration() -> Result<(Vec<String>, Vec<String>)> {
+    match write_serena_integration() {
+        Ok(result) => Ok(result),
+        Err(err) => match disable_serena_integration() {
+            Ok(_) => Err(err),
+            Err(cleanup_err) => Err(err.context(format!(
+                "rolling back partial Serena usage instructions also failed: {cleanup_err:#}"
+            ))),
+        },
+    }
+}
+
+fn write_serena_integration() -> Result<(Vec<String>, Vec<String>)> {
+    let mut changed_files = Vec::new();
+    let mut backup_files = Vec::new();
+    let nudge = build_serena_usage_nudge();
+
+    if serena_claude_target_exists() {
+        let path = markitdown_claude_md_path();
+        let (changed, backup) = upsert_managed_block(&path, "serena", nudge)?;
+        if changed {
+            changed_files.push(path.display().to_string());
+        }
+        if let Some(path) = backup {
+            backup_files.push(path.display().to_string());
+        }
+    }
+
+    if serena_codex_target_exists() {
+        let path = markitdown_codex_agents_path();
+        let (changed, backup) = upsert_managed_block(&path, "serena", nudge)?;
+        if changed {
+            changed_files.push(path.display().to_string());
+        }
+        if let Some(path) = backup {
+            backup_files.push(path.display().to_string());
+        }
+    }
+
+    Ok((changed_files, backup_files))
+}
+
+/// Remove Serena usage nudges unconditionally. This remains safe after a
+/// client is disconnected because the fenced block is the ownership boundary.
+pub fn disable_serena_integration() -> Result<bool> {
+    let mut changed = remove_managed_block(&markitdown_claude_md_path(), "serena")?;
+    changed |= remove_managed_block(&markitdown_codex_agents_path(), "serena")?;
+    Ok(changed)
 }
 
 /// Enables the MarkItDown addon integration for whichever coding clients are
@@ -8594,6 +8672,93 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         assert!(
             !after.contains("Headroom RTK"),
             "nudge removed on disable: {after}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn serena_integration_preserves_user_content_and_is_byte_idempotent() {
+        let home = TestHome::new();
+        let claude_md = home.path().join(".claude").join("CLAUDE.md");
+        let codex_agents = home.path().join(".codex").join("AGENTS.md");
+        fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        fs::create_dir_all(codex_agents.parent().unwrap()).unwrap();
+
+        let claude_original = "# Claude user instructions\n\n\
+# >>> headroom-local-community:markitdown_office >>>\n\
+keep markitdown\n\
+# <<< headroom-local-community:markitdown_office <<<\n";
+        let codex_original = "# Codex user instructions\n\n\
+# >>> headroom-local-community:rtk >>>\n\
+keep rtk\n\
+# <<< headroom-local-community:rtk <<<\n";
+        fs::write(&claude_md, claude_original).unwrap();
+        fs::write(&codex_agents, codex_original).unwrap();
+
+        assert!(!super::is_claude_code_enabled());
+        assert!(!super::is_codex_enabled());
+
+        let (changed, backups) = super::enable_serena_integration().expect("enable Serena");
+        assert_eq!(changed.len(), 2, "both detected clients updated");
+        assert_eq!(backups.len(), 2, "both pre-existing files backed up");
+
+        let claude_after_first = fs::read(&claude_md).unwrap();
+        let codex_after_first = fs::read(&codex_agents).unwrap();
+        for body in [&claude_after_first, &codex_after_first] {
+            let body = String::from_utf8_lossy(body);
+            assert_eq!(
+                body.matches("# >>> headroom-local-community:serena >>>")
+                    .count(),
+                1,
+                "one Serena managed block: {body}"
+            );
+            assert!(body.contains("Semantic code tools (Headroom Serena)"));
+            assert!(body.contains("`initial_instructions`"));
+            assert!(body.contains("`activate_project`"));
+            assert!(body.contains("do not run onboarding"));
+        }
+        assert!(String::from_utf8_lossy(&claude_after_first).contains(claude_original.trim_end()));
+        assert!(String::from_utf8_lossy(&codex_after_first).contains(codex_original.trim_end()));
+
+        let second = super::enable_serena_integration().expect("enable Serena again");
+        assert!(second.0.is_empty(), "second enable changes no files");
+        assert!(second.1.is_empty(), "second enable creates no backups");
+        assert_eq!(fs::read(&claude_md).unwrap(), claude_after_first);
+        assert_eq!(fs::read(&codex_agents).unwrap(), codex_after_first);
+
+        assert!(super::disable_serena_integration().expect("disable Serena"));
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), claude_original);
+        assert_eq!(fs::read_to_string(&codex_agents).unwrap(), codex_original);
+
+        assert!(
+            !super::disable_serena_integration().expect("disable Serena again"),
+            "second disable is a no-op"
+        );
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), claude_original);
+        assert_eq!(fs::read_to_string(&codex_agents).unwrap(), codex_original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn serena_integration_rolls_back_first_prompt_when_second_target_fails() {
+        let home = TestHome::new();
+        let claude_md = home.path().join(".claude").join("CLAUDE.md");
+        let codex_agents = home.path().join(".codex").join("AGENTS.md");
+        fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        fs::create_dir_all(&codex_agents).unwrap();
+        let original = "# Claude user instructions\n";
+        fs::write(&claude_md, original).unwrap();
+
+        let err = super::enable_serena_integration()
+            .expect_err("Codex AGENTS.md directory must reject the write");
+        assert!(
+            err.to_string().contains("rolling back partial Serena"),
+            "cleanup failure remains visible: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&claude_md).unwrap(),
+            original,
+            "Claude prompt written before the Codex failure was rolled back"
         );
     }
 

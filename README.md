@@ -31,14 +31,21 @@ application:
 | MCP server | `headroom_local_community` |
 | Managed markers | `headroom-local-community:*` |
 
-The application does not read or delete the paid app's bundle data, keychain
-entries, `~/.headroom` workspace, managed markers, MCP entry, backups, or
-shared HuggingFace cache.
+The application does not delete the paid app's bundle data, keychain entries,
+`~/.headroom` workspace, managed markers, MCP entry, backups, or shared
+HuggingFace cache. The sole read-only exception is
+`~/.headroom/mcp_installs.json`: Community may use its Serena fingerprint as
+proof that an existing `serena` MCP entry was installed by Headroom. The
+official ledger is never modified.
 
 A coding client can have only one active `ANTHROPIC_BASE_URL` or
 `OPENAI_BASE_URL`. If official Headroom routing is detected, Community refuses
 to overwrite it. Pause that connector in the official app before enabling the
-Community connector. Community never removes the official configuration.
+Community connector. Community never removes the official routing
+configuration. When Serena is enabled, Community may replace an old official
+Serena entry only when the complete current MCP specification matches the
+official ownership-ledger fingerprint; user-managed Serena entries are always
+left untouched.
 
 Codex, Claude Code, OpenCode, and other clients still use their own upstream
 API key or OAuth authentication. Only the separate Headroom product account
@@ -138,6 +145,8 @@ Depending on platform and enabled features, Community may write:
   product name and bundle ID.
 - `~/.headroom-local-community` for headroom-ai runtime state.
 - Community-managed, fenced blocks in supported client configuration files.
+- A fenced Serena usage hint in detected clients' `~/.codex/AGENTS.md` or
+  `~/.claude/CLAUDE.md` while the addon is enabled.
 - Community-named MCP entries and guard hooks.
 - Timestamped backups ending in `.headroom-local-community-backup-*` before
   editing a client configuration file.

@@ -791,6 +791,21 @@ impl AppState {
             log::warn!("RTK integrations failed during warm_runtime_on_launch: {err:#}");
         }
 
+        // Reconcile optional integrations on launch so an app upgrade repairs
+        // stale managed registrations without requiring a disable/enable cycle.
+        if self.tool_manager.serena_enabled() {
+            match self.tool_manager.ensure_serena_configured() {
+                Ok(()) => {
+                    if let Err(err) = crate::client_adapters::enable_serena_integration() {
+                        log::warn!("Serena usage instructions failed during launch: {err:#}");
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Serena MCP reconciliation failed during launch: {err:#}");
+                }
+            }
+        }
+
         // Pre-wrapper installs still have a bare symlink shim; refresh it so
         // the conversion counter starts recording without a reinstall.
         if self.tool_manager.markitdown_installed() {

@@ -1061,9 +1061,10 @@ const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rust. Mirrors upstream `_setup_serena_mcp` / `_remove_headroom_installed_serena_mcp`
 /// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
 /// ever overwritten or removed — a user-managed serena entry is left alone.
-/// argv: `register <serena-bin>` | `unregister`.
+/// argv: `register <serena-bin> [legacy-ledger]` | `unregister`.
 const SERENA_MCP_HELPER: &str = r#"
 import sys
+from pathlib import Path
 
 from headroom.mcp_registry import (
     ClaudeRegistrar,
@@ -1080,6 +1081,7 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
+legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 failures = []
 # Claude/Codex only: serena's --context values are named profiles and no
 # grok/opencode context has been validated against serena yet.
@@ -1101,10 +1103,18 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
             ),
         )
         result = registrar.register_server(spec)
-        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
-            registrar.name, registrar.get_server("serena")
-        ):
-            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.MISMATCH:
+            current = registrar.get_server("serena")
+            owned = headroom_installed_matching(registrar.name, current)
+            if not owned and legacy_ledger is not None:
+                # Community has its own workspace/ledger. Read the legacy
+                # official Headroom ledger only as ownership proof; never
+                # modify or clear it.
+                owned = headroom_installed_matching(
+                    registrar.name, current, path=legacy_ledger
+                )
+            if owned:
+                result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.FAILED:
@@ -1126,6 +1136,13 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
 if failures:
     sys.exit("; ".join(failures))
 "#;
+
+fn legacy_headroom_mcp_ledger_path() -> PathBuf {
+    crate::client_adapters::home_dir()
+        .join(".headroom")
+        .join("mcp_installs.json")
+}
+
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the Context7 MCP entry. The registered command is a bare `npx` (resolved
 /// from the agent session's own PATH, so nvm version switches don't strand an
@@ -2147,23 +2164,17 @@ impl ToolManager {
                 }
             }
         }
-        // The dashboard scans upward from the base port when it's taken, one
-        // process per MCP session; sum whatever responds in the first few.
-        let mut total: u64 = 0;
-        let mut any_responder = false;
-        for offset in 0..SERENA_DASHBOARD_PORT_SCAN {
-            let port = SERENA_DASHBOARD_BASE_PORT + offset;
-            if let Some(tokens) = fetch_serena_output_tokens(&format!("http://127.0.0.1:{port}")) {
-                any_responder = true;
-                total = total.saturating_add(tokens);
-            }
-        }
-        let stats = (any_responder && total > 0).then(|| {
-            let session_start = self
-                .serena_oldest_session_age()
-                .and_then(|age| Instant::now().checked_sub(age));
-            (total, session_start)
-        });
+        // Serena assigns the first free port above its base. Discover current
+        // listeners so later sessions remain visible even after the first four
+        // ports are occupied (or older sessions leave gaps).
+        let stats = fetch_serena_output_tokens_from_ports(&discover_serena_dashboard_ports()).map(
+            |total| {
+                let session_start = self
+                    .serena_oldest_session_age()
+                    .and_then(|age| Instant::now().checked_sub(age));
+                (total, session_start)
+            },
+        );
         *self.serena_live_stats_cache.lock() = Some((Instant::now(), stats));
         stats
     }
@@ -6056,6 +6067,10 @@ impl ToolManager {
         self.runtime.tools_dir.join("serena.json").exists() && self.serena_entrypoint().exists()
     }
 
+    pub fn serena_enabled(&self) -> bool {
+        self.serena_installed() && self.tool_enabled("serena")
+    }
+
     pub fn install_serena(&self) -> Result<()> {
         // --clear so a retry after a partial install starts from a clean venv.
         run_command_with_timeout(
@@ -6127,6 +6142,16 @@ impl ToolManager {
         Ok(())
     }
 
+    /// Reconcile an already-enabled install on app launch. This is what lets a
+    /// Community upgrade safely replace a stale official-Headroom registration
+    /// after the legacy ownership ledger proves that entry was Headroom-managed.
+    pub fn ensure_serena_configured(&self) -> Result<()> {
+        if !self.serena_enabled() {
+            return Ok(());
+        }
+        self.register_serena_mcp()
+    }
+
     pub fn uninstall_serena(&self) -> Result<()> {
         // Unregister before deleting the venv, and fail if it doesn't land: a
         // leftover MCP entry pointing at a deleted binary would make every new
@@ -6166,8 +6191,17 @@ impl ToolManager {
     fn register_serena_mcp(&self) -> Result<()> {
         set_serena_browser_dashboard();
         let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
-        self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "register", &entrypoint])
-            .context("registering serena MCP server")
+        let legacy_ledger = legacy_headroom_mcp_ledger_path()
+            .to_string_lossy()
+            .into_owned();
+        let result = self.run_mcp_helper(&[
+            "-c",
+            SERENA_MCP_HELPER,
+            "register",
+            &entrypoint,
+            &legacy_ledger,
+        ]);
+        result.context("registering serena MCP server")
     }
 
     fn unregister_serena_mcp(&self) -> Result<()> {
@@ -6811,7 +6845,135 @@ const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
 /// Serena's dashboard API binds the first free port scanning upward from here
 /// (`constants.py` 0x5EDA, `dashboard.py` `_find_first_free_port`).
 const SERENA_DASHBOARD_BASE_PORT: u16 = 24282;
-const SERENA_DASHBOARD_PORT_SCAN: u16 = 4;
+const SERENA_DASHBOARD_PORT_WINDOW: u16 = 64;
+
+/// Discover listening Serena dashboard candidates once per live-stats cache
+/// miss. We only query IPv4/IPv6 loopback and still require the dashboard's
+/// exact JSON shape. Keep candidates inside a bounded observation window so
+/// unrelated high-port local services are never probed. When listener
+/// enumeration is unavailable, scan the same window rather than regressing to
+/// the former four-port limit.
+fn discover_serena_dashboard_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+
+    for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
+        let Ok(output) = crate::proc::command(lsof)
+            .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN"])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            ports.extend(parse_lsof_listener_ports(&String::from_utf8_lossy(
+                &output.stdout,
+            )));
+            break;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if ports.is_empty() {
+        if let Ok(output) = crate::proc::command("ss").arg("-ltn").output() {
+            if output.status.success() {
+                ports.extend(parse_ss_listener_ports(&String::from_utf8_lossy(
+                    &output.stdout,
+                )));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    if ports.is_empty() {
+        if let Ok(output) = crate::proc::command("netstat")
+            .args(["-ano", "-p", "tcp"])
+            .output()
+        {
+            if output.status.success() {
+                ports.extend(parse_netstat_listener_ports(&String::from_utf8_lossy(
+                    &output.stdout,
+                )));
+            }
+        }
+    }
+
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.is_empty() {
+        ports.extend(
+            (0..SERENA_DASHBOARD_PORT_WINDOW)
+                .filter_map(|offset| SERENA_DASHBOARD_BASE_PORT.checked_add(offset)),
+        );
+    }
+    ports
+}
+
+fn parse_dashboard_listener_port(endpoint: &str) -> Option<u16> {
+    let (host, port) = endpoint.rsplit_once(':')?;
+    let host = host.trim_matches(['[', ']']);
+    if !matches!(
+        host,
+        "127.0.0.1" | "localhost" | "0.0.0.0" | "*" | "::1" | "::"
+    ) {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    let offset = port.checked_sub(SERENA_DASHBOARD_BASE_PORT)?;
+    (offset < SERENA_DASHBOARD_PORT_WINDOW).then_some(port)
+}
+
+fn parse_lsof_listener_ports(text: &str) -> Vec<u16> {
+    text.lines()
+        .skip(1)
+        .filter(|line| line.trim_end().ends_with("(LISTEN)"))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(parse_dashboard_listener_port)
+        })
+        .collect()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_ss_listener_ports(text: &str) -> Vec<u16> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 4 || !fields[0].eq_ignore_ascii_case("LISTEN") {
+                return None;
+            }
+            parse_dashboard_listener_port(fields[3])
+        })
+        .collect()
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_netstat_listener_ports(text: &str) -> Vec<u16> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5
+                || !fields[0].eq_ignore_ascii_case("TCP")
+                || !fields[3].eq_ignore_ascii_case("LISTENING")
+            {
+                return None;
+            }
+            parse_dashboard_listener_port(fields[1])
+        })
+        .collect()
+}
+
+fn fetch_serena_output_tokens_from_ports(ports: &[u16]) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut any_responder = false;
+    for port in ports {
+        let tokens = fetch_serena_output_tokens(&format!("http://127.0.0.1:{port}"))
+            .or_else(|| fetch_serena_output_tokens(&format!("http://[::1]:{port}")));
+        if let Some(tokens) = tokens {
+            any_responder = true;
+            total = total.saturating_add(tokens);
+        }
+    }
+    (any_responder && total > 0).then_some(total)
+}
 
 /// GET `{base_url}/get_tool_stats` and sum `output_tokens` across tools.
 /// Response shape: `{"stats": {tool: {num_times_called, input_tokens,
@@ -6827,15 +6989,17 @@ fn fetch_serena_output_tokens(base_url: &str) -> Option<u64> {
         .ok()?
         .json()
         .ok()?;
+    serena_output_tokens_from_value(&value)
+}
+
+fn serena_output_tokens_from_value(value: &Value) -> Option<u64> {
     let stats = value.get("stats")?.as_object()?;
     let mut total: u64 = 0;
     for entry in stats.values() {
-        total = total.saturating_add(
-            entry
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
+        let entry = entry.as_object()?;
+        entry.get("num_times_called")?.as_u64()?;
+        entry.get("input_tokens")?.as_u64()?;
+        total = total.saturating_add(entry.get("output_tokens")?.as_u64()?);
     }
     Some(total)
 }
@@ -12780,6 +12944,52 @@ after
     }
 
     #[test]
+    #[serial_test::serial]
+    fn serena_registration_migrates_only_ledger_proven_legacy_entries() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::new(home.path());
+        assert_eq!(
+            super::legacy_headroom_mcp_ledger_path(),
+            home.path().join(".headroom/mcp_installs.json")
+        );
+        assert!(super::SERENA_MCP_HELPER
+            .contains("legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None"));
+        assert!(super::SERENA_MCP_HELPER.contains(
+            "headroom_installed_matching(\n                    registrar.name, current, path=legacy_ledger"
+        ));
+        assert!(super::SERENA_MCP_HELPER.contains(
+            "if owned:\n                result = registrar.register_server(spec, force=True)"
+        ));
+        assert!(super::SERENA_MCP_HELPER
+            .contains("if not headroom_installed_matching(registrar.name, current):"));
+    }
+
+    #[test]
+    fn serena_dashboard_listener_parsers_find_late_loopback_ports() {
+        let lsof = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
+python3 10 user 4u IPv4 0x1 0t0 TCP 127.0.0.1:24282 (LISTEN)\n\
+python3 11 user 4u IPv6 0x2 0t0 TCP [::1]:24295 (LISTEN)\n\
+python3 12 user 4u IPv4 0x3 0t0 TCP 192.168.1.2:24296 (LISTEN)\n\
+python3 13 user 4u IPv4 0x4 0t0 TCP 127.0.0.1:24281 (LISTEN)\n\
+python3 14 user 4u IPv4 0x5 0t0 TCP 127.0.0.1:24346 (LISTEN)\n";
+        assert_eq!(super::parse_lsof_listener_ports(lsof), vec![24282, 24295]);
+
+        let ss = "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n\
+LISTEN 0 128 127.0.0.1:24290 0.0.0.0:*\n\
+LISTEN 0 128 *:24296 *:*\n\
+ESTAB 0 0 127.0.0.1:24297 127.0.0.1:1\n";
+        assert_eq!(super::parse_ss_listener_ports(ss), vec![24290, 24296]);
+
+        let netstat = "TCP 127.0.0.1:24291 0.0.0.0:0 LISTENING 44\n\
+TCP [::1]:24298 [::]:0 LISTENING 45\n\
+TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
+        assert_eq!(
+            super::parse_netstat_listener_ports(netstat),
+            vec![24291, 24298]
+        );
+    }
+
+    #[test]
     fn fetch_serena_output_tokens_sums_stats_across_tools() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -12798,6 +13008,13 @@ after
         let total = super::fetch_serena_output_tokens(&format!("http://127.0.0.1:{port}"));
         handle.join().expect("server thread");
         assert_eq!(total, Some(5000));
+        assert_eq!(
+            super::serena_output_tokens_from_value(&serde_json::json!({
+                "stats": {"foreign": {"output_tokens": 5000}}
+            })),
+            None,
+            "a generic local JSON service must not look like Serena"
+        );
 
         // Nothing listening: must be None, not Some(0).
         let unused = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -12807,6 +13024,37 @@ after
             super::fetch_serena_output_tokens(&format!("http://127.0.0.1:{dead_port}")),
             None
         );
+    }
+
+    #[test]
+    fn fetch_serena_output_tokens_sums_more_than_four_dashboards() {
+        let mut ports = Vec::new();
+        let mut handles = Vec::new();
+        for tokens in [100_u64, 200, 300, 400, 500] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            ports.push(listener.local_addr().expect("addr").port());
+            handles.push(std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0_u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = format!(
+                    r#"{{"stats":{{"find_symbol":{{"num_times_called":1,"input_tokens":0,"output_tokens":{tokens}}}}}}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write");
+            }));
+        }
+
+        assert_eq!(
+            super::fetch_serena_output_tokens_from_ports(&ports),
+            Some(1_500)
+        );
+        for handle in handles {
+            handle.join().expect("server thread");
+        }
     }
 
     #[test]

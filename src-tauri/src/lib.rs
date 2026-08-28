@@ -1225,6 +1225,16 @@ async fn install_addon(
                 .tool_manager
                 .install_serena()
                 .map_err(|err| err.to_string())?;
+            if let Err(err) = client_adapters::enable_serena_integration() {
+                return match state.tool_manager.set_serena_enabled(false) {
+                    Ok(()) => Err(format!(
+                        "Serena usage instructions failed, so Serena was disabled again: {err:#}"
+                    )),
+                    Err(rollback_err) => Err(format!(
+                        "Serena usage instructions failed ({err:#}); disabling Serena also failed: {rollback_err:#}"
+                    )),
+                };
+            }
         }
         "context7" => {
             state
@@ -1283,10 +1293,28 @@ async fn set_addon_enabled(
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
-            state
-                .tool_manager
-                .set_serena_enabled(enabled)
-                .map_err(|err| err.to_string())?;
+            if enabled {
+                state
+                    .tool_manager
+                    .set_serena_enabled(true)
+                    .map_err(|err| err.to_string())?;
+                if let Err(err) = client_adapters::enable_serena_integration() {
+                    return match state.tool_manager.set_serena_enabled(false) {
+                        Ok(()) => Err(format!(
+                            "Serena usage instructions failed, so Serena was disabled again: {err:#}"
+                        )),
+                        Err(rollback_err) => Err(format!(
+                            "Serena usage instructions failed ({err:#}); disabling Serena also failed: {rollback_err:#}"
+                        )),
+                    };
+                }
+            } else {
+                client_adapters::disable_serena_integration().map_err(|err| err.to_string())?;
+                state
+                    .tool_manager
+                    .set_serena_enabled(false)
+                    .map_err(|err| err.to_string())?;
+            }
         }
         "context7" => {
             state
@@ -1355,6 +1383,8 @@ async fn uninstall_addon(
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
+            client_adapters::disable_serena_integration()
+                .map_err(|err| format!("removing Serena usage instructions failed: {err:#}"))?;
             state
                 .tool_manager
                 .uninstall_serena()
@@ -4223,6 +4253,23 @@ async fn apply_client_setup(
     }
     match client_adapters::apply_client_setup(&client_id) {
         Ok(result) => {
+            // Serena registration is independent of proxy routing. A client
+            // first detected by this setup action must receive both its MCP
+            // entry and usage hint immediately, without waiting for restart.
+            if state.tool_manager.serena_enabled() {
+                match state.tool_manager.ensure_serena_configured() {
+                    Ok(()) => {
+                        if let Err(err) = client_adapters::enable_serena_integration() {
+                            log::warn!(
+                                "apply_client_setup: Serena usage instructions failed: {err:#}"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("apply_client_setup: Serena reconciliation failed: {err:#}");
+                    }
+                }
+            }
             analytics::track_event(
                 &app,
                 "client_setup_applied",
@@ -4502,6 +4549,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         let _ = client_adapters::disable_markitdown_integration(
             &state.tool_manager.markitdown_shim_path(),
         );
+        let _ = client_adapters::disable_serena_integration();
         if state.tool_manager.serena_installed() {
             if let Err(err) = state.tool_manager.uninstall_serena() {
                 log::warn!("uninstall: removing serena failed: {err:#}");
