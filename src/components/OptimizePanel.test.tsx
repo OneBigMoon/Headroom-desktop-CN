@@ -49,6 +49,42 @@ describe("OptimizePanel", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
+  it("renders Codex AGENTS.md and instructions.md results", async () => {
+    const codexPatterns: AppliedPatterns = {
+      claudeMd: [],
+      memoryMd: [],
+      codexAgentsMd: [
+        { title: "Tool discipline", bullets: ["Read once before editing."] }
+      ],
+      codexInstructionsMd: [
+        { title: "Retry discipline", bullets: ["Retry only after state changes."] }
+      ]
+    };
+    render(
+      <OptimizePanel
+        projectPath="codex"
+        source="codex"
+        preloadedApplied={codexPatterns}
+      />
+    );
+    const user = userEvent.setup();
+
+    expect(
+      screen.getByRole("button", { name: /1 learning in AGENTS\.md/i })
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /1 reminder in instructions\.md/i })
+    ).toBeEnabled();
+
+    await user.click(
+      screen.getByRole("button", { name: /1 learning in AGENTS\.md/i })
+    );
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "Learnings in ~/.codex/AGENTS.md"
+    );
+    expect(screen.getByText("Read once before editing.")).toBeInTheDocument();
+  });
+
   it("disables pills when the preloaded counts are zero", () => {
     render(
       <OptimizePanel

@@ -1080,7 +1080,7 @@ function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
   const { resolvedLocale, t } = useI18n();
   const { patternsToday, remindersToday, learningsToday, projectDisplayName } = event;
   const summary = resolvedLocale === "en"
-    ? `${patternsToday} pattern${patternsToday === 1 ? "" : "s"} identified today, ${remindersToday} reminder${remindersToday === 1 ? "" : "s"} and ${learningsToday} learning${learningsToday === 1 ? "" : "s"} written to memory.`
+    ? `Today's additions: ${patternsToday} pattern${patternsToday === 1 ? "" : "s"} identified, ${remindersToday} reminder${remindersToday === 1 ? "" : "s"} and ${learningsToday} learning${learningsToday === 1 ? "" : "s"} written to memory.`
     : t("activity.learnings.summary", { patterns: patternsToday, reminders: remindersToday, learnings: learningsToday });
   return (
     <li className="activity-feed__item activity-feed__item--learnings-milestone">

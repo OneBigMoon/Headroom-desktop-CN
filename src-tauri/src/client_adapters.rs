@@ -5961,7 +5961,7 @@ pub(crate) fn home_dir() -> PathBuf {
 /// proxy: honor `$CODEX_HOME` when set, else `~/.codex`. Staying in sync with
 /// the proxy matters — if the two layers disagree on where Codex lives, the
 /// provider retag rewrites a different store than the config it edited.
-fn codex_home() -> PathBuf {
+pub(crate) fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

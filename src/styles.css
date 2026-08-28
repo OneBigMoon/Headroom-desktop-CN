@@ -3457,6 +3457,11 @@ details[open] .optimize-minimal__details summary::after {
   font-weight: 600;
 }
 
+.optimize-project-row__status.optimize-minimal__result--success {
+  color: var(--success);
+  font-weight: 600;
+}
+
 .optimize-minimal__mono {
   font-family: var(--font-mono);
   font-size: 0.72rem;

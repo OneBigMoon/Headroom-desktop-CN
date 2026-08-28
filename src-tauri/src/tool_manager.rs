@@ -2726,6 +2726,10 @@ impl ToolManager {
                     // shaper only ever lowers an effort the client already sent and
                     // never toggles thinking.type, so it cannot 400 a model that
                     // lacks effort support.
+                    // headroom-ai 0.36+ rollout-gates this beta feature before
+                    // consulting HEADROOM_OUTPUT_SHAPER; without the channel,
+                    // /stats reports requested=true but blocked_by_channel.
+                    .env("HEADROOM_ROLLOUT_CHANNEL", "beta")
                     .env("HEADROOM_OUTPUT_SHAPER", "1")
                     // Pin the steering level explicitly. An explicit env is the
                     // manual-override tier in the shaper's level resolution, so it
@@ -3125,15 +3129,17 @@ impl ToolManager {
         // our Tauri-spawned log captures. Probe that file first; fall back to
         // the spawn-time tool log (covers older headroom versions that do
         // propagate to stderr).
-        // Positive markers: the startup `Kompress: ENABLED` line (cache hit at
-        // eager-preload) AND the lazy-load success lines emitted on first use
-        // when the model was downloaded after a cold-cache startup. The scan
-        // returns the most recent marker, so a lazy load flips the status to
-        // enabled without waiting for a backend restart.
+        // Positive markers: startup reports either `ENABLED` or `DEFERRED`
+        // (configured and ready to load on first use), followed by legacy
+        // lazy-load success lines or the 0.36+ per-request backend line. The
+        // scan returns the most recent marker, so both cold and warm runtimes
+        // report the feature as enabled.
         const KOMPRESS_ENABLED_MARKERS: &[&str] = &[
             "kompress: enabled",
+            "kompress: deferred",
             "kompress onnx loaded",
             "kompress pytorch loaded",
+            "kompress slow compress backend=",
         ];
         const KOMPRESS_DISABLED_MARKERS: &[&str] =
             &["kompress: not installed", "kompress: disabled"];
@@ -10738,30 +10744,52 @@ asyncio.run(verify())
     }
 
     #[test]
-    fn kompress_marker_scan_treats_lazy_load_as_enabled() {
+    fn kompress_marker_scan_treats_deferred_and_lazy_load_as_enabled() {
         let (root, runtime, manager) = seed_test_runtime("kompress-marker");
         fs::create_dir_all(runtime.logs_dir()).expect("logs dir");
         let enabled: &[&str] = &[
             "kompress: enabled",
+            "kompress: deferred",
             "kompress onnx loaded",
             "kompress pytorch loaded",
+            "kompress slow compress backend=",
         ];
         let disabled: &[&str] = &["kompress: not installed", "kompress: disabled"];
 
-        // Cold-cache startup logs "not installed"; a later first-use lazy load
-        // logs "Kompress ONNX loaded". The most-recent marker (lazy load) wins,
-        // so the desktop reports enabled without a restart.
+        // Current headroom-ai defers native model initialization until the
+        // first request. DEFERRED means the feature is configured and usable,
+        // not unknown or disabled.
+        let deferred_log = runtime.logs_dir().join("kompress-deferred.log");
+        fs::write(
+            &deferred_log,
+            "2026-06-12 10:00:00 - headroom.proxy - INFO - Kompress: DEFERRED (model loads on first request)\n",
+        )
+        .expect("write deferred log");
+        assert_eq!(
+            manager.scan_file_for_marker_state_cached(
+                "k-deferred",
+                &deferred_log,
+                enabled,
+                disabled,
+            ),
+            Some(true),
+            "a deferred startup should report enabled before first use"
+        );
+
+        // Cold-cache startup logs "not installed"; a later 0.36+ compression
+        // logs the backend actually used. The most-recent marker wins, so the
+        // desktop reports enabled without a restart.
         let log = runtime.logs_dir().join("kompress-lazy.log");
         fs::write(
             &log,
             "2026-06-12 10:00:00 - headroom.proxy - INFO - Kompress: not installed (pip install headroom-ai[ml])\n\
-             2026-06-12 10:05:00 - headroom.proxy - INFO - Kompress ONNX loaded: chopratejas/kompress-v2-base backend=onnx\n",
+             2026-06-12 10:05:00 - headroom.transforms.kompress_compressor - INFO - Kompress slow compress backend=onnx input_tokens=4096 output_tokens=2048\n",
         )
         .expect("write lazy log");
         assert_eq!(
             manager.scan_file_for_marker_state_cached("k-lazy", &log, enabled, disabled),
             Some(true),
-            "a lazy-load line after a not-installed line should report enabled"
+            "a compression line after a not-installed line should report enabled"
         );
 
         // A pure cold-cache log (no lazy load yet) still reports disabled.

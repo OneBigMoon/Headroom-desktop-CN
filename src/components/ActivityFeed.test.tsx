@@ -684,7 +684,7 @@ describe("ActivityFeed", () => {
     const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">Learnings<");
-    expect(markup).toContain("4 patterns identified today");
+    expect(markup).toContain("Today&#x27;s additions: 4 patterns identified");
     expect(markup).toContain("2 reminders");
     expect(markup).toContain("3 learnings written to memory");
     expect(markup).toContain("demo-repo");
@@ -701,7 +701,7 @@ describe("ActivityFeed", () => {
     };
     const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("0 patterns identified today");
+    expect(markup).toContain("Today&#x27;s additions: 0 patterns identified");
     expect(markup).not.toContain("activity-feed__project");
   });
 
@@ -716,7 +716,7 @@ describe("ActivityFeed", () => {
     };
     const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("1 pattern identified today");
+    expect(markup).toContain("Today&#x27;s additions: 1 pattern identified");
     expect(markup).toContain("1 reminder and 1 learning written to memory");
   });
 

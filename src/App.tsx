@@ -6494,6 +6494,9 @@ export default function App() {
     </section>
   );
 
+  const activeNavItem = navItems.find((item) => item.id === activeView);
+  const activeViewTitle = activeNavItem ? t(activeNavItem.labelKey) : t("nav.settings");
+
   return (
     <main className="tray-shell">
       {upgradeOverlay}
@@ -6506,7 +6509,8 @@ export default function App() {
             <button
               key={item.id}
               className={`tray-nav__item${activeView === item.id ? " is-active" : ""}`}
-              onMouseDown={() => setActiveView(item.id)}
+              aria-current={activeView === item.id ? "page" : undefined}
+              onClick={() => setActiveView(item.id)}
               type="button"
             >
               <span className="tray-nav__icon" aria-hidden="true">
@@ -6530,7 +6534,8 @@ export default function App() {
           ) : null}
           <button
             className={`tray-nav__item${activeView === "settings" ? " is-active" : ""}`}
-            onMouseDown={() => setActiveView("settings")}
+            aria-current={activeView === "settings" ? "page" : undefined}
+            onClick={() => setActiveView("settings")}
             type="button"
           >
             <span className="tray-nav__icon" aria-hidden="true">
@@ -6544,6 +6549,13 @@ export default function App() {
       </aside>
 
       <section className="tray-panel">
+        <header className="tray-panel__header">
+          <div>
+            <p className="tray-panel__eyebrow">{t("brand.tagline")}</p>
+            <h1 className="tray-panel__title">{activeViewTitle}</h1>
+          </div>
+          <span className="tray-panel__local-status">{t("brand.runsOnThisMac")}</span>
+        </header>
         <div className="tray-content" hidden={activeView !== "home"}>
             {!LOCAL_COMMUNITY_EDITION && tierMismatch ? (
               <section className="tier-mismatch-banner" role="alert">
@@ -6974,8 +6986,12 @@ export default function App() {
                           const codexShowResult =
                             codexIsLatest &&
                             !headroomLearnStatus.running &&
-                            (headroomLearnStatus.success === false ||
+                            (headroomLearnStatus.success != null ||
                               Boolean(headroomLearnStatus.error));
+                          const codexSucceeded =
+                            codexShowResult &&
+                            headroomLearnStatus.success === true &&
+                            !headroomLearnStatus.error;
                           if (!codexReady) {
                             const codexCmd = headroomLearnPrereq.codexCliAvailable
                               ? CODEX_CLI_LOGIN_CMD
@@ -7079,12 +7095,33 @@ export default function App() {
                                   </span>
                                   <div className="optimize-project-row__actions">
                                     {codexShowResult ? (
-                                      <span className="optimize-project-row__status optimize-minimal__result--failure">
-                                        {t("actions.lastRunFailed")}
+                                      <span
+                                        className={`optimize-project-row__status ${
+                                          codexSucceeded
+                                            ? "optimize-minimal__result--success"
+                                            : "optimize-minimal__result--failure"
+                                        }`}
+                                      >
+                                        {t(
+                                          codexSucceeded
+                                            ? "actions.lastRunSucceeded"
+                                            : "actions.lastRunFailed",
+                                        )}
                                       </span>
                                     ) : null}
                                   </div>
                                 </div>
+                                {!codexRunning ? (
+                                  <OptimizePanel
+                                    projectPath="codex"
+                                    source="codex"
+                                    refreshSignal={
+                                      codexIsLatest
+                                        ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
+                                        : 0
+                                    }
+                                  />
+                                ) : null}
                                 {codexShowResult && headroomLearnStatus.error ? (
                                   <div className="optimize-project-row__result">
                                     <p className="install-progress__error">

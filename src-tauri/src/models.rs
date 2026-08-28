@@ -611,6 +611,10 @@ pub struct AppliedSection {
 pub struct AppliedPatterns {
     pub claude_md: Vec<AppliedSection>,
     pub memory_md: Vec<AppliedSection>,
+    #[serde(default)]
+    pub codex_agents_md: Vec<AppliedSection>,
+    #[serde(default)]
+    pub codex_instructions_md: Vec<AppliedSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

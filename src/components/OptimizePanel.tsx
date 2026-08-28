@@ -10,6 +10,7 @@ import type { AppliedPatterns, AppliedSection } from "../lib/types";
 
 interface OptimizePanelProps {
   projectPath: string;
+  source?: "claude" | "codex";
   // Bump this to force a refetch after an external event (e.g. a Learn run
   // finishes). The value itself is ignored; only changes matter.
   refreshSignal?: number;
@@ -26,9 +27,11 @@ interface OptimizePanelProps {
 }
 
 type ModalKind = null | "claude" | "memory";
+type AppliedFileKind = "claude" | "memory" | "codex_agents" | "codex_instructions";
 
 export function OptimizePanel({
   projectPath,
+  source = "claude",
   refreshSignal,
   preloadedApplied,
   onAppliedMutated,
@@ -80,7 +83,7 @@ export function OptimizePanel({
   }, [refetch, refreshSignal]);
 
   const handleDeleteApplied = async (
-    fileKind: "claude" | "memory",
+    fileKind: AppliedFileKind,
     sectionTitle: string,
     bulletText: string,
   ) => {
@@ -109,11 +112,18 @@ export function OptimizePanel({
     }
   };
 
-  const claudeCount = applied?.claudeMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0;
-  const memoryCount = applied?.memoryMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0;
-  const claudeDisabled = applied === null || claudeCount === 0;
-  const memoryDisabled = applied === null || memoryCount === 0;
-
+  const primarySections = source === "codex"
+    ? applied?.codexAgentsMd ?? []
+    : applied?.claudeMd ?? [];
+  const secondarySections = source === "codex"
+    ? applied?.codexInstructionsMd ?? []
+    : applied?.memoryMd ?? [];
+  const primaryCount = primarySections.reduce((n, s) => n + s.bullets.length, 0);
+  const secondaryCount = secondarySections.reduce((n, s) => n + s.bullets.length, 0);
+  const primaryDisabled = applied === null || primaryCount === 0;
+  const secondaryDisabled = applied === null || secondaryCount === 0;
+  const primaryKind: AppliedFileKind = source === "codex" ? "codex_agents" : "claude";
+  const secondaryKind: AppliedFileKind = source === "codex" ? "codex_instructions" : "memory";
   if (neverScanned) {
     return (
       <span className="optimize-panel__pills">
@@ -151,35 +161,39 @@ export function OptimizePanel({
       <span className="optimize-panel__pills">
         <button
           type="button"
-          className={`optimize-panel__pill${claudeDisabled ? " optimize-panel__pill--empty" : ""}`}
+          className={`optimize-panel__pill${primaryDisabled ? " optimize-panel__pill--empty" : ""}`}
           onClick={() => setModal("claude")}
-          disabled={claudeDisabled}
+          disabled={primaryDisabled}
         >
-          {t(claudeCount === 1 ? "optimize.learningCountOne" : "optimize.learningCount", { count: claudeCount })}
+          {source === "codex"
+            ? t(primaryCount === 1 ? "optimize.codexAgentsCountOne" : "optimize.codexAgentsCount", { count: primaryCount })
+            : t(primaryCount === 1 ? "optimize.learningCountOne" : "optimize.learningCount", { count: primaryCount })}
         </button>
         <button
           type="button"
-          className={`optimize-panel__pill${memoryDisabled ? " optimize-panel__pill--empty" : ""}`}
+          className={`optimize-panel__pill${secondaryDisabled ? " optimize-panel__pill--empty" : ""}`}
           onClick={() => setModal("memory")}
-          disabled={memoryDisabled}
+          disabled={secondaryDisabled}
         >
-          {t(memoryCount === 1 ? "optimize.reminderCountOne" : "optimize.reminderCount", { count: memoryCount })}
+          {source === "codex"
+            ? t(secondaryCount === 1 ? "optimize.codexInstructionsCountOne" : "optimize.codexInstructionsCount", { count: secondaryCount })
+            : t(secondaryCount === 1 ? "optimize.reminderCountOne" : "optimize.reminderCount", { count: secondaryCount })}
         </button>
       </span>
 
       {modal === "claude" ? (
-        <Modal title={t("optimize.claudeTitle")} onClose={() => setModal(null)}>
+        <Modal title={t(source === "codex" ? "optimize.codexAgentsTitle" : "optimize.claudeTitle")} onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">{t("settings.loading")}</p>
-          ) : claudeCount === 0 ? (
+          ) : primaryCount === 0 ? (
             <p className="optimize-panel__empty">
-              {t("optimize.noLearnings")}
+              {t(source === "codex" ? "optimize.noCodexAgents" : "optimize.noLearnings")}
             </p>
           ) : (
             <AppliedSections
-              fileKind="claude"
-              sections={applied.claudeMd}
+              fileKind={primaryKind}
+              sections={primarySections}
               busyIds={busyIds}
               onDelete={handleDeleteApplied}
             />
@@ -188,18 +202,18 @@ export function OptimizePanel({
       ) : null}
 
       {modal === "memory" ? (
-        <Modal title={t("optimize.memoryTitle")} onClose={() => setModal(null)}>
+        <Modal title={t(source === "codex" ? "optimize.codexInstructionsTitle" : "optimize.memoryTitle")} onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">{t("settings.loading")}</p>
-          ) : memoryCount === 0 ? (
+          ) : secondaryCount === 0 ? (
             <p className="optimize-panel__empty">
-              {t("optimize.noReminders")}
+              {t(source === "codex" ? "optimize.noCodexInstructions" : "optimize.noReminders")}
             </p>
           ) : (
             <AppliedSections
-              fileKind="memory"
-              sections={applied.memoryMd}
+              fileKind={secondaryKind}
+              sections={secondarySections}
               busyIds={busyIds}
               onDelete={handleDeleteApplied}
             />
@@ -254,11 +268,11 @@ function AppliedSections({
   busyIds,
   onDelete,
 }: {
-  fileKind: "claude" | "memory";
+  fileKind: AppliedFileKind;
   sections: AppliedSection[];
   busyIds: Set<string>;
   onDelete: (
-    fileKind: "claude" | "memory",
+    fileKind: AppliedFileKind,
     sectionTitle: string,
     bulletText: string,
   ) => Promise<void> | void;

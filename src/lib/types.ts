@@ -439,6 +439,8 @@ export interface AppliedSection {
 export interface AppliedPatterns {
   claudeMd: AppliedSection[];
   memoryMd: AppliedSection[];
+  codexAgentsMd?: AppliedSection[];
+  codexInstructionsMd?: AppliedSection[];
 }
 
 export interface RtkTodayStats {

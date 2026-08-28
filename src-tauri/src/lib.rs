@@ -3577,7 +3577,7 @@ fn spawn_activity_observer(app: AppHandle) {
         // proxy fetch lands a few seconds after the proxy is actually up.
         std::thread::sleep(std::time::Duration::from_secs(3));
         loop {
-            run_activity_observation(&app);
+            run_activity_observation(&app, None);
             std::thread::sleep(ACTIVITY_OBSERVER_INTERVAL);
         }
     });
@@ -3601,7 +3601,7 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
     });
 }
 
-fn run_activity_observation(app: &AppHandle) {
+fn run_activity_observation(app: &AppHandle, preferred_target: Option<&str>) {
     let state: tauri::State<'_, AppState> = app.state();
 
     let _ = state.maybe_emit_weekly_recap();
@@ -3631,7 +3631,7 @@ fn run_activity_observation(app: &AppHandle) {
     // Collect current bullet sets for every project the user has touched
     // today, so `observe_learnings_today` has a baseline regardless of which
     // one ends up being "most active".
-    let project_inputs: Vec<crate::activity_facts::LearningsProjectInput> = projects
+    let mut project_inputs: Vec<crate::activity_facts::LearningsProjectInput> = projects
         .iter()
         .filter(|p| p.sessions_today > 0)
         .map(|p| {
@@ -3645,17 +3645,34 @@ fn run_activity_observation(app: &AppHandle) {
         })
         .collect();
 
+    let codex_applied = read_applied_patterns_for_codex();
+    project_inputs.push(crate::activity_facts::LearningsProjectInput {
+        project_path: "codex".into(),
+        project_display_name: "Codex sessions".into(),
+        claude_md_bullets: flatten_applied_bullets(&codex_applied.codex_agents_md),
+        memory_md_bullets: flatten_applied_bullets(&codex_applied.codex_instructions_md),
+    });
+
     // Most active = highest sessions_today; ties broken by most recent
     // last_worked_at so the chip tracks what the user is working on right now.
-    let active_project_path = projects
-        .iter()
-        .filter(|p| p.sessions_today > 0)
-        .max_by(|a, b| {
-            a.sessions_today
-                .cmp(&b.sessions_today)
-                .then(a.last_worked_at.cmp(&b.last_worked_at))
+    let active_project_path = preferred_target
+        .filter(|target| {
+            project_inputs
+                .iter()
+                .any(|input| input.project_path.as_str() == *target)
         })
-        .map(|p| p.project_path.clone());
+        .map(str::to_string)
+        .or_else(|| {
+            projects
+                .iter()
+                .filter(|p| p.sessions_today > 0)
+                .max_by(|a, b| {
+                    a.sessions_today
+                        .cmp(&b.sessions_today)
+                        .then(a.last_worked_at.cmp(&b.last_worked_at))
+                })
+                .map(|p| p.project_path.clone())
+        });
 
     let _ = state.observe_learnings_today(
         patterns_today,
@@ -3769,7 +3786,7 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
 async fn list_applied_patterns(
     project_path: String,
 ) -> Result<crate::models::AppliedPatterns, String> {
-    Ok(read_applied_patterns_for_project(&project_path))
+    Ok(read_applied_patterns_for_target(&project_path))
 }
 
 #[tauri::command]
@@ -3778,10 +3795,18 @@ async fn list_applied_patterns_for_projects(
 ) -> Result<std::collections::HashMap<String, crate::models::AppliedPatterns>, String> {
     let mut out = std::collections::HashMap::with_capacity(project_paths.len());
     for p in project_paths {
-        let patterns = read_applied_patterns_for_project(&p);
+        let patterns = read_applied_patterns_for_target(&p);
         out.insert(p, patterns);
     }
     Ok(out)
+}
+
+fn read_applied_patterns_for_target(target: &str) -> crate::models::AppliedPatterns {
+    if target == "codex" {
+        read_applied_patterns_for_codex()
+    } else {
+        read_applied_patterns_for_project(target)
+    }
 }
 
 fn read_applied_patterns_for_project(project_path: &str) -> crate::models::AppliedPatterns {
@@ -3791,6 +3816,23 @@ fn read_applied_patterns_for_project(project_path: &str) -> crate::models::Appli
     crate::models::AppliedPatterns {
         claude_md: read_applied_block(&claude_md),
         memory_md: read_applied_block(&memory_md),
+        codex_agents_md: Vec::new(),
+        codex_instructions_md: Vec::new(),
+    }
+}
+
+fn read_applied_patterns_for_codex() -> crate::models::AppliedPatterns {
+    read_applied_patterns_for_codex_home(&crate::client_adapters::codex_home())
+}
+
+fn read_applied_patterns_for_codex_home(
+    codex_home: &std::path::Path,
+) -> crate::models::AppliedPatterns {
+    crate::models::AppliedPatterns {
+        claude_md: Vec::new(),
+        memory_md: Vec::new(),
+        codex_agents_md: read_applied_block(&codex_home.join("AGENTS.md")),
+        codex_instructions_md: read_applied_block(&codex_home.join("instructions.md")),
     }
 }
 
@@ -3821,6 +3863,8 @@ async fn delete_applied_pattern(
     let path = match file_kind.as_str() {
         "claude" => claude_learn_md_path(&project_path),
         "memory" => crate::tool_manager::claude_project_memory_file(&project_path),
+        "codex_agents" => crate::client_adapters::codex_home().join("AGENTS.md"),
+        "codex_instructions" => crate::client_adapters::codex_home().join("instructions.md"),
         other => return Err(format!("Unknown file_kind: {other}")),
     };
     if !path.exists() {
@@ -3968,10 +4012,16 @@ async fn start_headroom_learn(
     }
 
     let app_handle = app.clone();
+    let activity_target = target.run_key.clone();
     std::thread::spawn(move || {
+        // Establish a pre-run file baseline so a successful Learn run can be
+        // attributed immediately instead of being mistaken for the day's
+        // initial zero-count observation.
+        run_activity_observation(&app_handle, Some(&activity_target));
         let state: tauri::State<'_, AppState> = app_handle.state();
         let run = execute_headroom_learn_run(&state, agent, project_path.as_deref());
         state.complete_headroom_learn_run(run.success, run.summary, run.error, run.output_tail);
+        run_activity_observation(&app_handle, Some(&activity_target));
     });
 
     Ok(())
@@ -9438,6 +9488,30 @@ Some unrelated content.
 ";
         std::fs::write(&path, content).expect("write CLAUDE.md");
         path
+    }
+
+    #[test]
+    fn read_codex_applied_patterns_reads_agents_and_instructions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = "<!-- headroom:learn:start -->\n## Headroom Learned Patterns\n### Tool discipline\n- Read once before editing.\n<!-- headroom:learn:end -->\n";
+        let instructions = "<!-- headroom:learn:start -->\n## Headroom Learned Patterns\n### Retry discipline\n- Retry only after state changes.\n<!-- headroom:learn:end -->\n";
+        std::fs::write(tmp.path().join("AGENTS.md"), agents).unwrap();
+        std::fs::write(tmp.path().join("instructions.md"), instructions).unwrap();
+
+        let result = super::read_applied_patterns_for_codex_home(tmp.path());
+
+        assert_eq!(result.codex_agents_md.len(), 1);
+        assert_eq!(
+            result.codex_agents_md[0].bullets,
+            ["Read once before editing."]
+        );
+        assert_eq!(result.codex_instructions_md.len(), 1);
+        assert_eq!(
+            result.codex_instructions_md[0].bullets,
+            ["Retry only after state changes."]
+        );
+        assert!(result.claude_md.is_empty());
+        assert!(result.memory_md.is_empty());
     }
 
     #[test]
