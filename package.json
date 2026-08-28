@@ -1,6 +1,6 @@
 {
   "name": "headroom-local-community",
-  "version": "0.8.9",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "scripts": {
