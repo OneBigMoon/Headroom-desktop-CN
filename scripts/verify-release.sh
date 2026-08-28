@@ -15,7 +15,9 @@ echo "Running desktop tests..."
 if command -v cargo-nextest >/dev/null 2>&1; then
   cargo nextest run --manifest-path src-tauri/Cargo.toml
 else
-  npm run test:desktop
+  # Several desktop tests temporarily mutate process-global environment.
+  # Match the release workflow's serial execution when nextest is unavailable.
+  npm run test:desktop -- -- --test-threads=1
 fi
 
 echo "Release checks passed."
