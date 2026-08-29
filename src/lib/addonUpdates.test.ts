@@ -21,7 +21,7 @@ function tool(overrides: Partial<ManagedTool>): ManagedTool {
 
 describe("addon update checks", () => {
   it("compares normalized numeric versions", () => {
-    expect(compareAddonVersions("v4.0.3", "4.0.2")).toBe(1);
+    expect(compareAddonVersions("v4.0.4", "4.0.3")).toBe(1);
     expect(compareAddonVersions("4.0", "4.0.0")).toBe(0);
     expect(compareAddonVersions("latest", "4.0.0")).toBeNull();
   });
@@ -33,13 +33,13 @@ describe("addon update checks", () => {
         tool({ id: "ponytail", version: "4.8.0", supportedVersion: "latest" }),
       ],
       [
-        { id: "context7", latestVersion: "4.0.3", error: null },
+        { id: "context7", latestVersion: "4.0.4", error: null },
         { id: "ponytail", latestVersion: "4.9.0", error: null },
       ],
     );
 
     expect(checked[0]).toMatchObject({
-      upstreamVersion: "4.0.3",
+      upstreamVersion: "4.0.4",
       upstreamUpdateAvailable: true,
       updateRequiresAppUpdate: true,
     });
@@ -54,7 +54,7 @@ describe("addon update checks", () => {
   it("does not show update notices for uninstalled tools", () => {
     const [checked] = applyAddonUpdateChecks(
       [tool({ status: "not_installed" })],
-      [{ id: "context7", latestVersion: "4.0.3", error: null }],
+      [{ id: "context7", latestVersion: "4.0.4", error: null }],
     );
     expect(checked.upstreamUpdateAvailable).toBeUndefined();
   });
@@ -73,18 +73,18 @@ describe("addon update checks", () => {
       [
         tool({
           version: "4.0.2",
-          supportedVersion: "4.0.3",
+          supportedVersion: "4.0.4",
           updateAvailable: true,
-          availableVersion: "4.0.3",
+          availableVersion: "4.0.4",
         }),
       ],
-      [{ id: "context7", latestVersion: "4.0.3", error: null }],
+      [{ id: "context7", latestVersion: "4.0.4", error: null }],
     );
 
     expect(checked).toMatchObject({
       updateAvailable: true,
-      availableVersion: "4.0.3",
-      upstreamVersion: "4.0.3",
+      availableVersion: "4.0.4",
+      upstreamVersion: "4.0.4",
       upstreamUpdateAvailable: true,
       updateRequiresAppUpdate: false,
     });

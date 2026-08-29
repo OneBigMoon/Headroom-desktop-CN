@@ -200,8 +200,8 @@ mod tests {
             Some("0.1.7")
         );
         assert_eq!(
-            json_version(&json!({ "version": "4.0.3" }), "/version").as_deref(),
-            Some("4.0.3")
+            json_version(&json!({ "version": "4.0.4" }), "/version").as_deref(),
+            Some("4.0.4")
         );
     }
 }

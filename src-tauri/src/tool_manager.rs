@@ -1039,7 +1039,7 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
 const RTK_VERSION: &str = "0.46.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.3";
+const CONTEXT7_PINNED_VERSION: &str = "4.0.4";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
