@@ -29,6 +29,7 @@ import {
   mergeProviderSavingsForDisplay,
   percent1,
   savingsRate,
+  shouldShowConnectorDetectionWarning,
   sortClientConnectors
 } from "./dashboardHelpers";
 import type {
@@ -319,6 +320,28 @@ describe("dashboard helpers", () => {
       text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.",
       tone: "reason"
     });
+  });
+
+  it("shows missing-client guidance only for enabled connectors", () => {
+    const connector: ClientConnectorStatus = {
+      clientId: "grok_build",
+      name: "Grok Build",
+      installed: false,
+      enabled: false,
+      verified: false
+    };
+
+    expect(shouldShowConnectorDetectionWarning(connector)).toBe(false);
+    expect(
+      shouldShowConnectorDetectionWarning({ ...connector, enabled: true })
+    ).toBe(true);
+    expect(
+      shouldShowConnectorDetectionWarning({
+        ...connector,
+        enabled: true,
+        installed: true
+      })
+    ).toBe(false);
   });
 
   it("keeps codex, grok_build and opencode alongside claude_code as supported connectors", () => {

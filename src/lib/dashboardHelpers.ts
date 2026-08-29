@@ -617,6 +617,12 @@ export type ConnectorStatusLine = {
   tone: "reason" | "restart";
 };
 
+export function shouldShowConnectorDetectionWarning(
+  connector: ClientConnectorStatus
+): boolean {
+  return connector.enabled && !connector.installed;
+}
+
 // A client picks up routing only when it restarts, and nothing local tells us
 // whether the user did. Rather than nag forever, the hint rides the configure
 // timestamp: relevant right after enabling, gone by the next day.

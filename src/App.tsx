@@ -148,6 +148,7 @@ import {
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
+  shouldShowConnectorDetectionWarning,
   sortClientConnectors,
   startOfDay,
   startOfMonth,
@@ -3777,7 +3778,7 @@ export default function App() {
   }
 
   function getConnectorDetectionWarning(connector: ClientConnectorStatus) {
-    if (connector.installed) {
+    if (!shouldShowConnectorDetectionWarning(connector)) {
       return null;
     }
     return connectorUnavailableReasons[connector.clientId] ?? null;
