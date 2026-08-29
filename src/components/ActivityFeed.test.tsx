@@ -690,7 +690,7 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("demo-repo");
   });
 
-  it("omits the project chip when no project is active today", () => {
+  it("treats a persisted zero-count learnings milestone as empty", () => {
     const data: LearningsMilestoneEvent = {
       observedAt: "2026-04-22T10:00:00Z",
       patternsToday: 0,
@@ -701,7 +701,8 @@ describe("ActivityFeed", () => {
     };
     const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Today&#x27;s additions: 0 patterns identified");
+    expect(markup).toContain("No patterns, reminders, or learnings have been written today.");
+    expect(markup).not.toContain("Today&#x27;s additions:");
     expect(markup).not.toContain("activity-feed__project");
   });
 
@@ -767,6 +768,25 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Rescan");
     expect(markup).toContain("4 active days");
     expect(markup).toContain("demo-repo");
+  });
+
+  it("passes the suggested target when navigating to Optimize", async () => {
+    const onNavigate = vi.fn();
+    const feed = feedWith({
+      trainSuggestion: {
+        observedAt: "2026-04-22T10:00:00Z",
+        projectPath: "codex",
+        projectDisplayName: "Codex sessions",
+        sessionCount: 7,
+        activeDaysSinceLastLearn: 0,
+        kind: "never_trained"
+      }
+    });
+    render(<ActivityFeed feed={feed} error={null} onNavigateToOptimize={onNavigate} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Try Optimize/ }));
+
+    expect(onNavigate).toHaveBeenCalledWith("codex");
   });
 
   it("omits the clickable affordance when onNavigateToOptimize is not provided", () => {

@@ -333,7 +333,13 @@ export function CommunityApp() {
       errors.push(describeError(projectsResult.reason, t));
     }
     if (prereqResult.status === "fulfilled") {
-      setLearnPrereq(prereqResult.value);
+      const prereq = prereqResult.value;
+      setLearnPrereq(prereq);
+      const hasClaudeProjects = projectsResult.status === "fulfilled" && projectsResult.value.length > 0;
+      if (prereq.codexCliAvailable && prereq.codexLoggedIn
+        && (!prereq.claudeCliAvailable || !hasClaudeProjects)) {
+        setLearnAgent((current) => current === "claude" ? "codex" : current);
+      }
     } else {
       errors.push(describeError(prereqResult.reason, t));
     }
@@ -957,7 +963,15 @@ export function CommunityApp() {
                 error={activityError}
                 feed={activityFeed}
                 loaded={activityLoaded}
-                onNavigateToOptimize={() => setActiveView("optimize")}
+              onNavigateToOptimize={(projectPath) => {
+                if (projectPath === "codex") {
+                  setLearnAgent("codex");
+                } else if (projectPath) {
+                  setLearnAgent("claude");
+                  setSelectedClaudeProjectPath(projectPath);
+                }
+                setActiveView("optimize");
+              }}
                 rtkInstalled={rtkInstalled}
                 serenaInstalled={serenaInstalled}
               />

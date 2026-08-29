@@ -3644,6 +3644,7 @@ fn run_activity_observation(app: &AppHandle, preferred_target: Option<&str>) {
     }
 
     let projects = state.list_claude_code_projects().unwrap_or_default();
+    let codex_project = state.codex_sessions_activity_project();
 
     // Memory.db "patterns today" comes from the export JSON's `created_at`
     // field. Everything else (reminders / learnings today) is derived from
@@ -3695,6 +3696,7 @@ fn run_activity_observation(app: &AppHandle, preferred_target: Option<&str>) {
         .or_else(|| {
             projects
                 .iter()
+                .chain(codex_project.iter())
                 .filter(|p| p.sessions_today > 0)
                 .max_by(|a, b| {
                     a.sessions_today
@@ -3710,11 +3712,20 @@ fn run_activity_observation(app: &AppHandle, preferred_target: Option<&str>) {
         active_project_path.as_deref(),
     );
 
-    // No point nudging the user to run Train if the claude CLI isn't installed —
-    // they'd just hit an install prompt. The Optimize tab surfaces the install
-    // UI in that case; let them fix prereqs first.
-    if state.headroom_learn_prereq_status().claude_cli_available {
-        let _ = state.observe_train_suggestions(&projects);
+    // Only publish suggestions whose analyzer is ready; otherwise the CTA leads
+    // directly to an install or sign-in prompt. Codex is one synthetic target
+    // because its Learn run scans all of ~/.codex/sessions at once.
+    let prereq = state.headroom_learn_prereq_status();
+    let mut suggestion_projects = if prereq.claude_cli_available {
+        projects.clone()
+    } else {
+        Vec::new()
+    };
+    if prereq.codex_cli_available && prereq.codex_logged_in {
+        suggestion_projects.extend(codex_project);
+    }
+    if !suggestion_projects.is_empty() {
+        let _ = state.observe_train_suggestions(&suggestion_projects);
     }
 }
 

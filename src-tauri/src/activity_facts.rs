@@ -644,9 +644,40 @@ impl ActivityFacts {
             project_display_name,
         };
 
-        if self.last_learnings_milestone.as_ref() != Some(&event) {
-            self.last_learnings_milestone = Some(event.clone());
-            self.dirty = true;
+        let has_progress = patterns_today > 0 || reminders_today > 0 || learnings_today > 0;
+        if !has_progress {
+            // A zero-count observation is not a milestone. Clear yesterday's
+            // event or an older persisted zero event, but keep today's real
+            // milestone across a transient read failure.
+            let should_clear = day_changed
+                || self
+                    .last_learnings_milestone
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        previous.patterns_today == 0
+                            && previous.reminders_today == 0
+                            && previous.learnings_today == 0
+                    });
+            if should_clear && self.last_learnings_milestone.take().is_some() {
+                self.dirty = true;
+            }
+        } else {
+            // `observed_at` is a polling timestamp, not a milestone change.
+            // Keep the original timestamp unless the visible contents differ.
+            let unchanged = self
+                .last_learnings_milestone
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous.patterns_today == event.patterns_today
+                        && previous.reminders_today == event.reminders_today
+                        && previous.learnings_today == event.learnings_today
+                        && previous.project_path == event.project_path
+                        && previous.project_display_name == event.project_display_name
+                });
+            if !unchanged {
+                self.last_learnings_milestone = Some(event.clone());
+                self.dirty = true;
+            }
         }
         event
     }
@@ -1651,6 +1682,62 @@ mod tests {
         assert_eq!(event.reminders_today, 0);
         assert!(event.project_path.is_none());
         assert!(event.project_display_name.is_none());
+        assert!(facts.last_learnings_milestone.is_none());
+    }
+
+    #[test]
+    fn learnings_today_clears_a_persisted_zero_milestone() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        let zero_event = facts.observe_learnings_today(0, Vec::new(), None, at(10, 0));
+        facts.last_learnings_milestone = Some(zero_event);
+        facts.dirty = false;
+
+        facts.observe_learnings_today(0, Vec::new(), None, at(11, 0));
+
+        assert!(facts.last_learnings_milestone.is_none());
+        assert!(facts.dirty);
+    }
+
+    #[test]
+    fn learnings_today_does_not_refresh_an_unchanged_nonzero_milestone() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        facts.observe_learnings_today(1, Vec::new(), None, at(10, 0));
+        facts.dirty = false;
+        facts.observe_learnings_today(1, Vec::new(), None, at(11, 0));
+
+        assert_eq!(
+            facts
+                .last_learnings_milestone
+                .as_ref()
+                .expect("nonzero milestone")
+                .observed_at,
+            at(10, 0)
+        );
+        assert!(!facts.dirty);
+    }
+
+    #[test]
+    fn learnings_today_keeps_same_day_progress_across_a_zero_observation() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        facts.observe_learnings_today(1, Vec::new(), None, at(10, 0));
+        facts.dirty = false;
+        facts.observe_learnings_today(0, Vec::new(), None, at(11, 0));
+
+        assert_eq!(
+            facts
+                .last_learnings_milestone
+                .as_ref()
+                .expect("same-day milestone")
+                .patterns_today,
+            1
+        );
+        assert!(!facts.dirty);
     }
 
     #[test]

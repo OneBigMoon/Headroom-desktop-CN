@@ -2640,6 +2640,22 @@ impl AppState {
         Ok(projects)
     }
 
+    /// Returns one activity target representing all locally recorded Codex sessions.
+    ///
+    /// Codex sessions are not grouped by project directory, but ActivityFacts needs
+    /// the same learn metadata shape as Claude Code projects.  Keep this synthetic
+    /// target stable so its learn summary and activity history have one key.
+    pub(crate) fn codex_sessions_activity_project(&self) -> Option<ClaudeCodeProject> {
+        self.codex_sessions_activity_project_in(&codex_sessions_dir())
+    }
+
+    fn codex_sessions_activity_project_in(&self, sessions_dir: &Path) -> Option<ClaudeCodeProject> {
+        let scan = collect_codex_sessions_scan(sessions_dir)?;
+        let mut project = build_claude_code_project(&self.tool_manager, "codex".to_string(), scan)?;
+        project.display_name = "Codex sessions".to_string();
+        Some(project)
+    }
+
     fn cached_claude_code_projects_fresh(&self) -> Option<Vec<ClaudeCodeProject>> {
         let cache = self.cached_claude_code_projects.lock();
         if let Some((ref projects, at)) = *cache {
@@ -3807,6 +3823,10 @@ fn claude_projects_dir() -> PathBuf {
     user_home_dir().join(".claude").join("projects")
 }
 
+fn codex_sessions_dir() -> PathBuf {
+    user_home_dir().join(".codex").join("sessions")
+}
+
 #[derive(Debug, Default)]
 struct ClaudeProjectScan {
     last_worked_at: Option<std::time::SystemTime>,
@@ -3910,6 +3930,60 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
             .ok()
     });
     files
+}
+
+fn collect_codex_sessions_scan(sessions_dir: &Path) -> Option<ClaudeProjectScan> {
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+
+    let mut pending = vec![sessions_dir.to_path_buf()];
+    let mut session_files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                    .unwrap_or(false)
+            {
+                session_files.push(path);
+            }
+        }
+    }
+
+    if session_files.is_empty() {
+        return None;
+    }
+
+    let last_worked_at = session_files
+        .iter()
+        .filter_map(|file| {
+            std::fs::metadata(file)
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+        .max();
+    let mut scan = ClaudeProjectScan {
+        last_worked_at,
+        ..Default::default()
+    };
+    scan.add_session_files(session_files);
+    if scan.last_worked_at.is_some() {
+        Some(scan)
+    } else {
+        None
+    }
 }
 
 fn canonical_session_file_path(path: &Path) -> PathBuf {
@@ -11891,5 +11965,42 @@ mod tests {
         assert_eq!(support_tier_for_platform("linux"), "experimental");
         assert_eq!(support_tier_for_platform("windows"), "experimental");
         assert_eq!(support_tier_for_platform("macos"), "stable");
+    }
+
+    #[test]
+    fn codex_sessions_activity_project_recurses_and_ignores_non_jsonl_files() {
+        let base_dir = temp_test_dir("headroom-codex-activity-project");
+        let sessions_dir = base_dir.join("sessions");
+        let nested_dir = sessions_dir.join("2026").join("08").join("29");
+        fs::create_dir_all(&nested_dir).expect("create nested sessions directory");
+        fs::write(sessions_dir.join("root.jsonl"), "{}\n").expect("write root session");
+        fs::write(nested_dir.join("nested.JSONL"), "{}\n").expect("write nested session");
+        fs::write(nested_dir.join("notes.txt"), "not a session\n").expect("write non-session");
+
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let project = state
+            .codex_sessions_activity_project_in(&sessions_dir)
+            .expect("Codex sessions project");
+
+        assert_eq!(project.project_path, "codex");
+        assert_eq!(project.display_name, "Codex sessions");
+        assert_eq!(project.session_count, 2);
+        assert_eq!(project.sessions_today, 2);
+
+        fs::remove_dir_all(&base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn codex_sessions_activity_project_is_absent_for_an_empty_directory() {
+        let base_dir = temp_test_dir("headroom-empty-codex-activity-project");
+        let sessions_dir = base_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create empty sessions directory");
+
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(state
+            .codex_sessions_activity_project_in(&sessions_dir)
+            .is_none());
+
+        fs::remove_dir_all(&base_dir).expect("remove temp dir");
     }
 }

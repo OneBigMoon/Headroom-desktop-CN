@@ -29,6 +29,10 @@ let ponytailEnabled = true;
 let ponytailMode = "ultra";
 let autoLearnEnabled = true;
 let autostartEnabled = false;
+let claudeCliAvailable = true;
+let codexCliAvailable = true;
+let codexLoggedIn = true;
+let exposeClaudeProjects = true;
 let learnStatus: HeadroomLearnStatus = {
   running: false,
   projectPath: "/Users/example/project",
@@ -186,6 +190,10 @@ beforeEach(() => {
   ponytailMode = "ultra";
   autoLearnEnabled = true;
   autostartEnabled = false;
+  claudeCliAvailable = true;
+  codexCliAvailable = true;
+  codexLoggedIn = true;
+  exposeClaudeProjects = true;
   runtime.headroomLearnSupported = true;
   runtime.headroomLearnDisabledReason = null;
   learnStatus = {
@@ -208,14 +216,14 @@ beforeEach(() => {
       case "get_activity_feed":
         return Promise.resolve(activityFeed);
       case "get_claude_code_projects":
-        return Promise.resolve(claudeProjects);
+        return Promise.resolve(exposeClaudeProjects ? claudeProjects : []);
       case "get_headroom_learn_prereq_status":
         return Promise.resolve({
-          claudeCliAvailable: true,
-          claudeCliPath: "/usr/local/bin/claude",
-          codexCliAvailable: true,
-          codexCliPath: "/usr/local/bin/codex",
-          codexLoggedIn: true,
+          claudeCliAvailable,
+          claudeCliPath: claudeCliAvailable ? "/usr/local/bin/claude" : null,
+          codexCliAvailable,
+          codexCliPath: codexCliAvailable ? "/usr/local/bin/codex" : null,
+          codexLoggedIn,
         });
       case "get_headroom_learn_status":
         return Promise.resolve(learnStatus);
@@ -430,6 +438,29 @@ describe("CommunityApp", () => {
       expect(invokeMock).toHaveBeenCalledWith("start_headroom_learn", {
         agent: "claude",
         projectPath: "/Users/example/project",
+      });
+    });
+  });
+
+  it("defaults Learn to Codex when no usable Claude source exists", async () => {
+    claudeCliAvailable = false;
+    exposeClaudeProjects = false;
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Optimize" }));
+    expect(await screen.findByRole("heading", { name: "Scan local coding sessions" })).toBeInTheDocument();
+
+    const agentSelect = screen.getByLabelText("Session source");
+    await waitFor(() => expect(agentSelect).toHaveValue("codex"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Learn" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start Learn" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("start_headroom_learn", {
+        agent: "codex",
+        projectPath: null,
       });
     });
   });

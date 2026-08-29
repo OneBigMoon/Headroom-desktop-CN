@@ -25,10 +25,10 @@ interface ActivityFeedProps {
   // prop is a default placeholder whose `proxyReachable: false` would
   // otherwise render the "proxy unreachable" state on initial load.
   loaded?: boolean;
-  // Invoked when a TrainSuggestion row is clicked, so the parent can switch
-  // tabs. Left optional so the component keeps rendering in contexts that
-  // can't navigate (tests, embedded previews).
-  onNavigateToOptimize?: () => void;
+  // Invoked with the suggested target when a TrainSuggestion row is clicked,
+  // so the parent can open Optimize on the matching session source. Left
+  // optional for contexts that cannot navigate (tests, embedded previews).
+  onNavigateToOptimize?: (projectPath?: string) => void;
   // RTK and Serena are opt-in, so their tiles (and empty placeholders) only
   // render for users who installed them. Data in the slot still wins: stats
   // from a just-uninstalled addon render rather than vanish mid-session.
@@ -98,10 +98,18 @@ export function ActivityFeed({
 }: ActivityFeedProps) {
   const { t } = useI18n();
   const { tiles } = feed;
+  const learningsMilestone = tiles.learningsMilestone
+    && (
+      tiles.learningsMilestone.patternsToday > 0
+      || tiles.learningsMilestone.remindersToday > 0
+      || tiles.learningsMilestone.learningsToday > 0
+    )
+    ? tiles.learningsMilestone
+    : null;
   // "Waiting for proxy" only fires when we've got nothing to show AND the
   // proxy isn't answering. If any slot is populated (persisted state from a
   // prior session), fall through to render it even while the proxy is down.
-  const hasAnyTile = Object.values(tiles).some((v) => v != null);
+  const hasAnyTile = Object.values({ ...tiles, learningsMilestone }).some((v) => v != null);
 
   return (
     <>
@@ -144,8 +152,8 @@ export function ActivityFeed({
           ) : (
             <EmptyTile kind="transformation" />
           )}
-          {tiles.learningsMilestone ? (
-            <LearningsMilestoneRow event={tiles.learningsMilestone} />
+          {learningsMilestone ? (
+            <LearningsMilestoneRow event={learningsMilestone} />
           ) : (
             <EmptyTile kind="learningsMilestone" />
           )}
@@ -183,7 +191,7 @@ function EmptyTile({
   onNavigateToOptimize
 }: {
   kind: TileKind;
-  onNavigateToOptimize?: () => void;
+  onNavigateToOptimize?: (projectPath?: string) => void;
 }) {
   const { t } = useI18n();
   const { badgeClass, badgeLabelKey, copyKey, itemModifier } = EMPTY_TILE_COPY[kind];
@@ -1035,7 +1043,7 @@ function TrainSuggestionRow({
   onNavigate
 }: {
   event: TrainSuggestionEvent;
-  onNavigate?: () => void;
+  onNavigate?: (projectPath: string) => void;
 }) {
   const { t } = useI18n();
   const isNeverTrained = event.kind === "never_trained";
@@ -1045,7 +1053,7 @@ function TrainSuggestionRow({
     : t("activity.train.stale", { count: event.activeDaysSinceLastLearn, project: event.projectDisplayName });
   const canNavigate = typeof onNavigate === "function";
   const handleActivate = () => {
-    if (canNavigate) onNavigate?.();
+    if (canNavigate) onNavigate?.(event.projectPath);
   };
   /* v8 ignore start — keyboard activation requires a DOM; see ExpandableRow. */
   const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
