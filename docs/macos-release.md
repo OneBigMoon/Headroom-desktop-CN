@@ -1,338 +1,114 @@
-# macOS Release and App Updates
+# macOS 发布说明
 
-Headroom is set up for outside-the-App-Store macOS distribution with:
+本项目仅通过 `.github/workflows/release-community-macos.yml` 发布 macOS Community 版本。工作流只响应稳定的 `vX.Y.Z` 标签，不提供 `workflow_dispatch`；构建要求版本文件、标签和发布说明一致。
 
-- Tauri's official updater plugin
-- signed updater artifacts
-- user-confirmed install prompts
-- Apple code signing and notarization
+## 发布流程
 
-## Build a signed DMG locally
+工作流分为只读的构建验证 Job 和有写权限的发布 Job：
 
-If your Apple Developer access is ready on your Mac, the fastest local path is:
+1. 构建 Job 在 `macos-14` 上检出代码，运行 `scripts/verify-release.sh`、前端测试、Rust 测试和 universal macOS 构建。
+2. 构建 Job 对 `.app` 做完整 `codesign --verify --deep --strict` 验签，并校验 DMG、updater tar.gz、sig 和 `latest.json` 的数量与名称。
+3. 构建 Job 将已验证产物和 `.github/release-notes/<版本>.md` 上传为短期 artifact。
+4. 发布 Job 下载该 artifact，创建 GitHub draft Release；随后通过 GitHub 返回的远端 SHA-256 digest 逐个核对资产。
+5. 只有远端 digest 全部匹配时，发布 Job 才把 draft Release 公开；仓库必须预先启用 release immutability，该设置只保护启用后创建的 Release。
+6. 公开后，工作流确认 Release 已不可变，并从 tag 下载地址重新下载四个资产，与 staging 内容逐字节比较。
+7. 工作流再从 `releases/latest/download/latest.json` 下载真实 updater 清单，确认版本、URL 和签名均指向本次 Release。
+
+发布仓库是 [`OneBigMoon/Headroom-macos`](https://github.com/OneBigMoon/Headroom-macos)。
+
+## 发布资产
+
+每个稳定 Release 应包含以下资产：
+
+```text
+Headroom.Local.Community_<版本>_universal.dmg
+Headroom.Local.Community_universal.app.tar.gz
+Headroom.Local.Community_universal.app.tar.gz.sig
+latest.json
+```
+
+原始 `.app` 仅用于构建阶段验签，不作为 Release 下载资产。`latest.json` 是 Tauri updater 清单；updater endpoint 为：
+
+```text
+https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json
+```
+
+## 发布前不可变设置
+
+首次发布前，在 GitHub 仓库 `Settings` 的 `Releases` 区域启用 `Enable release immutability`。该设置只作用于以后发布的 Release。工作流会在公开后立即检查 `immutable` 字段；若新公开的 Release 仍可修改，会立刻恢复为 draft 并让门禁失败，但发布前仍必须人工确认设置已启用，避免短暂公开窗口。
+
+## 故障版本回滚
+
+不可变 Release 发布后不能修改标签、资产、draft 或 prerelease 状态。常规回滚应从上一稳定提交恢复代码、提升到新的补丁版本并发布 recovery Release；不要移动标签、覆盖资产或复用故障版本号。
+
+若 recovery Release 尚未准备好且必须立即撤下故障版本，只能在明确确认后删除该 Release，使 `releases/latest` 回到上一稳定版。保留故障标签作为审计记录，且永远不要复用该标签名：
 
 ```bash
-npm install
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export TAURI_SIGNING_PRIVATE_KEY="$(cat .secrets/tauri-updater/private.key)"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="your-updater-key-password"
-export APPLE_API_ISSUER="your-app-store-connect-issuer-id"
-export APPLE_API_KEY="your-app-store-connect-key-id"
-export APPLE_API_KEY_PATH="$HOME/.private_keys/AuthKey_ABC123XYZ.p8"
-export HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
-export HEADROOM_UPDATER_PUBLIC_KEY="$(cat .secrets/tauri-updater/public.key)"
-export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
-npm run build:mac:dmg
+set -euo pipefail
+
+REPO="OneBigMoon/Headroom-macos"
+BAD_TAG="vX.Y.Z"
+GOOD_TAG="vA.B.C"
+GOOD_VERSION="${GOOD_TAG#v}"
+
+bad_id="$(gh api "repos/${REPO}/releases/tags/${BAD_TAG}" --jq '.id')"
+gh api --method DELETE "repos/${REPO}/releases/${bad_id}"
+
+test "$(gh api "repos/${REPO}/releases/latest" --jq '.tag_name')" = "${GOOD_TAG}"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+feed="https://github.com/${REPO}/releases/latest/download/latest.json"
+updater_name="Headroom.Local.Community_universal.app.tar.gz"
+
+curl -fsSL -H 'Cache-Control: no-cache' "${feed}" -o "${tmp}/latest.json"
+jq -e --arg version "${GOOD_VERSION}" --arg tag "${GOOD_TAG}" '
+  .version == $version
+  and ([.platforms[]?.url] | length > 0)
+  and ([.platforms[]?.url] | all(contains("/download/" + $tag + "/")))
+' "${tmp}/latest.json" >/dev/null
+
+for name in \
+  "Headroom.Local.Community_${GOOD_VERSION}_universal.dmg" \
+  "${updater_name}" \
+  "${updater_name}.sig" \
+  "latest.json"
+do
+  url="https://github.com/${REPO}/releases/download/${GOOD_TAG}/${name}"
+  curl -fsSL "${url}" -o "${tmp}/${name}"
+  local_digest="sha256:$(shasum -a 256 "${tmp}/${name}" | awk '{print $1}')"
+  remote_digest="$(gh api "repos/${REPO}/releases/tags/${GOOD_TAG}" \
+    --jq ".assets[] | select(.name == \"${name}\") | .digest")"
+  test "${local_digest}" = "${remote_digest}"
+done
+
+printf '%s' "${HEADROOM_UPDATER_PUBLIC_KEY}" > "${tmp}/public-key.b64"
+cargo run --quiet --manifest-path src-tauri/Cargo.toml \
+  --example verify_updater_signature -- \
+  "${tmp}/${updater_name}" "${tmp}/${updater_name}.sig" "${tmp}/public-key.b64"
 ```
 
-This produces a signed `Headroom_<version>.dmg` in `src-tauri/target/release/bundle/dmg/`.
+已安装故障版本的客户端不会自动降级，仍需手动重装上一稳定版 DMG。删除故障 Release 后应立即从上一稳定提交发布一个更高补丁版本；旧客户端随后只会看到恢复后的稳定 feed。
 
-If you want a universal build, install both Rust macOS targets first and then run:
+## 下载稳定版
+
+从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-macos/releases/latest) 下载最新稳定版 DMG。
+
+## 签名与密钥
+
+Community 使用 ad-hoc macOS 代码签名，以及独立的 Tauri updater 签名密钥。工作流需要仓库变量 `HEADROOM_UPDATER_PUBLIC_KEY` 和 secrets `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。这不等同于 Apple Developer ID 签名或 Apple 公证。
+
+## 本机构建
 
 ```bash
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-TARGET=universal-apple-darwin npm run build:mac:dmg
+git clone https://github.com/OneBigMoon/Headroom-macos.git
+cd Headroom-macos
+npm ci
+npm run build:mac:local
 ```
 
-The local helper script sets `CI=true` for Tauri's DMG bundler, validates the required secrets, and supports either:
+本地构建要求 macOS 14 或更高版本、Node.js/npm 和 Rust；产物位于 `src-tauri/target/release/bundle`。
 
-- `APPLE_API_KEY_PATH` for a local App Store Connect private key file
-- `APPLE_API_PRIVATE_KEY_P8` if you prefer storing the key contents directly in an environment variable
-- `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` if you want Apple ID notarization instead
+## Homebrew
 
-## What the app expects
-
-This build reads two compile-time environment variables:
-
-- `HEADROOM_UPDATER_PUBLIC_KEY`
-  The public key for verifying Tauri updater signatures.
-- `HEADROOM_UPDATER_ENDPOINTS`
-  A JSON array or comma-separated list of HTTPS update feed URLs.
-
-Example:
-
-```bash
-export HEADROOM_UPDATER_PUBLIC_KEY="$(cat .secrets/tauri-updater/public.key)"
-export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
-```
-
-These values are compiled into the release build. If they are missing, Headroom still runs, but update checks stay disabled for that build.
-
-## Environment variables to set
-
-Required for a signed local DMG in this repo:
-
-- `HEADROOM_ACCOUNT_API_BASE_URL`
-  The deployed Headroom account API base URL, for example `https://extraheadroom.com/api/v1`. Release builds now fail fast if this is missing so packaged sign-in cannot silently point at localhost.
-- `APPLE_SIGNING_IDENTITY`
-  Your Developer ID Application certificate name from Keychain Access, for example `Developer ID Application: Your Name (TEAMID)`.
-- `TAURI_SIGNING_PRIVATE_KEY`
-  The private updater signing key contents because this repo builds updater artifacts alongside the DMG.
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-  The password for that updater signing key.
-
-Required for notarization, choose one mode:
-
-- App Store Connect API mode:
-  `APPLE_API_ISSUER`, `APPLE_API_KEY`, and either `APPLE_API_KEY_PATH` or `APPLE_API_PRIVATE_KEY_P8`
-- Apple ID mode:
-  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`
-
-Recommended for production builds of Headroom so auto-update stays enabled:
-
-- `HEADROOM_UPDATER_PUBLIC_KEY`
-  The public half of the Tauri updater signing keypair.
-- `HEADROOM_UPDATER_ENDPOINTS`
-  A JSON array or comma-separated list of HTTPS update feed URLs.
-
-Optional, usually only needed outside your own machine:
-
-- `APPLE_CERTIFICATE`
-  Base64-encoded `.p12` signing certificate export. Useful for CI or a clean machine without the certificate already installed in your login keychain.
-- `APPLE_CERTIFICATE_PASSWORD`
-  Password for the exported `.p12` certificate.
-
-## Repository configuration
-
-The GitHub Actions workflow expects these repository settings:
-
-- Repository variable:
-  `HEADROOM_UPDATER_PUBLIC_KEY`
-- Repository secrets:
-  `TAURI_SIGNING_PRIVATE_KEY`
-  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-  `APPLE_CERTIFICATE`
-  `APPLE_CERTIFICATE_PASSWORD`
-  `APPLE_SIGNING_IDENTITY`
-
-For notarization, configure one of these two sets:
-
-- App Store Connect API:
-  `APPLE_API_ISSUER`
-  `APPLE_API_KEY`
-  `APPLE_API_PRIVATE_KEY_P8`
-- Apple ID:
-  `APPLE_ID`
-  `APPLE_PASSWORD`
-  `APPLE_TEAM_ID`
-
-## One-time updater key setup
-
-Generate a Tauri updater keypair once and keep the private key in CI secrets:
-
-```bash
-npm run tauri signer generate -- -w ~/.tauri/headroom-desktop.key
-```
-
-Store:
-
-- the generated public key in `HEADROOM_UPDATER_PUBLIC_KEY` during release builds
-- the generated private key in CI as `TAURI_SIGNING_PRIVATE_KEY`
-- the private-key password in CI as `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-
-## Release pipeline
-
-For each mac release:
-
-1. Build with `HEADROOM_UPDATER_PUBLIC_KEY` and `HEADROOM_UPDATER_ENDPOINTS` set.
-2. Code-sign the app with your Apple Developer ID Application certificate.
-3. Notarize the build with Apple.
-4. Publish the signed updater artifacts and `latest.json`.
-5. Create or update the GitHub Release that hosts those files.
-
-The app is already configured with `"createUpdaterArtifacts": true`, so Tauri will emit updater-friendly release artifacts during bundling.
-
-## Apple signing and notarization
-
-Use a Developer ID flow, not Mac App Store packaging.
-
-Tauri's macOS distribution docs support two notarization paths:
-
-- App Store Connect API credentials:
-  `APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_PATH`
-- Apple ID credentials:
-  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`
-
-You also need the signing certificate material used by the macOS bundle build, typically:
-
-- `APPLE_CERTIFICATE`
-- `APPLE_CERTIFICATE_PASSWORD`
-- `APPLE_SIGNING_IDENTITY`
-
-## Recommended hosting
-
-For a small app, the simplest setup is:
-
-- GitHub Releases for DMG and updater artifacts
-- a stable `latest.json` release asset URL
-
-`latest.json` should follow Tauri's static updater format and include the macOS platform entry, the signed update bundle URL, and the bundle signature.
-
-You can later move the updater feed to S3 or another CDN without changing app code, as long as the published endpoint URL stays valid and the signatures match the embedded public key.
-
-## User experience in Headroom
-
-Headroom does not auto-install updates silently.
-
-Current behavior:
-
-- checks for updates in the background after launch
-- lets the user manually check from Settings
-- prompts before download/install
-- asks the user to restart after install completes
-- production builds fall back to `https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json` when no explicit updater env vars are injected
-
-## Recommended next step
-
-Add a release workflow in CI that:
-
-- builds `tauri build` for macOS
-- injects the updater env vars above
-- signs and notarizes the app
-- uploads the updater artifacts plus `latest.json` to the release
-
-Tauri's official GitHub release tooling can generate `latest.json` for you, which is the easiest way to keep the feed and artifacts aligned.
-
-This repo now includes a workflow at `.github/workflows/release-macos.yml`.
-
-It:
-
-- runs on manual dispatch
-- also runs automatically when a version bump to `package.json` / `src-tauri/tauri.conf.json` is pushed to `main`
-- builds the Apple Silicon (`aarch64-apple-darwin`) release bundle
-- signs and notarizes the app
-- uploads updater artifacts and `latest.json` to the GitHub Release
-
-## Release channels: stable and staging
-
-There are two channels with separate GitHub Actions workflows:
-
-| Channel | Branch | Workflow | Version format | Endpoint |
-|---------|--------|----------|----------------|----------|
-| Stable | `main` | `release-macos.yml` | `X.Y.Z` | `releases/latest/download/latest.json` |
-| Staging | `staging` | `release-macos-staging.yml` | `X.Y.Z-rc.N` | `releases/download/staging-rolling/latest.json` |
-
-Both channels are cross-platform, and both build the same way: the macOS job
-publishes the release and its `latest.json`, then each other platform's job runs
-after it, uploads its bundles to the same release, and merges its own entry into
-that `latest.json`. Those jobs are chained rather than parallel because they all
-read-modify-write the one manifest.
-
-Both channels cover all three platforms: macOS, Windows and Linux. Linux was
-rc-only until `release-macos.yml` gained its own `linux` job, so a stable
-release no longer drops `linux-x86_64` from that channel.
-
-The retired `windows-preview` and `linux-preview` channels had their workflows
-deleted once every platform started building per rc. Their releases stay up
-because installs in the wild still poll those manifests; the stable Windows job
-keeps rewriting `windows-preview/latest.json` to pull those installs forward.
-
-### Branching model
-
-- Feature work happens on `feature/*` branches.
-- Feature branches merge into `staging` for release-candidate builds.
-- `main` is branch-protected (no direct pushes). Stable promotion goes through a release PR from a `release/X.Y.Z` branch (cut from the verified `staging` tip, with the version bumped to plain `X.Y.Z`) into `main`. Merge with **"Create a merge commit"** — squash and rebase merges rewrite the staging SHAs and break the rc-ancestor check below. See the README for the full step-by-step.
-
-### Staging workflow
-
-On each push to `staging` that bumps the version to `X.Y.Z-rc.N`:
-
-1. A versioned prerelease tag `vX.Y.Z-rc.N` is published with signed artifacts and `latest.json`.
-2. The previous rolling `staging` release is deleted and recreated pointing at the new rc's artifacts. The staging endpoint URL stays stable.
-
-The versioned tags give an auditable history of every rc; the rolling `staging` release is what the updater on the test machine actually polls.
-
-### One binary, two channels
-
-Both workflows bake **both** endpoints into every build via `HEADROOM_UPDATER_ENDPOINTS` (stable) and `HEADROOM_UPDATER_STAGING_ENDPOINTS` (staging). At runtime the app picks based on its own version: pre-release suffix (anything containing `-`, e.g. `0.2.44-rc.1`) → staging endpoint; plain `X.Y.Z` → stable endpoint. No separate build flavor required.
-
-### Installing the staging build
-
-Download the DMG attached to the rolling [`staging-rolling`](https://github.com/gglucass/headroom-desktop/releases/tag/staging-rolling) release on the clean test machine and install it once. Because its version has an `-rc.N` suffix, the app polls the staging endpoint from then on and self-updates as new rcs land.
-
-### Promotion guard
-
-The stable workflow refuses to run unless:
-
-1. The version is plain `X.Y.Z` (no `-rc` suffix).
-2. A `vX.Y.Z-rc.N` prerelease exists on GitHub whose tagged commit is an ancestor of the commit being released. This enforces that stable only ships code that was tested via the staging channel.
-
-To bypass the guard for emergency hotfixes, include `[skip-rc-check]` in the **PR merge commit message** (the workflow reads the merge commit on `main`, not the bump commit on the release branch). Putting `[skip-rc-check]` in the PR title or first body line is the easiest way — GitHub copies it into the auto-generated merge commit.
-
-### Final update-flow verification
-
-After the stable workflow publishes `vX.Y.Z`, it re-points the rolling `staging` release at the stable artifacts. The staging test machine receives `X.Y.Z` as an update via the staging endpoint (since `X.Y.Z > X.Y.Z-rc.N` in semver). Once installed, its version is plain `X.Y.Z` and the app automatically switches to the stable endpoint for all future update checks.
-
-## Homebrew (cask)
-
-Homebrew users can install the latest signed release with:
-
-```bash
-brew install --cask headroom
-```
-
-The cask token is `headroom`, not `headroom-desktop`. Homebrew's new-cask audit
-rejects any token ending in `desktop` (also `mac`, `osx`, `macos`, `launcher`),
-and the rule is `--new`-only so a plain `brew audit --cask --strict` run will not
-catch a rename back. Verify with `brew audit --cask --new --strict headroom`.
-
-The cask is versioned (`version "X.Y.Z"`, not `version :latest`) and points at
-the tagged release's `Headroom_X.Y.Z_mac.dmg` asset directly, since each stable
-release already publishes a versioned URL. A `livecheck` block using
-`strategy :github_latest` lets BrewTestBot autobump the cask on every release,
-and `auto_updates true` is accurate since the app also self-updates through its
-built-in updater between cask bumps.
-
-### The `--uninstall` flag and its release gate
-
-The app accepts a `--uninstall` flag (`handle_uninstall_flag` in `lib.rs`) that
-runs `client_adapters::revert_external_mutations()` headlessly and exits without
-showing a window. It undoes Headroom's edits to *other* tools — agent settings,
-shell rc blocks, hook scripts, MCP registrations, keychain entries, backup files,
-the LaunchAgent plist — and deliberately leaves Headroom's own directories alone,
-because a cask's `uninstall` must not delete user data (that is `zap`'s job).
-
-The cask should eventually call it:
-
-```ruby
-  uninstall script:    {
-                         executable: "#{appdir}/Headroom.app/Contents/MacOS/headroom-desktop",
-                         args:       ["--uninstall"],
-                       },
-            launchctl: "com.extraheadroom.headroom",
-            quit:      "com.extraheadroom.headroom"
-```
-
-This is safe ordering-wise: Homebrew's `ORDERED_DIRECTIVES` runs `script` after
-`quit`, and the `Uninstall` artifact sorts before `App`, so the binary still
-exists at `appdir` when the script fires.
-
-**Do not add that stanza until the cask's `version` points at a release that
-actually contains the flag.** An older binary ignores the unknown argument and
-launches the GUI instead, which would hang `brew uninstall` on a window nobody
-asked for. The flag landed after 0.7.6, so it is gated on the first release
-after that. Add the stanza in the same cask PR that bumps to that version.
-
-Until then, `quit: "com.extraheadroom.headroom"` already reverts the routing
-layer on its own, because the app's quit handler calls `clear_client_setups()` —
-verified on a clean VM: a plain `brew uninstall --cask` leaves no dead
-`ANTHROPIC_BASE_URL` and no dangling shell block or guard hook.
-
-### Maintaining the cask
-
-The cask source at `packaging/homebrew/headroom.rb` in this repo is a
-submission template, not a maintained artifact: `scripts/bump-version.sh` only
-touches `package.json`, `tauri.conf.json`, and `Cargo.toml`, and the `sha256`
-can't be filled in until CI has built and notarized the DMG, so it goes stale
-on the next release. Refresh both before submitting: `brew audit --cask --new
---strict` treats a `version` that differs from what `livecheck` resolves as a
-hard failure, not a warning. To ship it, open a PR against
-[`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
-file at `Casks/h/headroom.rb`. Once merged there, the tap becomes the
-source of truth and BrewTestBot maintains `version` and `sha256` automatically
-via `livecheck`.
-
-Do not add `verified:` to the `url` stanza. It is a no-op kept only for casks
-that already had it, and `brew audit --new` rejects it outright — which is easy
-to miss because the audit only fires on a brew new enough to carry the
-deprecation, so a local run on an older brew passes while CI fails.
+当前没有维护中的 Homebrew tap 或已核实的 cask 资产，因此项目不提供 Homebrew 安装承诺。请使用 GitHub Release DMG；待固定资产 URL 和 SHA 可复核后再单独恢复 Homebrew 文档。

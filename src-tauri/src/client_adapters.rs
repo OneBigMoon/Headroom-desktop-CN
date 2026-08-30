@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -57,6 +59,13 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
         name: "OpenCode",
     },
 ];
+
+const CODEX_DESKTOP_EXECUTABLE_SUFFIXES: [&str; 2] = [
+    "/ChatGPT.app/Contents/MacOS/ChatGPT",
+    "/Codex.app/Contents/MacOS/Codex",
+];
+#[cfg(target_os = "macos")]
+const CODEX_DESKTOP_BUNDLE_ID: &str = "com.openai.codex";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellFamily {
@@ -788,6 +797,12 @@ pub fn list_client_connectors(
                 None
             };
             let verified = verification.as_ref().is_some_and(|result| result.verified);
+            let last_configured_at = configured_timestamp(&setup_state, spec.id);
+            let restart_required = if spec.id == "codex" && enabled {
+                codex_desktop_restart_required(last_configured_at.as_deref())
+            } else {
+                None
+            };
 
             ClientConnectorStatus {
                 client_id: spec.id.to_string(),
@@ -795,13 +810,203 @@ pub fn list_client_connectors(
                 installed,
                 enabled,
                 verified,
-                last_configured_at: configured_timestamp(&setup_state, spec.id),
+                last_configured_at,
+                restart_required,
                 verification,
             }
         })
         .collect();
 
     Ok(connectors)
+}
+
+#[derive(Debug, Clone)]
+struct CodexDesktopProcess {
+    pid: u32,
+    started_at: DateTime<Local>,
+    executable: String,
+}
+
+fn same_codex_desktop_process(left: &CodexDesktopProcess, right: &CodexDesktopProcess) -> bool {
+    left.pid == right.pid
+        && left.started_at.timestamp() == right.started_at.timestamp()
+        && left.executable == right.executable
+}
+
+fn is_codex_desktop_executable(command: &str) -> bool {
+    CODEX_DESKTOP_EXECUTABLE_SUFFIXES
+        .iter()
+        .any(|suffix| command.ends_with(suffix))
+}
+
+fn parse_codex_desktop_processes(output: &str) -> Vec<CodexDesktopProcess> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let weekday = fields.next()?;
+            let month = fields.next()?;
+            let day = fields.next()?;
+            let time = fields.next()?;
+            let year = fields.next()?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            if !is_codex_desktop_executable(&command) {
+                return None;
+            }
+
+            let started_at = NaiveDateTime::parse_from_str(
+                &format!("{weekday} {month} {day} {time} {year}"),
+                "%a %b %e %T %Y",
+            )
+            .ok()
+            .and_then(|value| Local.from_local_datetime(&value).earliest())?;
+
+            Some(CodexDesktopProcess {
+                pid,
+                started_at,
+                executable: command,
+            })
+        })
+        .collect()
+}
+
+fn restart_required_from_processes(
+    processes: &[CodexDesktopProcess],
+    configured_at: &str,
+) -> Option<bool> {
+    let configured_at = DateTime::parse_from_rfc3339(configured_at).ok()?;
+    let configured_at = configured_at.timestamp();
+    let mut same_second = false;
+    for process in processes {
+        match process.started_at.timestamp().cmp(&configured_at) {
+            std::cmp::Ordering::Less => return Some(true),
+            std::cmp::Ordering::Equal => same_second = true,
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    (!same_second).then_some(false)
+}
+
+fn codex_desktop_restart_required(configured_at: Option<&str>) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let configured_at = configured_at?;
+        let processes = running_codex_desktop_processes().ok()?;
+        restart_required_from_processes(&processes, configured_at)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = configured_at;
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn running_codex_desktop_processes() -> Result<Vec<CodexDesktopProcess>> {
+    let output = crate::proc::command("ps")
+        .env("LC_ALL", "C")
+        .args(["-xww", "-o", "pid=,lstart=,comm="])
+        .output()
+        .context("checking whether Codex Desktop is running")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "checking Codex Desktop processes failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).context("reading Codex Desktop process list")?;
+    Ok(parse_codex_desktop_processes(&stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_codex_desktop_process(expected: &CodexDesktopProcess) -> Result<()> {
+    if !running_codex_desktop_processes()?
+        .iter()
+        .any(|process| same_codex_desktop_process(process, expected))
+    {
+        return Ok(());
+    }
+
+    let pid = i32::try_from(expected.pid).context("Codex Desktop PID is out of range")?;
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error).context(format!("asking Codex Desktop process {pid} to quit"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_codex_desktop_exit(expected: &[CodexDesktopProcess]) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let processes = running_codex_desktop_processes()?;
+        if !processes.iter().any(|process| {
+            expected
+                .iter()
+                .any(|candidate| same_codex_desktop_process(process, candidate))
+        }) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Codex did not quit within 5 seconds; it was not force-quit"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_codex_desktop_launch() -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !running_codex_desktop_processes()?.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!("Codex did not reopen within 10 seconds"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn restart_codex_desktop() -> Result<()> {
+    let processes = running_codex_desktop_processes()?;
+
+    for process in &processes {
+        terminate_codex_desktop_process(process)?;
+    }
+    if !processes.is_empty() {
+        wait_for_codex_desktop_exit(&processes)?;
+    }
+
+    let output = crate::proc::command("open")
+        .args(["-b", CODEX_DESKTOP_BUNDLE_ID])
+        .output()
+        .context("reopening Codex Desktop")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "reopening Codex Desktop failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    wait_for_codex_desktop_launch()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restart_codex_desktop() -> Result<()> {
+    Err(anyhow!(
+        "Restarting Codex Desktop is only supported on macOS"
+    ))
 }
 
 pub fn disable_client_setup(client_id: &str) -> Result<()> {
@@ -5039,7 +5244,13 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
     let start = format!("# >>> headroom-local-community:{block_id} >>>");
     let end = format!("# <<< headroom-local-community:{block_id} <<<");
 
-    let (Some(start_idx), Some(end_idx)) = (existing.find(&start), existing.find(&end)) else {
+    let Some(start_idx) = existing.find(&start) else {
+        return Ok(false);
+    };
+    let Some(end_idx) = existing[start_idx + start.len()..]
+        .find(&end)
+        .map(|end_idx| start_idx + start.len() + end_idx)
+    else {
         return Ok(false);
     };
 
@@ -6480,6 +6691,87 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
+    fn codex_desktop_process_parser_only_accepts_main_app_executables() {
+        let output = "4242 Sun Aug 30 10:11:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n\
+                      4243 Sun Aug 30 10:11:13 2026 /Applications/ChatGPT.app/Contents/Frameworks/ChatGPT Helper (Renderer).app/Contents/MacOS/ChatGPT Helper (Renderer)\n\
+                      4244 Sun Aug 30 10:11:14 2026 /Applications/ChatGPT.app/Contents/Resources/codex app-server\n\
+                      4245 Sun Aug 30 10:11:15 2026 /opt/homebrew/bin/codex\n\
+                      4246 Sun Aug 30 10:11:16 2026 /Applications/Codex.app/Contents/MacOS/Codex\n";
+
+        let processes = super::parse_codex_desktop_processes(output);
+
+        assert_eq!(
+            processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![4242, 4246]
+        );
+    }
+
+    #[test]
+    fn codex_restart_requirement_compares_process_start_with_configuration_time() {
+        let processes = super::parse_codex_desktop_processes(
+            "4242 Sun Aug 30 10:11:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n",
+        );
+        let started_at = processes[0].started_at;
+
+        assert_eq!(
+            super::restart_required_from_processes(
+                &processes,
+                &(started_at + chrono::Duration::seconds(1)).to_rfc3339(),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            super::restart_required_from_processes(
+                &processes,
+                &(started_at - chrono::Duration::seconds(1)).to_rfc3339(),
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            super::restart_required_from_processes(&[], &started_at.to_rfc3339()),
+            Some(false)
+        );
+        assert_eq!(
+            super::restart_required_from_processes(&processes, &started_at.to_rfc3339()),
+            None
+        );
+        assert_eq!(
+            super::restart_required_from_processes(&processes, "not-a-timestamp"),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_desktop_process_identity_rejects_reused_pids() {
+        let expected = super::parse_codex_desktop_processes(
+            "4242 Sun Aug 30 10:11:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n",
+        )
+        .remove(0);
+        let same = super::parse_codex_desktop_processes(
+            "4242 Sun Aug 30 10:11:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n",
+        )
+        .remove(0);
+        let reused = super::parse_codex_desktop_processes(
+            "4242 Sun Aug 30 10:11:13 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n",
+        )
+        .remove(0);
+        let different_app = super::parse_codex_desktop_processes(
+            "4242 Sun Aug 30 10:11:12 2026 /Applications/Codex.app/Contents/MacOS/Codex\n",
+        )
+        .remove(0);
+
+        assert!(super::same_codex_desktop_process(&expected, &same));
+        assert!(!super::same_codex_desktop_process(&expected, &reused));
+        assert!(!super::same_codex_desktop_process(
+            &expected,
+            &different_app
+        ));
+    }
+
+    #[test]
     fn strip_headroom_mcp_toml_removes_owned_tables_keeps_user_tables() {
         // Same straddled-HOME race as the JSON twin below: this reads
         // app_data_dir() to build the fixture and strip_headroom_mcp_toml
@@ -7021,6 +7313,23 @@ mod tests {
             .trim_end()
             .ends_with("# <<< headroom-local-community:claude_code <<<"));
         assert!(content.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6867"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_managed_block_ignores_an_end_marker_before_its_start() {
+        let root = unique_temp_dir("headroom-remove-reordered-markers");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zshrc");
+        let original = "# <<< headroom-local-community:claude_code <<<\nstray old body\n# >>> headroom-local-community:claude_code >>>\n";
+        fs::write(&path, original).expect("write malformed shell file");
+
+        assert!(!remove_managed_block(&path, "claude_code").expect("ignore malformed block"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read untouched shell file"),
+            original
+        );
 
         let _ = fs::remove_dir_all(root);
     }

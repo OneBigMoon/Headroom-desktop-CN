@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -5,8 +7,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${REPO_ROOT}"
 
+echo "Checking release tooling..."
+node --test scripts/prepare-community-release.check.mjs
+cargo check --manifest-path src-tauri/Cargo.toml --example verify_updater_signature
+
 echo "Running frontend coverage..."
-npm run test:coverage
+npm run test:coverage -- --maxWorkers=1 --no-file-parallelism
 
 echo "Running desktop tests..."
 # Prefer nextest: its slow-timeout/terminate-after (.config/nextest.toml) kills a

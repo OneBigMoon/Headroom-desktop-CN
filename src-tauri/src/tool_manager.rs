@@ -1083,9 +1083,29 @@ from headroom.mcp_registry.ledger import (
 action = sys.argv[1]
 legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 failures = []
+
+def headroom_owns_serena(registrar, current):
+    if headroom_installed_matching(registrar.name, current):
+        return True
+    return legacy_ledger is not None and headroom_installed_matching(
+        registrar.name, current, path=legacy_ledger
+    )
+
 # Claude/Codex only: serena's --context values are named profiles and no
 # grok/opencode context has been validated against serena yet.
-for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar(), "codex")):
+registrars = ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar(), "codex"))
+
+if action == "register":
+    for registrar, _ in registrars:
+        if not registrar.detect():
+            continue
+        current = registrar.get_server("serena")
+        if current is not None and not headroom_owns_serena(registrar, current):
+            failures.append(f"{registrar.name}: serena entry conflicts with user-managed configuration")
+    if failures:
+        sys.exit("; ".join(failures))
+
+for registrar, context in registrars:
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue
@@ -1105,18 +1125,12 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         result = registrar.register_server(spec)
         if result.status == RegisterStatus.MISMATCH:
             current = registrar.get_server("serena")
-            owned = headroom_installed_matching(registrar.name, current)
-            if not owned and legacy_ledger is not None:
-                # Community has its own workspace/ledger. Read the legacy
-                # official Headroom ledger only as ownership proof; never
-                # modify or clear it.
-                owned = headroom_installed_matching(
-                    registrar.name, current, path=legacy_ledger
-                )
-            if owned:
+            if headroom_owns_serena(registrar, current):
                 result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
+        elif result.status == RegisterStatus.MISMATCH:
+            failures.append(f"{registrar.name}: serena entry conflicts with user-managed configuration")
         elif result.status == RegisterStatus.FAILED:
             failures.append(f"{registrar.name}: {result.detail}")
         print(f"{registrar.name}: {result.status.value}")
@@ -12955,10 +12969,20 @@ after
         assert!(super::SERENA_MCP_HELPER
             .contains("legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None"));
         assert!(super::SERENA_MCP_HELPER.contains(
-            "headroom_installed_matching(\n                    registrar.name, current, path=legacy_ledger"
+            "headroom_installed_matching(\n        registrar.name, current, path=legacy_ledger"
+        ));
+        let preflight_exit = super::SERENA_MCP_HELPER
+            .find("    if failures:\n        sys.exit(\"; \".join(failures))")
+            .expect("registration preflight exits on conflicts");
+        let first_registration = super::SERENA_MCP_HELPER
+            .find("        result = registrar.register_server(spec)")
+            .expect("registration runs after preflight");
+        assert!(preflight_exit < first_registration);
+        assert!(super::SERENA_MCP_HELPER.contains(
+            "if headroom_owns_serena(registrar, current):\n                result = registrar.register_server(spec, force=True)"
         ));
         assert!(super::SERENA_MCP_HELPER.contains(
-            "if owned:\n                result = registrar.register_server(spec, force=True)"
+            "elif result.status == RegisterStatus.MISMATCH:\n            failures.append(f\"{registrar.name}: serena entry conflicts with user-managed configuration\")"
         ));
         assert!(super::SERENA_MCP_HELPER
             .contains("if not headroom_installed_matching(registrar.name, current):"));

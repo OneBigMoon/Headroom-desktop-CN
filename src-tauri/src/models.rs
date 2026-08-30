@@ -408,6 +408,8 @@ pub struct ClientConnectorStatus {
     pub verified: bool,
     pub last_configured_at: Option<String>,
     #[serde(default)]
+    pub restart_required: Option<bool>,
+    #[serde(default)]
     pub verification: Option<ClientSetupVerification>,
 }
 

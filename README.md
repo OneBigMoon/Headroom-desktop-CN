@@ -5,14 +5,18 @@
 Headroom Local Community is an unofficial, local-only desktop edition derived
 from the MIT-licensed
 [`gglucass/headroom-desktop`](https://github.com/gglucass/headroom-desktop)
-project. It is not affiliated with or endorsed by the upstream paid Headroom
-product.
+project and other open-source components. It is not affiliated with or endorsed
+by any upstream paid Headroom product.
+
+## 下载
+
+从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-macos/releases/latest) 下载最新稳定版 macOS DMG。
 
 This fork keeps the open-source local proxy, client connectors, token and
 savings dashboard, RTK, MarkItDown, and local add-on management. It does not
 provide or require a Headroom account, email login, trial, subscription,
-pricing, checkout, cancellation flow, marketing telemetry, or the official
-update service.
+pricing, checkout, cancellation flow, marketing telemetry, or official update
+service.
 
 ## Isolation from the upstream paid app
 
@@ -27,50 +31,35 @@ application:
 | headroom-ai workspace | `~/.headroom-local-community` |
 | Intercept proxy | `127.0.0.1:6867` |
 | Managed backend range | `6868-6890` |
-| Codex provider | `headroom_local_community` |
-| MCP server | `headroom_local_community` |
+| Codex provider / MCP server | `headroom_local_community` |
 | Managed markers | `headroom-local-community:*` |
 
 The application does not delete the paid app's bundle data, keychain entries,
 `~/.headroom` workspace, managed markers, MCP entry, backups, or shared
 HuggingFace cache. The sole read-only exception is
-`~/.headroom/mcp_installs.json`: Community may use its Serena fingerprint as
-proof that an existing `serena` MCP entry was installed by Headroom. The
-official ledger is never modified.
+`~/.headroom/mcp_installs.json`, which may be read for the Serena ownership
+fingerprint; the official ledger is never modified. Official routing is never
+overwritten, and user-managed Serena entries are left untouched.
 
-A coding client can have only one active `ANTHROPIC_BASE_URL` or
-`OPENAI_BASE_URL`. If official Headroom routing is detected, Community refuses
-to overwrite it. Pause that connector in the official app before enabling the
-Community connector. Community never removes the official routing
-configuration. When Serena is enabled, Community may replace an old official
-Serena entry only when the complete current MCP specification matches the
-official ownership-ledger fingerprint; user-managed Serena entries are always
-left untouched.
-
-Codex, Claude Code, OpenCode, and other clients still use their own upstream
-API key or OAuth authentication. Only the separate Headroom product account
-and billing system is removed.
+Codex, Claude Code, OpenCode, and other clients retain their own upstream API
+key or OAuth authentication. The proxy and headroom-ai state stay local.
 
 ## How it works
 
 ```text
 Claude Code / Codex / OpenCode
-        |
-        | ANTHROPIC_BASE_URL=http://127.0.0.1:6867
-        | OPENAI_BASE_URL=http://127.0.0.1:6867/v1
-        v
+  | ANTHROPIC_BASE_URL=http://127.0.0.1:6867
+  | OPENAI_BASE_URL=http://127.0.0.1:6867/v1
+  v
 Rust intercept proxy :6867
-        |
-        v
+  v
 Managed headroom-ai backend :6868-6890
-        |
-        v
+  v
 The same upstream API selected by the coding client
 ```
 
-The proxy and headroom-ai state stay local. Anonymous headroom-ai telemetry,
-Sentry, Aptabase, account APIs, and the official updater are disabled in this
-edition.
+Anonymous headroom-ai telemetry, Sentry, Aptabase, account APIs, and the
+official updater are disabled in this edition.
 
 ## Local components
 
@@ -84,79 +73,35 @@ edition.
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and
 license details.
 
-## 致谢与开源声明
-
-感谢 `headroomlabs-ai/headroom`、`rtk-ai/rtk`、Microsoft `MarkItDown` 和各可选开源工具的作者与贡献者。
-
-本 Community 版本的代码复用、工具集成、修改和再分发全部以相应项目的开源许可证为依据。该致谢不表示相关项目提供商业授权、官方背书、签名证书、付费服务或维护承诺。完整来源与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-macOS DMG 安装、ad-hoc 签名、quarantine 处理、Gatekeeper 验证及自动更新密钥说明见 [macOS 安装、签名与自动更新说明](docs/macos-install-and-signing.zh-CN.md)。
-
 ## Build on macOS
 
-Requirements:
-
-- macOS 14 or newer
-- Node.js and npm
-- Rust toolchain
-- Tauri system prerequisites
-
-Install dependencies and build an unsigned local package:
+Requirements: macOS 14 or newer, Node.js/npm, Rust, and Tauri prerequisites.
 
 ```bash
 npm ci
 npm run build:mac:local
 ```
 
-Artifacts are written under:
-
-```text
-src-tauri/target/release/bundle
-```
-
-The build script runs the configured frontend and Rust validation before
-creating `.app` and `.dmg` artifacts. It does not install, launch, sign,
-notarize, publish, or modify an existing `/Applications/Headroom.app`.
-
-Unsigned builds may trigger macOS Gatekeeper warnings. Public distribution
-without those warnings requires your own Apple Developer ID signing identity
-and Apple notarization. Do not use the upstream author's signing identity or
-official update channel.
-
-## Development
-
-```bash
-npm ci
-npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml --lib
-npm run test:frontend
-```
-
-Do not start Community during development when official Headroom is actively
-routing the same coding clients. Tests should use temporary homes and isolated
-configuration fixtures.
+Artifacts are written under `src-tauri/target/release/bundle`. The local
+script validates the frontend and Rust build, creates an ad-hoc signed `.app`
+and DMG, and does not install, publish, or replace another application.
 
 ## Data written by Community
 
-Depending on platform and enabled features, Community may write:
-
-- Its own Tauri app data, logs, preferences, and caches under the Community
-  product name and bundle ID.
-- `~/.headroom-local-community` for headroom-ai runtime state.
-- Community-managed, fenced blocks in supported client configuration files.
-- A fenced Serena usage hint in detected clients' `~/.codex/AGENTS.md` or
-  `~/.claude/CLAUDE.md` while the addon is enabled.
-- Community-named MCP entries and guard hooks.
-- Timestamped backups ending in `.headroom-local-community-backup-*` before
-  editing a client configuration file.
-
-The in-app uninstall flow removes only those Community-owned resources and
-reverses only Community-managed client changes.
+Depending on enabled features, Community may write its own app data, logs,
+preferences, caches, `~/.headroom-local-community`, Community-managed fenced
+blocks in client configuration, Serena usage hints in detected
+`~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`, Community-named MCP entries and
+guard hooks, and timestamped `.headroom-local-community-backup-*` files before
+editing client configuration. Uninstall removes only Community-owned resources
+and reverses only Community-managed client changes.
 
 ## License
 
 This repository remains available under the upstream MIT license. Preserve the
-upstream copyright notice, this license, and applicable third-party notices in
+upstream copyright notice, license, and applicable third-party notices in
 redistributions. “Headroom Local Community” must be presented as an unofficial
 community edition, not as the upstream paid product.
+
+The project does not provide Homebrew installation. Use the GitHub Releases
+DMG linked above.

@@ -352,6 +352,8 @@ function localizeLearnStatus(t: Translate, value: string): string {
 
 function localizeUiText(t: Translate, value: string): string {
   if (!value) return value;
+  const restartRequired = value.match(/^Restart (.+) to apply the configuration\.$/);
+  if (restartRequired) return t("connections.restartRequired", { name: restartRequired[1] });
   const restart = value.match(/^Quit and reopen (.+) if it was running when you enabled this\.$/);
   if (restart) return t("connections.restartAfterEnable", { name: restart[1] });
   const notDetected = value.match(/^(.+) was not detected\. Install (.+) and restart Headroom\.$/);
@@ -1772,6 +1774,7 @@ export default function App() {
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
+  const [codexRestartBusy, setCodexRestartBusy] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">(
     () => (isConnectorTrafficVerified() ? "healthy" : "verifying")
   );
@@ -2860,13 +2863,13 @@ export default function App() {
         const inactiveForMs = mainWindowLastBlurAtRef.current
           ? now.getTime() - mainWindowLastBlurAtRef.current
           : null;
-        // Skip `refreshConnectors` for quick alt-tabs: connectors only change
-        // via user action (app enable/disable) or manual edits to
-        // ~/.claude/settings.json — neither happens in the 30s window of a
-        // fast context switch. On initial focus (`inactiveForMs === null`)
-        // or after a real "came back from another app" gap, refresh to pick
-        // up outside changes.
-        if (inactiveForMs === null || inactiveForMs >= 30_000) {
+        // A pending Codex restart can resolve during a quick alt-tab, so recheck
+        // that state immediately; keep the old 30s gate for steady connectors.
+        const restartMayHaveResolved =
+          connectorsRef.current?.some(
+            (connector) => connector.restartRequired === true
+          ) ?? false;
+        if (restartMayHaveResolved || inactiveForMs === null || inactiveForMs >= 30_000) {
           void refreshConnectors();
         }
 
@@ -4773,6 +4776,26 @@ export default function App() {
     }
   }
 
+  async function restartCodexDesktop() {
+    if (codexRestartBusy) {
+      return;
+    }
+    setCodexRestartBusy(true);
+    setConnectorsError(null);
+    setConnectorsNotice(null);
+    try {
+      await invoke("restart_codex_desktop");
+      setConnectorsNotice(t("connections.codexRestarted"));
+      await refreshConnectors();
+    } catch (error) {
+      setConnectorsError(
+        describeInvokeError(error, t("connections.codexRestartFailed"))
+      );
+    } finally {
+      setCodexRestartBusy(false);
+    }
+  }
+
 
   function handleLauncherSurfaceMouseDown(event: MouseEvent<HTMLElement>) {
     if (event.button !== 0) {
@@ -5530,7 +5553,7 @@ export default function App() {
                         { name: connector.name }
                       )}
                       className={`connector-switch${connector.enabled ? " is-on" : ""}`}
-                      disabled={connectorsBusy || gateBlocksEnable}
+                      disabled={connectorsBusy || codexRestartBusy || gateBlocksEnable}
                       onClick={() =>
                         void toggleConnector(connector, !connector.enabled)
                       }
@@ -5540,6 +5563,20 @@ export default function App() {
                     >
                       <span className="connector-switch__thumb" />
                     </button>
+                    {connector.clientId === "codex" &&
+                    connector.restartRequired === true &&
+                    statusLine?.tone === "restart" ? (
+                      <button
+                        className="secondary-button secondary-button--small"
+                        disabled={connectorsBusy || codexRestartBusy}
+                        onClick={() => void restartCodexDesktop()}
+                        type="button"
+                      >
+                        {codexRestartBusy
+                          ? t("connections.restartingCodex")
+                          : t("connections.restartCodex")}
+                      </button>
+                    ) : null}
                   </div>
                 </article>
               );
@@ -7831,6 +7868,7 @@ export default function App() {
                     const statusLine = connectorStatusLine(connector);
                     const toggleDisabled =
                       connectorsBusy ||
+                      codexRestartBusy ||
                       !canConfigureConnectorWithoutDetection(connector) ||
                       gateBlocksEnable;
                     return (
@@ -7936,6 +7974,20 @@ export default function App() {
                           >
                             <span className="connector-switch__thumb" />
                           </button>
+                          {connector.clientId === "codex" &&
+                          connector.restartRequired === true &&
+                          statusLine?.tone === "restart" ? (
+                            <button
+                              className="secondary-button secondary-button--small"
+                              disabled={connectorsBusy || codexRestartBusy}
+                              onClick={() => void restartCodexDesktop()}
+                              type="button"
+                            >
+                              {codexRestartBusy
+                                ? t("connections.restartingCodex")
+                                : t("connections.restartCodex")}
+                            </button>
+                          ) : null}
                         </div>
                       </article>
                     );

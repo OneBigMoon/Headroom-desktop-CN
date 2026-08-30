@@ -104,7 +104,7 @@ const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
-type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+type InstallPendingUpdateFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QuitSource {
@@ -141,7 +141,7 @@ fn noop_app_update_progress_emitter() -> AppUpdateProgressEmitter {
 
 trait InstallableAppUpdate: Send {
     fn metadata(&self) -> AvailableAppUpdate;
-    fn install(self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture;
+    fn install(&self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture<'_>;
 }
 
 struct TauriPendingUpdate(Update);
@@ -161,7 +161,7 @@ impl InstallableAppUpdate for TauriPendingUpdate {
         }
     }
 
-    fn install(self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+    fn install(&self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture<'_> {
         Box::pin(async move {
             let downloaded = Arc::new(AtomicU64::new(0));
             let on_chunk_downloaded = Arc::clone(&downloaded);
@@ -844,7 +844,14 @@ where
     INSTALLING_UPDATE.store(true, Ordering::Release);
     let result = update.install(progress).await;
     INSTALLING_UPDATE.store(false, Ordering::Release);
-    result
+    if let Err(error) = result {
+        let mut pending = pending_update.lock();
+        if pending.is_none() {
+            *pending = Some(update);
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Set while an update install is running, to keep the privilege prompt it
@@ -4374,6 +4381,14 @@ async fn get_client_connectors(
 }
 
 #[tauri::command]
+async fn restart_codex_desktop() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(client_adapters::restart_codex_desktop)
+        .await
+        .map_err(|err| format!("Codex restart task failed: {err}"))?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), String> {
     client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
     analytics::track_event(
@@ -5135,6 +5150,7 @@ pub fn run() {
             verify_client_setup,
             detect_oss_remnants,
             get_client_connectors,
+            restart_codex_desktop,
             disable_client_setup,
             clear_client_setups,
             pause_headroom,
@@ -7857,8 +7873,8 @@ mod tests {
             self.metadata.clone()
         }
 
-        fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
-            Box::pin(async move { self.install_result })
+        fn install(&self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture<'_> {
+            Box::pin(async move { self.install_result.clone() })
         }
     }
 
@@ -8637,7 +8653,10 @@ mod tests {
                 unreachable!("metadata is not read on the install path")
             }
 
-            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+            fn install(
+                &self,
+                _progress: AppUpdateProgressEmitter,
+            ) -> InstallPendingUpdateFuture<'_> {
                 Box::pin(async move {
                     *self.0.lock() =
                         Some(super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire));
@@ -8722,9 +8741,12 @@ mod tests {
                 self.metadata.clone()
             }
 
-            fn install(self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+            fn install(
+                &self,
+                progress: AppUpdateProgressEmitter,
+            ) -> InstallPendingUpdateFuture<'_> {
                 Box::pin(async move {
-                    for event in self.events {
+                    for event in self.events.clone() {
                         progress(event);
                     }
                     Ok(())
@@ -8814,9 +8836,10 @@ mod tests {
     }
 
     #[test]
-    fn install_pending_update_returns_install_failures_after_taking_the_slot() {
+    fn install_pending_update_returns_install_failures_and_restores_the_slot() {
+        let metadata = sample_available_update("0.3.0");
         let pending = Mutex::new(Some(FakePendingUpdate {
-            metadata: sample_available_update("0.3.0"),
+            metadata: metadata.clone(),
             install_result: Err("signature mismatch".into()),
         }));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8832,7 +8855,10 @@ mod tests {
             .expect_err("install failure");
 
         assert_eq!(error, "signature mismatch");
-        assert!(pending.lock().is_none());
+        assert_eq!(
+            pending.lock().as_ref().expect("pending update").metadata(),
+            metadata
+        );
     }
 
     #[test]

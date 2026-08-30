@@ -1,6 +1,6 @@
 [package]
 name = "headroom-local-community"
-version = "1.0.1"
+version = "1.0.2"
 description = "Unofficial local-only community desktop for open-source Headroom tooling"
 authors = ["Headroom Local Community contributors"]
 license = "MIT"
@@ -50,6 +50,7 @@ tokio = { version = "=1.50.0", features = ["macros", "rt-multi-thread", "process
 uuid = { version = "=1.22.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
+minisign-verify = "0.2.5"
 tempfile = "3"
 serial_test = "3"
 

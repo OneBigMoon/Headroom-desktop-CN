@@ -651,6 +651,15 @@ export function connectorStatusLine(
       tone: "reason"
     };
   }
+  if (connector.restartRequired === true) {
+    return {
+      text: `Restart ${connector.name} to apply the configuration.`,
+      tone: "restart"
+    };
+  }
+  if (connector.restartRequired === false) {
+    return null;
+  }
   const configuredAt = connector.lastConfiguredAt
     ? Date.parse(connector.lastConfiguredAt)
     : Number.NaN;
@@ -713,6 +722,9 @@ export function connectorDashboardStatus(
     return connector.installed
       ? { label: "Verifying", tone: "pending" }
       : { label: "Restart needed", tone: "pending" };
+  }
+  if (connector.restartRequired === true) {
+    return { label: "Restart needed", tone: "pending" };
   }
   return { label: "Active", tone: "active" };
 }

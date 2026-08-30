@@ -290,8 +290,15 @@ describe("dashboard helpers", () => {
       }
     };
 
-    // Just configured: the one thing Headroom cannot do for the user.
-    expect(connectorStatusLine(base, now)).toEqual({
+    // A confirmed stale Codex process is a real restart requirement.
+    expect(connectorStatusLine({ ...base, restartRequired: true }, now)).toEqual({
+      text: "Restart Codex to apply the configuration.",
+      tone: "restart"
+    });
+    // Known-restarted clients do not receive the old timestamp-only hint.
+    expect(connectorStatusLine({ ...base, restartRequired: false }, now)).toBeNull();
+    // Unknown process state retains the short fallback hint.
+    expect(connectorStatusLine({ ...base, restartRequired: null }, now)).toEqual({
       text: "Quit and reopen Codex if it was running when you enabled this.",
       tone: "restart"
     });
@@ -387,10 +394,13 @@ describe("dashboard helpers", () => {
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true })
     ).toEqual({ label: "Active", tone: "active" });
+    expect(
+      connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true, restartRequired: true })
+    ).toEqual({ label: "Restart needed", tone: "pending" });
     // Red is reserved for enabled-but-broken: proxy down while a connector is on.
     expect(
       connectorDashboardStatus(
-        { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true },
+        { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true, restartRequired: true },
         { proxyReachable: false }
       )
     ).toEqual({ label: "Proxy unreachable", tone: "idle" });

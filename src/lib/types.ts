@@ -260,6 +260,7 @@ export interface ClientConnectorStatus {
   enabled: boolean;
   verified: boolean;
   lastConfiguredAt?: string | null;
+  restartRequired?: boolean | null;
   verification?: ClientSetupVerification | null;
 }
 

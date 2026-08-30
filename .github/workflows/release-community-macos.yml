@@ -4,88 +4,399 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: community-macos-release-${{ github.ref }}
+  group: community-macos-release
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build universal macOS release
+  build:
+    name: Test, build, and verify universal macOS assets
     runs-on: macos-14
-    timeout-minutes: 60
-    env:
-      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json"]'
-      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      staging_digest: ${{ steps.release_assets.outputs.staging_digest }}
+      version: ${{ steps.release_meta.outputs.version }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Validate release version and secrets
+      - name: Validate stable release tag and versions
+        id: release_meta
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]]
+          [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          [[ -n "${DEFAULT_BRANCH}" ]]
+          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}"
+          tag_version="${BASH_REMATCH[1]}"
+
           package_version="$(node -p "require('./package.json').version")"
+          package_lock_version="$(node -p "require('./package-lock.json').version")"
+          package_lock_root_version="$(node -p "require('./package-lock.json').packages[''].version")"
           tauri_version="$(node -p "JSON.parse(require('fs').readFileSync('./src-tauri/tauri.conf.json', 'utf8')).version")"
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
-          [[ "$package_version" == "$tauri_version" ]]
-          [[ "$package_version" == "$cargo_version" ]]
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            [[ "${GITHUB_REF_NAME}" == "v${package_version}" ]]
-          fi
-          [[ -n "${HEADROOM_UPDATER_PUBLIC_KEY:-}" ]]
-          [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]
-          [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]
+          cargo_lock_version="$(awk '
+            $0 == "name = \"headroom-local-community\"" { found = 1; next }
+            found && /^version = / { gsub(/^version = \"|\"$/, ""); print; exit }
+          ' src-tauri/Cargo.lock)"
+
+          [[ "${tag_version}" == "${package_version}" ]]
+          [[ "${package_version}" == "${package_lock_version}" ]]
+          [[ "${package_version}" == "${package_lock_root_version}" ]]
+          [[ "${package_version}" == "${tauri_version}" ]]
+          [[ "${package_version}" == "${cargo_version}" ]]
+          [[ "${package_version}" == "${cargo_lock_version}" ]]
+
+          notes_file=".github/release-notes/${package_version}.md"
+          [[ -s "${notes_file}" ]]
+
+          printf 'version=%s\n' "${package_version}" >> "${GITHUB_OUTPUT}"
+          printf 'notes_file=%s\n' "${notes_file}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Set up Rust universal targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Run frontend tests
-        run: npm run test:frontend
+      - name: Run complete release checks
+        run: ./scripts/verify-release.sh
 
-      - name: Run Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
-
-      - name: Build and publish signed updater artifacts
-        uses: tauri-apps/tauri-action@action-v0.6.2
+      - name: Build universal app and DMG
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json"]'
+          HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${HEADROOM_UPDATER_PUBLIC_KEY:-}" ]]
+          npm run tauri build -- \
+            --target universal-apple-darwin \
+            --bundles app,dmg \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Package updater archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          app_bundle="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          updater="${bundle_root}/macos/Headroom Local Community.app.tar.gz"
+          [[ -n "${app_bundle}" && -d "${app_bundle}" ]]
+          COPYFILE_DISABLE=1 tar -czf "${updater}" \
+            -C "${bundle_root}/macos" \
+            "$(basename "${app_bundle}")"
+
+      - name: Sign updater archive
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]
+          updater="src-tauri/target/universal-apple-darwin/release/bundle/macos/Headroom Local Community.app.tar.gz"
+          [[ -f "${updater}" ]]
+          ./node_modules/.bin/tauri signer sign "${updater}"
+          [[ -f "${updater}.sig" ]]
+
+      - name: Verify and stage release assets
+        id: release_assets
+        shell: bash
+        env:
+          HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+          RELEASE_NOTES_FILE: ${{ steps.release_meta.outputs.notes_file }}
+        run: |
+          set -euo pipefail
+
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          app_bundle="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          dmg="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name "*_${RELEASE_VERSION}_universal.dmg" -print -quit)"
+          updater="$(find "${bundle_root}/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+          signature="${updater}.sig"
+
+          [[ -n "${app_bundle}" && -d "${app_bundle}" ]]
+          [[ -n "${dmg}" && -f "${dmg}" ]]
+          [[ -n "${updater}" && -f "${updater}" ]]
+          [[ -f "${signature}" ]]
+          [[ "$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name "*_${RELEASE_VERSION}_universal.dmg" | wc -l | tr -d ' ')" == "1" ]]
+          [[ "$(find "${bundle_root}/macos" -maxdepth 1 -type f -name '*.app.tar.gz' | wc -l | tr -d ' ')" == "1" ]]
+
+          codesign --verify --deep --strict "${app_bundle}"
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_bundle}/Contents/Info.plist")"
+          executable="${app_bundle}/Contents/MacOS/${executable_name}"
+          archs="$(lipo -archs "${executable}")"
+          [[ " ${archs} " == *" arm64 "* ]]
+          [[ " ${archs} " == *" x86_64 "* ]]
+          hdiutil verify "${dmg}"
+          tar -tzf "${updater}" >/dev/null
+
+          public_key_file="${RUNNER_TEMP}/headroom-updater-public-key.b64"
+          printf '%s' "${HEADROOM_UPDATER_PUBLIC_KEY}" > "${public_key_file}"
+          cargo run --quiet --manifest-path src-tauri/Cargo.toml \
+            --example verify_updater_signature -- \
+            "${updater}" "${signature}" "${public_key_file}"
+
+          node scripts/prepare-community-release.mjs \
+            "${RELEASE_VERSION}" \
+            "${GITHUB_REF_NAME}" \
+            "${GITHUB_REPOSITORY}" \
+            "${dmg}" \
+            "${updater}" \
+            "${signature}" \
+            "${RELEASE_NOTES_FILE}" \
+            release-staging
+
+          staged_updater="release-staging/assets/Headroom.Local.Community_universal.app.tar.gz"
+          cargo run --quiet --manifest-path src-tauri/Cargo.toml \
+            --example verify_updater_signature -- \
+            "${staged_updater}" "${staged_updater}.sig" "${public_key_file}"
+
+          staged_files=(
+            "assets/Headroom.Local.Community_${RELEASE_VERSION}_universal.dmg"
+            "assets/Headroom.Local.Community_universal.app.tar.gz"
+            "assets/Headroom.Local.Community_universal.app.tar.gz.sig"
+            "assets/latest.json"
+            "release-body.md"
+          )
+          staging_digest="$(
+            (
+              cd release-staging
+              for file in "${staged_files[@]}"; do
+                printf '%s\0' "${file}"
+                cat "${file}"
+              done
+            ) | openssl dgst -sha256 | awk '{print $NF}'
+          )"
+          [[ "${staging_digest}" =~ ^[0-9a-f]{64}$ ]]
+          printf 'staging_digest=%s\n' "${staging_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          tagName: v__VERSION__
-          releaseName: Headroom Local Community v__VERSION__
-          releaseBody: |
-            Headroom Local Community macOS 社区发行版。
+          name: community-macos-${{ steps.release_meta.outputs.version }}
+          path: release-staging
+          if-no-files-found: error
+          retention-days: 1
 
-            - 纯本地运行，不需要 Headroom 账户或付费后端。
-            - 更新包使用 Community 独立签名密钥验证。
-            - 全部代码复用与工具集成均依据相应开源许可证。
-            - 感谢 headroomlabs-ai/headroom、rtk-ai/rtk、Microsoft MarkItDown 和各可选开源工具的作者与贡献者。
+  publish:
+    name: Publish verified macOS release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
 
-            安装和签名问题请阅读 `docs/macos-install-and-signing.zh-CN.md`。
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-          args: --target universal-apple-darwin --bundles app,dmg
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: community-macos-${{ needs.build.outputs.version }}
+          path: release-staging
+
+      - name: Create draft, verify uploaded digests, and publish
+        shell: bash
+        env:
+          EXPECTED_STAGING_DIGEST: ${{ needs.build.outputs.staging_digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          assets_dir="release-staging/assets"
+
+          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ -s "release-staging/release-body.md" ]]
+          [[ -f "${assets_dir}/Headroom.Local.Community_${version}_universal.dmg" ]]
+          [[ -f "${assets_dir}/Headroom.Local.Community_universal.app.tar.gz" ]]
+          [[ -f "${assets_dir}/Headroom.Local.Community_universal.app.tar.gz.sig" ]]
+          [[ -f "${assets_dir}/latest.json" ]]
+          [[ "$(find "${assets_dir}" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "4" ]]
+
+          staged_files=(
+            "assets/Headroom.Local.Community_${version}_universal.dmg"
+            "assets/Headroom.Local.Community_universal.app.tar.gz"
+            "assets/Headroom.Local.Community_universal.app.tar.gz.sig"
+            "assets/latest.json"
+            "release-body.md"
+          )
+          staging_digest="$(
+            (
+              cd release-staging
+              for file in "${staged_files[@]}"; do
+                printf '%s\0' "${file}"
+                cat "${file}"
+              done
+            ) | openssl dgst -sha256 | awk '{print $NF}'
+          )"
+          [[ "${EXPECTED_STAGING_DIGEST}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${staging_digest}" == "${EXPECTED_STAGING_DIGEST}" ]]
+
+          release_api="repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+          release_error="${RUNNER_TEMP}/release-api-error"
+          release_state=absent
+          if release_json="$(gh api "${release_api}" 2>"${release_error}")"; then
+            if [[ "$(jq -r '.draft' <<<"${release_json}")" == "true" ]]; then
+              release_state=draft
+            else
+              release_state=public
+            fi
+          elif grep -q 'HTTP 404' "${release_error}"; then
+            gh release create "${tag}" "${assets_dir}"/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "Headroom Local Community ${tag}" \
+              --notes-file release-staging/release-body.md
+            release_state=draft
+          else
+            cat "${release_error}" >&2
+            exit 1
+          fi
+
+          release_json="$(gh api "${release_api}")"
+          [[ "$(jq -r '.tag_name' <<<"${release_json}")" == "${tag}" ]]
+          [[ "$(jq -r '.prerelease' <<<"${release_json}")" == "false" ]]
+          [[ "$(jq -r '.name' <<<"${release_json}")" == "Headroom Local Community ${tag}" ]]
+          [[ "$(jq -r '.body' <<<"${release_json}")" == "$(cat release-staging/release-body.md)" ]]
+          [[ "$(jq -r '.assets | length' <<<"${release_json}")" == "4" ]]
+
+          expected_names="$(printf '%s\n' \
+            "Headroom.Local.Community_${version}_universal.dmg" \
+            "Headroom.Local.Community_universal.app.tar.gz" \
+            "Headroom.Local.Community_universal.app.tar.gz.sig" \
+            "latest.json" | LC_ALL=C sort)"
+          actual_names="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+          [[ "${actual_names}" == "${expected_names}" ]]
+
+          for asset in "${assets_dir}"/*; do
+            name="$(basename "${asset}")"
+            local_digest="sha256:$(sha256sum "${asset}" | awk '{print $1}')"
+            remote_digest="$(jq -r --arg name "${name}" \
+              '.assets[] | select(.name == $name) | .digest' <<<"${release_json}")"
+            [[ "${remote_digest}" == "${local_digest}" ]]
+          done
+
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq '.sha')"
+          [[ "${tag_sha}" == "${GITHUB_SHA}" ]]
+
+          if [[ "${release_state}" == "draft" ]]; then
+            gh release edit "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft=false
+          fi
+
+          release_json="$(gh api "${release_api}")"
+          if [[ "$(jq -r '.immutable' <<<"${release_json}")" != "true" ]]; then
+            if [[ "${release_state}" == "draft" ]]; then
+              gh release edit "${tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --draft=true
+            fi
+            echo "::error::Release immutability is not enabled; refusing a mutable public release."
+            exit 1
+          fi
+
+      - name: Verify immutable public release downloads
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          assets_dir="release-staging/assets"
+          public_dir="$(mktemp -d "${RUNNER_TEMP}/headroom-public-release.XXXXXX")"
+          trap 'rm -rf "${public_dir}"' EXIT
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          [[ "$(jq -r '.draft' <<<"${release_json}")" == "false" ]]
+          [[ "$(jq -r '.prerelease' <<<"${release_json}")" == "false" ]]
+          [[ "$(jq -r '.immutable' <<<"${release_json}")" == "true" ]]
+          [[ "$(jq -r '.assets | length' <<<"${release_json}")" == "4" ]]
+
+          asset_names=(
+            "Headroom.Local.Community_${version}_universal.dmg"
+            "Headroom.Local.Community_universal.app.tar.gz"
+            "Headroom.Local.Community_universal.app.tar.gz.sig"
+            "latest.json"
+          )
+          expected_names="$(printf '%s\n' "${asset_names[@]}" | LC_ALL=C sort)"
+          actual_names="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+          [[ "${actual_names}" == "${expected_names}" ]]
+
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq '.sha')"
+          [[ "${tag_sha}" == "${GITHUB_SHA}" ]]
+
+          for name in "${asset_names[@]}"; do
+            curl --fail --location --silent --show-error \
+              --retry 8 --retry-all-errors --retry-delay 2 --retry-max-time 90 \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${name}" \
+              --output "${public_dir}/${name}"
+            staged_digest="sha256:$(sha256sum "${assets_dir}/${name}" | awk '{print $1}')"
+            public_digest="sha256:$(sha256sum "${public_dir}/${name}" | awk '{print $1}')"
+            [[ "${public_digest}" == "${staged_digest}" ]]
+          done
+
+          latest_url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json"
+          latest_manifest="${public_dir}/latest-endpoint.json"
+          latest_verified=false
+          for _ in {1..12}; do
+            if curl --fail --location --silent --show-error \
+                --header 'Cache-Control: no-cache' \
+                --retry 2 --retry-all-errors --retry-delay 1 \
+                "${latest_url}" --output "${latest_manifest}"; then
+              staged_digest="sha256:$(sha256sum "${assets_dir}/latest.json" | awk '{print $1}')"
+              latest_digest="sha256:$(sha256sum "${latest_manifest}" | awk '{print $1}')"
+              if [[ "${latest_digest}" == "${staged_digest}" ]]; then
+                latest_verified=true
+                break
+              fi
+            fi
+            sleep 5
+          done
+          [[ "${latest_verified}" == "true" ]]
+
+          updater_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/Headroom.Local.Community_universal.app.tar.gz"
+          signature="$(tr -d '\r\n' < "${public_dir}/Headroom.Local.Community_universal.app.tar.gz.sig")"
+          jq -e \
+            --arg version "${version}" \
+            --arg updater_url "${updater_url}" \
+            --arg signature "${signature}" \
+            '.version == $version
+              and (.platforms | length == 4)
+              and ([.platforms[].url] | unique == [$updater_url])
+              and ([.platforms[].signature] | unique == [$signature])' \
+            "${latest_manifest}" >/dev/null

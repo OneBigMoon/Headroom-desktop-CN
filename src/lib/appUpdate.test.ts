@@ -218,6 +218,23 @@ describe("app update helpers", () => {
     });
   });
 
+  it("allows retrying the install after an error", async () => {
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce("network unavailable")
+      .mockResolvedValueOnce(undefined);
+
+    await expect(runAppUpdateInstall({ availableUpdate, invokeFn })).resolves.toEqual({
+      statusCopy: "network unavailable",
+    });
+    await expect(runAppUpdateInstall({ availableUpdate, invokeFn })).resolves.toEqual({
+      readyToRestart: true,
+      showDialog: true,
+      statusCopy: "Headroom 0.3.0 is installed and ready to restart.",
+    });
+    expect(invokeFn).toHaveBeenCalledTimes(2);
+  });
+
   it("returns an empty patch when install is requested without an update", async () => {
     const invokeFn = vi.fn();
 

@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "headroom-local-community"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1801,6 +1801,7 @@ dependencies = [
  "libc",
  "log",
  "mac-notification-sys",
+ "minisign-verify",
  "os_info",
  "parking_lot",
  "rand 0.9.4",
