@@ -80,3 +80,29 @@ test("rejects prerelease versions and mismatched tags", (t) => {
     /does not match version/,
   );
 });
+
+test("release workflow resolves drafts from the release list and updates by id", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release-community-macos.yml", import.meta.url),
+    "utf8",
+  );
+  const publishStep = workflow.match(
+    /- name: Create draft, verify uploaded digests, and publish([\s\S]*?)- name: Verify immutable public release downloads/,
+  );
+
+  assert.ok(publishStep);
+  assert.match(publishStep[1], /gh api --paginate --slurp "\$\{releases_api\}"/);
+  assert.match(
+    publishStep[1],
+    /release_api="repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{release_id\}"/,
+  );
+  assert.match(
+    publishStep[1],
+    /gh api --method PATCH "\$\{release_api\}" -F draft=false/,
+  );
+  assert.match(
+    publishStep[1],
+    /gh api --method PATCH "\$\{release_api\}" -F draft=true/,
+  );
+  assert.doesNotMatch(publishStep[1], /releases\/tags\/\$\{tag\}/);
+});
