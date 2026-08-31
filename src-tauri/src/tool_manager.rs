@@ -1287,6 +1287,8 @@ struct PluginAddon {
     marketplace_name: &'static str,
     /// `plugin@marketplace` ref used by install/enable/disable/uninstall.
     plugin_ref: &'static str,
+    /// Plugin directory inside the Codex marketplace checkout.
+    codex_local_path: &'static str,
 }
 
 static PLUGIN_ADDONS: [PluginAddon; 2] = [
@@ -1295,12 +1297,14 @@ static PLUGIN_ADDONS: [PluginAddon; 2] = [
         marketplace: "DietrichGebert/ponytail",
         marketplace_name: "ponytail",
         plugin_ref: "ponytail@ponytail",
+        codex_local_path: ".",
     },
     PluginAddon {
         id: "caveman",
         marketplace: "JuliusBrussee/caveman",
         marketplace_name: "caveman",
         plugin_ref: "caveman@caveman",
+        codex_local_path: "./plugins/caveman",
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
@@ -6548,6 +6552,7 @@ impl ToolManager {
         let cli = host.cli().context("CLI not found on PATH")?;
         if host.plugin_present(plugin) {
             let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
+            host.prepare_marketplace_snapshot(plugin)?;
             self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))?;
         } else {
             // Re-adding an already-known marketplace is a benign error, so its
@@ -6560,6 +6565,7 @@ impl ToolManager {
             let marketplace_err = self
                 .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
                 .err();
+            host.prepare_marketplace_snapshot(plugin)?;
             self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
                 .map_err(|err| match marketplace_err {
                     Some(add_err) => {
@@ -6760,6 +6766,19 @@ impl PluginHost {
         vec!["plugin", "marketplace", "add", plugin.marketplace]
     }
 
+    fn prepare_marketplace_snapshot(self, plugin: &PluginAddon) -> Result<()> {
+        if matches!(self, PluginHost::Codex) {
+            write_codex_compat_marketplace_manifest_at(
+                &crate::client_adapters::home_dir()
+                    .join(".codex")
+                    .join(".tmp")
+                    .join("marketplaces"),
+                plugin,
+            )?;
+        }
+        Ok(())
+    }
+
     fn marketplace_remove_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         vec!["plugin", "marketplace", "remove", plugin.marketplace_name]
     }
@@ -6813,6 +6832,34 @@ impl PluginHost {
             PluginHost::Codex => codex_plugin_present(plugin),
         }
     }
+}
+
+fn write_codex_compat_marketplace_manifest_at(root: &Path, plugin: &PluginAddon) -> Result<()> {
+    let manifest = root
+        .join(plugin.marketplace_name)
+        .join(".agents")
+        .join("plugins")
+        .join("marketplace.json");
+    let parent = manifest
+        .parent()
+        .context("Codex compatibility marketplace manifest has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    let body = json!({
+        "name": plugin.marketplace_name,
+        "interface": { "displayName": plugin.id },
+        "plugins": [{
+            "name": plugin.id,
+            "source": { "source": "local", "path": plugin.codex_local_path },
+            "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+            "category": "Productivity"
+        }]
+    });
+    crate::client_adapters::atomic_write(
+        &manifest,
+        &serde_json::to_vec_pretty(&body).context("serializing Codex compatibility marketplace")?,
+    )
+    .with_context(|| format!("writing {}", manifest.display()))
 }
 
 pub(crate) fn claude_installed_plugins() -> Option<Value> {
@@ -12433,6 +12480,33 @@ after
             crate::tool_manager::PluginHost::ClaudeCode.install_args(plugin),
             vec!["plugin", "install", plugin.plugin_ref]
         );
+    }
+
+    #[test]
+    fn codex_compat_marketplace_manifest_uses_local_plugin_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "headroom-codex-marketplace-compat-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        for plugin in &PLUGIN_ADDONS {
+            write_codex_compat_marketplace_manifest_at(&root, plugin)
+                .expect("compatibility manifest");
+            let path = root
+                .join(plugin.marketplace_name)
+                .join(".agents/plugins/marketplace.json");
+            let value: Value = serde_json::from_slice(&fs::read(path).expect("manifest bytes"))
+                .expect("valid JSON");
+            assert_eq!(value["plugins"][0]["name"], plugin.id);
+            assert_eq!(value["plugins"][0]["source"]["source"], "local");
+            assert_eq!(
+                value["plugins"][0]["source"]["path"],
+                plugin.codex_local_path
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
