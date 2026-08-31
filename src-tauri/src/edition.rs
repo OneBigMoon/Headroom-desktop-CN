@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn runtime_env_overrides_telemetry_and_uses_community_model_cache() {
-        let mut command = Command::new("headroom-ai");
+        let mut command = crate::proc::command("headroom-ai");
         command
             .env("HEADROOM_TELEMETRY", "on")
             .env("HEADROOM_BEACON", "on")
