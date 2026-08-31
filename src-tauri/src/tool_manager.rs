@@ -12497,8 +12497,9 @@ after
             let path = root
                 .join(plugin.marketplace_name)
                 .join(".agents/plugins/marketplace.json");
-            let value: Value = serde_json::from_slice(&fs::read(path).expect("manifest bytes"))
-                .expect("valid JSON");
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).expect("manifest bytes"))
+                    .expect("valid JSON");
             assert_eq!(value["plugins"][0]["name"], plugin.id);
             assert_eq!(value["plugins"][0]["source"]["source"], "local");
             assert_eq!(
