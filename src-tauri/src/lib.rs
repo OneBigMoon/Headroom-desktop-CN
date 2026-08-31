@@ -10422,14 +10422,14 @@ Some unrelated content.
         );
 
         let passthrough = crate::proc::command(&wrapper)
-            .arg("--version")
+            .arg("login")
             .env("HEADROOM_REAL_CODEX", "/bin/echo")
             .output()
             .expect("run passthrough wrapper");
         assert!(passthrough.status.success());
         assert_eq!(
             String::from_utf8_lossy(&passthrough.stdout).trim(),
-            "--version"
+            "login"
         );
     }
 
