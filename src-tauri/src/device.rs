@@ -1,6 +1,8 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
 
 use crate::keychain;
 
