@@ -189,9 +189,16 @@ test("release workflow resumes drafts without replacing existing assets", () => 
     publishStep[1],
     /gh api --method PATCH "\$\{release_api\}" -F draft=false/,
   );
-  assert.match(
+  assert.doesNotMatch(
     publishStep[1],
     /gh api --method PATCH "\$\{release_api\}" -F draft=true/,
+  );
+  assert.match(publishStep[1], /immutable-releases/);
+  assert.match(publishStep[1], /X-GitHub-Api-Version: 2026-03-10/);
+  assert.match(publishStep[1], /for _ in \{1\.\.30\}/);
+  assert.match(
+    publishStep[1],
+    /Release did not become immutable within 60 seconds/,
   );
   assert.doesNotMatch(publishStep[1], /releases\/tags\/\$\{tag\}/);
   assert.doesNotMatch(publishStep[1], /--clobber/);

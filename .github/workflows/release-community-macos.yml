@@ -478,6 +478,17 @@ jobs:
             "latest.json"
           )
 
+          api_version_header="X-GitHub-Api-Version: 2026-03-10"
+          immutable_releases_enabled="$(
+            gh api -H "${api_version_header}" \
+              "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+              --jq '.enabled'
+          )"
+          if [[ "${immutable_releases_enabled}" != "true" ]]; then
+            echo "::error::GitHub immutable releases must be enabled before publishing."
+            exit 1
+          fi
+
           releases_api="repos/${GITHUB_REPOSITORY}/releases?per_page=100"
           find_release_matches() {
             gh api --paginate --slurp "${releases_api}" |
@@ -606,12 +617,18 @@ jobs:
             gh api --method PATCH "${release_api}" -F draft=false >/dev/null
           fi
 
-          release_json="$(gh api "${release_api}")"
-          if [[ "$(jq -r '.immutable' <<<"${release_json}")" != "true" ]]; then
-            if [[ "${release_state}" == "draft" ]]; then
-              gh api --method PATCH "${release_api}" -F draft=true >/dev/null
+          release_immutable=false
+          for _ in {1..30}; do
+            release_json="$(gh api -H "${api_version_header}" "${release_api}")"
+            release_immutable="$(jq -r '.immutable // false' <<<"${release_json}")"
+            if [[ "${release_immutable}" == "true" ]]; then
+              break
             fi
-            echo "::error::Release immutability not enabled; refusing mutable public release."
+            sleep 2
+          done
+
+          if [[ "${release_immutable}" != "true" ]]; then
+            echo "::error::Release did not become immutable within 60 seconds."
             exit 1
           fi
 
@@ -628,7 +645,10 @@ jobs:
           public_dir="$(mktemp -d "${RUNNER_TEMP}/headroom-public-release.XXXXXX")"
           trap 'rm -rf "${public_dir}"' EXIT
 
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          release_json="$(
+            gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+          )"
           [[ "$(jq -r '.draft' <<<"${release_json}")" == "false" ]]
           [[ "$(jq -r '.prerelease' <<<"${release_json}")" == "false" ]]
           [[ "$(jq -r '.immutable' <<<"${release_json}")" == "true" ]]
