@@ -479,14 +479,25 @@ jobs:
           )
 
           api_version_header="X-GitHub-Api-Version: 2026-03-10"
-          immutable_releases_enabled="$(
+          immutable_releases_error="${RUNNER_TEMP}/headroom-immutable-releases-error.txt"
+          if immutable_releases_enabled="$(
             gh api -H "${api_version_header}" \
               "repos/${GITHUB_REPOSITORY}/immutable-releases" \
-              --jq '.enabled'
-          )"
-          if [[ "${immutable_releases_enabled}" != "true" ]]; then
-            echo "::error::GitHub immutable releases must be enabled before publishing."
-            exit 1
+              --jq '.enabled' 2>"${immutable_releases_error}"
+          )"; then
+            if [[ "${immutable_releases_enabled}" != "true" ]]; then
+              echo "::error::GitHub immutable releases must be enabled before publishing."
+              exit 1
+            fi
+          else
+            immutable_error="$(cat "${immutable_releases_error}")"
+            if [[ "${immutable_error}" != *"Resource not accessible by integration"* ||
+                  "${immutable_error}" != *"(HTTP 403)"* ]]; then
+              cat "${immutable_releases_error}" >&2
+              echo "::error::Unable to verify GitHub immutable releases before publishing."
+              exit 1
+            fi
+            echo "::notice::GITHUB_TOKEN cannot read repository administration settings; relying on the mandatory post-publish immutable verification."
           fi
 
           releases_api="repos/${GITHUB_REPOSITORY}/releases?per_page=100"
