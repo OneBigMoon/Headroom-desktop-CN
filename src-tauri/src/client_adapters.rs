@@ -734,7 +734,10 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
     // can finish after this verification runs. Surface it via the
     // `proxy_reachable` field, but don't fail `verified` on it. `verified`
     // attests only to "we wrote everything we needed to write".
-    let proxy_reachable = is_headroom_proxy_reachable();
+    // Reuse the status/watchdog probe so setup verification does not report
+    // "proxy not answering" while the proxy is merely busy or returning a
+    // transient non-routing readiness warning.
+    let proxy_reachable = crate::state::headroom_proxy_reachable();
     if proxy_reachable {
         checks.push("Headroom proxy is reachable on 127.0.0.1:6867.".into());
     }
@@ -5411,28 +5414,6 @@ fn claude_settings_hook_matches(hook_fragment: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
-fn is_headroom_proxy_reachable() -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-
-    ["127.0.0.1", "localhost"].iter().any(|host| {
-        client
-            .get(format!("http://{host}:6867/readyz"))
-            .send()
-            // 404 = an older proxy build without the /readyz route, still up and
-            // serving -- count it as reachable (Sentry RUST-2X).
-            .map(|response| {
-                let status = response.status();
-                status.is_success() || status == reqwest::StatusCode::NOT_FOUND
-            })
-            .unwrap_or(false)
-    })
-}
 
 /// Pure core for `detect_oss_remnants`: given the environment facts, produce the
 /// operator-facing warnings. Stale open-source-install remnants coexisting with

@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -170,6 +171,32 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Prepend a binary's own directory to PATH using the platform-native PATH
+/// encoding. An explicit `existing` value keeps this helper pure and lets
+/// callers preserve a missing or empty PATH without mutating process state.
+pub(crate) fn path_with_binary_dir(binary: &Path, existing: Option<&OsStr>) -> OsString {
+    let existing = existing.unwrap_or_else(|| OsStr::new(""));
+    let Some(dir) = binary.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return existing.to_os_string();
+    };
+
+    let mut paths = vec![dir.to_path_buf()];
+    if !existing.is_empty() {
+        paths.extend(std::env::split_paths(existing));
+    }
+
+    match std::env::join_paths(paths) {
+        Ok(path) => path,
+        Err(err) => {
+            log::warn!(
+                "Could not prepend {} to PATH: {err}; using the existing PATH unchanged",
+                dir.display()
+            );
+            existing.to_os_string()
+        }
+    }
+}
+
 /// `is_executable` only checks the POSIX exec bit; on dual-architecture Macs
 /// an Intel-only Homebrew remnant in `/usr/local/bin` will satisfy the bit but
 /// the kernel returns `ENOEXEC` when we try to run it. Smoke-test by spawning
@@ -191,14 +218,9 @@ fn is_runnable(path: &Path) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(dir) = path.parent() {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        let augmented = if existing.is_empty() {
-            dir.display().to_string()
-        } else {
-            format!("{}:{}", dir.display(), existing)
-        };
-        command.env("PATH", augmented);
+    if path.parent().is_some() {
+        let existing = std::env::var_os("PATH");
+        command.env("PATH", path_with_binary_dir(path, existing.as_deref()));
     }
     let child = match command.spawn() {
         Ok(child) => child,
@@ -270,6 +292,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn path_with_binary_dir_round_trips_native_entries_with_spaces() {
+        let root = std::env::temp_dir().join("Headroom PATH tests");
+        let binary_dir = root.join("Program Files").join("Headroom").join("bin");
+        let binary = binary_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let existing_paths = vec![
+            root.join("Node Tools"),
+            binary_dir.clone(),
+            root.join("System Bin"),
+        ];
+        let existing = std::env::join_paths(&existing_paths).unwrap();
+
+        let augmented = path_with_binary_dir(&binary, Some(existing.as_os_str()));
+        let actual: Vec<_> = std::env::split_paths(&augmented).collect();
+        let mut expected = vec![binary_dir];
+        expected.extend(existing_paths);
+
+        // Existing order and duplicates are preserved; only the binary dir is
+        // prepended. On Windows this same test exercises `;`, on Unix `:`.
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn path_with_binary_dir_preserves_empty_and_parentless_path_semantics() {
+        let root = std::env::temp_dir().join("Headroom PATH empty tests");
+        let binary_dir = root.join("bin");
+        let binary = binary_dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+
+        let augmented = path_with_binary_dir(&binary, Some(OsStr::new("")));
+        assert_eq!(
+            std::env::split_paths(&augmented).collect::<Vec<_>>(),
+            vec![binary_dir]
+        );
+
+        let existing = std::env::join_paths([root.join("Existing Tools")]).unwrap();
+        assert_eq!(
+            path_with_binary_dir(Path::new("claude"), Some(existing.as_os_str())),
+            existing
+        );
+    }
+
+    #[test]
+    fn path_with_binary_dir_falls_back_when_join_rejects_the_binary_dir() {
+        let root = std::env::temp_dir().join("Headroom PATH invalid tests");
+        let invalid_dir = root.join(if cfg!(windows) {
+            "invalid\"directory"
+        } else {
+            "invalid:directory"
+        });
+        let binary = invalid_dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+        let existing = std::env::join_paths([root.join("Existing Tools")]).unwrap();
+
+        assert_eq!(
+            path_with_binary_dir(&binary, Some(existing.as_os_str())),
+            existing
+        );
     }
 
     #[cfg(unix)]

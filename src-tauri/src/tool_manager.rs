@@ -5575,15 +5575,11 @@ impl ToolManager {
             }
             let mut cmd = build_command(&entrypoint, &args[..], &self.runtime.root_dir);
             if let Some(claude_path) = detected_claude.as_ref() {
-                if let Some(dir) = claude_path.parent() {
-                    let existing = std::env::var("PATH").unwrap_or_default();
-                    let augmented = if existing.is_empty() {
-                        dir.display().to_string()
-                    } else {
-                        format!("{}:{}", dir.display(), existing)
-                    };
-                    cmd.env("PATH", augmented);
-                }
+                let existing = std::env::var_os("PATH");
+                cmd.env(
+                    "PATH",
+                    crate::claude_cli::path_with_binary_dir(claude_path, existing.as_deref()),
+                );
             }
             let output = cmd
                 .output()
@@ -9338,20 +9334,6 @@ fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
 }
 
-fn path_with_binary_dir(binary: &Path) -> String {
-    let existing = std::env::var("PATH").unwrap_or_default();
-    match binary.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => {
-            if existing.is_empty() {
-                dir.display().to_string()
-            } else {
-                format!("{}:{}", dir.display(), existing)
-            }
-        }
-        _ => existing,
-    }
-}
-
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
     let mut command = crate::proc::command(binary);
     command
@@ -9362,7 +9344,13 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         // CLI with a `#!/usr/bin/env node` shebang (e.g. codex) fails with exit
         // 127 / "env: node: No such file or directory". node lives alongside the
         // CLI in nvm's bin, so prepend the binary's own dir to PATH.
-        .env("PATH", path_with_binary_dir(binary))
+        .env(
+            "PATH",
+            crate::claude_cli::path_with_binary_dir(
+                binary,
+                std::env::var_os("PATH").as_deref(),
+            ),
+        )
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
         .env("PYTHONNOUSERSITE", "1")
@@ -10007,7 +9995,7 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
         parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
-        parse_tasklist_image, path_with_binary_dir, pending_addon_update, pinned_headroom_release,
+        parse_tasklist_image, pending_addon_update, pinned_headroom_release,
         pip_failure_category, plugin_install_failure_category, pre_upstream_concurrency,
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
@@ -10507,16 +10495,6 @@ asyncio.run(verify())
         // No bundle, or blank -> nothing to bridge.
         assert!(httpx_ca_bundle_bridge_from(false, None).is_empty());
         assert!(httpx_ca_bundle_bridge_from(false, Some("  ")).is_empty());
-    }
-
-    #[test]
-    fn path_with_binary_dir_prepends_parent() {
-        let path =
-            path_with_binary_dir(&PathBuf::from("/Users/x/.nvm/versions/node/v22/bin/codex"));
-        assert!(path.starts_with("/Users/x/.nvm/versions/node/v22/bin:"));
-        // A bare binary name has no usable parent; PATH is left unchanged.
-        let existing = std::env::var("PATH").unwrap_or_default();
-        assert_eq!(path_with_binary_dir(&PathBuf::from("codex")), existing);
     }
 
     #[test]

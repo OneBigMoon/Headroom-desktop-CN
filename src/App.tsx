@@ -32,9 +32,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
-  PREVIEW_SUPPORT_EMAIL,
   platformPreviewNoticeFor,
-  platformPreviewSupportMailto,
+  platformPreviewSupportIssueUrl,
 } from "./lib/platform";
 import {
   Bar,
@@ -45,7 +44,7 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import headroomLogo from "./assets/headroom-logo.svg";
+import headroomAvatar from "./assets/headroom-rage-avatar.png";
 import packageJson from "../package.json";
 import { LOCAL_COMMUNITY_EDITION } from "./lib/localEdition";
 import {
@@ -193,7 +192,9 @@ import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
 import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
+import { ProjectIssuesLink } from "./components/ProjectIssuesLink";
 import { TermsGate } from "./components/TermsGate";
+import { WindowChrome } from "./components/WindowChrome";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -1672,12 +1673,21 @@ function addonDisplayRank(id: string): number {
   return rank === -1 ? ADDON_DISPLAY_ORDER.length : rank;
 }
 
-function buildAddonRequestMailto(): string {
-  const subject = "Addon request";
-  const body =
-    "Which addon would you like to see in Headroom?\n\n\n" +
-    "What would it do for you / which tool does it wrap?\n\n\n";
-  return `mailto:headroom-local-community@localhost.invalid?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+function normalizeDesktopPlatform(platform: string | undefined, userAgent: string) {
+  const reportedPlatform = platform?.toLowerCase();
+  if (reportedPlatform === "darwin" || reportedPlatform === "macos") {
+    return "macos";
+  }
+  if (reportedPlatform === "win32" || reportedPlatform === "windows") {
+    return "windows";
+  }
+  if (reportedPlatform) {
+    return reportedPlatform;
+  }
+  if (userAgent.includes("Windows")) {
+    return "windows";
+  }
+  return userAgent.includes("Mac") ? "macos" : "linux";
 }
 
 function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
@@ -4919,11 +4929,34 @@ export default function App() {
   }, [startupPercent, startupCopy]);
 
   useEffect(() => {
+    const root = document.documentElement;
+    const previousPlatform = root.dataset.platform;
+    const detectedPlatform = normalizeDesktopPlatform(
+      runtimeStatus?.platform,
+      navigator.userAgent
+    );
+
+    root.dataset.platform = detectedPlatform;
+    return () => {
+      if (previousPlatform) {
+        root.dataset.platform = previousPlatform;
+      } else {
+        delete root.dataset.platform;
+      }
+    };
+  }, [runtimeStatus?.platform]);
+
+  useEffect(() => {
     if (!startupReady || windowLabel === null) {
       return;
     }
     window.dispatchEvent(new CustomEvent("headroom:boot-complete"));
   }, [startupReady, windowLabel]);
+
+  const desktopPlatform = normalizeDesktopPlatform(
+    runtimeStatus?.platform,
+    navigator.userAgent
+  );
 
   if (!startupReady || windowLabel === null) {
     return null;
@@ -5584,7 +5617,13 @@ export default function App() {
           </div>
           {unavailableConnectors.length > 0 ? (
             <div className="connector-list connector-list--unavailable">
-              <p className="connector-list__section-label">{t("connections.notInstalled")}</p>
+              <p className="connector-list__section-label">
+                {t(
+                  desktopPlatform === "windows"
+                    ? "connections.notInstalledDevice"
+                    : "connections.notInstalled"
+                )}
+              </p>
               {unavailableConnectors.map((connector) => {
                 const unavailableReason = getConnectorUnavailableReason(connector);
                 const supportWarning = getConnectorSupportWarning(connector);
@@ -6038,6 +6077,7 @@ export default function App() {
   const platformPreviewNotice = platformPreviewNoticeFor(
     runtimeStatus?.platform,
     runtimeStatus?.supportTier,
+    t,
   );
   const headroomLearnSupported = runtimeStatus?.headroomLearnSupported !== false;
   const headroomLearnDisabledReason =
@@ -6534,13 +6574,16 @@ export default function App() {
 
   const activeNavItem = navItems.find((item) => item.id === activeView);
   const activeViewTitle = activeNavItem ? t(activeNavItem.labelKey) : t("nav.settings");
-
   return (
     <main className="tray-shell">
       {upgradeOverlay}
+      <WindowChrome
+        platform={desktopPlatform === "windows" ? "windows" : "macos"}
+        title={`Headroom · ${activeViewTitle}`}
+      />
       <aside className="tray-sidebar">
         <div className="tray-sidebar__logo">
-          <img src={headroomLogo} alt="Headroom" />
+          <img src={headroomAvatar} alt="Headroom" />
         </div>
         <nav className="tray-nav" aria-label={t("aria.trayNavigation")}>
           {navItems.map((item) => (
@@ -6592,7 +6635,11 @@ export default function App() {
             <p className="tray-panel__eyebrow">{t("brand.tagline")}</p>
             <h1 className="tray-panel__title">{activeViewTitle}</h1>
           </div>
-          <span className="tray-panel__local-status">{t("brand.runsOnThisMac")}</span>
+            <span className="tray-panel__local-status">
+              {desktopPlatform === "windows"
+                ? t("brand.runsOnThisDevice")
+                : t("brand.runsOnThisMac")}
+            </span>
         </header>
         <div className="tray-content" hidden={activeView !== "home"}>
             {!LOCAL_COMMUNITY_EDITION && tierMismatch ? (
@@ -6645,23 +6692,22 @@ export default function App() {
                 <h1>{calloutTitle}</h1>
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">
-                    {platformPreviewNotice} Please report any issues to{" "}
+                    {platformPreviewNotice} {t("platform.previewReportPrompt")}{" "}
                     <button
                       type="button"
                       className="link-button"
                       onClick={() =>
-                        void invoke("open_external_link", {
-                          url: platformPreviewSupportMailto({
+                        void openExternalLink(
+                          platformPreviewSupportIssueUrl({
                             platform: runtimeStatus?.platform,
                             appVersion: appSemver,
                             headroomVersion,
-                          }),
-                        }).catch(() => {})
+                          }, t)
+                        ).catch(() => {})
                       }
                     >
-                      {PREVIEW_SUPPORT_EMAIL}
+                      {t("platform.githubIssues")}
                     </button>
-                    .
                   </p>
                 ) : null}
                 {showUpgradeSavingsLine ? (
@@ -7295,14 +7341,14 @@ export default function App() {
                 <h1>{t("nav.tools")}</h1>
               </div>
               <p className="addons-card__blurb">
-                {t("tools.description")} {" "}
-                <button
-                  type="button"
-                  className="addon-card__link"
-                  onClick={() => void openExternalLink(buildAddonRequestMailto())}
-                >
+                {t(
+                  desktopPlatform === "windows"
+                    ? "tools.descriptionDevice"
+                    : "tools.description"
+                )} {" "}
+                <ProjectIssuesLink onOpen={openExternalLink}>
                   {t("tools.requestAddon")}
-                </button>
+                </ProjectIssuesLink>
               </p>
               <div className="addons-card__updates" aria-live="polite">
                 <button
@@ -7784,7 +7830,7 @@ export default function App() {
           </>
         ) : null}
 
-        <div className="tray-content" hidden={activeView !== "settings"}>
+        <div className="tray-content tray-content--settings" hidden={activeView !== "settings"}>
             <section className="panel-stack">
               {!LOCAL_COMMUNITY_EDITION ? (
                 <article className="soft-card panel-card settings-account-card">
@@ -8163,7 +8209,11 @@ export default function App() {
                   </div>
                   <div>
                     <p>
-                      {t("settings.startupDescription")}
+                      {t(
+                        desktopPlatform === "windows"
+                          ? "settings.startupDescriptionDevice"
+                          : "settings.startupDescription"
+                      )}
                     </p>
                   </div>
                   <div className="connector-item__controls">

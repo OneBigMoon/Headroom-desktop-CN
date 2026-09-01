@@ -1,20 +1,21 @@
-# macOS 发布说明
+# macOS 与 Windows 发布说明
 
-本项目仅通过 `.github/workflows/release-community-macos.yml` 发布 macOS Community 版本。工作流只响应稳定的 `vX.Y.Z` 标签，不提供 `workflow_dispatch`；构建要求版本文件、标签和发布说明一致。
+本项目仅通过 `.github/workflows/release-community-macos.yml` 同时发布 macOS 与 Windows Community 版本。文件名为历史兼容保留；工作流只响应稳定的 `vX.Y.Z` 标签，不提供 `workflow_dispatch`，并要求版本文件、标签和发布说明一致。
 
 ## 发布流程
 
-工作流分为只读的构建验证 Job 和有写权限的发布 Job：
+工作流把构建、汇总和发布权限分离：
 
-1. 构建 Job 在 `macos-14` 上检出代码，运行 `scripts/verify-release.sh`、前端测试、Rust 测试和 universal macOS 构建。
-2. 构建 Job 对 `.app` 做完整 `codesign --verify --deep --strict` 验签，并校验 DMG、updater tar.gz、sig 和 `latest.json` 的数量与名称。
-3. 构建 Job 将已验证产物和 `.github/release-notes/<版本>.md` 上传为短期 artifact。
-4. 发布 Job 下载该 artifact，创建 GitHub draft Release；随后通过 GitHub 返回的远端 SHA-256 digest 逐个核对资产。
-5. 只有远端 digest 全部匹配时，发布 Job 才把 draft Release 公开；仓库必须预先启用 release immutability，该设置只保护启用后创建的 Release。
-6. 公开后，工作流确认 Release 已不可变，并从 tag 下载地址重新下载四个资产，与 staging 内容逐字节比较。
-7. 工作流再从 `releases/latest/download/latest.json` 下载真实 updater 清单，确认版本、URL 和签名均指向本次 Release。
+1. Ubuntu 校验 Job 检查稳定标签、所有版本文件和 `.github/release-notes/<版本>.md`。
+2. `macos-14` 与 `windows-latest` 构建 Job 在校验后并行运行；macOS Job 继续执行完整 release checks。
+3. macOS Job 构建 universal `.app`/DMG，校验代码签名、双架构、DMG 和 updater tar.gz 签名。
+4. Windows Job 构建 Windows 11 x64 预览版 NSIS `.exe` 及 Tauri `v1Compatible` updater `.nsis.zip`/`.sig`，并验证 updater 签名；首次联合发布前仍必须在干净 Windows 11 x64 上完成安装、首次启动、更新和卸载 smoke。Windows 10 尚未完成该门禁，不承诺当前版本已支持。
+5. Ubuntu 汇总 Job 下载两个平台的只读 artifact，生成唯一的 `latest.json`，同时包含 Darwin 与 `windows-x86_64`。
+6. 唯一有 `contents: write` 的发布 Job 创建 GitHub draft Release，并通过 GitHub 返回的远端 SHA-256 digest 逐个核对七个资产。
+7. 只有远端 digest 全部匹配时才公开 Release；仓库必须预先启用 release immutability，该设置只保护启用后创建的 Release。
+8. 公开后，工作流从 tag 下载地址重新下载全部资产，再从 `releases/latest/download/latest.json` 校验两个平台的 URL 与签名。
 
-发布仓库是 [`OneBigMoon/Headroom-macos`](https://github.com/OneBigMoon/Headroom-macos)。
+发布仓库是 [`OneBigMoon/Headroom-desktop-CN`](https://github.com/OneBigMoon/Headroom-desktop-CN)。
 
 ## 发布资产
 
@@ -24,13 +25,16 @@
 Headroom.Local.Community_<版本>_universal.dmg
 Headroom.Local.Community_universal.app.tar.gz
 Headroom.Local.Community_universal.app.tar.gz.sig
+Headroom.Local.Community_<版本>_x64-setup.exe
+Headroom.Local.Community_x64-setup.nsis.zip
+Headroom.Local.Community_x64-setup.nsis.zip.sig
 latest.json
 ```
 
-原始 `.app` 仅用于构建阶段验签，不作为 Release 下载资产。`latest.json` 是 Tauri updater 清单；updater endpoint 为：
+原始 `.app` 仅用于构建阶段验签，不作为 Release 下载资产。DMG 和 NSIS `.exe` 面向手动安装；两个压缩 updater 资产由同一个 `latest.json` 按平台选择。updater endpoint 为：
 
 ```text
-https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json
+https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json
 ```
 
 ## 发布前不可变设置
@@ -46,7 +50,7 @@ https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.jso
 ```bash
 set -euo pipefail
 
-REPO="OneBigMoon/Headroom-macos"
+REPO="OneBigMoon/Headroom-desktop-CN"
 BAD_TAG="vX.Y.Z"
 GOOD_TAG="vA.B.C"
 GOOD_VERSION="${GOOD_TAG#v}"
@@ -60,6 +64,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 feed="https://github.com/${REPO}/releases/latest/download/latest.json"
 updater_name="Headroom.Local.Community_universal.app.tar.gz"
+windows_updater_name="Headroom.Local.Community_x64-setup.nsis.zip"
 
 curl -fsSL -H 'Cache-Control: no-cache' "${feed}" -o "${tmp}/latest.json"
 jq -e --arg version "${GOOD_VERSION}" --arg tag "${GOOD_TAG}" '
@@ -72,6 +77,9 @@ for name in \
   "Headroom.Local.Community_${GOOD_VERSION}_universal.dmg" \
   "${updater_name}" \
   "${updater_name}.sig" \
+  "Headroom.Local.Community_${GOOD_VERSION}_x64-setup.exe" \
+  "${windows_updater_name}" \
+  "${windows_updater_name}.sig" \
   "latest.json"
 do
   url="https://github.com/${REPO}/releases/download/${GOOD_TAG}/${name}"
@@ -86,29 +94,32 @@ printf '%s' "${HEADROOM_UPDATER_PUBLIC_KEY}" > "${tmp}/public-key.b64"
 cargo run --quiet --manifest-path src-tauri/Cargo.toml \
   --example verify_updater_signature -- \
   "${tmp}/${updater_name}" "${tmp}/${updater_name}.sig" "${tmp}/public-key.b64"
+cargo run --quiet --manifest-path src-tauri/Cargo.toml \
+  --example verify_updater_signature -- \
+  "${tmp}/${windows_updater_name}" "${tmp}/${windows_updater_name}.sig" "${tmp}/public-key.b64"
 ```
 
-已安装故障版本的客户端不会自动降级，仍需手动重装上一稳定版 DMG。删除故障 Release 后应立即从上一稳定提交发布一个更高补丁版本；旧客户端随后只会看到恢复后的稳定 feed。
+已安装故障版本的客户端不会自动降级，仍需手动重装上一稳定版 DMG 或 NSIS 安装包。删除故障 Release 后应立即从上一稳定提交发布一个更高补丁版本；旧客户端随后只会看到恢复后的稳定 feed。
 
-## 下载稳定版
+## 下载
 
-从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-macos/releases/latest) 下载最新稳定版 DMG。
+从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest) 下载稳定版 macOS universal DMG，或同一 Release 中的 Windows 11 x64 预览版 NSIS `.exe`。
 
 ## 签名与密钥
 
-Community 使用 ad-hoc macOS 代码签名，以及独立的 Tauri updater 签名密钥。工作流需要仓库变量 `HEADROOM_UPDATER_PUBLIC_KEY` 和 secrets `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。这不等同于 Apple Developer ID 签名或 Apple 公证。
+Community 使用 ad-hoc macOS 代码签名，以及供 macOS/Windows updater 共用的独立 Tauri 签名密钥。工作流需要仓库变量 `HEADROOM_UPDATER_PUBLIC_KEY` 和 secrets `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。这不等同于 Apple Developer ID 签名、Apple 公证或 Windows Authenticode 签名；当前 NSIS 安装包可能触发 Windows SmartScreen 的“未知发布者”提示，updater 签名不能替代 Authenticode 的发布者信任。
 
 ## 本机构建
 
 ```bash
-git clone https://github.com/OneBigMoon/Headroom-macos.git
-cd Headroom-macos
+git clone https://github.com/OneBigMoon/Headroom-desktop-CN.git
+cd Headroom-desktop-CN
 npm ci
 npm run build:mac:local
 ```
 
-本地构建要求 macOS 14 或更高版本、Node.js/npm 和 Rust；产物位于 `src-tauri/target/release/bundle`。
+macOS 本地构建要求 macOS 14 或更高版本、Node.js/npm 和 Rust；产物位于 `src-tauri/target/release/bundle`。Windows 11 x64 预览版构建还需要 Microsoft C++ Build Tools、WebView2 和 Tauri Windows prerequisites；Windows 10 未完成 smoke，不构成支持承诺。发布用 `.nsis.zip`/`.sig` 只由带 updater 私钥的 CI 生成。
 
 ## Homebrew
 
-当前没有维护中的 Homebrew tap 或已核实的 cask 资产，因此项目不提供 Homebrew 安装承诺。请使用 GitHub Release DMG；待固定资产 URL 和 SHA 可复核后再单独恢复 Homebrew 文档。
+当前没有维护中的 Homebrew tap 或已核实的 cask 资产，因此项目不提供 Homebrew 安装承诺。请使用 GitHub Release DMG 或 NSIS 安装包；待固定资产 URL 和 SHA 可复核后再单独恢复 Homebrew 文档。

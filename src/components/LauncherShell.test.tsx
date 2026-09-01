@@ -27,18 +27,16 @@ describe("LauncherShell", () => {
     );
   });
 
-  it("renders the spinner image by default", () => {
+  it("renders a CSS spinner separately from the brand avatar", () => {
     const { container } = renderShell();
-    // Two img tags: the badge logo and the spinner. With showSpinner=true,
-    // both should be present.
-    const imgs = container.querySelectorAll("img");
-    expect(imgs.length).toBe(2);
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(container.querySelectorAll("img")).toHaveLength(1);
   });
 
   it("hides the spinner when showSpinner is false", () => {
     const { container } = renderShell({ showSpinner: false });
-    const imgs = container.querySelectorAll("img");
-    expect(imgs.length).toBe(1);
+    expect(screen.queryByRole("status", { name: "Loading" })).toBeNull();
+    expect(container.querySelectorAll("img")).toHaveLength(1);
   });
 
   it("forwards the mouseDown event so window-drag handlers wire through", async () => {

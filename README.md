@@ -1,6 +1,6 @@
 # Headroom Local Community
 
-> GitHub 项目：[`OneBigMoon/Headroom-macos`](https://github.com/OneBigMoon/Headroom-macos)
+> GitHub 项目：[`OneBigMoon/Headroom-desktop-CN`](https://github.com/OneBigMoon/Headroom-desktop-CN)
 
 Headroom Local Community is an unofficial, local-only desktop edition derived
 from the MIT-licensed
@@ -10,7 +10,7 @@ by any upstream paid Headroom product.
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-macos/releases/latest) 下载最新稳定版 macOS DMG。
+从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest) 下载：macOS 使用稳定版 universal DMG；Windows 11 x64 preview（预览版）使用同一 Release 中的 NSIS `.exe` 安装包。
 
 This fork keeps the open-source local proxy, client connectors, token and
 savings dashboard, RTK, MarkItDown, and local add-on management. It does not
@@ -86,6 +86,27 @@ Artifacts are written under `src-tauri/target/release/bundle`. The local
 script validates the frontend and Rust build, creates an ad-hoc signed `.app`
 and DMG, and does not install, publish, or replace another application.
 
+## Build on Windows
+
+Requirements for the supported preview: Windows 11 x64, Node.js/npm, Rust,
+Microsoft C++ Build Tools, WebView2, and the Tauri Windows prerequisites.
+Windows 10 has not completed the required smoke test and is not currently a
+supported compatibility promise.
+
+```powershell
+npm ci
+npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+The release workflow builds a Windows x64 preview NSIS installer alongside the
+stable macOS DMG and publishes both under one version and one `latest.json`
+updater manifest. Promote Windows beyond preview only after a clean Win11 x64
+install, first-run, update, and uninstall smoke test passes.
+
+The preview installer is not Authenticode-signed, so Windows SmartScreen may
+show an unknown-publisher warning. The Tauri updater signature verifies update
+artifacts but does not replace Authenticode trust for the NSIS installer.
+
 ## Data written by Community
 
 Depending on enabled features, Community may write its own app data, logs,
@@ -103,5 +124,5 @@ upstream copyright notice, license, and applicable third-party notices in
 redistributions. “Headroom Local Community” must be presented as an unofficial
 community edition, not as the upstream paid product.
 
-The project does not provide Homebrew installation. Use the GitHub Releases
-DMG linked above.
+The project does not provide Homebrew installation. Use the stable macOS DMG or
+the Windows 11 x64 preview NSIS installer from GitHub Releases.

@@ -82,7 +82,7 @@ const UPDATER_STAGING_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ST
 const SENTRY_DSN: Option<&str> = None;
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzQjlBMTUwODdBN0UxQ0EKUldUSzRhZUhVS0c1ODRjaWVYSDg1UUdpMlJiREM3SjZBSlE2bnlCVDM3OXdNUnBWMmI0bUY1d3IK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
-    "https://github.com/OneBigMoon/Headroom-macos/releases/latest/download/latest.json";
+    "https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json";
 /// Cadence of the background liveness ping. Long enough to be negligible
 /// backend load (4 calls/day/user), short enough that admin can tell a
 /// running-but-idle app from a quit one within half a day.
@@ -94,15 +94,14 @@ const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 /// can run a command before deleting the bundle. See `handle_uninstall_flag`.
 const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6867/dashboard";
-const MAIN_WINDOW_WIDTH: u32 = 760;
-const MAIN_WINDOW_HEIGHT: u32 = 560;
+const MAIN_WINDOW_WIDTH: u32 = 960;
+const MAIN_WINDOW_HEIGHT: u32 = 680;
 /// Extra main-window height for the platforms that render the preview-build
 /// notice (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real
 /// layout width for their scrollbars, which wraps text elsewhere too.
 #[cfg(not(target_os = "macos"))]
 const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
-const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
 type InstallPendingUpdateFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
@@ -836,14 +835,7 @@ where
             .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
     };
 
-    // The window hides 150ms after losing focus, and a .deb install raises a
-    // polkit password prompt that takes it. The user authenticates, the update
-    // lands, and the window they were just looking at is gone - leaving "Restart
-    // now" behind a tray click nobody would think to make. Hold the window open
-    // for the length of the install.
-    INSTALLING_UPDATE.store(true, Ordering::Release);
     let result = update.install(progress).await;
-    INSTALLING_UPDATE.store(false, Ordering::Release);
     if let Err(error) = result {
         let mut pending = pending_update.lock();
         if pending.is_none() {
@@ -854,9 +846,9 @@ where
     Ok(())
 }
 
-/// Set while an update install is running, to keep the privilege prompt it
-/// raises from hiding the window behind it. See `handle_window_event`.
-static INSTALLING_UPDATE: AtomicBool = AtomicBool::new(false);
+/// Anchor or center the main window only once; later tray toggles preserve the
+/// position chosen by native window dragging.
+static MAIN_WINDOW_HAS_BEEN_POSITIONED: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 async fn restart_app(app: AppHandle) {
@@ -7380,27 +7372,6 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
 
 fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
-        WindowEvent::Focused(false) => {
-            // An update install steals focus with a privilege prompt; hiding
-            // underneath it strands the user mid-flow.
-            if INSTALLING_UPDATE.load(Ordering::Acquire) {
-                return;
-            }
-            if window.label() == "main" {
-                let window = window.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        MAIN_WINDOW_BLUR_HIDE_DELAY_MS,
-                    ));
-
-                    let still_unfocused = matches!(window.is_focused(), Ok(false));
-                    let still_visible = matches!(window.is_visible(), Ok(true));
-                    if still_unfocused && still_visible {
-                        let _ = window.hide();
-                    }
-                });
-            }
-        }
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             let _ = window.hide();
@@ -7609,11 +7580,14 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
         return Err(tauri::Error::WebviewNotFound);
     };
 
-    if let Some(rect) = anchor_rect {
-        position_tray_window(&window, rect)?;
-    } else {
-        #[cfg(target_os = "linux")]
-        position_near_panel(&window)?;
+    if !MAIN_WINDOW_HAS_BEEN_POSITIONED.load(Ordering::Acquire) {
+        if let Some(rect) = anchor_rect {
+            position_tray_window(&window, rect)?;
+        } else {
+            #[cfg(target_os = "linux")]
+            position_near_panel(&window)?;
+        }
+        MAIN_WINDOW_HAS_BEEN_POSITIONED.store(true, Ordering::Release);
     }
 
     window.show()?;
@@ -8429,7 +8403,7 @@ mod tests {
 
     #[test]
     fn community_release_uses_independent_default_updater_feed() {
-        assert!(DEFAULT_UPDATER_ENDPOINT.contains("OneBigMoon/Headroom-macos"));
+        assert!(DEFAULT_UPDATER_ENDPOINT.contains("OneBigMoon/Headroom-desktop-CN"));
         assert!(!DEFAULT_UPDATER_ENDPOINT.contains("gglucass/headroom-desktop"));
     }
 
@@ -8639,55 +8613,6 @@ mod tests {
         )))
         .expect_err("other failures still bubble up");
         assert!(real.contains("connection reset"), "{real}");
-    }
-
-    /// The privilege prompt a .deb install raises steals focus, and the blur
-    /// handler hides the window 150ms later. The flag is what keeps "Restart
-    /// now" on screen instead of behind an unexplained tray click.
-    #[test]
-    fn install_pending_update_holds_the_window_open_while_it_runs() {
-        struct FlagObservingUpdate(Arc<Mutex<Option<bool>>>);
-
-        impl InstallableAppUpdate for FlagObservingUpdate {
-            fn metadata(&self) -> AvailableAppUpdate {
-                unreachable!("metadata is not read on the install path")
-            }
-
-            fn install(
-                &self,
-                _progress: AppUpdateProgressEmitter,
-            ) -> InstallPendingUpdateFuture<'_> {
-                Box::pin(async move {
-                    *self.0.lock() =
-                        Some(super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire));
-                    Ok(())
-                })
-            }
-        }
-
-        let seen = Arc::new(Mutex::new(None));
-        let pending = Mutex::new(Some(FlagObservingUpdate(Arc::clone(&seen))));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        runtime
-            .block_on(install_pending_update(
-                &pending,
-                noop_app_update_progress_emitter(),
-            ))
-            .expect("install");
-
-        assert_eq!(
-            *seen.lock(),
-            Some(true),
-            "window would hide behind the privilege prompt mid-install"
-        );
-        assert!(
-            !super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire),
-            "flag outlived the install, so the window can never auto-hide again"
-        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import type { MouseEvent, ReactNode } from "react";
 
-import headroomLogo from "../assets/headroom-logo.svg";
+import headroomAvatar from "../assets/headroom-rage-avatar.png";
 
 export interface LauncherShellProps {
   shellClassName: string;
@@ -27,17 +27,12 @@ export function LauncherShell({
     <main className="app-shell app-shell--launcher">
       <section className={shellClassName} onMouseDown={onMouseDown}>
         <div className="hero__badge hero__badge--launcher">
-          <img src={headroomLogo} alt="" aria-hidden="true" />
+          <img src={headroomAvatar} alt="" aria-hidden="true" />
           <span>v{version}</span>
         </div>
-        {showSpinner && (
-          <img
-            className={spinnerClassName}
-            src={headroomLogo}
-            alt=""
-            aria-hidden="true"
-          />
-        )}
+        {showSpinner ? (
+          <span className={spinnerClassName} role="status" aria-label="Loading" />
+        ) : null}
         <div className="intro-shell__content">
           <div className={copyClassName}>{children}</div>
         </div>

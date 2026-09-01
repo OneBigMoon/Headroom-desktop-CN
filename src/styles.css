@@ -716,8 +716,11 @@ select {
 }
 
 .hero__badge--launcher img {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  object-fit: cover;
 }
 
 .intro-shell__spinner {
@@ -726,7 +729,11 @@ select {
   right: 22px;
   width: 26px;
   height: 26px;
-  animation: slow-spin 18s linear infinite;
+  box-sizing: border-box;
+  border: 3px solid var(--accent-tint-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: launcher-spinner-spin 900ms linear infinite;
 }
 
 .intro-shell__spinner--post-install {
@@ -734,8 +741,8 @@ select {
   height: 56px;
   top: 24px;
   right: 24px;
-  animation: slow-spin 8s linear infinite;
-  filter: drop-shadow(0 8px 14px rgba(36, 31, 29, 0.16));
+  border-width: 4px;
+  filter: drop-shadow(0 8px 14px rgba(36, 31, 29, 0.12));
 }
 
 .brand-logo {
@@ -4277,6 +4284,12 @@ html.window-hiding {
   }
 }
 
+@keyframes launcher-spinner-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 
 @media (max-width: 960px) {
   .intro-shell__content,
@@ -5923,8 +5936,13 @@ html.window-hiding {
 }
 
 .terms-gate__logo {
-  width: 44px;
-  height: 44px;
+  width: 56px;
+  height: 56px;
+  border: 1px solid var(--border-default);
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(36, 31, 29, 0.12);
+  object-fit: cover;
 }
 
 .terms-gate__title {

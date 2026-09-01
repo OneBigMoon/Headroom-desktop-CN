@@ -2,7 +2,7 @@ import { useState, type ReactNode } from "react";
 
 import { invoke } from "@tauri-apps/api/core";
 
-import headroomLogo from "../assets/headroom-logo.svg";
+import headroomAvatar from "../assets/headroom-rage-avatar.png";
 
 export interface TermsGateProps {
   /// The terms version the user is accepting (DashboardState.requiredTermsVersion).
@@ -56,7 +56,7 @@ export function TermsGate({
       aria-labelledby="terms-gate-title"
     >
       <div className="terms-gate__panel">
-        <img className="terms-gate__logo" src={headroomLogo} alt="" aria-hidden="true" />
+        <img className="terms-gate__logo" src={headroomAvatar} alt="" aria-hidden="true" />
         <h1 id="terms-gate-title" className="terms-gate__title">
           {signInPresentation ? "Sign in" : "Terms of Service"}
         </h1>

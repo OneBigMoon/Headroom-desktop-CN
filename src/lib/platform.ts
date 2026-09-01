@@ -1,38 +1,44 @@
-export const PREVIEW_SUPPORT_EMAIL = "headroom-local-community@localhost.invalid";
+import type { Translate } from "./i18n";
+
+export const PROJECT_ISSUES_NEW_URL =
+  "https://github.com/OneBigMoon/Headroom-desktop-CN/issues/new";
 
 export function platformPreviewNoticeFor(
   platform: string | undefined,
   supportTier: string | undefined,
+  t: Translate,
 ): string | null {
   if (supportTier !== "experimental") {
     return null;
   }
-  if (platform === "linux" || platform === "windows") {
+  if (platform === "linux" || platform === "windows" || platform === "win32") {
     const name = platform === "linux" ? "Linux" : "Windows";
-    return `${name} is currently in preview.`;
+    return t("platform.previewNamed", { platform: name });
   }
-  return "This platform is currently in preview.";
+  return t("platform.previewGeneric");
 }
 
-/** Pre-filled support mail for preview-platform reports: the diagnostics we
- *  always end up asking for (platform, app build, runtime build) are already
- *  in the body so the user only has to describe what broke. */
-export function platformPreviewSupportMailto(context: {
-  platform: string | undefined;
-  appVersion: string;
-  headroomVersion: string;
-}): string {
-  const subject = `Headroom ${context.platform ?? "platform"} preview issue`;
+/** Pre-filled GitHub issue for preview-platform reports. */
+export function platformPreviewSupportIssueUrl(
+  context: {
+    platform: string | undefined;
+    appVersion: string;
+    headroomVersion: string;
+  },
+  t: Translate,
+): string {
+  const platformName = context.platform ?? t("platform.unknown");
+  const subject = t("platform.issueSubject", { platform: platformName });
   const body =
-    "What happened, and what were you doing at the time?\n\n\n" +
+    `${t("platform.issuePrompt")}\n\n\n` +
     "---\n" +
-    "Diagnostic info (please keep):\n" +
+    `${t("platform.issueDiagnostics")}\n` +
     [
-      `Platform: ${context.platform ?? "unknown"}`,
-      `App version: ${context.appVersion}`,
-      `Headroom CLI: ${context.headroomVersion}`,
+      t("platform.issuePlatform", { platform: platformName }),
+      t("platform.issueAppVersion", { version: context.appVersion }),
+      t("platform.issueCliVersion", { version: context.headroomVersion }),
     ].join("\n");
-  return `mailto:${PREVIEW_SUPPORT_EMAIL}?subject=${encodeURIComponent(
+  return `${PROJECT_ISSUES_NEW_URL}?title=${encodeURIComponent(
     subject,
   )}&body=${encodeURIComponent(body)}`;
 }
