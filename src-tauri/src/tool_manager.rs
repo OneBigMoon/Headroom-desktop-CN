@@ -72,6 +72,51 @@ const PIP_ONLY_BINARY: &str = "--only-binary=:all:";
 fn headroom_proxy_port() -> String {
     backend_port::get().to_string()
 }
+
+/// HTTPX 0.28.1 turns IPv6 CIDR entries from NO_PROXY into invalid URL
+/// patterns and aborts client construction (for example, `fd00::/8` becomes
+/// an "Invalid port" error). HTTPX does not support CIDR matching here anyway,
+/// so omit only those incompatible entries from the managed runtime child.
+fn httpx_compatible_no_proxy(raw: &str) -> (String, usize) {
+    let mut dropped = 0usize;
+    let entries = raw.split(',').filter_map(|entry| {
+        let entry = entry.trim();
+        let is_ipv6_cidr = entry
+            .rsplit_once('/')
+            .map(|(address, _)| {
+                address
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        if is_ipv6_cidr {
+            dropped += 1;
+            None
+        } else {
+            Some(entry)
+        }
+    });
+    (entries.collect::<Vec<_>>().join(","), dropped)
+}
+
+fn apply_httpx_compatible_proxy_env(command: &mut Command) {
+    for key in ["NO_PROXY", "no_proxy"] {
+        let Some(raw) = std::env::var_os(key) else {
+            continue;
+        };
+        let (value, dropped) = httpx_compatible_no_proxy(&raw.to_string_lossy());
+        if dropped > 0 {
+            command.env(key, value);
+            log::info!(
+                "[tool_manager] omitted {dropped} HTTPX-incompatible IPv6 CIDR entr{} from {key}",
+                if dropped == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+}
+
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6867";
 const MCP_METHOD_CLAUDE_CLI: &str = "claude_cli";
 const MCP_METHOD_FALLBACK_JSON: &str = "fallback_json";
@@ -1759,6 +1804,66 @@ pub struct HeadroomLearnProjectSummary {
     pub pattern_count: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadroomLearnPreviousRun {
+    pub(crate) run_key: String,
+    pub(crate) finished_at: DateTime<Utc>,
+    pub(crate) success: bool,
+    pub(crate) error: Option<String>,
+}
+
+fn parse_headroom_learn_previous_run(
+    content: &str,
+    fallback_finished_at: DateTime<Utc>,
+) -> Option<HeadroomLearnPreviousRun> {
+    const LLM_FAILURE_MARKER: &str = "LLM analysis failed:";
+
+    let header = content.lines().next()?;
+    let run_key = header
+        .rsplit_once("(target=")?
+        .1
+        .strip_suffix(')')?
+        .to_string();
+    let finished_at = header
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(timestamp, _)| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .unwrap_or(fallback_finished_at);
+    let status = content
+        .lines()
+        .find_map(|line| line.strip_prefix("status: "))?
+        .trim();
+    let llm_failures: Vec<String> = content
+        .lines()
+        .filter_map(|line| {
+            line.split_once(LLM_FAILURE_MARKER)
+                .map(|(_, reason)| format!("{LLM_FAILURE_MARKER} {}", reason.trim()))
+        })
+        .collect();
+    let process_succeeded = matches!(status, "exit status: 0" | "exit code: 0");
+    let success = process_succeeded && llm_failures.is_empty();
+    let error = if !llm_failures.is_empty() {
+        Some(llm_failures.join("\n"))
+    } else if success {
+        None
+    } else {
+        let stderr = content
+            .split_once("--- stderr ---")
+            .map(|(_, stderr)| stderr)
+            .and_then(|stderr| stderr.lines().map(str::trim).find(|line| !line.is_empty()))
+            .map(|line| line.chars().take(500).collect::<String>());
+        Some(stderr.unwrap_or_else(|| format!("Previous scan failed ({status}).")))
+    };
+
+    Some(HeadroomLearnPreviousRun {
+        run_key,
+        finished_at,
+        success,
+        error,
+    })
+}
+
 /// HuggingFace hub cache directory name for the Kompress model. Uninstall
 /// cleanup sweeps the whole `models--chopratejas--` prefix instead of this one
 /// name, so the two can drift apart without leaking.
@@ -2376,6 +2481,27 @@ impl ToolManager {
         logs_dir.join(format!("headroom-learn-{safe_name}-{short_hash}.log"))
     }
 
+    pub(crate) fn latest_headroom_learn_run(&self) -> Option<HeadroomLearnPreviousRun> {
+        std::fs::read_dir(self.runtime.logs_dir())
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| {
+                        name.starts_with("headroom-learn-") && name.ends_with(".log")
+                    })
+            })
+            .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+            .max_by_key(|(modified, _)| *modified)
+            .and_then(|(modified, path)| {
+                let fallback_finished_at: DateTime<Utc> = modified.into();
+                let content = std::fs::read_to_string(path).ok()?;
+                parse_headroom_learn_previous_run(&content, fallback_finished_at)
+            })
+    }
+
     pub fn headroom_learn_last_run_at(&self, project_path: &str) -> Option<String> {
         let path = self.headroom_learn_log_path(project_path);
         if let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) {
@@ -2640,6 +2766,7 @@ impl ToolManager {
                 };
                 command.current_dir(&self.runtime.root_dir);
                 crate::edition::apply_runtime_env(&mut command);
+                apply_httpx_compatible_proxy_env(&mut command);
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::CommandExt;
@@ -10015,6 +10142,52 @@ mod tests {
     use crate::port_conflict;
     use std::net::TcpListener;
 
+    #[test]
+    fn previous_learn_run_treats_exit_zero_llm_timeout_as_failure() {
+        let log = r#"[2026-08-31T12:34:11Z] headroom learn --agent codex (target=codex)
+status: exit status: 0
+
+--- stdout ---
+No actionable patterns found.
+
+--- stderr ---
+LLM analysis failed: `codex exec` did not respond within 300s.
+"#;
+
+        let run = super::parse_headroom_learn_previous_run(log, chrono::Utc::now())
+            .expect("previous run");
+
+        assert_eq!(run.run_key, "codex");
+        assert!(!run.success);
+        assert_eq!(run.finished_at.to_rfc3339(), "2026-08-31T12:34:11+00:00");
+        assert_eq!(
+            run.error.as_deref(),
+            Some("LLM analysis failed: `codex exec` did not respond within 300s.")
+        );
+    }
+
+    #[test]
+    fn previous_learn_run_accepts_clean_cross_platform_exit_zero() {
+        for status in ["exit status: 0", "exit code: 0"] {
+            let log = format!(
+                r#"[2026-09-01T08:00:00Z] headroom learn --agent codex (target=codex)
+status: {status}
+
+--- stdout ---
+No actionable patterns found.
+
+--- stderr ---
+"#
+            );
+
+            let run = super::parse_headroom_learn_previous_run(&log, chrono::Utc::now())
+                .expect("previous run");
+
+            assert!(run.success, "{status}");
+            assert_eq!(run.error, None, "{status}");
+        }
+    }
+
     fn write_ttl_obs(dir: &Path, rows: &[(&str, f64, bool, &str)]) -> PathBuf {
         let path = dir.join("cache_ttl_observations.jsonl");
         let mut lines: Vec<String> = rows
@@ -12003,6 +12176,16 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             cc_switch_reconcile_for_runtime(Some(HEADROOM_PINNED_VERSION)),
             "1"
         );
+    }
+
+    #[test]
+    fn httpx_no_proxy_filter_drops_only_ipv6_cidrs() {
+        let (value, dropped) = crate::tool_manager::httpx_compatible_no_proxy(
+            "127.0.0.1,localhost,::1,10.0.0.0/8,fd00::/8,[fe80::]/10,.local",
+        );
+
+        assert_eq!(dropped, 2);
+        assert_eq!(value, "127.0.0.1,localhost,::1,10.0.0.0/8,.local");
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`

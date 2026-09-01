@@ -672,6 +672,24 @@ export function connectorStatusLine(
   return null;
 }
 
+export function shouldAutoRestartCodex(
+  clientId: string,
+  nextEnabled: boolean,
+  connectors: ClientConnectorStatus[]
+): boolean {
+  if (clientId !== "codex" || !nextEnabled) {
+    return false;
+  }
+
+  const codex = connectors.find((connector) => connector.clientId === "codex");
+  return Boolean(
+    codex?.enabled &&
+      codex.verified &&
+      codex.restartRequired === true &&
+      codex.verification?.proxyReachable !== false
+  );
+}
+
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {
   return connectors.filter((connector) =>
     SUPPORTED_CONNECTOR_IDS.has(connector.clientId)

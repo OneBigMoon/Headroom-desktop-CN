@@ -130,6 +130,7 @@ import {
   compactNumber,
   connectorDashboardStatus,
   connectorStatusLine,
+  shouldAutoRestartCodex,
   clientSetupNotice,
   currency,
   currencyExact,
@@ -4761,6 +4762,9 @@ export default function App() {
   }
 
   async function toggleConnector(connector: ClientConnectorStatus, nextEnabled: boolean) {
+    if (connectorsBusy || codexRestartBusy) {
+      return;
+    }
     setConnectorsBusy(true);
     setConnectorsError(null);
     try {
@@ -4776,7 +4780,17 @@ export default function App() {
 
       const latestDashboard = await loadDashboard();
       applyDashboardIfChanged(latestDashboard);
-      await refreshConnectors();
+      const latestConnectors = await fetchConnectors();
+      applyConnectorsIfChanged(latestConnectors);
+      if (
+        shouldAutoRestartCodex(
+          connector.clientId,
+          nextEnabled,
+          latestConnectors
+        )
+      ) {
+        await restartCodexDesktop();
+      }
     } catch (error) {
       setConnectorsError(
         describeInvokeError(error, "Failed to update connector.")
@@ -7036,7 +7050,7 @@ export default function App() {
                             </div>
                             {showInlineResult && headroomLearnStatus.error ? (
                               <div className="optimize-project-row__result">
-                                <p className="install-progress__error">{headroomLearnStatus.error}</p>
+                                  <p className="install-progress__error" role="alert">{headroomLearnStatus.error}</p>
                               </div>
                             ) : null}
                           </div>
@@ -7208,7 +7222,7 @@ export default function App() {
                                 ) : null}
                                 {codexShowResult && headroomLearnStatus.error ? (
                                   <div className="optimize-project-row__result">
-                                    <p className="install-progress__error">
+                              <p className="install-progress__error" role="alert">
                                       {headroomLearnStatus.error}
                                     </p>
                                   </div>
@@ -7294,7 +7308,7 @@ export default function App() {
                             </div>
                             {showResult && headroomLearnStatus.error ? (
                               <div className="optimize-project-row__result">
-                                <p className="install-progress__error">
+                            <p className="install-progress__error" role="alert">
                                   {headroomLearnStatus.error}
                                 </p>
                               </div>
@@ -7311,7 +7325,7 @@ export default function App() {
                 {headroomLearnStatus.error &&
                 !["codex", "opencode", "grok"].includes(headroomLearnStatus.projectPath ?? "") &&
                 !claudeProjects.some((project) => project.projectPath === headroomLearnStatus.projectPath) ? (
-                  <p className="install-progress__error">{headroomLearnStatus.error}</p>
+                  <p className="install-progress__error" role="alert">{headroomLearnStatus.error}</p>
                 ) : null}
               </div>
             </article>

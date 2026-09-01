@@ -70,14 +70,14 @@ describe("OptimizePanel", () => {
     const user = userEvent.setup();
 
     expect(
-      screen.getByRole("button", { name: /1 learning in AGENTS\.md/i })
+      screen.getByRole("button", { name: /Headroom learnings in AGENTS\.md: 1/i })
     ).toBeEnabled();
     expect(
-      screen.getByRole("button", { name: /1 reminder in instructions\.md/i })
+      screen.getByRole("button", { name: /Headroom reminders in instructions\.md: 1/i })
     ).toBeEnabled();
 
     await user.click(
-      screen.getByRole("button", { name: /1 learning in AGENTS\.md/i })
+      screen.getByRole("button", { name: /Headroom learnings in AGENTS\.md: 1/i })
     );
     expect(await screen.findByRole("dialog")).toHaveTextContent(
       "Learnings in ~/.codex/AGENTS.md"

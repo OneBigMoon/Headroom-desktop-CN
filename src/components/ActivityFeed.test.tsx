@@ -701,7 +701,8 @@ describe("ActivityFeed", () => {
     };
     const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("No patterns, reminders, or learnings have been written today.");
+    expect(markup).toContain("This is a write count, not a scan result");
+    expect(markup).toContain("open Optimize to check the latest scan");
     expect(markup).not.toContain("Today&#x27;s additions:");
     expect(markup).not.toContain("activity-feed__project");
   });

@@ -639,6 +639,37 @@ impl AppState {
 
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
         let tool_manager = ToolManager::new(runtime);
+        let headroom_learn_state = tool_manager
+            .latest_headroom_learn_run()
+            .map(|previous| {
+                let project_name = project_display_name(&previous.run_key);
+                HeadroomLearnRuntimeState {
+                    running: false,
+                    project_path: Some(previous.run_key),
+                    started_at: None,
+                    finished_at: Some(previous.finished_at),
+                    success: Some(previous.success),
+                    summary: if previous.success {
+                        format!("headroom learn completed {project_name}.")
+                    } else {
+                        format!("headroom learn failed {project_name}.")
+                    },
+                    error: previous.error,
+                    output_tail: Vec::new(),
+                    current_step: None,
+                }
+            })
+            .unwrap_or_else(|| HeadroomLearnRuntimeState {
+                running: false,
+                project_path: None,
+                started_at: None,
+                finished_at: None,
+                success: None,
+                summary: "Select a project to run headroom learn.".into(),
+                error: None,
+                output_tail: Vec::new(),
+                current_step: None,
+            });
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
@@ -687,17 +718,7 @@ impl AppState {
             pricing_gate_violation_streak: Arc::new(AtomicU32::new(0)),
             weekly_limit_reached_reported: Arc::new(AtomicBool::new(false)),
             weekly_limit_approaching_reported: Arc::new(AtomicBool::new(false)),
-            headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
-                running: false,
-                project_path: None,
-                started_at: None,
-                finished_at: None,
-                success: None,
-                summary: "Select a project to run headroom learn.".into(),
-                error: None,
-                output_tail: Vec::new(),
-                current_step: None,
-            }),
+            headroom_learn_state: Mutex::new(headroom_learn_state),
             launch_profile: Mutex::new(launch_profile),
             launch_profile_path,
             last_known_good_plan: Mutex::new(last_known_good_plan),
@@ -9084,6 +9105,41 @@ mod tests {
             "stop_headroom blocked on the held lifecycle lock for {lock_wait:?} \
              (total {waited:?}, sweep baseline {baseline:?})"
         );
+    }
+
+    #[test]
+    fn learn_status_restores_latest_failure_log_after_restart() {
+        let base_dir = temp_test_dir("headroom-learn-restore");
+        {
+            let state = AppState::new_in(base_dir.clone()).expect("app state");
+            let log_path = state.tool_manager.headroom_learn_log_path("codex");
+            std::fs::create_dir_all(log_path.parent().expect("log directory"))
+                .expect("create log directory");
+            std::fs::write(
+                log_path,
+                r#"[2026-08-31T12:34:11Z] headroom learn --agent codex (target=codex)
+status: exit status: 0
+
+--- stdout ---
+No actionable patterns found.
+
+--- stderr ---
+LLM analysis failed: `codex exec` did not respond within 300s.
+"#,
+            )
+            .expect("write learn log");
+        }
+
+        let reloaded = AppState::new_in(base_dir).expect("reloaded app state");
+        let status = reloaded.headroom_learn_status(None);
+
+        assert_eq!(status.project_path.as_deref(), Some("codex"));
+        assert_eq!(status.success, Some(false));
+        assert_eq!(status.finished_at.as_deref(), Some("2026-08-31T12:34:11+00:00"));
+        assert!(status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("did not respond within 300s")));
     }
 
     #[test]

@@ -43,6 +43,11 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_DIRECT_BODY: usize = 100 * 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const CODEX_BACKEND_RECOVERY_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const CODEX_BACKEND_RECOVERY_WAIT: Duration = Duration::from_millis(100);
+const CODEX_BACKEND_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Max requests forwarded to the Python backend concurrently. Each forward
 /// holds a client + backend FD for the request's full lifetime (SSE streams
@@ -715,6 +720,33 @@ fn bearer_value_changed(slot: &SharedToken, candidate: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// ChatGPT-authenticated Codex cannot bypass directly to api.openai.com: its
+/// token is scoped to the ChatGPT backend. Bridge short backend restart and
+/// wake-recovery gaps at the stable 6867 listener instead of returning a 503
+/// that Codex surfaces as a failed turn.
+async fn connect_backend_with_retry(retry_for: Duration) -> Option<(TcpStream, SocketAddr)> {
+    let deadline = tokio::time::Instant::now() + retry_for;
+    let mut delay = Duration::from_millis(50);
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))).await;
+
+        // Startup may move from 6868 to a fallback port while this request is
+        // waiting, so re-read the selected backend port on every attempt.
+        let backend_addr: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
+        if let Ok(backend) = TcpStream::connect(backend_addr).await {
+            return Some((backend, backend_addr));
+        }
+        delay = delay
+            .saturating_mul(2)
+            .min(CODEX_BACKEND_RECOVERY_MAX_BACKOFF);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut client: TcpStream,
@@ -969,27 +1001,40 @@ async fn handle(
     };
 
     // Forward to the headroom backend.
-    let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
-        // Backend down or mid-restart (crash, gate transition, post-update
-        // cold boot — which deliberately holds the bypass flags off for up to
-        // 10 minutes): fall back per-request to the native provider for Claude
-        // and API-key Codex. ChatGPT-authenticated Codex must retry until the
-        // backend returns because its OAuth token is not valid at the Platform
-        // API used by the direct forwarder.
-        // info, not warn: warn would ship to Sentry per request; the watchdog's
-        // capture_watchdog_give_up already reports genuine down episodes.
-        note_backend_reachability(false, backend_addr);
-        if is_chatgpt_codex {
-            BACKEND_DOWN_CODEX_RETRY_503S.fetch_add(1, Ordering::AcqRel);
-            write_retryable_service_unavailable(&mut client).await;
-        } else if is_plugin_routed {
-            // See the bypass branch above: no correct direct upstream exists
-            // for plugin-routed third-party providers.
-            write_retryable_service_unavailable(&mut client).await;
-        } else {
-            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+    let mut backend_addr = backend_addr;
+    let mut backend = match TcpStream::connect(backend_addr).await {
+        Ok(backend) => backend,
+        Err(_) => {
+            // Backend down or mid-restart (crash, gate transition, post-update
+            // cold boot): fall back per-request to the native provider for
+            // Claude and API-key Codex. ChatGPT-authenticated Codex cannot use
+            // that path, so hold its request while the watchdog/startup path
+            // restores the backend rather than surfacing a transient 503.
+            // info, not warn: warn would ship to Sentry per request; the
+            // watchdog's capture_watchdog_give_up already reports genuine down
+            // episodes.
+            note_backend_reachability(false, backend_addr);
+            if is_chatgpt_codex {
+                if let Some((recovered, recovered_addr)) =
+                    connect_backend_with_retry(CODEX_BACKEND_RECOVERY_WAIT).await
+                {
+                    backend_addr = recovered_addr;
+                    recovered
+                } else {
+                    BACKEND_DOWN_CODEX_RETRY_503S.fetch_add(1, Ordering::AcqRel);
+                    write_retryable_service_unavailable(&mut client).await;
+                    return;
+                }
+            } else if is_plugin_routed {
+                // See the bypass branch above: no correct direct upstream exists
+                // for plugin-routed third-party providers.
+                write_retryable_service_unavailable(&mut client).await;
+                return;
+            } else {
+                forward_direct_to_anthropic(client, buf, &upstream_base).await;
+                return;
+            }
         }
-        return;
     };
     note_backend_reachability(true, backend_addr);
 
@@ -3087,6 +3132,29 @@ mod tests {
         );
 
         run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn backend_retry_connects_after_restart_gap() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve backend port");
+        let backend_addr = reservation.local_addr().expect("backend address");
+        drop(reservation);
+        backend_port::set(backend_addr.port());
+
+        let waiting = tokio::spawn(super::connect_backend_with_retry(
+            std::time::Duration::from_millis(500),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let listener = TcpListener::bind(backend_addr)
+            .await
+            .expect("start replacement backend");
+
+        let connected = waiting.await.expect("retry task");
+        assert!(connected.is_some(), "request should bridge the restart gap");
+
+        drop(listener);
         backend_port::reset_for_tests();
     }
 

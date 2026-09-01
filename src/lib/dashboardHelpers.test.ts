@@ -13,6 +13,7 @@ import {
   compactNumber,
   connectorDashboardStatus,
   connectorStatusLine,
+  shouldAutoRestartCodex,
   clientSetupNotice,
   currency,
   currencyExact,
@@ -307,6 +308,34 @@ describe("dashboard helpers", () => {
     // Not installed is not a fault: Codex desktop/IDE share ~/.codex/config.toml.
     expect(connectorStatusLine({ ...base, lastConfiguredAt: null }, now)).toBeNull();
     expect(connectorStatusLine({ ...base, enabled: false }, now)).toBeNull();
+
+    const staleCodex = {
+      ...base,
+      installed: true,
+      restartRequired: true
+    };
+    expect(shouldAutoRestartCodex("codex", true, [staleCodex])).toBe(true);
+    expect(shouldAutoRestartCodex("codex", false, [staleCodex])).toBe(false);
+    expect(shouldAutoRestartCodex("claude_code", true, [staleCodex])).toBe(false);
+    expect(
+      shouldAutoRestartCodex("codex", true, [
+        { ...staleCodex, verified: false }
+      ])
+    ).toBe(false);
+    expect(
+      shouldAutoRestartCodex("codex", true, [
+        {
+          ...staleCodex,
+          verification: {
+            clientId: "codex",
+            verified: true,
+            proxyReachable: false,
+            checks: [],
+            failures: []
+          }
+        }
+      ])
+    ).toBe(false);
 
     expect(connectorStatusLine({ ...base, verified: false }, now)).toEqual({
       text: "Setup is incomplete - open the info panel for the exact checks.",
