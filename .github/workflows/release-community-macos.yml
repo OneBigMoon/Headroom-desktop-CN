@@ -517,28 +517,28 @@ jobs:
               release_state=public
             fi
           elif [[ "${release_count}" == "0" ]]; then
-          gh release create "${tag}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --draft \
-            --title "Headroom Local Community ${tag}" \
-            --notes-file release-staging/release-body.md
-          release_state=draft
-          release_count=0
-          for _ in {1..15}; do
-            release_matches="$(find_release_matches)"
-            release_count="$(jq 'length' <<<"${release_matches}")"
-            if [[ "${release_count}" != "0" ]]; then
-              break
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "Headroom Local Community ${tag}" \
+              --notes-file release-staging/release-body.md
+            release_state=draft
+            release_count=0
+            for _ in {1..15}; do
+              release_matches="$(find_release_matches)"
+              release_count="$(jq 'length' <<<"${release_matches}")"
+              if [[ "${release_count}" != "0" ]]; then
+                break
+              fi
+              sleep 2
+            done
+            if [[ "${release_count}" != "1" ]]; then
+              echo "::error::Created draft ${tag} did not become uniquely visible within 30 seconds."
+              exit 1
             fi
-            sleep 2
-          done
-          if [[ "${release_count}" != "1" ]]; then
-            echo "::error::Created draft ${tag} did not become uniquely visible within 30 seconds."
-            exit 1
-          fi
-          release_json="$(jq -c '.[0]' <<<"${release_matches}")"
-          [[ "$(jq -r '.draft' <<<"${release_json}")" == "true" ]]
+            release_json="$(jq -c '.[0]' <<<"${release_matches}")"
+            [[ "$(jq -r '.draft' <<<"${release_json}")" == "true" ]]
           else
             echo "::error::Multiple releases found for ${tag}; refusing ambiguous publish."
             exit 1
