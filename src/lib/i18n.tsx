@@ -1618,7 +1618,7 @@ const supplementalEnglish = {
 } as const;
 
 type SupplementalTranslationKey = keyof typeof supplementalEnglish;
-type SupplementalDictionary = Record<SupplementalTranslationKey, string>;
+type SupplementalDictionary = Partial<Record<SupplementalTranslationKey, string>>;
 
 const supplementalCopy: Record<ResolvedLocale, SupplementalDictionary> = {
   en: supplementalEnglish,
