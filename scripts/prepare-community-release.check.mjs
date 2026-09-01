@@ -179,6 +179,10 @@ test("release workflow resumes drafts without replacing existing assets", () => 
   assert.match(publishStep[1], /gh api --paginate --slurp "\$\{releases_api\}"/);
   assert.match(
     publishStep[1],
+    /gh release create "\$\{tag\}"[\s\S]*?for _ in \{1\.\.15\}[\s\S]*?Created draft \$\{tag\} did not become uniquely visible within 30 seconds/,
+  );
+  assert.match(
+    publishStep[1],
     /release_api="repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{release_id\}"/,
   );
   assert.match(publishStep[1], /Unexpected asset .* refusing no-replace recovery/);
