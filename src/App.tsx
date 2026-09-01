@@ -118,7 +118,6 @@ import {
   aggregateClientConnectors,
   addDays,
   addMonths,
-  baseUrlTakeoverNotice,
   buildHourlySavingsChartData,
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
@@ -131,7 +130,6 @@ import {
   connectorDashboardStatus,
   connectorStatusLine,
   shouldAutoRestartCodex,
-  clientSetupNotice,
   currency,
   currencyExact,
   dayOfMonthTickFormatter,
@@ -360,7 +358,36 @@ function localizeUiText(t: Translate, value: string): string {
   if (restart) return t("connections.restartAfterEnable", { name: restart[1] });
   const notDetected = value.match(/^(.+) was not detected\. Install (.+) and restart Headroom\.$/);
   if (notDetected) return t("connections.notDetectedInstall", { name: notDetected[1] });
+  const verifyPrompt = value.match(/^Run one (.+) prompt and verify activity appears in Headroom\.$/);
+  if (verifyPrompt) return t("connections.setup.verifyPrompt", { name: verifyPrompt[1] });
   const exact: Record<string, TranslationKey> = {
+    "Client was already configured for Headroom.": "connections.setup.alreadyConfigured",
+    "Client configuration updated to route through Headroom.": "connections.setup.updated",
+    "Your shell profile (e.g. ~/.zshrc) couldn't be updated - it isn't writable, or it isn't valid UTF-8 text. Core routing still works via the client's own config; to launch the client from a terminal, fix the file and re-run setup, or add the export manually.": "connections.setup.shellProfileUnwritable",
+    "Restart your terminal/editor session to pick up environment changes.": "connections.setup.restartSession",
+    "Quit and reopen any Codex desktop app, CLI, or IDE sessions to load the managed provider.": "connections.setup.reopenCodex",
+    "In Codex, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard).": "connections.setup.trustCodexGuard",
+    "Found Claude Code ANTHROPIC_BASE_URL export in managed shell block.": "connections.verification.claudeShellFound",
+    "Found Headroom-managed RTK PATH export in shell profiles.": "connections.verification.rtkPathFound",
+    "Found ~/.claude/settings.json env.ANTHROPIC_BASE_URL pointing to Headroom.": "connections.verification.claudeSettingsFound",
+    "Found Headroom-managed RTK Claude hook in ~/.claude/settings.json.": "connections.verification.rtkHookFound",
+    "Claude Code ANTHROPIC_BASE_URL was not found in shell blocks or ~/.claude/settings.json.": "connections.verification.claudeRoutingMissing",
+    "Headroom-managed RTK PATH export was not found in shell profiles.": "connections.verification.rtkPathMissing",
+    "Headroom-managed RTK Claude hook was not found in ~/.claude/settings.json.": "connections.verification.rtkHookMissing",
+    "Found Headroom routing guard registered in ~/.claude/settings.json.": "connections.verification.claudeGuardFound",
+    "Headroom routing guard was not found in ~/.claude/settings.json.": "connections.verification.claudeGuardMissing",
+    "Found Codex OPENAI_BASE_URL export in managed shell block.": "connections.verification.codexShellFound",
+    "Found Headroom-managed provider block in ~/.codex/config.toml.": "connections.verification.codexProviderFound",
+    "Headroom-managed provider block was not found in ~/.codex/config.toml.": "connections.verification.codexProviderMissing",
+    "Found Headroom routing guard registered in ~/.codex/hooks.json.": "connections.verification.codexGuardFound",
+    "Headroom routing guard was not found in ~/.codex/hooks.json.": "connections.verification.codexGuardMissing",
+    "Found Grok Build GROK_CLI_CHAT_PROXY_BASE_URL export in managed shell block.": "connections.verification.grokShellFound",
+    "Found Headroom-managed proxy block in ~/.grok/config.toml.": "connections.verification.grokProxyFound",
+    "Headroom-managed proxy block was not found in ~/.grok/config.toml.": "connections.verification.grokProxyMissing",
+    "Grok Build GROK_CLI_CHAT_PROXY_BASE_URL export was not found in shell profiles.": "connections.verification.grokShellMissing",
+    "Found Headroom proxy base URLs for the anthropic and openai providers in OpenCode's config.": "connections.verification.opencodeProxyFound",
+    "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config.": "connections.verification.opencodeProxyMissing",
+    "Headroom proxy is reachable on 127.0.0.1:6867.": "connections.verification.proxyReachable",
     "Setup is incomplete - open the info panel for the exact checks.": "connections.setupIncomplete",
     "Setup could not be verified - open the info panel and re-check.": "connections.setupUnverified",
     "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.": "connections.configuredProxyOffline",
@@ -374,6 +401,19 @@ function localizeUiText(t: Translate, value: string): string {
     "Connector is unavailable because this client is not detected on this machine.": "connections.genericUnavailable",
   };
   return exact[value] ? t(exact[value]) : value;
+}
+
+function localizedClientSetupNotice(
+  t: Translate,
+  clientName: string,
+  result: ClientSetupResult
+): string {
+  return [
+    result.replacedBaseUrl
+      ? t("connections.baseUrlTakeover", { address: result.replacedBaseUrl })
+      : t("connections.configuredThroughHeadroom", { name: clientName }),
+    ...result.nextSteps.map((step) => localizeUiText(t, step)),
+  ].join(" ");
 }
 
 function localizeAppUpdateCopy(t: Translate, value: string | null): string | null {
@@ -3744,9 +3784,12 @@ export default function App() {
     if (canConfigureConnectorWithoutDetection(connector)) {
       return null;
     }
+    if (connector.clientId === "claude_code") {
+      return t("connections.claudeNotDetected");
+    }
     return (
       connectorUnavailableReasons[connector.clientId] ??
-      "Connector is unavailable because this client is not detected on this machine."
+      t("connections.genericUnavailable")
     );
   }
 
@@ -3766,7 +3809,9 @@ export default function App() {
   }
 
   function getConnectorSupportWarning(connector: ClientConnectorStatus) {
-    return connectorSupportWarnings[connector.clientId] ?? null;
+    return connector.clientId === "claude_code"
+      ? t("connections.claudeDesktopLimitation")
+      : connectorSupportWarnings[connector.clientId] ?? null;
   }
 
   // Pricing gate: enabling a connector while optimization is disallowed just
@@ -3794,6 +3839,9 @@ export default function App() {
   function getConnectorDetectionWarning(connector: ClientConnectorStatus) {
     if (!shouldShowConnectorDetectionWarning(connector)) {
       return null;
+    }
+    if (connector.clientId === "claude_code") {
+      return t("connections.claudeNotDetected");
     }
     return connectorUnavailableReasons[connector.clientId] ?? null;
   }
@@ -4091,7 +4139,9 @@ export default function App() {
         for (const clientId of step.clientIds) {
           const result = await invoke<ClientSetupResult>("apply_client_setup", { clientId });
           if (result.replacedBaseUrl) {
-            setConnectorsNotice(baseUrlTakeoverNotice(result.replacedBaseUrl));
+            setConnectorsNotice(
+              t("connections.baseUrlTakeover", { address: result.replacedBaseUrl })
+            );
           }
         }
         latestConnectors = await fetchConnectors();
@@ -4772,7 +4822,7 @@ export default function App() {
         const result = await invoke<ClientSetupResult>("apply_client_setup", {
           clientId: connector.clientId,
         });
-        setConnectorsNotice(clientSetupNotice(connector.name, result));
+        setConnectorsNotice(localizedClientSetupNotice(t, connector.name, result));
       } else {
         await invoke("disable_client_setup", { clientId: connector.clientId });
         setConnectorsNotice(null);
@@ -5587,7 +5637,7 @@ export default function App() {
                           type="button"
                           onClick={connectorGateCta}
                         >
-                          {pricingStatus?.authenticated ? "Upgrade" : "Sign in"}
+                          {t(pricingStatus?.authenticated ? "connections.upgrade" : "connections.signIn")}
                         </button>
                       </p>
                     ) : null}
@@ -7967,12 +8017,12 @@ export default function App() {
                                     <ul>
                                       {connector.verification.checks.map((check) => (
                                         <li className="is-good" key={check}>
-                                          ✓ {check}
+                                  ✓ {localizeUiText(t, check)}
                                         </li>
                                       ))}
                                       {connector.verification.failures.map((failure) => (
                                         <li className="is-bad" key={failure}>
-                                          × {failure}
+                                  × {localizeUiText(t, failure)}
                                         </li>
                                       ))}
                                       {!connector.verification.proxyReachable ? (
