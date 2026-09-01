@@ -353,8 +353,8 @@ describe("dashboard helpers", () => {
         now
       )
     ).toEqual({
-      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.",
-      tone: "reason"
+      text: "Quit and reopen Codex if it was running when you enabled this.",
+      tone: "restart"
     });
   });
 

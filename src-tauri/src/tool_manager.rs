@@ -1334,15 +1334,18 @@ struct PluginAddon {
     plugin_ref: &'static str,
     /// Plugin directory inside the Codex marketplace checkout.
     codex_local_path: &'static str,
+    /// Host CLIs this plugin supports.
+    hosts: &'static [PluginHost],
 }
 
-static PLUGIN_ADDONS: [PluginAddon; 2] = [
+static PLUGIN_ADDONS: [PluginAddon; 3] = [
     PluginAddon {
         id: "ponytail",
         marketplace: "DietrichGebert/ponytail",
         marketplace_name: "ponytail",
         plugin_ref: "ponytail@ponytail",
         codex_local_path: ".",
+        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
     },
     PluginAddon {
         id: "caveman",
@@ -1350,6 +1353,15 @@ static PLUGIN_ADDONS: [PluginAddon; 2] = [
         marketplace_name: "caveman",
         plugin_ref: "caveman@caveman",
         codex_local_path: "./plugins/caveman",
+        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+    },
+    PluginAddon {
+        id: "allinluna",
+        marketplace: "zenx0x/allinluna",
+        marketplace_name: "allinluna",
+        plugin_ref: "allinluna@allinluna",
+        codex_local_path: "./plugins/allinluna",
+        hosts: &[PluginHost::Codex],
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
@@ -2131,6 +2143,17 @@ impl ToolManager {
                         .into(),
                 runtime: "plugin".into(),
                 source_url: "https://github.com/JuliusBrussee/caveman".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "allinluna".into(),
+                name: "All in Luna".into(),
+                description: "Codex-only plugin for coordinating multi-agent work with persistent goals, execution lanes, resource policies, and verification evidence. Uses its bundled local Python runtime."
+                    .into(),
+                runtime: "plugin".into(),
+                source_url: "https://github.com/zenx0x/allinluna".into(),
                 version: PLUGIN_DISPLAY_VERSION.into(),
                 checksum: None,
                 required: false,
@@ -4508,7 +4531,7 @@ impl ToolManager {
         if !enabled {
             return Ok(());
         }
-        if !PluginHost::ALL
+        if !plugin.hosts
             .iter()
             .any(|host| host.plugin_present(plugin))
         {
@@ -6614,7 +6637,7 @@ impl ToolManager {
             return false;
         };
         self.plugin_receipt_exists(plugin)
-            && PluginHost::ALL
+            && plugin.hosts
                 .iter()
                 .any(|host| host.plugin_present(plugin))
     }
@@ -6710,10 +6733,16 @@ impl ToolManager {
     /// is a version skew the user can only fix by updating Codex.
     pub fn install_plugin(&self, id: &str) -> Result<bool> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let hosts: Vec<PluginHost> = PluginHost::ALL
-            .into_iter()
+        let hosts: Vec<PluginHost> = plugin.hosts
+            .iter().copied()
             .filter(|host| host.cli().is_some())
             .collect();
+        if hosts.is_empty()
+            && plugin.hosts.len() == 1
+            && matches!(plugin.hosts[0], PluginHost::Codex)
+        {
+            bail!("Codex CLI ('codex') was not found on PATH. Install Codex, then try again.");
+        }
         if hosts.is_empty() {
             bail!(
                 "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
@@ -6776,7 +6805,7 @@ impl ToolManager {
         }
         let mut errors: Vec<String> = Vec::new();
         let mut changed_any = false;
-        for host in PluginHost::ALL {
+        for &host in plugin.hosts {
             let Some(cli) = host.cli() else { continue };
             // Codex has no enable/disable verb, so enabling re-installs and
             // disabling removes. Skip disabling a host that isn't present.
@@ -6808,7 +6837,7 @@ impl ToolManager {
         if !self.plugin_receipt_exists(plugin) {
             return Ok(());
         }
-        for host in PluginHost::ALL {
+        for &host in plugin.hosts {
             if let Some(cli) = host.cli() {
                 let _ = self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin));
                 let _ =
@@ -6840,7 +6869,7 @@ impl ToolManager {
             }
             // Enabled per our receipt: require it still be registered with a host,
             // so a manual `/plugin` removal surfaces as not-installed.
-            return if PluginHost::ALL
+            return if plugin.hosts
                 .iter()
                 .any(|host| host.plugin_present(plugin))
             {
@@ -6869,8 +6898,6 @@ enum PluginHost {
 }
 
 impl PluginHost {
-    const ALL: [PluginHost; 2] = [PluginHost::ClaudeCode, PluginHost::Codex];
-
     fn label(self) -> &'static str {
         match self {
             PluginHost::ClaudeCode => "Claude Code",

@@ -645,12 +645,9 @@ export function connectorStatusLine(
       tone: "reason"
     };
   }
-  if (connector.verification && !connector.verification.proxyReachable) {
-    return {
-      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.",
-      tone: "reason"
-    };
-  }
+  // `verification.proxyReachable` is only the post-write snapshot. Runtime
+  // status owns live proxy reachability, so a warm-up miss must not become a
+  // persistent connector error after the proxy has recovered.
   if (connector.restartRequired === true) {
     return {
       text: `Restart ${connector.name} to apply the configuration.`,

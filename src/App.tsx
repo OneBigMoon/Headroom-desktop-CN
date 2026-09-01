@@ -289,6 +289,17 @@ const addonCopy: Record<string, AddonCopy> = {
     disabling: "Disabling Caveman...",
     disabled: "Caveman is off. It stays installed but no longer compresses replies."
   },
+  allinluna: {
+    whatItDoes:
+      "Installing registers the All in Luna marketplace and plugin in Codex. It runs the plugin's bundled local Python runtime and may coordinate workspace files, Git, and shell commands through Codex. Nothing is installed into Claude Code.",
+    installing: "Registering the All in Luna plugin with Codex...",
+    uninstalling: "Removing the All in Luna plugin from Codex...",
+    uninstalled: "All in Luna removed from Codex.",
+    installed: "All in Luna installed. Run /allinluna in Codex to start orchestration.",
+    enabling: "Enabling All in Luna in Codex...",
+    disabling: "Disabling All in Luna in Codex...",
+    disabled: "All in Luna is off. Re-enable it when you want Codex orchestration."
+  },
   serena: {
     whatItDoes:
       "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and Codex. Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
@@ -1684,6 +1695,7 @@ const ADDON_INFO_KEYS: Record<string, TranslationKey> = {
   markitdown: "addons.description.markitdown",
   ponytail: "addons.description.ponytail",
   caveman: "addons.description.caveman",
+  allinluna: "addons.info.allinluna",
   serena: "addons.description.serena",
   "codebase-memory": "addons.description.codebaseMemory",
   context7: "addons.description.context7",
@@ -1694,12 +1706,14 @@ const ADDON_DESCRIPTION_KEYS: Record<string, TranslationKey> = {
   markitdown: "addons.description.markitdown",
   ponytail: "addons.description.ponytail",
   caveman: "addons.description.caveman",
+  allinluna: "addons.description.allinluna",
   serena: "addons.description.serena",
   "codebase-memory": "addons.description.codebaseMemory",
   context7: "addons.description.context7",
 };
 
 const ADDON_DISPLAY_ORDER = [
+  "allinluna",
   "ponytail",
   "serena",
   "codebase-memory",
@@ -1707,6 +1721,20 @@ const ADDON_DISPLAY_ORDER = [
   "markitdown",
   "caveman"
 ];
+
+const ADDON_CLIENT_IDS: Record<string, readonly string[]> = {
+  allinluna: ["codex"],
+};
+
+function addonConnectors(
+  toolId: string,
+  connectors: ClientConnectorStatus[]
+): ClientConnectorStatus[] {
+  const supportedClientIds = ADDON_CLIENT_IDS[toolId];
+  return supportedClientIds
+    ? connectors.filter((connector) => supportedClientIds.includes(connector.clientId))
+    : connectors;
+}
 
 // Unknown ids land after the curated ones, before the trailing RTK card.
 function addonDisplayRank(id: string): number {
@@ -7476,7 +7504,7 @@ export default function App() {
                       }
                       sourceUrl={tool.sourceUrl}
                       onOpenSource={() => void openExternalLink(tool.sourceUrl)}
-                      connectors={connectors}
+                      connectors={addonConnectors(tool.id, connectors)}
                       showClients={installed && tool.enabled}
                       savings={tool.savingsLabel ?? null}
                       actionsDisabled={tool.id in addonBusyById}

@@ -74,6 +74,17 @@ const toolRuntimeKeys: Record<ManagedTool["runtime"], TranslationKey> = {
   plugin: "tools.runtime.plugin",
 };
 
+const toolDescriptionKeys: Record<string, TranslationKey> = {
+  rtk: "addons.description.rtk",
+  markitdown: "addons.description.markitdown",
+  ponytail: "addons.description.ponytail",
+  caveman: "addons.description.caveman",
+  allinluna: "addons.info.allinluna",
+  serena: "addons.description.serena",
+  "codebase-memory": "addons.description.codebaseMemory",
+  context7: "addons.description.context7",
+};
+
 const toolModeLabelKeys: Record<string, TranslationKey> = {
   lite: "tools.mode.lite",
   full: "tools.mode.full",
@@ -857,6 +868,8 @@ export function CommunityApp() {
                 const canToggle = !tool.unavailableReason && tool.status !== "installing";
                 const supportedModes = tool.supportedModes?.filter(Boolean) ?? [];
                 const selectedMode = selectedToolMode(tool, supportedModes);
+                const descriptionKey = toolDescriptionKeys[tool.id];
+                const description = descriptionKey ? t(descriptionKey) : tool.description;
                 const canSetMode = supportedModes.length > 0
                   && tool.status !== "not_installed"
                   && tool.status !== "installing"
@@ -877,7 +890,7 @@ export function CommunityApp() {
                       <span className={`community-state${tool.status === "healthy" ? " is-ready" : ""}`}>{toolStatusLabel(tool, t)}</span>
                     </div>
                     <h3>{tool.name}</h3>
-                    <p>{tool.unavailableReason ?? tool.description}</p>
+                    <p>{tool.unavailableReason ?? description}</p>
                     {supportedModes.length ? (
                       <fieldset className="community-tool__modes">
                         <legend>{t("tools.defaultMode.title")}</legend>

@@ -138,6 +138,17 @@ function dashboardState(): DashboardState {
         defaultMode: ponytailMode,
         supportedModes: ["lite", "full", "ultra"],
       },
+      {
+        id: "allinluna",
+        name: "All in Luna",
+        description: "Codex multi-agent orchestration.",
+        runtime: "plugin",
+        required: false,
+        enabled: false,
+        status: "not_installed",
+        sourceUrl: "https://github.com/zenx0x/allinluna",
+        version: "latest",
+      },
     ],
   };
 }
@@ -358,6 +369,27 @@ describe("CommunityApp", () => {
     await user.click(await within(rtkCard as HTMLElement).findByRole("button", { name: "Disable" }));
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "rtk", enabled: false });
+    });
+  });
+
+  it("offers All in Luna as a Codex-only plugin", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+    const card = (await screen.findByText("All in Luna", { selector: "h3" })).closest(
+      ".community-tool"
+    );
+    expect(card).not.toBeNull();
+    expect(
+      within(card as HTMLElement).getByText(/Installing registers the All in Luna marketplace/)
+    ).toBeInTheDocument();
+    expect(within(card as HTMLElement).queryByRole("radiogroup")).not.toBeInTheDocument();
+
+    await user.click(within(card as HTMLElement).getByRole("button", { name: "Install" }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("install_addon", { id: "allinluna" });
     });
   });
 
