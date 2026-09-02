@@ -17,6 +17,10 @@ pub struct ManagedTool {
     pub name: String,
     pub description: String,
     pub runtime: String,
+    pub category: String,
+    #[serde(default)]
+    pub workflow_group: Option<String>,
+    pub activation_scope: String,
     pub required: bool,
     pub enabled: bool,
     pub status: ToolStatus,

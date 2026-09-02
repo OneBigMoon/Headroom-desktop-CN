@@ -4,7 +4,10 @@ export interface ManagedTool {
   id: string;
   name: string;
   description: string;
-  runtime: "python" | "binary" | "plugin";
+  runtime: "python" | "binary" | "node" | "plugin";
+  category?: string;
+  workflowGroup?: string | null;
+  activationScope?: string | null;
   required: boolean;
   enabled: boolean;
   status: ToolStatus;
