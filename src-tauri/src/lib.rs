@@ -1200,16 +1200,16 @@ async fn install_addon(
             )
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
-        "ponytail" | "caveman" => {
+        plugin_id if tool_manager::is_plugin_addon(plugin_id) => {
             let codex_outdated = state
                 .tool_manager
                 .install_plugin(&id)
                 .map_err(|err| err.to_string())?;
             if codex_outdated {
-                let name = if id == "caveman" {
-                    "Caveman"
-                } else {
-                    "Ponytail"
+                let name = match id.as_str() {
+                    "caveman" => "Caveman",
+                    "allinluna" => "All in Luna",
+                    _ => "Ponytail",
                 };
                 let _ = show_notification_impl(
                     &app,
@@ -1285,7 +1285,7 @@ async fn set_addon_enabled(
                 .map_err(|err| err.to_string())?;
             }
         }
-        "ponytail" | "caveman" => {
+        plugin_id if tool_manager::is_plugin_addon(plugin_id) => {
             state
                 .tool_manager
                 .set_plugin_enabled(&id, enabled)
@@ -1375,7 +1375,7 @@ async fn uninstall_addon(
                 .uninstall_rtk()
                 .map_err(|err| err.to_string())?;
         }
-        "ponytail" | "caveman" => {
+        plugin_id if tool_manager::is_plugin_addon(plugin_id) => {
             state
                 .tool_manager
                 .uninstall_plugin(&id)

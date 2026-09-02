@@ -1582,6 +1582,10 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
     PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
 }
 
+pub(crate) fn is_plugin_addon(id: &str) -> bool {
+    plugin_addon(id).is_some()
+}
+
 /// Whether the card offers an Update action, and what it would move to.
 ///
 /// The pinned version is a *minimum*, not a target: a user already ahead of the
@@ -14292,6 +14296,11 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
             ));
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allinluna_is_registered_for_command_dispatch() {
+        assert!(super::is_plugin_addon("allinluna"));
     }
 
     #[test]
