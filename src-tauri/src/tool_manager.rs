@@ -13572,8 +13572,13 @@ after
         let launcher = manager.allinluna_entrypoint();
         let body = fs::read_to_string(&launcher).expect("launcher contents");
         assert!(body.contains(&runtime.managed_python().display().to_string()));
-        assert!(body.contains(".codex/.tmp/marketplaces/allinluna"));
-        assert!(body.contains(".claude/plugins/marketplaces/allinluna"));
+        if cfg!(target_os = "windows") {
+            assert!(body.contains(r".codex\.tmp\marketplaces\allinluna"));
+            assert!(body.contains(r".claude\plugins\marketplaces\allinluna"));
+        } else {
+            assert!(body.contains(".codex/.tmp/marketplaces/allinluna"));
+            assert!(body.contains(".claude/plugins/marketplaces/allinluna"));
+        }
         assert!(body.contains("Headroom-managed Python >= 3.11"));
         assert!(!body.contains("/usr/bin/python3"));
     }
