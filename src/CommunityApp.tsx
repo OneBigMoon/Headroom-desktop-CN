@@ -17,6 +17,7 @@ import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
+import { activationScopeCopy, conflictHeadingCopy, conflictMatrixCopy, sourceLinkCopy, toolCategory, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy } from "./lib/workflowCatalog";
 import type {
   ActivityFeedResponse,
   ClaudeCodeProject,
@@ -68,7 +69,7 @@ const learnAgents: Array<{ id: LearnAgent; labelKey: TranslationKey; description
   { id: "grok", labelKey: "learn.agent.grok", descriptionKey: "learn.agent.grokDescription" },
 ];
 
-const toolRuntimeKeys: Record<ManagedTool["runtime"], TranslationKey> = {
+const toolRuntimeKeys: Partial<Record<ManagedTool["runtime"], TranslationKey>> = {
   python: "tools.runtime.python",
   binary: "tools.runtime.binary",
   plugin: "tools.runtime.plugin",
@@ -610,6 +611,11 @@ export function CommunityApp() {
   const currentProxy = proxyStatus(runtime, t);
   const controlsDisabled = busyAction !== null;
   const tools = dashboard?.tools ?? [];
+  const groupedTools = useMemo(() => {
+    const groups = new Map(TOOL_CATEGORY_ORDER.map((category) => [category, [] as ManagedTool[]]));
+    for (const tool of tools) groups.get(toolCategory(tool.category))?.push(tool);
+    return groups;
+  }, [tools]);
   const activeNavigationItem = navigationItems.find((item) => item.id === activeView);
   const selectedLearnAgent = learnAgents.find((item) => item.id === learnAgent) ?? learnAgents[0];
   const savingsTrend = useMemo(() => {
@@ -861,8 +867,17 @@ export function CommunityApp() {
                 <p>{t("tools.description")}</p>
               </div>
             </section>
-            <section className="community-tool-grid" aria-label={t("aria.localTools")}>
-              {tools.length ? tools.map((tool) => {
+          {tools.length ? TOOL_CATEGORY_ORDER.map((category) => {
+            const categoryTools = groupedTools.get(category) ?? [];
+            if (!categoryTools.length) return null;
+            const categoryCopy = toolCategoryCopy[category];
+            return <section className="community-tool-group" key={category} aria-labelledby={`tool-group-${category}`}>
+              <div className="community-tool-group__heading">
+                <h3 id={`tool-group-${category}`}>{categoryCopy.title[resolvedLocale]}</h3>
+                <p>{categoryCopy.description[resolvedLocale]}</p>
+              </div>
+              <div className="community-tool-grid" aria-label={categoryCopy.title[resolvedLocale]}>
+            {categoryTools.map((tool) => {
                 const actionKey = `tool:${tool.id}`;
                 const removalKey = `tool:remove:${tool.id}`;
                 const canToggle = !tool.unavailableReason && tool.status !== "installing";
@@ -886,11 +901,13 @@ export function CommunityApp() {
                 return (
                   <article className={`community-tool${supportedModes.length ? " community-tool--with-modes" : ""}`} key={tool.id}>
                     <div className="community-tool__topline">
-                      <span className="community-tool__runtime">{t(toolRuntimeKeys[tool.runtime])}</span>
+                      <span className="community-tool__runtime">{tool.runtime === "node" ? "Node.js" : t(toolRuntimeKeys[tool.runtime]!)}</span>
+                            {tool.workflowGroup ? <span className="community-state">{workflowGroupCopy[tool.workflowGroup]?.[resolvedLocale] ?? tool.workflowGroup}</span> : null}
                       <span className={`community-state${tool.status === "healthy" ? " is-ready" : ""}`}>{toolStatusLabel(tool, t)}</span>
                     </div>
                     <h3>{tool.name}</h3>
-                    <p>{tool.unavailableReason ?? description}</p>
+              <p>{tool.unavailableReason ?? toolCopy[tool.id]?.[resolvedLocale] ?? description}</p>
+              {tool.activationScope === "new_session" ? <p className="community-tool__activation-note">{activationScopeCopy[resolvedLocale]}</p> : null}
                     {supportedModes.length ? (
                       <fieldset className="community-tool__modes">
                         <legend>{t("tools.defaultMode.title")}</legend>
@@ -926,6 +943,7 @@ export function CommunityApp() {
                       </fieldset>
                     ) : null}
                     <div className="community-tool__footer">
+                            <a href={tool.sourceUrl} target="_blank" rel="noreferrer" className="community-text-button">{sourceLinkCopy[resolvedLocale]}</a>
                       <button
                         className="community-button community-button--secondary"
                         disabled={controlsDisabled || !canToggle}
@@ -947,10 +965,18 @@ export function CommunityApp() {
                     </div>
                   </article>
                 );
-              }) : (
+            })}
+              </div>
+            </section>;
+          }) : (
                 <p className="community-empty">{t("tools.empty")}</p>
               )}
-            </section>
+          <section className="community-workflow-guide" aria-labelledby="workflow-guide-heading">
+                <div className="community-tool-group__heading">
+                  <h3 id="workflow-guide-heading">{conflictHeadingCopy[resolvedLocale]}</h3>
+                  <p>{conflictMatrixCopy[resolvedLocale]}</p>
+                </div>
+              </section>
           </div>
         ) : null}
 

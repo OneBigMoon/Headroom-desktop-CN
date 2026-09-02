@@ -91,6 +91,16 @@ const runtime: RuntimeStatus = {
   },
 };
 
+const additionalTools: DashboardState["tools"] = [
+  { id: "stop-that-shit", name: "Stop That Shit", description: "Guarded scope checks.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://example.invalid/stop-that-shit", version: "latest", category: "guardrails", activationScope: "new_session" },
+  { id: "agent-guard", name: "Agent Guard", description: "Local secret guard.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://example.invalid/agent-guard", version: "latest", category: "guardrails", activationScope: "new_session" },
+  { id: "grill-me", name: "Grill Me", description: "Read-only understanding check.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://example.invalid/grill-me", version: "latest", category: "learning", activationScope: "new_session" },
+  { id: "openspec", name: "OpenSpec", description: "Specification workflow.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/Fission-AI/OpenSpec", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
+  { id: "superpowers", name: "Superpowers", description: "Disciplined coding workflow.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/obra/superpowers", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
+  { id: "gstack", name: "gstack", description: "Product to ship workflow.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/garrytan/gstack", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
+  { id: "ralph-loop", name: "Ralph Loop", description: "Bounded automation loop.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/SantanderAI/ralph", version: "latest", category: "automation", workflowGroup: "execution_engine", activationScope: "new_session" },
+];
+
 function dashboardState(): DashboardState {
   return {
     ...mockDashboard,
@@ -100,6 +110,7 @@ function dashboardState(): DashboardState {
     lifetimeEstimatedTokensSaved: 18_500,
     lifetimeEstimatedSavingsUsd: 3.5,
     tools: [
+      ...additionalTools,
       {
         id: "rtk",
         name: "RTK",
@@ -146,9 +157,12 @@ function dashboardState(): DashboardState {
         required: false,
         enabled: false,
         status: "not_installed",
-        sourceUrl: "https://github.com/zenx0x/allinluna",
-        version: "latest",
-      },
+      sourceUrl: "https://github.com/zenx0x/allinluna",
+      version: "latest",
+      category: "automation",
+      workflowGroup: "execution_engine",
+      activationScope: "new_session",
+    },
     ],
   };
 }
@@ -391,6 +405,40 @@ describe("CommunityApp", () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("install_addon", { id: "allinluna" });
     });
+  });
+
+  it("groups tools, exposes install controls, and documents session activation", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+    expect(screen.getByRole("heading", { name: "Safety constraints" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Learning" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Primary workflow" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Automation executor" })).toBeInTheDocument();
+    expect(screen.getAllByText(/new sessions/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/No Headroom or 6867 proxy restart is needed/).length).toBeGreaterThan(0);
+    for (const name of ["Stop That Shit", "Agent Guard", "Grill Me", "OpenSpec", "Superpowers", "gstack", "Ralph Loop"]) {
+      const card = screen.getByText(name, { selector: "h3" }).closest("article");
+      expect(card).not.toBeNull();
+      expect(within(card as HTMLElement).getByRole("button", { name: "Install" })).toBeInTheDocument();
+      expect(within(card as HTMLElement).getByRole("link", { name: "Source and acknowledgements" })).toBeInTheDocument();
+    }
+    expect(screen.getByRole("heading", { name: "Conflict and switching rules" })).toBeInTheDocument();
+    expect(screen.getAllByText("Single-select: primary workflow")).toHaveLength(3);
+    expect(screen.getAllByText("Single-select: automation executor").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Headroom and port 6867 stay running/)).toBeInTheDocument();
+  });
+
+  it("uses addon controls without restarting the proxy for new-session tools", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+    const card = screen.getByText("Agent Guard", { selector: "h3" }).closest("article") as HTMLElement;
+    await user.click(within(card).getByRole("button", { name: "Install" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("install_addon", { id: "agent-guard" }));
+    expect(invokeMock).not.toHaveBeenCalledWith("force_restart_headroom");
   });
 
   it("shows each add-on's actual default-mode choices and saves a selected mode", async () => {

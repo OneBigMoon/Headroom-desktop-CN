@@ -1336,9 +1336,13 @@ struct PluginAddon {
     codex_local_path: &'static str,
     /// Host CLIs this plugin supports.
     hosts: &'static [PluginHost],
+    source_url: &'static str,
+    /// Paths Codex should sparse-checkout when the repository also ships a
+    /// Claude marketplace with the same name.
+    codex_sparse_paths: &'static [&'static str],
 }
 
-static PLUGIN_ADDONS: [PluginAddon; 3] = [
+static PLUGIN_ADDONS: [PluginAddon; 10] = [
     PluginAddon {
         id: "ponytail",
         marketplace: "DietrichGebert/ponytail",
@@ -1346,6 +1350,8 @@ static PLUGIN_ADDONS: [PluginAddon; 3] = [
         plugin_ref: "ponytail@ponytail",
         codex_local_path: ".",
         hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        source_url: "https://github.com/DietrichGebert/ponytail",
+        codex_sparse_paths: &[],
     },
     PluginAddon {
         id: "caveman",
@@ -1354,6 +1360,8 @@ static PLUGIN_ADDONS: [PluginAddon; 3] = [
         plugin_ref: "caveman@caveman",
         codex_local_path: "./plugins/caveman",
         hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        source_url: "https://github.com/JuliusBrussee/caveman",
+        codex_sparse_paths: &[],
     },
     PluginAddon {
         id: "allinluna",
@@ -1362,9 +1370,94 @@ static PLUGIN_ADDONS: [PluginAddon; 3] = [
         plugin_ref: "allinluna@allinluna",
         codex_local_path: "./plugins/allinluna",
         hosts: &[PluginHost::Codex],
+        source_url: "https://github.com/zenx0x/allinluna",
+        codex_sparse_paths: &[],
+    },
+    PluginAddon {
+        id: "openspec",
+        marketplace: "Fission-AI/OpenSpec",
+        marketplace_name: "openspec",
+        plugin_ref: "openspec@openspec",
+        codex_local_path: ".",
+        hosts: &[PluginHost::Codex],
+        source_url: "https://github.com/Fission-AI/OpenSpec",
+        codex_sparse_paths: &[],
+    },
+    PluginAddon {
+        id: "superpowers",
+        marketplace: "openai-curated",
+        marketplace_name: "openai-curated",
+        plugin_ref: "superpowers@openai-curated",
+        codex_local_path: "./plugins/superpowers",
+        hosts: &[PluginHost::Codex],
+        source_url: "https://github.com/obra/superpowers",
+        codex_sparse_paths: &[],
+    },
+    PluginAddon {
+        id: "gstack",
+        marketplace: "garrytan/gstack",
+        marketplace_name: "gstack",
+        plugin_ref: "gstack@gstack",
+        codex_local_path: ".",
+        hosts: &[PluginHost::Codex],
+        source_url: "https://github.com/garrytan/gstack",
+        codex_sparse_paths: &[],
+    },
+    PluginAddon {
+        id: "ralph-loop",
+        marketplace: "SantanderAI/ralph",
+        marketplace_name: "ralph",
+        plugin_ref: "ralph-loop@ralph",
+        codex_local_path: ".",
+        hosts: &[PluginHost::Codex],
+        source_url: "https://github.com/SantanderAI/ralph",
+        codex_sparse_paths: &[],
+    },
+    PluginAddon {
+        id: "stop-that-shit",
+        marketplace: "lennney/stop-that-shit",
+        marketplace_name: "stop-that-shit",
+        plugin_ref: "stop-that-shit@stop-that-shit",
+        codex_local_path: ".",
+        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        source_url: "https://github.com/lennney/stop-that-shit",
+        codex_sparse_paths: &[
+            ".agents",
+            ".codex-plugin",
+            ".hermes-plugin",
+            "assets",
+            "hooks",
+            "opencode",
+            "pi",
+            "scripts",
+            "skills",
+            "src",
+            "test",
+        ],
+    },
+    PluginAddon {
+        id: "agent-guard",
+        marketplace: "JeongJaeSoon/agent-guard",
+        marketplace_name: "agent-guard",
+        plugin_ref: "agent-guard@agent-guard",
+        codex_local_path: "./plugins/agent-guard",
+        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        source_url: "https://github.com/JeongJaeSoon/agent-guard",
+        codex_sparse_paths: &[".agents", "plugins/agent-guard"],
+    },
+    PluginAddon {
+        id: "grill-me",
+        marketplace: "joshuawheelock/grill-me",
+        marketplace_name: "grill-me",
+        plugin_ref: "grill-me@grill-me",
+        codex_local_path: ".",
+        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        source_url: "https://github.com/joshuawheelock/grill-me",
+        codex_sparse_paths: &[],
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
+const GSTACK_BUN_VERSION: &str = "1.3.14";
 
 const PONYTAIL_SUPPORTED_MODES: &[&str] = &["lite", "full", "ultra"];
 const CAVEMAN_SUPPORTED_MODES: &[&str] = &[
@@ -1582,6 +1675,10 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
     PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
 }
 
+fn plugin_uses_existing_marketplace(plugin: &PluginAddon) -> bool {
+    plugin.id == "superpowers"
+}
+
 pub(crate) fn is_plugin_addon(id: &str) -> bool {
     plugin_addon(id).is_some()
 }
@@ -1749,6 +1846,9 @@ pub struct ManagedToolManifest {
     pub name: String,
     pub description: String,
     pub runtime: String,
+    pub category: String,
+    pub workflow_group: Option<String>,
+    pub activation_scope: String,
     pub source_url: String,
     pub version: String,
     pub checksum: Option<String>,
@@ -2063,6 +2163,9 @@ impl ToolManager {
                 name: "Headroom".into(),
                 description: "Default optimizer stage for every supported client.".into(),
                 runtime: "python".into(),
+                category: "core".into(),
+                workflow_group: None,
+                activation_scope: "immediate".into(),
                 source_url: "https://pypi.org/project/headroom-ai/".into(),
                 version: HEADROOM_PINNED_VERSION.into(),
                 checksum: None,
@@ -2074,6 +2177,9 @@ impl ToolManager {
                 description:
                     "Token-optimized shell command proxy for your coding agent and your terminal.".into(),
                 runtime: "binary".into(),
+                category: "efficiency".into(),
+                workflow_group: None,
+                activation_scope: "immediate".into(),
                 source_url: "https://github.com/rtk-ai/rtk".into(),
                 version: RTK_VERSION.into(),
                 checksum: rtk_checksum,
@@ -2086,6 +2192,9 @@ impl ToolManager {
                     "Converts PDF and Office documents to Markdown so they cost far fewer tokens when your agent reads them."
                         .into(),
                 runtime: "python".into(),
+                category: "documents".into(),
+                workflow_group: None,
+                activation_scope: "immediate".into(),
                 source_url: "https://github.com/microsoft/markitdown".into(),
                 version: MARKITDOWN_PINNED_VERSION.into(),
                 checksum: None,
@@ -2098,6 +2207,9 @@ impl ToolManager {
                     "MCP server that gives your agent symbol-level code tools, so it reads one function instead of a whole file. Saves most in large repos; adds its tool definitions to every request."
                         .into(),
                 runtime: "python".into(),
+                category: "code_intelligence".into(),
+                workflow_group: None,
+                activation_scope: "immediate".into(),
                 source_url: "https://github.com/oraios/serena".into(),
                 version: SERENA_PINNED_VERSION.into(),
                 checksum: None,
@@ -2110,6 +2222,9 @@ impl ToolManager {
                     "MCP server that indexes your codebase into a persistent knowledge graph - call chains, classes, routes - so your agent answers structure questions from the graph instead of re-reading files. Complements Serena: pre-built map vs live symbol tools."
                         .into(),
                 runtime: "binary".into(),
+                category: "code_intelligence".into(),
+                workflow_group: None,
+                activation_scope: "immediate".into(),
                 source_url: "https://github.com/DeusData/codebase-memory-mcp".into(),
                 version: CODEBASE_MEMORY_VERSION.into(),
                 checksum: None,
@@ -2122,6 +2237,9 @@ impl ToolManager {
                     "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Requires Node.js 20.18.1 or newer on PATH."
                         .into(),
                 runtime: "node".into(),
+                category: "code_intelligence".into(),
+                workflow_group: None,
+                activation_scope: "immediate".into(),
                 source_url: "https://github.com/upstash/context7".into(),
                 version: CONTEXT7_PINNED_VERSION.into(),
                 checksum: None,
@@ -2134,6 +2252,9 @@ impl ToolManager {
                     "Plugin that nudges the agent to write the least code possible. Installs into Claude Code and Codex. Requires their CLI and Node.js on PATH."
                         .into(),
                 runtime: "plugin".into(),
+                category: "efficiency".into(),
+                workflow_group: None,
+                activation_scope: "new_session".into(),
                 source_url: "https://github.com/DietrichGebert/ponytail".into(),
                 version: PLUGIN_DISPLAY_VERSION.into(),
                 checksum: None,
@@ -2146,6 +2267,9 @@ impl ToolManager {
                     "Plugin that makes the agent reply in terse caveman-speak, cutting output tokens while keeping code, commands, and errors exact. Installs into Claude Code and Codex. Requires their CLI and Node.js on PATH."
                         .into(),
                 runtime: "plugin".into(),
+                category: "efficiency".into(),
+                workflow_group: None,
+                activation_scope: "new_session".into(),
                 source_url: "https://github.com/JuliusBrussee/caveman".into(),
                 version: PLUGIN_DISPLAY_VERSION.into(),
                 checksum: None,
@@ -2154,10 +2278,104 @@ impl ToolManager {
             ManagedToolManifest {
                 id: "allinluna".into(),
                 name: "All in Luna".into(),
-                description: "Codex-only plugin for coordinating multi-agent work with persistent goals, execution lanes, resource policies, and verification evidence. Uses its bundled local Python runtime."
-                    .into(),
+            description: "Codex-only plugin for coordinating multi-agent work with persistent goals, execution lanes, resource policies, and verification evidence. Uses its bundled local Python runtime. Thanks to All in Luna author @zenx0x for the open-source contribution."
+                .into(),
                 runtime: "plugin".into(),
+                category: "automation".into(),
+                workflow_group: Some("execution_engine".into()),
+                activation_scope: "new_session".into(),
                 source_url: "https://github.com/zenx0x/allinluna".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "openspec".into(),
+                name: "OpenSpec".into(),
+                description: "Specification-driven workflow for changes with explicit requirements, artifacts, and acceptance checks. Includes the OpenSpec CLI and Codex skills. Thanks to Fission AI and contributors.".into(),
+                runtime: "plugin".into(),
+                category: "workflow".into(),
+                workflow_group: Some("primary_workflow".into()),
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/Fission-AI/OpenSpec".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "superpowers".into(),
+                name: "Superpowers".into(),
+                description: "Structured coding workflow covering brainstorming, planning, TDD, debugging, review, and delivery. Thanks to Jesse Vincent and contributors.".into(),
+                runtime: "plugin".into(),
+                category: "workflow".into(),
+                workflow_group: Some("primary_workflow".into()),
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/obra/superpowers".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "gstack".into(),
+                name: "gstack".into(),
+                description: "Full engineering workflow with product, design, browser, QA, review, and shipping skills. Requires Bun and Node.js. Thanks to Garry Tan and contributors.".into(),
+                runtime: "plugin".into(),
+                category: "workflow".into(),
+                workflow_group: Some("primary_workflow".into()),
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/garrytan/gstack".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "ralph-loop".into(),
+                name: "Ralph Loop".into(),
+                description: "Bounded autonomous loop that starts a fresh coding-agent session each iteration and stops on explicit completion signals. Thanks to Santander AI and contributors.".into(),
+                runtime: "plugin".into(),
+                category: "automation".into(),
+                workflow_group: Some("execution_engine".into()),
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/SantanderAI/ralph".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "stop-that-shit".into(),
+                name: "Stop That Shit".into(),
+                description: "Guardrail plugin that helps agents stop unsafe or unwanted behavior. Thanks to @lennney and contributors.".into(),
+                runtime: "plugin".into(),
+                category: "guardrails".into(),
+                workflow_group: None,
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/lennney/stop-that-shit".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "agent-guard".into(),
+                name: "Agent Guard".into(),
+                description: "Guardrail plugin for safer agent execution. Thanks to @JeongJaeSoon and contributors.".into(),
+                runtime: "plugin".into(),
+                category: "guardrails".into(),
+                workflow_group: None,
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/JeongJaeSoon/agent-guard".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "grill-me".into(),
+                name: "Grill Me".into(),
+                description: "Learning plugin that stress-tests plans and assumptions. Thanks to Joshua Wheelock.".into(),
+                runtime: "plugin".into(),
+                category: "learning".into(),
+                workflow_group: None,
+                activation_scope: "new_session".into(),
+                source_url: "https://github.com/joshuawheelock/grill-me".into(),
                 version: PLUGIN_DISPLAY_VERSION.into(),
                 checksum: None,
                 required: false,
@@ -2195,6 +2413,9 @@ impl ToolManager {
                     name: manifest.name.clone(),
                     description: manifest.description.clone(),
                     runtime: manifest.runtime.clone(),
+                    category: manifest.category.clone(),
+                    workflow_group: manifest.workflow_group.clone(),
+                    activation_scope: manifest.activation_scope.clone(),
                     required: manifest.required,
                     enabled,
                     status: self.detect_status(&manifest.id),
@@ -2413,6 +2634,193 @@ impl ToolManager {
             "rtk"
         };
         self.runtime.bin_dir.join(name)
+    }
+
+    pub fn allinluna_entrypoint(&self) -> PathBuf {
+        let name = if cfg!(target_os = "windows") {
+            "allinluna.cmd"
+        } else {
+            "allinluna"
+        };
+        self.runtime.bin_dir.join(name)
+    }
+
+    fn allinluna_runtime_path(&self) -> Option<PathBuf> {
+        let home = crate::client_adapters::home_dir();
+        [
+            home.join(".codex/.tmp/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py"),
+            home.join(".claude/plugins/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    fn ensure_allinluna_launcher(&self) -> Result<()> {
+        let launcher = self.allinluna_entrypoint();
+        let managed_python = self.runtime.managed_python();
+        #[cfg(windows)]
+        let body = format!(
+            "@echo off\r\nset \"PLUGIN_RUNTIME=%USERPROFILE%\\.codex\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" (\r\n  echo All in Luna runtime was not found in the installed marketplace. Install or enable All in Luna again. 1>&2\r\n  exit /b 1\r\n)\r\n\"{}\" \"%PLUGIN_RUNTIME%\" %*\r\n",
+            managed_python.display()
+        );
+        #[cfg(not(windows))]
+        let body = format!(
+            "#!/bin/sh\nset -eu\nfor plugin_runtime in \\\n  \"$HOME/.codex/.tmp/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py\" \\\n  \"$HOME/.claude/plugins/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py\"; do\n  if [ -f \"$plugin_runtime\" ]; then\n    exec '{}' \"$plugin_runtime\" \"$@\"\n  fi\ndone\necho 'All in Luna requires the installed marketplace runtime and Headroom-managed Python >= 3.11.' >&2\nexit 1\n",
+            managed_python.display().to_string().replace('\'', "'\\''")
+        );
+        crate::client_adapters::atomic_write(&launcher, body.as_bytes())
+            .with_context(|| format!("writing {}", launcher.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&launcher)
+                .with_context(|| format!("reading permissions of {}", launcher.display()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&launcher, permissions)
+                .with_context(|| format!("marking {} executable", launcher.display()))?;
+        }
+        Ok(())
+    }
+
+    fn remove_allinluna_launcher(&self) -> Result<()> {
+        let launcher = self.allinluna_entrypoint();
+        if launcher.exists() {
+            std::fs::remove_file(&launcher)
+                .with_context(|| format!("removing {}", launcher.display()))?;
+        }
+        Ok(())
+    }
+
+    fn allinluna_launcher_healthy(&self) -> bool {
+        self.python_runtime_installed()
+            && self.allinluna_entrypoint().is_file()
+            && self.allinluna_runtime_path().is_some()
+    }
+
+    fn codex_plugin_source_path(&self, plugin: &PluginAddon) -> PathBuf {
+        crate::client_adapters::home_dir()
+            .join(".codex")
+            .join(".tmp")
+            .join("marketplaces")
+            .join(plugin.marketplace_name)
+            .join(plugin.codex_local_path.trim_start_matches("./"))
+    }
+
+    fn openspec_entrypoint(&self) -> PathBuf {
+        self.runtime.bin_dir.join(if cfg!(target_os = "windows") {
+            "openspec.cmd"
+        } else {
+            "openspec"
+        })
+    }
+
+    fn ralph_entrypoint(&self) -> PathBuf {
+        self.runtime.bin_dir.join(if cfg!(target_os = "windows") {
+            "ralph-loop.cmd"
+        } else {
+            "ralph-loop.sh"
+        })
+    }
+
+    fn ensure_openspec_launcher(&self, plugin: &PluginAddon) -> Result<()> {
+        let runtime = self.codex_plugin_source_path(plugin).join("bin/openspec.js");
+        if !runtime.is_file() {
+            bail!("OpenSpec runtime was not built at {}", runtime.display());
+        }
+        let launcher = self.openspec_entrypoint();
+        #[cfg(windows)]
+        let body = format!("@echo off\r\nnode \"{}\" %*\r\n", runtime.display());
+        #[cfg(not(windows))]
+        let body = format!(
+            "#!/bin/sh\nexec node '{}' \"$@\"\n",
+            runtime.display().to_string().replace('\'', "'\\''")
+        );
+        crate::client_adapters::atomic_write(&launcher, body.as_bytes())
+            .with_context(|| format!("writing {}", launcher.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&launcher)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&launcher, permissions)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_ralph_launcher(&self, plugin: &PluginAddon) -> Result<()> {
+        let source_root = self.codex_plugin_source_path(plugin);
+        let source = if cfg!(target_os = "windows") {
+            source_root.join("ralph-loop.ps1")
+        } else {
+            source_root.join("ralph-loop.sh")
+        };
+        let bytes = std::fs::read(&source)
+            .with_context(|| format!("reading Ralph Loop runtime {}", source.display()))?;
+        let launcher = self.ralph_entrypoint();
+        #[cfg(windows)]
+        let bytes = format!(
+            "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" %*\r\n",
+            source.display()
+        )
+        .into_bytes();
+        crate::client_adapters::atomic_write(&launcher, &bytes)
+            .with_context(|| format!("writing {}", launcher.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&launcher)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&launcher, permissions)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_plugin_runtime(&self, plugin: &PluginAddon) -> Result<()> {
+        match plugin.id {
+            "allinluna" => self.ensure_allinluna_launcher(),
+            "openspec" => self.ensure_openspec_launcher(plugin),
+            "ralph-loop" => self.ensure_ralph_launcher(plugin),
+            _ => Ok(()),
+        }
+    }
+
+    fn remove_plugin_runtime(&self, plugin: &PluginAddon) -> Result<()> {
+        let launcher = match plugin.id {
+            "allinluna" => return self.remove_allinluna_launcher(),
+            "openspec" => Some(self.openspec_entrypoint()),
+            "ralph-loop" => Some(self.ralph_entrypoint()),
+            _ => None,
+        };
+        if let Some(launcher) = launcher {
+            if launcher.exists() {
+                std::fs::remove_file(&launcher)
+                    .with_context(|| format!("removing {}", launcher.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn plugin_runtime_healthy(&self, plugin: &PluginAddon) -> bool {
+        let root = self.codex_plugin_source_path(plugin);
+        match plugin.id {
+            "allinluna" => self.allinluna_launcher_healthy(),
+            "openspec" => {
+                self.openspec_entrypoint().is_file() && root.join("dist/cli/index.js").is_file()
+            }
+            "gstack" => {
+                let browse = if cfg!(target_os = "windows") {
+                    root.join("browse/dist/browse.exe")
+                } else {
+                    root.join("browse/dist/browse")
+                };
+                browse.is_file() && root.join(".agents/skills").is_dir()
+            }
+            "ralph-loop" => {
+                self.ralph_entrypoint().is_file() && root.join("ralph-loop.sh").is_file()
+            }
+            _ => true,
+        }
     }
 
     /// Seed the output-shaper savings baseline by mining the user's Claude Code
@@ -4555,6 +4963,9 @@ impl ToolManager {
                 }
             );
         }
+        if !self.plugin_runtime_healthy(plugin) {
+            bail!("{id} is registered but its managed runtime is incomplete");
+        }
         Ok(())
     }
 
@@ -6676,6 +7087,59 @@ impl ToolManager {
             .exists()
     }
 
+    fn conflicting_plugin_ids(&self, id: &str) -> Vec<String> {
+        let Some(group) = self
+            .manifests
+            .iter()
+            .find(|manifest| manifest.id == id)
+            .and_then(|manifest| manifest.workflow_group.as_deref())
+        else {
+            return Vec::new();
+        };
+        self.manifests
+            .iter()
+            .filter(|manifest| {
+                manifest.id != id
+                    && manifest.workflow_group.as_deref() == Some(group)
+                    && plugin_addon(&manifest.id).is_some()
+            })
+            .map(|manifest| manifest.id.clone())
+            .collect()
+    }
+
+    fn enforce_exclusive_plugin_group(&self, id: &str) -> Result<()> {
+        let peers: Vec<String> = self
+            .conflicting_plugin_ids(id)
+            .into_iter()
+            .filter(|peer| {
+                plugin_addon(peer).is_some_and(|plugin| self.plugin_receipt_exists(plugin))
+                    && self.tool_enabled(peer)
+            })
+            .collect();
+        let mut disabled: Vec<String> = Vec::new();
+        for peer in peers {
+            if let Err(err) = self.set_plugin_enabled_inner(&peer, false) {
+                let mut rollback_errors = Vec::new();
+                if let Err(rollback_err) = self.set_plugin_enabled_inner(id, false) {
+                    rollback_errors.push(format!("disabling {id}: {rollback_err:#}"));
+                }
+                for restored in disabled.iter().rev() {
+                    if let Err(rollback_err) = self.set_plugin_enabled_inner(restored, true) {
+                        rollback_errors.push(format!("restoring {restored}: {rollback_err:#}"));
+                    }
+                }
+                let rollback = if rollback_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; rollback issues: {}", rollback_errors.join("; "))
+                };
+                bail!("could not disable conflicting workflow {peer}: {err:#}{rollback}");
+            }
+            disabled.push(peer);
+        }
+        Ok(())
+    }
+
     fn run_plugin_cmd(
         &self,
         plugin: &PluginAddon,
@@ -6700,9 +7164,15 @@ impl ToolManager {
     /// the install path replayed.
     fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
         let cli = host.cli().context("CLI not found on PATH")?;
+        if matches!(host, PluginHost::Codex) && codex_plugin_adapter(plugin).is_some() {
+            return self.install_codex_adapter_plugin(plugin, &cli);
+        }
         if host.plugin_present(plugin) {
-            let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
-            host.prepare_marketplace_snapshot(plugin)?;
+            if !plugin_uses_existing_marketplace(plugin) {
+                let _ =
+                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
+                host.prepare_marketplace_snapshot(plugin)?;
+            }
             self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))?;
         } else {
             // Re-adding an already-known marketplace is a benign error, so its
@@ -6712,10 +7182,15 @@ impl ToolManager {
             // reports only "plugin <x> was not found in marketplace <y>", which
             // names a consequence and hides every cause (Sentry RUST-6K). Carry
             // the add error and attach it if the install then fails.
-            let marketplace_err = self
-                .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
-                .err();
-            host.prepare_marketplace_snapshot(plugin)?;
+            let marketplace_err = if plugin_uses_existing_marketplace(plugin) {
+                None
+            } else {
+                let error = self
+                    .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                    .err();
+                host.prepare_marketplace_snapshot(plugin)?;
+                error
+            };
             self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
                 .map_err(|err| match marketplace_err {
                     Some(add_err) => {
@@ -6726,6 +7201,33 @@ impl ToolManager {
         }
         if !host.plugin_present(plugin) {
             bail!("install completed but the plugin was not registered");
+        }
+        Ok(())
+    }
+
+    fn install_codex_adapter_plugin(&self, plugin: &'static PluginAddon, cli: &Path) -> Result<()> {
+        let source = prepare_codex_adapter_marketplace(plugin)?;
+        let source_text = source.to_string_lossy().into_owned();
+        let marketplace_err = self
+            .run_plugin_cmd(
+                plugin,
+                cli,
+                PluginHost::Codex,
+                &["plugin", "marketplace", "add", &source_text],
+            )
+            .err();
+        self.run_plugin_cmd(
+            plugin,
+            cli,
+            PluginHost::Codex,
+            &PluginHost::Codex.install_args(plugin),
+        )
+        .map_err(|err| match marketplace_err {
+            Some(add_err) => err.context(format!("local marketplace add failed first: {add_err:#}")),
+            None => err,
+        })?;
+        if !PluginHost::Codex.plugin_present(plugin) {
+            bail!("install completed but the Codex adapter plugin was not registered");
         }
         Ok(())
     }
@@ -6795,11 +7297,21 @@ impl ToolManager {
         }
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
+        self.ensure_plugin_runtime(plugin)?;
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
+        self.enforce_exclusive_plugin_group(plugin.id)?;
         Ok(codex_outdated)
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.set_plugin_enabled_inner(id, enabled)?;
+        if enabled {
+            self.enforce_exclusive_plugin_group(id)?;
+        }
+        Ok(())
+    }
+
+    fn set_plugin_enabled_inner(&self, id: &str, enabled: bool) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         // Guard on the receipt, not host presence: disabling on a host without a
         // disable verb (Codex) removes the plugin, so `plugin_installed()`
@@ -6831,6 +7343,11 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": enabled }))?;
+        if enabled {
+            self.ensure_plugin_runtime(plugin)?;
+        } else {
+            self.remove_plugin_runtime(plugin)?;
+        }
         Ok(())
     }
 
@@ -6844,11 +7361,18 @@ impl ToolManager {
         for &host in plugin.hosts {
             if let Some(cli) = host.cli() {
                 let _ = self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin));
-                let _ =
-                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
+                if !plugin_uses_existing_marketplace(plugin) {
+                    let _ = self.run_plugin_cmd(
+                        plugin,
+                        &cli,
+                        host,
+                        &host.marketplace_remove_args(plugin),
+                    );
+                }
             }
         }
         let receipt = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
+        self.remove_plugin_runtime(plugin)?;
         if receipt.exists() {
             std::fs::remove_file(&receipt)
                 .with_context(|| format!("removing {}", receipt.display()))?;
@@ -6877,7 +7401,11 @@ impl ToolManager {
                 .iter()
                 .any(|host| host.plugin_present(plugin))
             {
-                ToolStatus::Healthy
+                if !self.plugin_runtime_healthy(plugin) {
+                    ToolStatus::Degraded
+                } else {
+                    ToolStatus::Healthy
+                }
             } else {
                 ToolStatus::NotInstalled
             };
@@ -6895,7 +7423,7 @@ impl ToolManager {
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
 /// (Claude has enable/disable/install/uninstall; Codex only add/remove), so
 /// each host carries its own argument vectors.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PluginHost {
     ClaudeCode,
     Codex,
@@ -6917,18 +7445,23 @@ impl PluginHost {
     }
 
     fn marketplace_add_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
-        vec!["plugin", "marketplace", "add", plugin.marketplace]
+        let mut args = vec!["plugin", "marketplace", "add", plugin.marketplace];
+        if matches!(self, PluginHost::Codex) {
+            for path in plugin.codex_sparse_paths {
+                args.extend(["--sparse", *path]);
+            }
+        }
+        args
     }
 
     fn prepare_marketplace_snapshot(self, plugin: &PluginAddon) -> Result<()> {
         if matches!(self, PluginHost::Codex) {
-            write_codex_compat_marketplace_manifest_at(
-                &crate::client_adapters::home_dir()
-                    .join(".codex")
-                    .join(".tmp")
-                    .join("marketplaces"),
-                plugin,
-            )?;
+            let root = crate::client_adapters::home_dir()
+                .join(".codex")
+                .join(".tmp")
+                .join("marketplaces");
+            write_codex_compat_marketplace_manifest_at(&root, plugin)?;
+            prepare_codex_plugin_adapter_at(&root, plugin)?;
         }
         Ok(())
     }
@@ -7014,6 +7547,264 @@ fn write_codex_compat_marketplace_manifest_at(root: &Path, plugin: &PluginAddon)
         &serde_json::to_vec_pretty(&body).context("serializing Codex compatibility marketplace")?,
     )
     .with_context(|| format!("writing {}", manifest.display()))
+}
+
+fn codex_plugin_adapter(plugin: &PluginAddon) -> Option<(&'static str, &'static str, &'static str)> {
+    match plugin.id {
+        "openspec" => Some((
+            "1.11.0",
+            "Specification-driven change workflow with OpenSpec CLI support",
+            "./skills/",
+        )),
+        "gstack" => Some((
+            "1.79.0",
+            "Product, design, browser, QA, review, and shipping workflow",
+            "./.agents/skills/",
+        )),
+        "ralph-loop" => Some((
+            "0.0.0",
+            "Bounded autonomous coding-agent loop with explicit stop signals",
+            "./skills/",
+        )),
+        _ => None,
+    }
+}
+
+fn codex_marketplace_plugin_root(root: &Path, plugin: &PluginAddon) -> PathBuf {
+    root.join(plugin.marketplace_name)
+        .join(plugin.codex_local_path.trim_start_matches("./"))
+}
+
+fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
+    let root = crate::client_adapters::home_dir()
+        .join(".codex")
+        .join(".tmp")
+        .join("marketplaces");
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    let source = root.join(plugin.marketplace_name);
+    let marker = source.join(".headroom-local-community-adapter.json");
+
+    if source.join(".git").is_dir() {
+        if !marker.is_file() {
+            bail!(
+                "{} already exists but is not marked as a Headroom-managed adapter marketplace",
+                source.display()
+            );
+        }
+        let source_text = source.to_string_lossy().into_owned();
+        run_codex_adapter_command("git", &["-C", &source_text, "pull", "--ff-only"], &root)?;
+    } else {
+        if source.exists() {
+            bail!(
+                "{} already exists without a Git checkout; remove the stale directory before retrying",
+                source.display()
+            );
+        }
+        let url = format!("https://github.com/{}.git", plugin.marketplace);
+        let source_text = source.to_string_lossy().into_owned();
+        run_codex_adapter_command(
+            "git",
+            &["clone", "--depth", "1", &url, &source_text],
+            &root,
+        )?;
+        crate::client_adapters::atomic_write(
+            &marker,
+            &serde_json::to_vec_pretty(&json!({
+                "id": plugin.id,
+                "source": plugin.source_url
+            }))
+            .context("serializing Codex adapter ownership marker")?,
+        )
+        .with_context(|| format!("writing {}", marker.display()))?;
+    }
+
+    write_codex_compat_marketplace_manifest_at(&root, plugin)?;
+    prepare_codex_plugin_adapter_at(&root, plugin)?;
+    Ok(source)
+}
+
+fn run_codex_adapter_command(command: &str, args: &[&str], cwd: &Path) -> Result<()> {
+    run_codex_adapter_binary(Path::new(command), args, cwd)
+}
+
+fn run_codex_adapter_binary(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
+    run_command_streaming(binary, args, cwd, &mut |line: &str| {
+        let command = binary.display();
+        log::info!("codex plugin adapter [{command}]: {line}")
+    })
+    .with_context(|| {
+        format!(
+            "running {} {} in {}",
+            binary.display(),
+            args.join(" "),
+            cwd.display()
+        )
+    })
+}
+
+fn gstack_bun_binary(plugin_root: &Path) -> Result<PathBuf> {
+    if crate::proc::command("bun")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return Ok(PathBuf::from("bun"));
+    }
+
+    let install_root = plugin_root.join(".headroom-bun");
+    let executable = install_root
+        .join("node_modules")
+        .join(".bin")
+        .join(if cfg!(target_os = "windows") {
+            "bun.cmd"
+        } else {
+            "bun"
+        });
+    if !executable.is_file() {
+        let prefix = install_root.to_string_lossy().into_owned();
+        let cache = plugin_root
+            .join(".headroom-npm-cache")
+            .to_string_lossy()
+            .into_owned();
+        let package = format!("bun@{GSTACK_BUN_VERSION}");
+        run_codex_adapter_command(
+            "npm",
+            &[
+                "install",
+                "--prefix",
+                &prefix,
+                "--cache",
+                &cache,
+                "--no-audit",
+                "--no-fund",
+                &package,
+            ],
+            plugin_root,
+        )?;
+    }
+    if !executable.is_file() {
+        bail!(
+            "private Bun {GSTACK_BUN_VERSION} install completed but {} was not created",
+            executable.display()
+        );
+    }
+    Ok(executable)
+}
+
+fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<()> {
+    let Some((version, description, skills)) = codex_plugin_adapter(plugin) else {
+        return Ok(());
+    };
+    let plugin_root = codex_marketplace_plugin_root(root, plugin);
+    match plugin.id {
+        "openspec" => {
+            if !plugin_root.join("dist/cli/index.js").is_file() {
+                let npm_cache = plugin_root
+                    .join(".headroom-npm-cache")
+                    .to_string_lossy()
+                    .into_owned();
+                run_codex_adapter_command(
+                    "npm",
+                    &[
+                        "install",
+                        "--ignore-scripts",
+                        "--cache",
+                        &npm_cache,
+                        "--no-audit",
+                        "--no-fund",
+                    ],
+                    &plugin_root,
+                )?;
+                run_codex_adapter_command(
+                    "npm",
+                    &["--cache", &npm_cache, "run", "build"],
+                    &plugin_root,
+                )?;
+            }
+        }
+        "gstack" => {
+            let bun = gstack_bun_binary(&plugin_root)?;
+            let browse = if cfg!(target_os = "windows") {
+                plugin_root.join("browse/dist/browse.exe")
+            } else {
+                plugin_root.join("browse/dist/browse")
+            };
+            if !browse.is_file() || !plugin_root.join(".agents/skills").is_dir() {
+                run_codex_adapter_binary(&bun, &["install", "--ignore-scripts"], &plugin_root)?;
+                run_codex_adapter_binary(&bun, &["run", "build"], &plugin_root)?;
+                run_codex_adapter_binary(
+                    &bun,
+                    &[
+                        "run",
+                        "gen:skill-docs",
+                        "--host",
+                        "codex",
+                        "--model",
+                        "gpt-5.6-sol",
+                    ],
+                    &plugin_root,
+                )?;
+            }
+            rewrite_gstack_plugin_paths(&plugin_root.join(".agents/skills"))?;
+        }
+        "ralph-loop" => {
+            if !plugin_root.join("ralph-loop.sh").is_file() {
+                bail!("Ralph Loop marketplace snapshot is missing ralph-loop.sh");
+            }
+        }
+        _ => {}
+    }
+
+    let manifest = plugin_root.join(".codex-plugin/plugin.json");
+    let parent = manifest
+        .parent()
+        .context("Codex plugin adapter manifest has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    let body = json!({
+        "name": plugin.id,
+        "version": version,
+        "description": description,
+        "skills": skills,
+        "hooks": {},
+        "interface": {
+            "displayName": plugin.id,
+            "shortDescription": description,
+            "developerName": "Headroom Local Community adapter",
+            "category": "Developer Tools",
+            "websiteURL": plugin.source_url,
+            "capabilities": ["Interactive", "Read", "Write"]
+        }
+    });
+    crate::client_adapters::atomic_write(
+        &manifest,
+        &serde_json::to_vec_pretty(&body).context("serializing Codex plugin adapter")?,
+    )
+    .with_context(|| format!("writing {}", manifest.display()))
+}
+
+fn rewrite_gstack_plugin_paths(root: &Path) -> Result<()> {
+    if !root.is_dir() {
+        bail!("gstack Codex skills were not generated at {}", root.display());
+    }
+    for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            rewrite_gstack_plugin_paths(&path)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("md") {
+            let original = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let updated = original
+                .replace("${CODEX_HOME:-$HOME/.codex}/skills/gstack", "$CODEX_PLUGIN_ROOT")
+                .replace("$HOME/.codex/skills/gstack", "$CODEX_PLUGIN_ROOT")
+                .replace("~/.codex/skills/gstack", "$CODEX_PLUGIN_ROOT");
+            if updated != original {
+                crate::client_adapters::atomic_write(&path, updated.as_bytes())
+                    .with_context(|| format!("rewriting {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn claude_installed_plugins() -> Option<Value> {
@@ -10166,7 +10957,7 @@ mod tests {
         HEADROOM_LINUX_REQUIREMENTS_LOCK,
         HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
         MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        UNKNOWN_OCCUPANT,
+        UNKNOWN_OCCUPANT, PluginHost,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -12704,6 +13495,90 @@ after
     }
 
     #[test]
+    fn managed_tool_metadata_and_native_plugin_registry_are_stable() {
+        use std::collections::HashSet;
+
+        let (_root, _runtime, manager) = seed_test_runtime("managed-tool-metadata");
+        let tools = manager.list_tools();
+        let ids: HashSet<_> = tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert_eq!(ids.len(), tools.len());
+
+        for (id, category, activation_scope, workflow_group) in [
+            ("headroom", "core", "immediate", None),
+            ("rtk", "efficiency", "immediate", None),
+            ("markitdown", "documents", "immediate", None),
+            ("serena", "code_intelligence", "immediate", None),
+            ("codebase-memory", "code_intelligence", "immediate", None),
+            ("context7", "code_intelligence", "immediate", None),
+            ("ponytail", "efficiency", "new_session", None),
+            ("caveman", "efficiency", "new_session", None),
+            ("allinluna", "automation", "new_session", Some("execution_engine")),
+            ("stop-that-shit", "guardrails", "new_session", None),
+            ("agent-guard", "guardrails", "new_session", None),
+            ("grill-me", "learning", "new_session", None),
+        ] {
+            let tool = listed_tool(&manager, id);
+            assert_eq!(tool.category, category, "category for {id}");
+            assert_eq!(tool.activation_scope, activation_scope, "scope for {id}");
+            assert_eq!(tool.workflow_group.as_deref(), workflow_group, "workflow for {id}");
+        }
+
+        for (id, marketplace, marketplace_name, plugin_ref, local_path, source_url) in [
+            (
+                "stop-that-shit",
+                "lennney/stop-that-shit",
+                "stop-that-shit",
+                "stop-that-shit@stop-that-shit",
+                ".",
+                "https://github.com/lennney/stop-that-shit",
+            ),
+            (
+                "agent-guard",
+                "JeongJaeSoon/agent-guard",
+                "agent-guard",
+                "agent-guard@agent-guard",
+                "./plugins/agent-guard",
+                "https://github.com/JeongJaeSoon/agent-guard",
+            ),
+            (
+                "grill-me",
+                "joshuawheelock/grill-me",
+                "grill-me",
+                "grill-me@grill-me",
+                ".",
+                "https://github.com/joshuawheelock/grill-me",
+            ),
+        ] {
+            let plugin = PLUGIN_ADDONS
+                .iter()
+                .find(|plugin| plugin.id == id)
+                .expect("registered plugin");
+            assert_eq!(plugin.marketplace, marketplace);
+            assert_eq!(plugin.marketplace_name, marketplace_name);
+            assert_eq!(plugin.plugin_ref, plugin_ref);
+            assert_eq!(plugin.codex_local_path, local_path);
+            assert_eq!(plugin.source_url, source_url);
+            assert_eq!(plugin.hosts, &[PluginHost::ClaudeCode, PluginHost::Codex]);
+        }
+    }
+
+    #[test]
+    fn allinluna_launcher_uses_managed_python_and_marketplace_runtime() {
+        let (_root, runtime, manager) = seed_test_runtime("allinluna-launcher");
+        manager
+            .ensure_allinluna_launcher()
+            .expect("write All in Luna launcher");
+
+        let launcher = manager.allinluna_entrypoint();
+        let body = fs::read_to_string(&launcher).expect("launcher contents");
+        assert!(body.contains(&runtime.managed_python().display().to_string()));
+        assert!(body.contains(".codex/.tmp/marketplaces/allinluna"));
+        assert!(body.contains(".claude/plugins/marketplaces/allinluna"));
+        assert!(body.contains("Headroom-managed Python >= 3.11"));
+        assert!(!body.contains("/usr/bin/python3"));
+    }
+
+    #[test]
     fn tool_enabled_reads_receipt_flag_and_defaults_true() {
         let (_root, runtime, manager) = seed_test_runtime("tool-enabled");
         // No receipt -> default enabled.
@@ -14315,39 +15190,57 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         let _ = fs::remove_dir_all(root);
     }
 
-    /// End-to-end round trip against the real `claude`/`codex` plugin CLIs:
-    /// install, confirm both presence checks + smoke test flip on, then
-    /// uninstall and confirm they flip off. Ignored by default — it needs at
-    /// least one CLI on PATH plus network, and mutates the real ~/.claude and
-    /// ~/.codex plugin config. Run locally:
-    /// `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored ponytail_install_roundtrip`
+    /// End-to-end round trip against the real Codex plugin CLI: install,
+    /// disable, re-enable, smoke-test, and uninstall. Ignored by default - it
+    /// needs network and mutates the real ~/.codex plugin config. Select the
+    /// addon with HEADROOM_PLUGIN_ROUNDTRIP_ID (defaults to ponytail).
     #[test]
     #[ignore]
-    fn ponytail_install_roundtrip() {
-        let (root, _runtime, manager) = seed_test_runtime("ponytail-roundtrip");
-
+    fn plugin_install_roundtrip() {
+        let id = std::env::var("HEADROOM_PLUGIN_ROUNDTRIP_ID")
+            .unwrap_or_else(|_| "ponytail".to_string());
+        let (root, _runtime, manager) = seed_test_runtime("plugin-roundtrip");
         if crate::claude_cli::detect_claude_cli().is_none()
             && crate::claude_cli::detect_codex_cli().is_none()
         {
-            eprintln!("skipping ponytail_install_roundtrip: no claude/codex CLI on PATH");
+            eprintln!("skipping plugin_install_roundtrip: no claude/codex CLI on PATH");
             let _ = fs::remove_dir_all(&root);
             return;
         }
 
         // Capture every result and always run uninstall before asserting, so a
         // failed assertion never leaves the plugin behind on the real machine.
-        let install = manager.install_plugin("ponytail");
-        let installed = manager.plugin_installed("ponytail");
-        let smoke_while_installed = manager.smoke_test_plugin("ponytail");
-        let uninstall = manager.uninstall_plugin("ponytail");
-        let gone = !manager.plugin_installed("ponytail");
+        let install = manager.install_plugin(&id);
+        let installed = manager.plugin_installed(&id);
+        let disable = manager.set_plugin_enabled(&id, false);
+        let disabled = !manager.tool_enabled(&id);
+        let enable = manager.set_plugin_enabled(&id, true);
+        let enabled = manager.tool_enabled(&id);
+        let smoke_while_installed = manager.smoke_test_plugin(&id);
+        let uninstall = manager.uninstall_plugin(&id);
+        let gone = !manager.plugin_installed(&id);
         let _ = fs::remove_dir_all(&root);
 
         install.expect("install_plugin should succeed");
         assert!(installed, "plugin_installed() should be true after install");
+        disable.expect("set_plugin_enabled(false) should succeed");
+        assert!(disabled, "tool_enabled() should be false after disable");
+        enable.expect("set_plugin_enabled(true) should succeed");
+        assert!(enabled, "tool_enabled() should be true after re-enable");
         smoke_while_installed.expect("smoke_test_plugin should pass while installed");
         uninstall.expect("uninstall_plugin should succeed");
         assert!(gone, "plugin_installed() should be false after uninstall");
+    }
+
+    #[test]
+    fn workflow_conflict_groups_are_complete_and_symmetric() {
+        let (_root, _runtime, manager) = seed_test_runtime("workflow-conflicts");
+        assert_eq!(manager.conflicting_plugin_ids("openspec"), vec!["superpowers".to_string(), "gstack".to_string()]);
+        assert_eq!(manager.conflicting_plugin_ids("superpowers"), vec!["openspec".to_string(), "gstack".to_string()]);
+        assert_eq!(manager.conflicting_plugin_ids("gstack"), vec!["openspec".to_string(), "superpowers".to_string()]);
+        assert_eq!(manager.conflicting_plugin_ids("allinluna"), vec!["ralph-loop".to_string()]);
+        assert_eq!(manager.conflicting_plugin_ids("ralph-loop"), vec!["allinluna".to_string()]);
+        assert!(manager.conflicting_plugin_ids("agent-guard").is_empty());
     }
 
     #[test]
