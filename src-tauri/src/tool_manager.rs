@@ -13579,7 +13579,12 @@ after
             assert!(body.contains(".codex/.tmp/marketplaces/allinluna"));
             assert!(body.contains(".claude/plugins/marketplaces/allinluna"));
         }
-        assert!(body.contains("Headroom-managed Python >= 3.11"));
+        let required_python = if cfg!(target_os = "windows") {
+            "Headroom-managed Python ^>= 3.11"
+        } else {
+            "Headroom-managed Python >= 3.11"
+        };
+        assert!(body.contains(required_python));
         assert!(!body.contains("/usr/bin/python3"));
     }
 
