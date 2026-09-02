@@ -2660,7 +2660,7 @@ impl ToolManager {
         let managed_python = self.runtime.managed_python();
         #[cfg(windows)]
         let body = format!(
-            "@echo off\r\nset \"PLUGIN_RUNTIME=%USERPROFILE%\\.codex\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" (\r\n  echo All in Luna runtime was not found in the installed marketplace. Install or enable All in Luna again. 1>&2\r\n  exit /b 1\r\n)\r\n\"{}\" \"%PLUGIN_RUNTIME%\" %*\r\n",
+        "@echo off\r\nset \"PLUGIN_RUNTIME=%USERPROFILE%\\.codex\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" (\r\n  echo All in Luna requires the installed marketplace runtime and Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n  exit /b 1\r\n)\r\n\"{}\" \"%PLUGIN_RUNTIME%\" %*\r\n",
             managed_python.display()
         );
         #[cfg(not(windows))]
