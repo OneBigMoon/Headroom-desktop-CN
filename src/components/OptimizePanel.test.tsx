@@ -150,6 +150,25 @@ describe("OptimizePanel", () => {
     });
   });
 
+  it("refetches applied results when a completed Learn run changes refreshSignal", async () => {
+    invokeMock
+      .mockResolvedValueOnce({ claudeMd: [], memoryMd: [] })
+      .mockResolvedValueOnce(samplePatterns);
+
+    const { rerender } = render(<OptimizePanel projectPath="/proj" refreshSignal={0} />);
+    expect(
+      await screen.findByRole("button", { name: /0 learnings in CLAUDE\.local\.md/i }),
+    ).toBeDisabled();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+
+    rerender(<OptimizePanel projectPath="/proj" refreshSignal={1} />);
+
+    expect(
+      await screen.findByRole("button", { name: /2 learnings in CLAUDE\.local\.md/i }),
+    ).toBeEnabled();
+    expect(invokeMock).toHaveBeenLastCalledWith("list_applied_patterns", { projectPath: "/proj" });
+  });
+
   it("offers a retry when the first load fails", async () => {
     // Without this the pills stay disabled at "0 learnings" forever: the modal
     // that holds the error cannot be opened, so an IPC failure is invisible.

@@ -11,14 +11,18 @@ import {
 } from "react";
 import {
   ArrowClockwise,
+  ArrowSquareOut,
+  ArrowsLeftRight,
   Bell,
   Brain,
   CaretLeft,
   Cpu,
   CurrencyCircleDollar,
   CurrencyDollar,
+  Copy,
   Info,
   EnvelopeSimple,
+  FolderOpen,
   GearSix,
   House,
   Key,
@@ -57,6 +61,14 @@ import {
   type AddonUpdateCheck,
 } from "./lib/addonUpdates";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
+import {
+  getActivationScopeCopy,
+  groupToolsByCategory,
+  toolCopy,
+  toolCategoryCopy,
+  TOOL_CATEGORY_ORDER,
+  workflowGroupCopy,
+} from "./lib/workflowCatalog";
 import {
   formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
@@ -193,7 +205,9 @@ import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { ProjectIssuesLink } from "./components/ProjectIssuesLink";
 import { TermsGate } from "./components/TermsGate";
+import { ToolModeSelector, localizedToolModeLabel } from "./components/ToolModeSelector";
 import { WindowChrome } from "./components/WindowChrome";
+import { AddonPresetBar, RECOMMENDED_ADDON_PRESET } from "./components/AddonPresetBar";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -228,10 +242,216 @@ interface NavItem {
   icon: ElementType;
 }
 
+const collaborationBridgeCopy: Record<Exclude<Locale, "system">, { title: string; description: string; rule: string; detail: string; activation: string; notice: string; pending: string }> = {
+  en: { title: "Collaboration bridges", description: "Connect external planning and review services; does not replace the primary workflow or run autonomous loops.", rule: "Can run with other groups", detail: "Lets ChatGPT plan and review while Codex retains code execution through a read-only MCP Bridge bounded to the workspace.", activation: "Requires Node.js 20+, first-time ChatGPT login, and one-time pairing. The connection flow is ready.", notice: "Bridge installation and pairing are managed here; authorization is completed in ChatGPT.", pending: "Ready to connect" },
+  "zh-CN": { title: "协作桥接", description: "连接外部规划与审查服务；不替代主工作流，也不参与自动执行循环。", rule: "可与其他分组同时启用", detail: "让 ChatGPT 负责规划与审查，Codex 保留代码执行权；通过受工作区边界限制的只读 MCP Bridge 读取代码。", activation: "需要 Node.js 20+、首次 ChatGPT 登录和一次性配对，当前连接流程已可用。", notice: "Bridge 的安装与配对可在此管理，账号授权在 ChatGPT 中完成。", pending: "可以开始连接" },
+  "zh-TW": { title: "協作橋接", description: "連接外部規劃與審查服務；不取代主要工作流程，也不參與自動執行循環。", rule: "可與其他分組同時啟用", detail: "讓 ChatGPT 負責規劃與審查，Codex 保留程式執行權；透過受工作區邊界限制的唯讀 MCP Bridge 讀取程式碼。", activation: "需要 Node.js 20+、首次 ChatGPT 登入和一次性配對，目前連線流程已可用。", notice: "Bridge 的安裝與配對可在此管理，帳號授權在 ChatGPT 中完成。", pending: "可以開始連線" },
+  ja: { title: "コラボレーションブリッジ", description: "外部の計画・レビューサービスを接続します。主ワークフローや自動実行ループの代替ではありません。", rule: "他のグループと併用可能", detail: "ChatGPT が計画とレビューを担当し、Codex はワークスペース境界内の読み取り専用 MCP Bridge 経由で実行権を保持します。", activation: "Node.js 20 以上、初回 ChatGPT ログイン、一度限りのペアリングが必要です。接続フローを利用できます。", notice: "Bridge のインストールとペアリングはここで管理し、アカウント認証は ChatGPT で完了します。", pending: "接続を開始" },
+  ko: { title: "협업 브리지", description: "외부 계획 및 검토 서비스를 연결합니다. 주 워크플로를 대체하거나 자동 실행 루프에 참여하지 않습니다.", rule: "다른 그룹과 함께 사용 가능", detail: "ChatGPT가 계획과 검토를 담당하고 Codex는 작업공간 경계의 읽기 전용 MCP Bridge를 통해 실행 권한을 유지합니다.", activation: "Node.js 20 이상, 최초 ChatGPT 로그인 및 일회성 페어링이 필요합니다. 연결 흐름을 사용할 수 있습니다.", notice: "Bridge 설치와 페어링은 여기서 관리하고 계정 인증은 ChatGPT에서 완료합니다.", pending: "연결 시작" },
+};
+
+const bridgeUiCopy: Record<Exclude<Locale, "system">, { workspace: string; install: string; update: string; setup: string; doctor: string; pair: string; unpair: string; stop: string; uninstall: string; working: string; running: string; stopped: string; missing: string; node: string; port: string; paired: string; authorized: string; unauthorized: string; docs: string; authorization: string; scope: string; pairingStep: string; service: string; diagnostics: string; authorizationHint: string; scopeHint: string; pairingHint: string; serviceHint: string; installHint: string; pairingReady: string; connect: string; openChatGPT: string; copyCode: string; copied: string; expires: string; waiting: string; autoWorkspace: string; manualWorkspace: string }> = {
+  en: { workspace: "Workspace path", install: "Install Bridge", update: "Update Bridge", setup: "Configure and start", doctor: "Diagnose and repair", pair: "Create pairing code", unpair: "Revoke pairing", stop: "Stop Bridge", uninstall: "Uninstall", working: "Running", running: "Bridge running", stopped: "Installed, stopped", missing: "Not installed", node: "Node.js", port: "Port", paired: "Pairing", authorized: "Connected", unauthorized: "Not connected", docs: "View project guide", authorization: "ChatGPT connection", scope: "Authorized workspace", pairingStep: "Connect ChatGPT", service: "Bridge service", diagnostics: "Diagnostics", authorizationHint: "This local Bridge connects ChatGPT and Codex without exposing your account token to Headroom.", scopeHint: "The current Codex workspace is used automatically; only this folder is exposed.", pairingHint: "Start the connection to generate a one-time code, then finish authorization in ChatGPT.", serviceHint: "Installation, startup, update, and stop controls", installHint: "The first connection installs and starts Bridge automatically.", pairingReady: "Ready to connect", connect: "Connect ChatGPT", openChatGPT: "Open ChatGPT connector", copyCode: "Copy code", copied: "Copied", expires: "Expires", waiting: "Waiting for ChatGPT authorization…", autoWorkspace: "Detected from current Codex session", manualWorkspace: "Advanced: change workspace" },
+  "zh-CN": { workspace: "工作区路径", install: "安装 Bridge", update: "更新 Bridge", setup: "配置并启动", doctor: "诊断修复", pair: "生成配对码", unpair: "取消配对", stop: "停止 Bridge", uninstall: "卸载", working: "正在执行", running: "Bridge 正在运行", stopped: "已安装，未运行", missing: "尚未安装", node: "Node.js", port: "端口", paired: "配对", authorized: "已连接", unauthorized: "未连接", docs: "查看项目说明", authorization: "ChatGPT 连接", scope: "授权工作区", pairingStep: "连接 ChatGPT", service: "Bridge 服务", diagnostics: "诊断详情", authorizationHint: "本地 Bridge 连接 ChatGPT 与 Codex，Headroom 不会接触你的账号令牌。", scopeHint: "默认自动使用当前 Codex 对话工作区，只会暴露这个文件夹。", pairingHint: "开始连接后会生成一次性配对码，再回到 ChatGPT 完成授权。", serviceHint: "安装、启动、更新和停止服务", installHint: "首次连接会自动安装并启动 Bridge。", pairingReady: "可以开始连接", connect: "连接 ChatGPT", openChatGPT: "打开 ChatGPT 连接器", copyCode: "复制配对码", copied: "已复制", expires: "有效期至", waiting: "等待 ChatGPT 完成授权…", autoWorkspace: "已从当前 Codex 对话自动识别", manualWorkspace: "高级设置：更换工作区" },
+  "zh-TW": { workspace: "工作區路徑", install: "安裝 Bridge", update: "更新 Bridge", setup: "設定並啟動", doctor: "診斷修復", pair: "產生配對碼", unpair: "取消配對", stop: "停止 Bridge", uninstall: "解除安裝", working: "正在執行", running: "Bridge 正在執行", stopped: "已安裝，未執行", missing: "尚未安裝", node: "Node.js", port: "連接埠", paired: "配對", authorized: "已連線", unauthorized: "未連線", docs: "查看專案說明", authorization: "ChatGPT 連線", scope: "授權工作區", pairingStep: "連線 ChatGPT", service: "Bridge 服務", diagnostics: "診斷詳情", authorizationHint: "本機 Bridge 連接 ChatGPT 與 Codex，Headroom 不會接觸你的帳號令牌。", scopeHint: "預設自動使用目前 Codex 對話工作區，只會暴露此資料夾。", pairingHint: "開始連線後會產生一次性配對碼，再回到 ChatGPT 完成授權。", serviceHint: "安裝、啟動、更新與停止服務", installHint: "首次連線會自動安裝並啟動 Bridge。", pairingReady: "可以開始連線", connect: "連線 ChatGPT", openChatGPT: "開啟 ChatGPT 連接器", copyCode: "複製配對碼", copied: "已複製", expires: "有效期至", waiting: "等待 ChatGPT 完成授權…", autoWorkspace: "已從目前 Codex 對話自動識別", manualWorkspace: "進階設定：更換工作區" },
+  ja: { workspace: "ワークスペースのパス", install: "Bridge をインストール", update: "Bridge を更新", setup: "設定して起動", doctor: "診断と修復", pair: "ペアリングコードを作成", unpair: "ペアリングを解除", stop: "Bridge を停止", uninstall: "アンインストール", working: "実行中", running: "Bridge は実行中", stopped: "インストール済み・停止中", missing: "未インストール", node: "Node.js", port: "ポート", paired: "ペアリング", authorized: "接続済み", unauthorized: "未接続", docs: "プロジェクトガイドを見る", authorization: "ChatGPT 接続", scope: "認証済みワークスペース", pairingStep: "ChatGPT に接続", service: "Bridge サービス", diagnostics: "診断の詳細", authorizationHint: "ローカル Bridge が ChatGPT と Codex を接続します。Headroom はアカウントトークンに触れません。", scopeHint: "現在の Codex セッションのワークスペースを自動使用し、このフォルダだけを公開します。", pairingHint: "接続を開始すると一度限りのコードが生成され、ChatGPT で認証を完了できます。", serviceHint: "インストール、起動、更新、停止", installHint: "初回接続時に Bridge を自動インストールして起動します。", pairingReady: "接続準備完了", connect: "ChatGPT に接続", openChatGPT: "ChatGPT コネクターを開く", copyCode: "コードをコピー", copied: "コピー済み", expires: "有効期限", waiting: "ChatGPT の認証を待っています…", autoWorkspace: "現在の Codex セッションから自動検出", manualWorkspace: "詳細設定：ワークスペースを変更" },
+  ko: { workspace: "작업공간 경로", install: "Bridge 설치", update: "Bridge 업데이트", setup: "설정 후 시작", doctor: "진단 및 복구", pair: "페어링 코드 생성", unpair: "페어링 해제", stop: "Bridge 중지", uninstall: "제거", working: "실행 중", running: "Bridge 실행 중", stopped: "설치됨, 중지됨", missing: "설치되지 않음", node: "Node.js", port: "포트", paired: "페어링", authorized: "연결됨", unauthorized: "연결되지 않음", docs: "프로젝트 안내 보기", authorization: "ChatGPT 연결", scope: "인증된 작업공간", pairingStep: "ChatGPT 연결", service: "Bridge 서비스", diagnostics: "진단 상세", authorizationHint: "로컬 Bridge가 ChatGPT와 Codex를 연결하며 Headroom은 계정 토큰에 접근하지 않습니다.", scopeHint: "현재 Codex 세션의 작업공간을 자동으로 사용하며 이 폴더만 공개합니다.", pairingHint: "연결을 시작하면 일회성 코드가 생성되고 ChatGPT에서 인증을 완료할 수 있습니다.", serviceHint: "설치, 시작, 업데이트 및 중지", installHint: "처음 연결할 때 Bridge를 자동으로 설치하고 시작합니다.", pairingReady: "연결 준비 완료", connect: "ChatGPT 연결", openChatGPT: "ChatGPT 커넥터 열기", copyCode: "코드 복사", copied: "복사됨", expires: "만료", waiting: "ChatGPT 인증을 기다리는 중…", autoWorkspace: "현재 Codex 세션에서 자동 감지", manualWorkspace: "고급 설정: 작업공간 변경" },
+};
+
+interface CodexBridgeStatus {
+  installed: boolean;
+  nodeAvailable: boolean;
+  nodeVersion?: string | null;
+  sourcePath: string;
+  running: boolean;
+  port?: number | null;
+  paired: boolean;
+  message: string;
+  output?: string | null;
+  workspacePath?: string | null;
+  workspaceName?: string | null;
+  workspaceId?: string | null;
+  publicUrl?: string | null;
+  tokenCount?: number | null;
+  pairingActive?: boolean | null;
+  pairingCode?: string | null;
+  pairingExpiresAt?: number | string | null;
+  expiresAt?: string | null;
+  authorizationUrl?: string | null;
+  mcpUrl?: string | null;
+  endpointRepairRequired?: boolean | null;
+  endpointChanged?: boolean | null;
+  connectorName?: string | null;
+  safeOutput?: string | null;
+}
+
+const bridgeChooseWorkspaceCopy: Record<Exclude<Locale, "system">, string> = {
+  en: "Choose folder",
+  "zh-CN": "选择文件夹",
+  "zh-TW": "選擇資料夾",
+  ja: "フォルダを選択",
+  ko: "폴더 선택",
+};
+
+const bridgeChooseWorkspaceErrorCopy: Record<Exclude<Locale, "system">, string> = {
+  en: "Could not open the folder picker.",
+  "zh-CN": "无法打开文件夹选择器。",
+  "zh-TW": "無法開啟資料夾選擇器。",
+  ja: "フォルダ選択を開けませんでした。",
+  ko: "폴더 선택기를 열 수 없습니다.",
+};
+const bridgeWorkspaceUnavailableCopy: Record<Exclude<Locale, "system">, string> = {
+  en: "Current Codex workspace was not detected",
+  "zh-CN": "未检测到当前 Codex 工作区",
+  "zh-TW": "未偵測到目前 Codex 工作區",
+  ja: "現在の Codex ワークスペースを検出できません",
+  ko: "현재 Codex 작업공간을 감지하지 못했습니다",
+};
+const CHATGPT_CONNECTOR_URL =
+  "https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins";
+
+const bridgeRepairCopy: Record<Exclude<Locale, "system">, {
+  title: string;
+  detail: string;
+  open: string;
+  copy: string;
+  copied: string;
+  instruction: string;
+}> = {
+  en: { title: "Connector needs repair", detail: "Bridge returned a new address. Open ChatGPT connector settings, remove the old connector, and create it again with the new address.", open: "Open connector settings", copy: "Copy new address", copied: "Copied", instruction: "Headroom never deletes connectors or handles OAuth tokens automatically." },
+  "zh-CN": { title: "连接器需要修复", detail: "Bridge 返回了新的地址。请打开 ChatGPT 连接器设置，手动删除旧连接器，再用新地址重新创建。", open: "打开连接器设置", copy: "复制新地址", copied: "已复制", instruction: "Headroom 不会自动删除连接器，也不会保存或处理 OAuth 令牌。" },
+  "zh-TW": { title: "連接器需要修復", detail: "Bridge 回傳了新的位址。請開啟 ChatGPT 連接器設定，手動刪除舊連接器，再使用新位址重新建立。", open: "開啟連接器設定", copy: "複製新位址", copied: "已複製", instruction: "Headroom 不會自動刪除連接器，也不會儲存或處理 OAuth 令牌。" },
+  ja: { title: "コネクターの修復が必要です", detail: "Bridge が新しいアドレスを返しました。ChatGPT のコネクター設定を開き、古いコネクターを手動で削除して新しいアドレスで作り直してください。", open: "コネクター設定を開く", copy: "新しいアドレスをコピー", copied: "コピー済み", instruction: "Headroom はコネクターを自動削除せず、OAuth トークンも保存・処理しません。" },
+  ko: { title: "커넥터를 수정해야 합니다", detail: "Bridge가 새 주소를 반환했습니다. ChatGPT 커넥터 설정을 열어 기존 커넥터를 직접 삭제한 뒤 새 주소로 다시 만드세요.", open: "커넥터 설정 열기", copy: "새 주소 복사", copied: "복사됨", instruction: "Headroom은 커넥터를 자동으로 삭제하지 않으며 OAuth 토큰을 저장하거나 처리하지 않습니다." },
+};
+
+function normalizeBridgeEndpoint(url: string | null): string | null {
+  if (!url) return null;
+  const normalized = url.trim().toLowerCase().replace(/\/+$/, "").replace(/\/mcp$/, "");
+  return normalized || null;
+}
+
+const bridgeRepairAckCopy: Record<Exclude<Locale, "system">, string> = {
+  en: "I rebuilt it / mark as fixed",
+  "zh-CN": "我已完成重建，标记为已修复",
+  "zh-TW": "我已完成重建，標記為已修復",
+  ja: "再構築しました／修復済みとして確認",
+  ko: "재구축 완료 / 수정됨으로 표시",
+};
+
+export function bridgeConnectionNeedsRepair(previousUrl: string | null, nextUrl: string | null, paired: boolean): boolean {
+  return paired && Boolean(previousUrl && nextUrl && normalizeBridgeEndpoint(previousUrl) !== normalizeBridgeEndpoint(nextUrl));
+}
+
+export function nextBridgeWorkspaceGeneration(
+  current: { workspace: string | null; generation: number },
+  workspace: string | null,
+): { workspace: string | null; generation: number } {
+  return current.workspace === workspace
+    ? current
+    : { workspace, generation: current.generation + 1 };
+}
+
+export function bridgeResponseIsCurrent(
+  responseRequestGeneration: number,
+  currentRequestGeneration: number,
+  responseWorkspaceGeneration: number,
+  currentWorkspaceGeneration: number,
+): boolean {
+  return responseRequestGeneration === currentRequestGeneration && responseWorkspaceGeneration === currentWorkspaceGeneration;
+}
+
+export function recommendedAddonPresetMatches(dashboard: DashboardState): boolean {
+  const matches = Object.entries(RECOMMENDED_ADDON_PRESET).every(([id, target]) => {
+    const tool = dashboard.tools.find((candidate) => candidate.id === id);
+    if (!tool) return false;
+    if (target.enabled !== (tool.status !== "not_installed" && tool.enabled)) return false;
+    return !target.mode || target.mode === tool.defaultMode;
+  });
+  return matches && dashboard.tools.every((tool) => tool.required || RECOMMENDED_ADDON_PRESET[tool.id] || !tool.enabled);
+}
+
+function bridgeExpiryValue(
+  status: Pick<CodexBridgeStatus, "pairingExpiresAt" | "expiresAt"> | null | undefined,
+): number | null {
+  const raw = status?.pairingExpiresAt ?? status?.expiresAt;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(value)) return null;
+  return value < 100_000_000_000 ? value * 1000 : value;
+}
+
+function formatBridgeExpiry(
+  status: CodexBridgeStatus | null | undefined,
+  locale: Exclude<Locale, "system">,
+  now = Date.now(),
+): string | null {
+  const expiry = bridgeExpiryValue(status);
+  if (expiry === null) return null;
+  const remaining = expiry - now;
+  if (remaining <= 0) {
+    return locale === "zh-CN" ? "已过期" : locale === "zh-TW" ? "已過期" : locale === "ja" ? "期限切れ" : locale === "ko" ? "만료됨" : "Expired";
+  }
+  const totalSeconds = Math.floor(remaining / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+export function bridgePairingIsUsable(
+  status: Pick<CodexBridgeStatus, "pairingCode" | "pairingExpiresAt" | "expiresAt"> | null | undefined,
+  now = Date.now(),
+): boolean {
+  const expiry = bridgeExpiryValue(status);
+  return Boolean(status?.pairingCode && (expiry === null || expiry > now));
+}
+
+export function chooseCodexBridgeActionWorkspace(
+  explicitWorkspace: string | null | undefined,
+  statusWorkspace: string | null | undefined,
+): string | null {
+  return explicitWorkspace?.trim() || statusWorkspace?.trim() || null;
+}
+
+function mergeCodexBridgeStatus(
+  next: CodexBridgeStatus,
+  previous: CodexBridgeStatus | null,
+): CodexBridgeStatus {
+  if (next.paired) {
+    return { ...next, pairingCode: null, pairingExpiresAt: null, expiresAt: null };
+  }
+  const pairingCode = next.pairingCode === undefined ? previous?.pairingCode ?? null : next.pairingCode;
+  const pairingExpiresAt = next.pairingExpiresAt === undefined
+    ? previous?.pairingExpiresAt ?? null
+    : next.pairingExpiresAt;
+  const expiresAt = next.expiresAt === undefined ? previous?.expiresAt ?? null : next.expiresAt;
+  const expiry = bridgeExpiryValue({ pairingExpiresAt, expiresAt });
+  const expired = expiry !== null && expiry <= Date.now();
+  return {
+    ...next,
+    pairingCode: expired ? null : pairingCode,
+    pairingExpiresAt: expired ? null : pairingExpiresAt,
+    expiresAt: expired ? null : expiresAt,
+    authorizationUrl: next.authorizationUrl === undefined
+      ? previous?.authorizationUrl ?? null
+      : next.authorizationUrl,
+    mcpUrl: next.mcpUrl === undefined ? previous?.mcpUrl ?? null : next.mcpUrl,
+  };
+}
+
+const bridgeStepCopy: Record<Exclude<Locale, "system">, string> = {
+  en: "Next: choose a workspace folder, install Bridge once, configure and start it, then create a pairing code.",
+  "zh-CN": "下一步：选择工作区文件夹 → 首次安装 Bridge → 配置并启动 → 生成配对码。",
+  "zh-TW": "下一步：選擇工作區資料夾 → 首次安裝 Bridge → 設定並啟動 → 產生配對碼。",
+  ja: "次の手順：ワークスペースを選択 → Bridge を初回インストール → 設定して起動 → ペアリングコードを作成。",
+  ko: "다음 단계: 작업공간 폴더 선택 → Bridge 최초 설치 → 설정 후 시작 → 페어링 코드 생성.",
+};
+
 const navItems: NavItem[] = [
   { id: "home", labelKey: "nav.overview", icon: House },
   { id: "optimization", labelKey: "nav.optimize", icon: Sliders },
   { id: "notifications", labelKey: "nav.activity", icon: Bell },
+  { id: "bridge", labelKey: "nav.tools", icon: ArrowsLeftRight },
   { id: "addons", labelKey: "nav.tools", icon: PuzzlePiece },
 ];
 
@@ -1454,9 +1674,15 @@ function AddonClientChips({
   connectors: ClientConnectorStatus[];
   savings?: string | null;
 }) {
-  const { t } = useI18n();
+  const { t, resolvedLocale } = useI18n();
+  const localizedSavings = resolvedLocale === "zh-CN" && savings
+    ? savings
+        .replace(/^(\d+) docs? converted$/i, "已转换 $1 份文档")
+        .replace(/lower cost \(benchmark\)/i, "成本降低（基准数据）")
+        .replace(/fewer output tokens \(benchmark\)/i, "输出 Token 减少（基准数据）")
+    : savings;
   const clients = sortClientConnectors(aggregateClientConnectors(connectors));
-  if (clients.length === 0 && !savings) {
+  if (clients.length === 0 && !localizedSavings) {
     return null;
   }
   return (
@@ -1478,20 +1704,27 @@ function AddonClientChips({
           </span>
         );
       })}
-      {savings ? (
+      {localizedSavings ? (
         <span className="callout-banner__chip" title={t("metrics.savingsLabel")}>
           <span
             className="callout-banner__chip-dot callout-banner__chip-dot--active"
             aria-hidden="true"
           />
-          <span className="callout-banner__chip-name">{savings}</span>
+          <span className="callout-banner__chip-name">{localizedSavings}</span>
         </span>
       ) : null}
     </div>
   );
 }
 
-function formatAddonVersion(version: string): string {
+function formatAddonVersion(version: string, locale?: string): string {
+  if (version === "latest") {
+    if (locale === "zh-CN") return "未获取版本";
+    if (locale === "zh-TW") return "未取得版本";
+    if (locale === "ja") return "バージョン未取得";
+    if (locale === "ko") return "버전 확인 안 됨";
+    return "Version unavailable";
+  }
   return /^\d/.test(version) ? `v${version}` : version;
 }
 
@@ -1502,6 +1735,7 @@ function AddonCard({
   installed,
   enabled,
   description,
+  activationLabel,
   copy,
   infoOpen,
   onToggleInfo,
@@ -1519,11 +1753,17 @@ function AddonCard({
   connectors,
   showClients,
   savings,
+  defaultMode,
+  supportedModes,
   actionsDisabled,
+  onModeChange = () => undefined,
   onInstall,
   onToggleEnabled,
   onUninstall,
   updateAvailable,
+  updateActionAvailable,
+  repairActionAvailable,
+  updateCheckFailed,
   onUpdate,
   availableVersion,
   unavailableReason,
@@ -1535,6 +1775,7 @@ function AddonCard({
   installed: boolean;
   enabled: boolean;
   description: ReactNode;
+  activationLabel?: string | null;
   copy?: AddonCopy;
   infoOpen: boolean;
   onToggleInfo: () => void;
@@ -1552,18 +1793,24 @@ function AddonCard({
   connectors: ClientConnectorStatus[];
   showClients: boolean;
   savings?: string | null;
+  defaultMode?: string | null;
+  supportedModes?: string[];
   actionsDisabled: boolean;
+  onModeChange?: (mode: string) => void;
   onInstall: () => void;
   onToggleEnabled: () => void;
   onUninstall: () => void;
   updateAvailable?: boolean;
+  updateActionAvailable?: boolean;
+  repairActionAvailable?: boolean;
+  updateCheckFailed?: boolean;
   onUpdate?: () => void;
   availableVersion?: string | null;
   /** Platform has no installable build: gray the card, drop the actions. */
   unavailableReason?: string | null;
   children?: ReactNode;
 }) {
-  const { t } = useI18n();
+  const { t, resolvedLocale } = useI18n();
   const infoKey = ADDON_INFO_KEYS[toolId];
   return (
     <li className={`addon-card${unavailableReason ? " addon-card--unavailable" : ""}`}>
@@ -1571,7 +1818,7 @@ function AddonCard({
         <div className="addon-card__heading">
           <span className="addon-card__name">{name}</span>
           {installed && version ? (
-            <span className="addon-card__version">{formatAddonVersion(version)}</span>
+            <span className="addon-card__version">{formatAddonVersion(version, resolvedLocale)}</span>
           ) : null}
           {copy ? (
             <button
@@ -1596,6 +1843,19 @@ function AddonCard({
           <p className="addon-card__info-text">{infoKey ? t(infoKey) : copy.whatItDoes}</p>
         ) : null}
         <p className="addon-card__description">{description}</p>
+        {activationLabel ? (
+          <p className="addon-card__activation-note">{activationLabel}</p>
+        ) : null}
+        <ToolModeSelector
+          toolId={toolId}
+          name={name}
+          installed={installed}
+          enabled={enabled}
+          defaultMode={defaultMode}
+          supportedModes={supportedModes}
+          disabled={actionsDisabled || Boolean(unavailableReason)}
+          onChange={onModeChange}
+        />
         {showClients ? (
           <AddonClientChips connectors={connectors} savings={savings} />
         ) : null}
@@ -1608,15 +1868,18 @@ function AddonCard({
         {updateRequiresAppUpdate && upstreamVersion ? (
           <p className="addon-card__notice addon-card__notice--update">
             {t("addons.upstreamRequiresAppUpdate", {
-              latest: formatAddonVersion(upstreamVersion),
-              supported: supportedVersion ? formatAddonVersion(supportedVersion) : "—",
+              latest: formatAddonVersion(upstreamVersion, resolvedLocale),
+              supported: supportedVersion ? formatAddonVersion(supportedVersion, resolvedLocale) : "—",
             })}
           </p>
         ) : null}
         {upstreamUpdateAvailable && !updateAvailable && !updateRequiresAppUpdate && upstreamVersion ? (
           <p className="addon-card__notice addon-card__notice--update">
-            {t("addons.enableBeforeUpdate", { latest: formatAddonVersion(upstreamVersion) })}
+            {t("addons.enableBeforeUpdate", { latest: formatAddonVersion(upstreamVersion, resolvedLocale) })}
           </p>
+        ) : null}
+        {updateCheckFailed ? (
+          <p className="addon-card__notice">{t("addons.updateCheckFailed")}</p>
         ) : null}
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
@@ -1653,7 +1916,16 @@ function AddonCard({
           </button>
         ) : (
           <>
-            {updateAvailable && onUpdate ? (
+            {repairActionAvailable && onUpdate ? (
+              <button
+                type="button"
+                className="addon-card__action addon-card__action--primary"
+                disabled={actionsDisabled}
+                onClick={onUpdate}
+              >
+                {t("addons.repair")}
+              </button>
+            ) : updateActionAvailable && onUpdate ? (
               // install_addon is idempotent and always installs the pinned
               // version, so it is also the upgrade path -- no second command.
               <button
@@ -1663,7 +1935,7 @@ function AddonCard({
                 onClick={onUpdate}
               >
                 {availableVersion
-                  ? t("addons.updateTo", { version: formatAddonVersion(availableVersion) })
+                  ? t("addons.updateTo", { version: formatAddonVersion(availableVersion, resolvedLocale) })
                   : t("addons.update")}
               </button>
             ) : null}
@@ -1713,12 +1985,20 @@ const ADDON_DESCRIPTION_KEYS: Record<string, TranslationKey> = {
 };
 
 const ADDON_DISPLAY_ORDER = [
+  "stop-that-shit",
+  "agent-guard",
+  "grill-me",
+  "openspec",
+  "superpowers",
+  "gstack",
   "allinluna",
-  "ponytail",
+  "ralph-loop",
   "serena",
   "codebase-memory",
   "context7",
   "markitdown",
+  "rtk",
+  "ponytail",
   "caveman"
 ];
 
@@ -1803,6 +2083,9 @@ export default function App() {
   const [addonUpdateBusy, setAddonUpdateBusy] = useState(false);
   const [addonUpdatesChecked, setAddonUpdatesChecked] = useState(false);
   const [addonUpdateCheckFailed, setAddonUpdateCheckFailed] = useState(false);
+  // An update check can outlive an install/update operation.  Its result is
+  // only valid for the dashboard snapshot that existed when it started.
+  const addonUpdateGenerationRef = useRef(0);
   const [bootstrapping, setBootstrapping] = useState(false);
   const [bootstrapProgress, setBootstrapProgress] =
     useState<BootstrapProgress>(idleBootstrapProgress);
@@ -1816,6 +2099,261 @@ export default function App() {
   const [startupCopy, setStartupCopy] = useState("Opening launch window…");
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
+  const [selectedClaudeProjectPath, setSelectedClaudeProjectPath] = useState<string | null>(null);
+  const [codexBridgeStatus, setCodexBridgeStatus] = useState<CodexBridgeStatus | null>(null);
+  const [codexBridgeBusy, setCodexBridgeBusy] = useState<string | null>(null);
+  const [codexBridgeError, setCodexBridgeError] = useState<string | null>(null);
+  const [codexBridgeWorkspace, setCodexBridgeWorkspace] = useState("");
+  const [codexBridgeCopied, setCodexBridgeCopied] = useState(false);
+  const [codexBridgeRepairCopied, setCodexBridgeRepairCopied] = useState(false);
+  const [codexBridgeRepairNeeded, setCodexBridgeRepairNeeded] = useState(false);
+  const connectedBridgeUrlRef = useRef<string | null>(null);
+  const codexBridgeStatusRequestGenerationRef = useRef(0);
+  const codexBridgeStatusInFlightWorkspaceRef = useRef<string | null | undefined>(undefined);
+  const [codexBridgeNow, setCodexBridgeNow] = useState(() => Date.now());
+  const effectiveCodexBridgeWorkspace = codexBridgeWorkspace || codexBridgeStatus?.workspacePath || null;
+  const codexBridgeWorkspaceGenerationRef = useRef({
+    workspace: effectiveCodexBridgeWorkspace,
+    generation: 0,
+  });
+  codexBridgeWorkspaceGenerationRef.current = nextBridgeWorkspaceGeneration(
+    codexBridgeWorkspaceGenerationRef.current,
+    effectiveCodexBridgeWorkspace,
+  );
+  useEffect(() => {
+    if (activeView !== "bridge" || codexBridgeBusy) return;
+    if (codexBridgeStatusInFlightWorkspaceRef.current === effectiveCodexBridgeWorkspace) return;
+    codexBridgeStatusInFlightWorkspaceRef.current = effectiveCodexBridgeWorkspace;
+    const generation = ++codexBridgeStatusRequestGenerationRef.current;
+    void invoke<CodexBridgeStatus>("get_codex_bridge_status", {
+      workspace: effectiveCodexBridgeWorkspace,
+    })
+      .then((next) => {
+        if (generation !== codexBridgeStatusRequestGenerationRef.current) return;
+        setCodexBridgeStatus((previous) => mergeCodexBridgeStatus(next, previous));
+      })
+      .catch((error) => {
+        if (generation !== codexBridgeStatusRequestGenerationRef.current) return;
+        setCodexBridgeError(describeInvokeError(error, "无法读取 Bridge 状态。"));
+      })
+      .finally(() => {
+        if (generation === codexBridgeStatusRequestGenerationRef.current) {
+          codexBridgeStatusInFlightWorkspaceRef.current = undefined;
+        }
+      });
+  }, [activeView, effectiveCodexBridgeWorkspace, codexBridgeBusy]);
+
+  useEffect(() => {
+    if (activeView !== "bridge" || codexBridgeBusy) return;
+    const interval = window.setInterval(() => {
+      if (codexBridgeStatusInFlightWorkspaceRef.current === effectiveCodexBridgeWorkspace) return;
+      codexBridgeStatusInFlightWorkspaceRef.current = effectiveCodexBridgeWorkspace;
+      const generation = ++codexBridgeStatusRequestGenerationRef.current;
+      void invoke<CodexBridgeStatus>("get_codex_bridge_status", {
+        workspace: effectiveCodexBridgeWorkspace,
+      }).then((next) => {
+        if (generation !== codexBridgeStatusRequestGenerationRef.current) return;
+        setCodexBridgeStatus((previous) => mergeCodexBridgeStatus(next, previous));
+      }).catch(() => {}).finally(() => {
+        if (generation === codexBridgeStatusRequestGenerationRef.current) {
+          codexBridgeStatusInFlightWorkspaceRef.current = undefined;
+        }
+      });
+    }, codexBridgeStatus?.paired ? 5000 : 2000);
+    return () => window.clearInterval(interval);
+  }, [activeView, codexBridgeStatus?.paired, effectiveCodexBridgeWorkspace, codexBridgeBusy]);
+
+  useEffect(() => {
+    const endpoint = codexBridgeStatus?.mcpUrl || codexBridgeStatus?.publicUrl || null;
+    if (codexBridgeStatus?.endpointRepairRequired || codexBridgeStatus?.endpointChanged) {
+      setCodexBridgeRepairNeeded(true);
+      return;
+    }
+    if (!codexBridgeStatus?.paired || !endpoint) return;
+    if (!connectedBridgeUrlRef.current) {
+      connectedBridgeUrlRef.current = endpoint;
+      return;
+    }
+    setCodexBridgeRepairNeeded(bridgeConnectionNeedsRepair(connectedBridgeUrlRef.current, endpoint, true));
+  }, [codexBridgeStatus?.mcpUrl, codexBridgeStatus?.publicUrl, codexBridgeStatus?.paired]);
+
+  useEffect(() => {
+    if (activeView !== "bridge" || !codexBridgeStatus?.pairingCode || codexBridgeStatus.paired) return;
+    const interval = window.setInterval(() => setCodexBridgeNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [activeView, codexBridgeStatus?.pairingCode, codexBridgeStatus?.paired]);
+
+  async function handlePickCodexBridgeWorkspace() {
+    setCodexBridgeError(null);
+    try {
+      const selected = await invoke<string | null>("pick_workspace_directory");
+      if (selected) {
+        setCodexBridgeWorkspace(selected);
+      }
+    } catch (error) {
+      setCodexBridgeError(
+        describeInvokeError(error, bridgeChooseWorkspaceErrorCopy[resolvedLocale]),
+      );
+    }
+  }
+
+  async function handleCodexBridgeAction(action: "install" | "update" | "setup" | "doctor" | "pair" | "unpair" | "stop" | "uninstall" | "ack_endpoint") {
+    if (action === "uninstall" && !window.confirm(`确定要${bridgeUiCopy[resolvedLocale].uninstall} Codex with ChatGPT 吗？`)) return;
+    const actionWorkspace = effectiveCodexBridgeWorkspace;
+    const actionWorkspaceGeneration = codexBridgeWorkspaceGenerationRef.current.generation;
+    const actionRequestGeneration = ++codexBridgeStatusRequestGenerationRef.current;
+    codexBridgeStatusInFlightWorkspaceRef.current = undefined;
+    setCodexBridgeBusy(action);
+    setCodexBridgeError(null);
+    try {
+      const wasRunning = codexBridgeStatus?.running === true;
+      if (action === "update" && wasRunning) {
+        await invoke("run_codex_bridge_action", { action: "stop", workspace: actionWorkspace });
+      }
+      const status = action === "install" || action === "update"
+        ? await invoke<CodexBridgeStatus>("install_codex_bridge", { workspace: actionWorkspace })
+        : action === "uninstall"
+          ? await invoke<CodexBridgeStatus>("uninstall_codex_bridge", { workspace: actionWorkspace })
+          : await invoke<CodexBridgeStatus>("run_codex_bridge_action", {
+            action,
+            workspace: actionWorkspace,
+          });
+      const finalStatus = action === "update" && wasRunning
+        ? await invoke<CodexBridgeStatus>("run_codex_bridge_action", {
+          action: "setup",
+          workspace: actionWorkspace,
+        })
+        : status;
+      if (!bridgeResponseIsCurrent(
+        actionRequestGeneration,
+        codexBridgeStatusRequestGenerationRef.current,
+        actionWorkspaceGeneration,
+        codexBridgeWorkspaceGenerationRef.current.generation,
+      )) return;
+      setCodexBridgeStatus(finalStatus);
+      if (action === "ack_endpoint") {
+        connectedBridgeUrlRef.current = null;
+        setCodexBridgeRepairNeeded(false);
+        setCodexBridgeStatus((current) => current ? { ...current, endpointRepairRequired: false, endpointChanged: false } : current);
+      }
+    } catch (error) {
+      if (
+        codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+        codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+      ) return;
+      setCodexBridgeError(describeInvokeError(error, "Bridge 操作失败。"));
+      void invoke<CodexBridgeStatus>("get_codex_bridge_status", {
+        workspace: actionWorkspace,
+      }).then((next) => {
+        if (
+          codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+          codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+        ) return;
+        setCodexBridgeStatus((previous) => mergeCodexBridgeStatus(next, previous));
+      }).catch(() => {});
+    } finally {
+      if (codexBridgeStatusRequestGenerationRef.current === actionRequestGeneration) {
+        setCodexBridgeBusy(null);
+      }
+    }
+  }
+
+  async function handleConnectCodexBridge() {
+    const actionRequestGeneration = ++codexBridgeStatusRequestGenerationRef.current;
+    codexBridgeStatusInFlightWorkspaceRef.current = undefined;
+    const actionWorkspaceGeneration = codexBridgeWorkspaceGenerationRef.current.generation;
+    setCodexBridgeBusy("connect");
+    setCodexBridgeError(null);
+    try {
+      const requestedWorkspace = chooseCodexBridgeActionWorkspace(
+        codexBridgeWorkspace,
+        codexBridgeStatus?.workspacePath,
+      );
+      if (!requestedWorkspace) {
+        throw new Error(bridgeWorkspaceUnavailableCopy[resolvedLocale]);
+      }
+      let status = await invoke<CodexBridgeStatus>("get_codex_bridge_status", {
+        workspace: requestedWorkspace,
+      });
+      if (
+        codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+        codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+      ) return;
+      setCodexBridgeStatus((previous) => mergeCodexBridgeStatus(status, previous));
+      if (status?.paired) return;
+      let actionWorkspace = status.workspacePath?.trim() || requestedWorkspace;
+      if (!status?.installed) {
+        status = await invoke<CodexBridgeStatus>("install_codex_bridge", { workspace: requestedWorkspace });
+        if (
+          codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+          codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+        ) return;
+        actionWorkspace = status.workspacePath?.trim() || actionWorkspace;
+      }
+      const pairingStillValid = bridgePairingIsUsable(status);
+      if (!pairingStillValid) {
+        status = await invoke<CodexBridgeStatus>("run_codex_bridge_action", {
+          action: "setup",
+          workspace: actionWorkspace,
+        });
+        if (
+          codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+          codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+        ) return;
+      }
+      if (!status.pairingCode) {
+        status = await invoke<CodexBridgeStatus>("run_codex_bridge_action", {
+          action: "pair",
+          workspace: actionWorkspace,
+        });
+        if (
+          codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+          codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+        ) return;
+      }
+      const displayedStatus = mergeCodexBridgeStatus(status as CodexBridgeStatus, codexBridgeStatus);
+      if (
+        codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+        codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+      ) return;
+      setCodexBridgeStatus(displayedStatus);
+      await openExternalLink(displayedStatus.authorizationUrl || CHATGPT_CONNECTOR_URL);
+    } catch (error) {
+      if (
+        codexBridgeWorkspaceGenerationRef.current.generation !== actionWorkspaceGeneration ||
+        codexBridgeStatusRequestGenerationRef.current !== actionRequestGeneration
+      ) return;
+      setCodexBridgeError(describeInvokeError(error, "连接 ChatGPT 失败。"));
+    } finally {
+      if (codexBridgeStatusRequestGenerationRef.current === actionRequestGeneration) {
+        setCodexBridgeBusy(null);
+      }
+    }
+  }
+
+  async function copyCodexBridgePairingCode() {
+    const code = codexBridgeStatus?.pairingCode;
+    if (!code || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      setCodexBridgeCopied(true);
+      window.setTimeout(() => setCodexBridgeCopied(false), 2000);
+    } catch (error) {
+      setCodexBridgeError(describeInvokeError(error, "复制配对码失败。"));
+    }
+  }
+
+  async function copyCodexBridgeEndpoint() {
+    const endpoint = codexBridgeStatus?.mcpUrl || codexBridgeStatus?.publicUrl;
+    if (!endpoint || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(endpoint);
+      setCodexBridgeRepairCopied(true);
+      window.setTimeout(() => setCodexBridgeRepairCopied(false), 2000);
+    } catch (error) {
+      setCodexBridgeError(describeInvokeError(error, "复制新地址失败。"));
+    }
+  }
 
   useEffect(() => {
     if (!LOCAL_COMMUNITY_EDITION) return;
@@ -1903,7 +2441,6 @@ export default function App() {
   const [claudeProjectsBusy, setClaudeProjectsBusy] = useState(false);
   const [claudeProjectsError, setClaudeProjectsError] = useState<string | null>(null);
   const [showAllClaudeProjects, setShowAllClaudeProjects] = useState(false);
-  const [selectedClaudeProjectPath, setSelectedClaudeProjectPath] = useState<string | null>(null);
   const [headroomLearnStatus, setHeadroomLearnStatus] =
     useState<HeadroomLearnStatus>(idleHeadroomLearnStatus);
   const [optimizeAppliedByProject, setOptimizeAppliedByProject] =
@@ -3143,6 +3680,7 @@ export default function App() {
   }
 
   async function refreshAddonUpdates() {
+    const generation = addonUpdateGenerationRef.current;
     setAddonUpdateBusy(true);
     setAddonUpdateCheckFailed(false);
     try {
@@ -3150,21 +3688,70 @@ export default function App() {
       if (!Array.isArray(checks)) {
         throw new Error("invalid addon update response");
       }
+      if (generation !== addonUpdateGenerationRef.current) {
+        return;
+      }
       setAddonUpdateChecks(checks);
       setAddonUpdateCheckFailed(checks.every((check) => Boolean(check.error)));
     } catch (error) {
       console.error("Failed to check addon updates", error);
+      if (generation !== addonUpdateGenerationRef.current) {
+        return;
+      }
+      // A failed check must not leave the previous successful result visible.
+      setAddonUpdateChecks([]);
       setAddonUpdateCheckFailed(true);
     } finally {
-      setAddonUpdatesChecked(true);
-      setAddonUpdateBusy(false);
+      if (generation === addonUpdateGenerationRef.current) {
+        setAddonUpdatesChecked(true);
+        setAddonUpdateBusy(false);
+      } else {
+        // The action that invalidated this request still needs the next
+        // effect pass to launch a fresh check.
+        setAddonUpdateBusy(false);
+      }
     }
   }
 
-  async function handleHeadroomCliUpdate() {
+  function invalidateAddonUpdateChecks() {
+    addonUpdateGenerationRef.current += 1;
+    setAddonUpdateChecks([]);
+    setAddonUpdatesChecked(false);
+    setAddonUpdateCheckFailed(false);
+  }
+
+  async function handleHeadroomCliUpdate(version?: string | null) {
     setCliUpdateError(null);
+    setRuntimeUpgradeProgress({
+      ...idleRuntimeUpgradeProgress,
+      running: true,
+      currentStep: t("addons.updating", { name: t("settings.headroomCli") }),
+      message: t("addons.updating", { name: t("settings.headroomCli") }),
+      fromVersion: headroomTool?.version ?? null,
+      toVersion: version ?? null,
+    });
     try {
-      await invoke("update_headroom_cli");
+      await invoke("update_headroom_cli", { version: version ?? null });
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const progress = await invoke<RuntimeUpgradeProgress>("get_runtime_upgrade_progress");
+        setRuntimeUpgradeProgress(progress);
+        if (!progress.running || progress.complete || progress.failed) {
+          if (progress.failed) {
+            setCliUpdateError(progress.message || t("messages.localOperationFailed"));
+          }
+          break;
+        }
+      }
+      try {
+        const refreshed = await invoke<DashboardState>("get_dashboard_state");
+        if (refreshed && Array.isArray(refreshed.tools)) {
+          setDashboard(refreshed);
+        }
+      } catch (refreshError) {
+        console.error("Failed refresh dashboard after Headroom CLI update", refreshError);
+      }
+      invalidateAddonUpdateChecks();
     } catch (error) {
       setCliUpdateError(describeInvokeError(error, t("messages.localOperationFailed")));
     }
@@ -4310,10 +4897,18 @@ export default function App() {
     command: "install_addon" | "set_addon_enabled" | "uninstall_addon",
     id: string,
     enabled?: boolean,
-    // An update reuses install_addon, so only the wording differs.
-    updateLabels?: { busy: string; done: string }
+    // An update reuses install_addon, so only the wording and version differ.
+    updateLabels?: { busy: string; done: string },
+    version?: string | null
   ) {
+    if (!addonPresetBusy) {
+      addonPresetUserSelectedCustomRef.current = true;
+      setAddonPresetMode("custom");
+    }
     const toolName = dashboard.tools.find((tool) => tool.id === id)?.name ?? id;
+    // Invalidate before invoking the mutating command so an older in-flight
+    // check cannot write its pre-action version back into the UI.
+    invalidateAddonUpdateChecks();
     const busyLabel =
       command === "install_addon"
         ? (updateLabels?.busy ?? t("addons.installing", { name: toolName }))
@@ -4326,8 +4921,28 @@ export default function App() {
     setAddonErrorById((current) => clearAddonOperationMessage(current, id));
     setAddonResultById((current) => clearAddonOperationMessage(current, id));
     try {
-      const next = await invoke<DashboardState>(command, { id, enabled });
-      setDashboard(next);
+      const next = await invoke<DashboardState>(command, {
+        id,
+        enabled,
+        ...(command === "install_addon" && version ? { version } : {}),
+      });
+      // Re-read the dashboard after both success and failure paths.  The
+      // command result is a useful fallback, but the explicit read also
+      // covers post-install hooks that update state after the command returns.
+      try {
+        const refreshed = await invoke<DashboardState>("get_dashboard_state");
+        if (refreshed && Array.isArray(refreshed.tools)) {
+          setDashboard(refreshed);
+        } else {
+          setDashboard(next);
+        }
+      } catch (refreshError) {
+        console.error("Failed to refresh dashboard after addon action", refreshError);
+        setDashboard(next);
+      }
+      // Invalidate again in case a check was started while the operation was
+      // running; the effect below will issue a check for the new dashboard.
+      invalidateAddonUpdateChecks();
       if (id === "rtk") {
         await refreshRuntimeStatus();
       }
@@ -4343,6 +4958,19 @@ export default function App() {
         setAddonResultById((current) => setAddonOperationMessage(current, id, message));
       }
     } catch (error) {
+      // The command may have changed local state before reporting an error
+      // (for example, a post-install hook can fail). Refresh the dashboard on
+      // a best-effort basis, while preserving the original action error for
+      // the user.
+      try {
+        const recovered = await invoke<DashboardState>("get_dashboard_state");
+        if (recovered && Array.isArray(recovered.tools)) {
+          setDashboard(recovered);
+        }
+      } catch (refreshError) {
+        console.error("Failed to refresh dashboard after addon action error", refreshError);
+      }
+      invalidateAddonUpdateChecks();
       setAddonErrorById((current) =>
         setAddonOperationMessage(
           current,
@@ -4352,6 +4980,100 @@ export default function App() {
       );
     } finally {
       setAddonBusyById((current) => clearAddonOperationMessage(current, id));
+    }
+  }
+
+  async function runAddonModeAction(id: string, mode: string) {
+    if (!addonPresetBusy) {
+      addonPresetUserSelectedCustomRef.current = true;
+      setAddonPresetMode("custom");
+    }
+    const tool = dashboard.tools.find((candidate) => candidate.id === id);
+    if (
+      !tool ||
+      !tool.enabled ||
+      tool.status === "not_installed" ||
+      !tool.supportedModes?.includes(mode) ||
+      tool.defaultMode === mode
+    ) {
+      return;
+    }
+
+    setAddonBusyById((current) => setAddonOperationMessage(current, id, t("tools.savingMode")));
+    setAddonResultById((current) => clearAddonOperationMessage(current, id));
+    setAddonErrorById((current) => clearAddonOperationMessage(current, id));
+    try {
+      const next = await invoke<DashboardState>("set_addon_mode", { id, mode });
+      setDashboard(next);
+      setAddonResultById((current) =>
+        setAddonOperationMessage(
+          current,
+          id,
+          t("messages.toolModeSaved", {
+            name: tool.name,
+            mode: localizedToolModeLabel(mode, t),
+          })
+        )
+      );
+    } catch (error) {
+      setAddonErrorById((current) =>
+        setAddonOperationMessage(
+          current,
+          id,
+          describeInvokeError(error, t("messages.localOperationFailed"))
+        )
+      );
+    } finally {
+      setAddonBusyById((current) => clearAddonOperationMessage(current, id));
+    }
+  }
+
+  const [addonPresetBusy, setAddonPresetBusy] = useState(false);
+  const [addonPresetMode, setAddonPresetMode] = useState<"recommended" | "custom">("recommended");
+  const addonPresetUserSelectedCustomRef = useRef(false);
+
+  useEffect(() => {
+    if (addonPresetBusy || addonPresetUserSelectedCustomRef.current) return;
+    setAddonPresetMode(recommendedAddonPresetMatches(dashboard) ? "recommended" : "custom");
+  }, [dashboard, addonPresetBusy]);
+
+  async function applyRecommendedAddonPreset() {
+    if (addonPresetBusy) return;
+    addonPresetUserSelectedCustomRef.current = false;
+    setAddonPresetMode("recommended");
+    setAddonPresetBusy(true);
+    try {
+      for (const [id, target] of Object.entries(RECOMMENDED_ADDON_PRESET)) {
+        let tool = dashboard.tools.find((candidate) => candidate.id === id);
+        if (!tool) continue;
+        if (target.enabled && tool.status === "not_installed") {
+          await runAddonAction("install_addon", id);
+          const refreshed = await invoke<DashboardState>("get_dashboard_state");
+          setDashboard(refreshed);
+          tool = refreshed.tools.find((candidate) => candidate.id === id);
+        }
+        if (!tool) continue;
+        if (tool.enabled !== target.enabled && tool.status !== "not_installed") {
+          await runAddonAction("set_addon_enabled", id, target.enabled);
+          const refreshed = await invoke<DashboardState>("get_dashboard_state");
+          setDashboard(refreshed);
+          tool = refreshed.tools.find((candidate) => candidate.id === id);
+        }
+        if (target.enabled && target.mode && tool?.supportedModes?.includes(target.mode) && tool?.defaultMode !== target.mode) {
+          await runAddonModeAction(id, target.mode);
+        }
+      }
+      const refreshed = await invoke<DashboardState>("get_dashboard_state");
+      setDashboard(refreshed);
+      if (!recommendedAddonPresetMatches(refreshed)) {
+        throw new Error("Recommended add-on preset was not fully applied.");
+      }
+      setAddonPresetMode("recommended");
+    } catch (error) {
+      setAddonPresetMode("custom");
+      console.error("Failed to apply recommended add-on preset", error);
+    } finally {
+      setAddonPresetBusy(false);
     }
   }
 
@@ -4992,13 +5714,35 @@ export default function App() {
       : null;
   const checkedTools = applyAddonUpdateChecks(dashboard.tools, addonUpdateChecks);
   const checkedRtkTool = checkedTools.find((tool) => tool.id === "rtk");
+  const groupedAddonTools = groupToolsByCategory(
+    checkedTools
+      .filter((tool) => !tool.required && tool.id !== "rtk")
+      .sort((a, b) => addonDisplayRank(a.id) - addonDisplayRank(b.id))
+  );
   const addonUpdateFailureCount = addonUpdateChecks.filter((check) => Boolean(check.error)).length;
   const addonUpdatesFound = checkedTools.filter(
     (tool) =>
       !tool.required &&
       tool.status !== "not_installed" &&
-      (tool.updateAvailable || tool.upstreamUpdateAvailable)
+      tool.updateActionAvailable === true
   ).length;
+  const disabledAddonUpdates = checkedTools.filter(
+    (tool) =>
+      !tool.required &&
+      tool.status !== "not_installed" &&
+      tool.enabled === false &&
+      tool.upstreamUpdateAvailable === true
+  ).length;
+  const disabledAddonUpdatesLabel =
+    resolvedLocale === "zh-CN"
+      ? `有 ${disabledAddonUpdates} 个工具可更新，但需先启用`
+      : resolvedLocale === "zh-TW"
+        ? `有 ${disabledAddonUpdates} 個工具可更新，但需先啟用`
+        : resolvedLocale === "ja"
+          ? `${disabledAddonUpdates} 件の更新は有効化後に実行できます`
+          : resolvedLocale === "ko"
+            ? `업데이트 ${disabledAddonUpdates}개는 먼저 활성화해야 합니다`
+            : `${disabledAddonUpdates} updates require enabling the tool first`;
   const lifetimeDataDays = new Set(
     dashboard.dailySavings
       .map((point) => point.date)
@@ -6665,7 +7409,11 @@ export default function App() {
   );
 
   const activeNavItem = navItems.find((item) => item.id === activeView);
-  const activeViewTitle = activeNavItem ? t(activeNavItem.labelKey) : t("nav.settings");
+  const activeViewTitle = activeNavItem
+    ? activeNavItem.id === "bridge"
+      ? collaborationBridgeCopy[resolvedLocale].title
+      : t(activeNavItem.labelKey)
+    : t("nav.settings");
   return (
     <main className="tray-shell">
       {upgradeOverlay}
@@ -6690,7 +7438,11 @@ export default function App() {
                 <item.icon className="tray-nav__icon-svg" size={26} weight={activeView === item.id ? "fill" : "regular"} />
               </span>
               <span className="tray-nav__text">
-                <strong>{t(item.labelKey)}</strong>
+                <strong>
+                  {item.id === "bridge"
+                    ? collaborationBridgeCopy[resolvedLocale].title
+                    : t(item.labelKey)}
+                </strong>
               </span>
             </button>
           ))}
@@ -7098,6 +7850,8 @@ export default function App() {
                                     <OptimizePanel
                                       projectPath={project.projectPath}
                                       neverScanned={hasNeverScanned(project)}
+                                      onScan={() => void handleRunHeadroomLearn("claude", project.projectPath)}
+                                      scanDisabled={disableLearn}
                                       refreshSignal={
                                         isLatestLearnProject && !headroomLearnStatus.running
                                           ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
@@ -7291,6 +8045,8 @@ export default function App() {
                                   <OptimizePanel
                                     projectPath="codex"
                                     source="codex"
+                                    onScan={() => void handleRunHeadroomLearn("codex")}
+                                    scanDisabled={codexDisable}
                                     refreshSignal={
                                       codexIsLatest
                                         ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
@@ -7405,6 +8161,11 @@ export default function App() {
                 !claudeProjects.some((project) => project.projectPath === headroomLearnStatus.projectPath) ? (
                   <p className="install-progress__error" role="alert">{headroomLearnStatus.error}</p>
                 ) : null}
+                {addonUpdatesChecked && !addonUpdateBusy && disabledAddonUpdates > 0 ? (
+                  <span className="addons-card__update-disabled-notice">
+                    {disabledAddonUpdatesLabel}
+                  </span>
+                ) : null}
               </div>
             </article>
 
@@ -7421,6 +8182,65 @@ export default function App() {
               (tool) => tool.id === "serena" && tool.status !== "not_installed"
             )}
           />
+        </div>
+
+        <div className="tray-content" hidden={activeView !== "bridge"}>
+          <article className="soft-card addons-card">
+            <header className="addons-card__head">
+              <div className="addons-card__title-row">
+                <span className="addons-card__title-icon" aria-hidden="true">
+                  <ArrowsLeftRight weight="duotone" />
+                </span>
+                <h1>{collaborationBridgeCopy[resolvedLocale].title}</h1>
+              </div>
+              <p className="addons-card__blurb">{collaborationBridgeCopy[resolvedLocale].description}</p>
+            </header>
+          </article>
+          <section className="addon-group addon-group--collaboration">
+            <header className="addon-group__head">
+              <div className="addon-group__copy">
+                <h2>{bridgeUiCopy[resolvedLocale].authorization}</h2>
+                <p>{collaborationBridgeCopy[resolvedLocale].detail}</p>
+              </div>
+              <span className={`addon-card__badge ${codexBridgeStatus?.running ? "addon-card__badge--on" : "addon-card__badge--off"}`}>
+                {codexBridgeStatus
+                  ? codexBridgeStatus.running
+                    ? bridgeUiCopy[resolvedLocale].running
+                    : codexBridgeStatus.installed
+                      ? bridgeUiCopy[resolvedLocale].stopped
+                      : bridgeUiCopy[resolvedLocale].missing
+                  : t("settings.loading")}
+              </span>
+            </header>
+            <p className="addon-card__activation-note">{bridgeStepCopy[resolvedLocale]}</p>
+            <div className="bridge-auth-card__status">
+              <div className="bridge-auth-card__status-icon" aria-hidden="true">{codexBridgeStatus?.paired ? "✓" : "○"}</div>
+              <div><strong>{codexBridgeStatus?.paired ? bridgeUiCopy[resolvedLocale].authorized : codexBridgeStatus?.pairingCode ? bridgeUiCopy[resolvedLocale].waiting : bridgeUiCopy[resolvedLocale].unauthorized}</strong><span>{bridgeUiCopy[resolvedLocale].authorizationHint}</span></div>
+            </div>
+            {codexBridgeRepairNeeded && codexBridgeStatus?.paired && (codexBridgeStatus?.mcpUrl || codexBridgeStatus?.publicUrl) ? <div className="bridge-auth-card__status bridge-auth-card__status--warning" role="alert">
+              <div className="bridge-auth-card__status-icon" aria-hidden="true">!</div>
+              <div><strong>{bridgeRepairCopy[resolvedLocale].title}</strong><span>{bridgeRepairCopy[resolvedLocale].detail}</span><code>{codexBridgeStatus.mcpUrl || codexBridgeStatus.publicUrl}</code><div className="addons-card__updates"><button className="secondary-button" type="button" onClick={() => void openExternalLink(CHATGPT_CONNECTOR_URL)}><ArrowSquareOut size={16} aria-hidden="true" />{bridgeRepairCopy[resolvedLocale].open}</button><button className="secondary-button" type="button" onClick={() => void copyCodexBridgeEndpoint()}><Copy size={16} aria-hidden="true" />{codexBridgeRepairCopied ? bridgeRepairCopy[resolvedLocale].copied : bridgeRepairCopy[resolvedLocale].copy}</button><button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void handleCodexBridgeAction("ack_endpoint")}>{bridgeRepairAckCopy[resolvedLocale]}</button></div><small>{bridgeRepairCopy[resolvedLocale].instruction}</small></div>
+            </div> : null}
+            <section className="bridge-auth-card__section">
+              <div className="bridge-auth-card__section-head"><div><h3>{bridgeUiCopy[resolvedLocale].scope}</h3><p>{bridgeUiCopy[resolvedLocale].scopeHint}</p></div><span className="bridge-auth-card__step">1</span></div>
+              <div className="bridge-auth-card__workspace">{effectiveCodexBridgeWorkspace || bridgeWorkspaceUnavailableCopy[resolvedLocale]}</div>
+              {!codexBridgeWorkspace && effectiveCodexBridgeWorkspace ? <p className="addon-card__activation-note">{bridgeUiCopy[resolvedLocale].autoWorkspace}</p> : null}
+              <details className="bridge-auth-card__advanced"><summary>{bridgeUiCopy[resolvedLocale].manualWorkspace}</summary><div className="community-field"><label htmlFor="codex-bridge-workspace">{bridgeUiCopy[resolvedLocale].workspace}</label><div className="community-field__row"><input id="codex-bridge-workspace" value={codexBridgeWorkspace} onChange={(event) => setCodexBridgeWorkspace(event.target.value)} placeholder={effectiveCodexBridgeWorkspace || "/Users/name/project"} spellCheck={false} /><button className="secondary-button community-field__browse" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void handlePickCodexBridgeWorkspace()} title={bridgeChooseWorkspaceCopy[resolvedLocale]} aria-label={bridgeChooseWorkspaceCopy[resolvedLocale]}><FolderOpen size={16} aria-hidden="true" /><span>{bridgeChooseWorkspaceCopy[resolvedLocale]}</span></button></div></div></details>
+            </section>
+            <section className="bridge-auth-card__section">
+              <div className="bridge-auth-card__section-head"><div><h3>{bridgeUiCopy[resolvedLocale].pairingStep}</h3><p>{bridgeUiCopy[resolvedLocale].pairingHint}</p></div><span className="bridge-auth-card__step">2</span></div>
+              <div className="bridge-auth-card__pairing-state">{codexBridgeStatus?.paired ? bridgeUiCopy[resolvedLocale].authorized : codexBridgeStatus?.pairingCode ? bridgeUiCopy[resolvedLocale].waiting : bridgeUiCopy[resolvedLocale].pairingReady}</div>
+              {codexBridgeStatus?.pairingCode && !codexBridgeStatus.paired ? <div className="bridge-auth-card__pairing-code"><code>{codexBridgeStatus.pairingCode}</code><button className="secondary-button" type="button" onClick={() => void copyCodexBridgePairingCode()}><Copy size={16} aria-hidden="true" />{codexBridgeCopied ? bridgeUiCopy[resolvedLocale].copied : bridgeUiCopy[resolvedLocale].copyCode}</button>{bridgeExpiryValue(codexBridgeStatus) !== null ? <small>{bridgeUiCopy[resolvedLocale].expires} {formatBridgeExpiry(codexBridgeStatus, resolvedLocale, codexBridgeNow)}</small> : null}</div> : null}
+              <div className="addons-card__updates" aria-live="polite"><button className="primary-button" type="button" disabled={Boolean(codexBridgeBusy) || !effectiveCodexBridgeWorkspace || codexBridgeStatus?.paired} onClick={() => void handleConnectCodexBridge()}>{bridgeUiCopy[resolvedLocale].connect}</button>{codexBridgeStatus?.pairingCode && !codexBridgeStatus.paired ? <button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void openExternalLink(codexBridgeStatus.authorizationUrl || CHATGPT_CONNECTOR_URL)}><ArrowSquareOut size={16} aria-hidden="true" />{bridgeUiCopy[resolvedLocale].openChatGPT}</button> : null}{codexBridgeStatus?.paired ? <button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void handleCodexBridgeAction("unpair")}>{bridgeUiCopy[resolvedLocale].unpair}</button> : null}</div>
+            </section>
+            <details className="bridge-auth-card__section bridge-auth-card__service"><summary><span><strong>{bridgeUiCopy[resolvedLocale].service}</strong><small>{bridgeUiCopy[resolvedLocale].serviceHint}</small></span><span className="bridge-auth-card__step">3</span></summary>
+              <div className="addons-card__updates" aria-live="polite">{!codexBridgeStatus?.installed ? <button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void handleCodexBridgeAction("install")}>{bridgeUiCopy[resolvedLocale].install}</button> : <><button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy) || !effectiveCodexBridgeWorkspace} onClick={() => void handleCodexBridgeAction("setup")}>{bridgeUiCopy[resolvedLocale].setup}</button><button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void handleCodexBridgeAction("update")}>{bridgeUiCopy[resolvedLocale].update}</button><button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy) || !effectiveCodexBridgeWorkspace} onClick={() => void handleCodexBridgeAction("doctor")}>{bridgeUiCopy[resolvedLocale].doctor}</button><button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy) || !codexBridgeStatus.running} onClick={() => void handleCodexBridgeAction("stop")}>{bridgeUiCopy[resolvedLocale].stop}</button><button className="secondary-button" type="button" disabled={Boolean(codexBridgeBusy)} onClick={() => void handleCodexBridgeAction("uninstall")}>{bridgeUiCopy[resolvedLocale].uninstall}</button></>}{codexBridgeBusy ? <span>{bridgeUiCopy[resolvedLocale].working}：{codexBridgeBusy}…</span> : null}</div>
+              <p className="addon-card__activation-note">{bridgeUiCopy[resolvedLocale].node}：{codexBridgeStatus?.nodeVersion ?? "—"} · {bridgeUiCopy[resolvedLocale].port}：{codexBridgeStatus?.port ?? "—"}</p>
+            </details>
+            {codexBridgeError ? <p className="addons__error addon-card__error" role="alert">{codexBridgeError}</p> : null}
+            {(codexBridgeStatus?.safeOutput || codexBridgeStatus?.output) ? <details className="bridge-auth-card__diagnostics"><summary>{bridgeUiCopy[resolvedLocale].diagnostics}</summary><pre className="install-progress__log">{codexBridgeStatus.safeOutput || codexBridgeStatus.output}</pre></details> : null}
+            <button type="button" className="addon-card__link" onClick={() => void openExternalLink("https://github.com/XiaoDuoYa/codex-with-chatgpt")}>{bridgeUiCopy[resolvedLocale].docs}</button>
+          </section>
         </div>
 
         <div className="tray-content" hidden={activeView !== "addons"}>
@@ -7467,13 +8287,45 @@ export default function App() {
                   </span>
                 ) : null}
               </div>
+              <AddonPresetBar
+                dashboard={dashboard}
+                busy={addonPresetBusy}
+                mode={addonPresetMode}
+                onApplyRecommended={() => void applyRecommendedAddonPreset()}
+                onSelectCustom={() => {
+                  addonPresetUserSelectedCustomRef.current = true;
+                  setAddonPresetMode("custom");
+                }}
+              />
             </header>
           </article>
-          <ul className="addons__list">
-              {checkedTools
-                .filter((tool) => !tool.required && tool.id !== "rtk")
-                .sort((a, b) => addonDisplayRank(a.id) - addonDisplayRank(b.id))
-                .map((tool) => {
+            <div className="addons__groups">
+              {TOOL_CATEGORY_ORDER.map((category) => {
+                const categoryTools = groupedAddonTools.get(category) ?? [];
+                const includesRtk = category === "efficiency";
+                if (!categoryTools.length && !includesRtk) return null;
+                const categoryCopy = toolCategoryCopy[category];
+                const workflowGroup = categoryTools.find((tool) => tool.workflowGroup)?.workflowGroup;
+                const singleSelectLabel = workflowGroup
+                  ? workflowGroupCopy[workflowGroup]?.[resolvedLocale]
+                  : null;
+                return (
+                  <section
+ className={`addon-group addon-group--${category}`}
+                    key={category}
+                    aria-labelledby={`addon-group-${category}`}
+                  >
+                    <header className="addon-group__head">
+                      <div className="addon-group__copy">
+                        <h2 id={`addon-group-${category}`}>{categoryCopy.title[resolvedLocale]}</h2>
+                        <p>{categoryCopy.description[resolvedLocale]}</p>
+                      </div>
+                      {singleSelectLabel ? (
+                  <span className="tool-group__rule">{singleSelectLabel}</span>
+                      ) : null}
+                    </header>
+                    <ul className="addons__list">
+                      {categoryTools.map((tool) => {
                   const installed = tool.status !== "not_installed";
                   return (
                     <AddonCard
@@ -7483,7 +8335,12 @@ export default function App() {
                       version={tool.version}
                       installed={installed}
                       enabled={tool.enabled}
-                      description={ADDON_DESCRIPTION_KEYS[tool.id] ? t(ADDON_DESCRIPTION_KEYS[tool.id]) : tool.description}
+                    description={
+                      ADDON_DESCRIPTION_KEYS[tool.id]
+                        ? t(ADDON_DESCRIPTION_KEYS[tool.id])
+                        : toolCopy[tool.id]?.[resolvedLocale] ?? tool.description
+                    }
+                      activationLabel={getActivationScopeCopy(tool.activationScope)[resolvedLocale]}
                       copy={addonCopy[tool.id]}
                       infoOpen={addonInfoId === tool.id}
                       onToggleInfo={() =>
@@ -7504,18 +8361,24 @@ export default function App() {
                       }
                       sourceUrl={tool.sourceUrl}
                       onOpenSource={() => void openExternalLink(tool.sourceUrl)}
-                      connectors={addonConnectors(tool.id, connectors)}
-                      showClients={installed && tool.enabled}
-                      savings={tool.savingsLabel ?? null}
-                      actionsDisabled={tool.id in addonBusyById}
+                    connectors={addonConnectors(tool.id, connectors)}
+                    showClients={installed && tool.enabled}
+                    savings={tool.savingsLabel ?? null}
+                    defaultMode={tool.defaultMode ?? null}
+                    supportedModes={tool.supportedModes ?? []}
+                    actionsDisabled={addonPresetMode === "recommended" || tool.id in addonBusyById}
+                    onModeChange={(mode) => void runAddonModeAction(tool.id, mode)}
                       updateAvailable={tool.updateAvailable ?? false}
+                      updateActionAvailable={tool.updateActionAvailable ?? false}
+                      repairActionAvailable={tool.repairActionAvailable ?? false}
+                      updateCheckFailed={tool.updateCheckFailed ?? false}
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
                       onUpdate={() =>
                         void runAddonAction("install_addon", tool.id, undefined, {
-                          busy: t("addons.updating", { name: tool.name }),
-                          done: t("addons.updated", { name: tool.name })
-                        })
+                          busy: t(tool.repairActionAvailable ? "addons.repairing" : "addons.updating", { name: tool.name }),
+                          done: t(tool.repairActionAvailable ? "addons.repaired" : "addons.updated", { name: tool.name })
+                        }, tool.availableVersion)
                       }
                       onInstall={() => void runAddonAction("install_addon", tool.id)}
                       onToggleEnabled={() =>
@@ -7525,7 +8388,8 @@ export default function App() {
                     />
                   );
                 })}
-              <AddonCard
+                      {includesRtk ? (
+                        <AddonCard
                 key="rtk"
                 toolId="rtk"
                 name="RTK"
@@ -7540,6 +8404,7 @@ export default function App() {
                       : ""}
                   </>
                 }
+                activationLabel={getActivationScopeCopy(checkedRtkTool?.activationScope)[resolvedLocale]}
                 copy={addonCopy.rtk}
                 infoOpen={addonInfoId === "rtk"}
                 onToggleInfo={() => setAddonInfoId(addonInfoId === "rtk" ? null : "rtk")}
@@ -7571,8 +8436,11 @@ export default function App() {
                   runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
                 }
                 savings={rtkSavingsChip}
-                actionsDisabled={rtkBusy || "rtk" in addonBusyById || !runtimeStatus}
+                actionsDisabled={addonPresetMode === "recommended" || rtkBusy || "rtk" in addonBusyById || !runtimeStatus}
                 updateAvailable={checkedRtkTool?.updateAvailable ?? false}
+                updateActionAvailable={checkedRtkTool?.updateActionAvailable ?? false}
+                repairActionAvailable={checkedRtkTool?.repairActionAvailable ?? false}
+                updateCheckFailed={checkedRtkTool?.updateCheckFailed ?? false}
                 availableVersion={checkedRtkTool?.availableVersion ?? null}
                 unavailableReason={
                   checkedRtkTool?.unavailableReason ??
@@ -7582,7 +8450,7 @@ export default function App() {
                   void runAddonAction("install_addon", "rtk", undefined, {
                     busy: t("addons.updating", { name: "RTK" }),
                     done: t("addons.updated", { name: "RTK" })
-                  })
+                  }, checkedRtkTool?.availableVersion)
                 }
                 onInstall={() => void runAddonAction("install_addon", "rtk")}
                 onToggleEnabled={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
@@ -7615,8 +8483,13 @@ export default function App() {
                     ) : null}
                   </>
                 ) : null}
-              </AddonCard>
-            </ul>
+                        </AddonCard>
+                      ) : null}
+                    </ul>
+                  </section>
+                );
+              })}
+            </div>
         </div>
 
         {!LOCAL_COMMUNITY_EDITION ? (
@@ -8185,15 +9058,16 @@ export default function App() {
                 <button
                   className="secondary-button secondary-button--small"
                   disabled={runtimeUpgradeProgress.running}
-                  onClick={() => void handleHeadroomCliUpdate()}
+                    onClick={() => void handleHeadroomCliUpdate(headroomTool.availableVersion)}
                   type="button"
                 >
                   {runtimeUpgradeProgress.running
                     ? t("addons.updating", { name: t("settings.headroomCli") })
                     : t("addons.updateTo", {
-                        version: formatAddonVersion(
-                          headroomTool.availableVersion ?? headroomTool.supportedVersion ?? "",
-                        ),
+                            version: formatAddonVersion(
+                              headroomTool.availableVersion ?? headroomTool.supportedVersion ?? "",
+                              resolvedLocale,
+                            ),
                       })}
                 </button>
                 {cliUpdateError ? (
@@ -8206,9 +9080,10 @@ export default function App() {
             {headroomTool?.updateRequiresAppUpdate && headroomTool.upstreamVersion ? (
               <p className="app-update-card__summary runtime-status__summary">
                 {t("addons.upstreamRequiresAppUpdate", {
-                  latest: formatAddonVersion(headroomTool.upstreamVersion),
+                  latest: formatAddonVersion(headroomTool.upstreamVersion, resolvedLocale),
                   supported: formatAddonVersion(
                     headroomTool.supportedVersion ?? headroomVersion,
+                    resolvedLocale,
                   ),
                 })}
               </p>

@@ -20,6 +20,12 @@ pub fn detect_npx() -> Option<PathBuf> {
     detect_cli("npx")
 }
 
+/// Resolve npm the same way GUI startup resolves the other user-installed CLIs.
+/// The desktop process does not necessarily inherit the user's interactive PATH.
+pub fn detect_npm_cli() -> Option<PathBuf> {
+    detect_cli("npm")
+}
+
 fn detect_cli(name: &str) -> Option<PathBuf> {
     if let Some(path) = probe_known_paths(name) {
         return Some(path);
@@ -266,6 +272,15 @@ fn home_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_path_candidates_support_npm_resolution() {
+        let candidates = known_path_candidates(PathBuf::from("/Users/test"), "npm");
+
+        assert!(candidates.contains(&PathBuf::from("/opt/homebrew/bin/npm")));
+        assert!(candidates.contains(&PathBuf::from("/usr/local/bin/npm")));
+        assert!(candidates.contains(&PathBuf::from("/Users/test/.volta/bin/npm")));
+    }
+
     use super::*;
     use std::fs;
     #[cfg(unix)]
@@ -320,7 +335,11 @@ mod tests {
     fn path_with_binary_dir_preserves_empty_and_parentless_path_semantics() {
         let root = std::env::temp_dir().join("Headroom PATH empty tests");
         let binary_dir = root.join("bin");
-        let binary = binary_dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+        let binary = binary_dir.join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
 
         let augmented = path_with_binary_dir(&binary, Some(OsStr::new("")));
         assert_eq!(
@@ -343,7 +362,11 @@ mod tests {
         } else {
             "invalid:directory"
         });
-        let binary = invalid_dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+        let binary = invalid_dir.join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
         let existing = std::env::join_paths([root.join("Existing Tools")]).unwrap();
 
         assert_eq!(

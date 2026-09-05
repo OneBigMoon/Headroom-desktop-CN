@@ -24,6 +24,9 @@ interface OptimizePanelProps {
   // Learn has never run here, so zero counts mean "not scanned yet" rather
   // than "scanned and found nothing". Collapses the two pills into one.
   neverScanned?: boolean;
+  /** Run Learn for this target from the empty-state action. */
+  onScan?: () => void;
+  scanDisabled?: boolean;
 }
 
 type ModalKind = null | "claude" | "memory";
@@ -36,6 +39,8 @@ export function OptimizePanel({
   preloadedApplied,
   onAppliedMutated,
   neverScanned = false,
+  onScan,
+  scanDisabled = false,
 }: OptimizePanelProps) {
   const { t } = useI18n();
   const hasPreloadedApplied = preloadedApplied !== undefined;
@@ -126,10 +131,20 @@ export function OptimizePanel({
   const secondaryKind: AppliedFileKind = source === "codex" ? "codex_instructions" : "memory";
   if (neverScanned) {
     return (
-      <span className="optimize-panel__pills">
+      <span className="optimize-panel__pills" aria-live="polite">
         <button type="button" className="optimize-panel__pill optimize-panel__pill--empty" disabled>
           {t("optimize.notScanned")}
         </button>
+        {onScan ? (
+          <button
+            type="button"
+            className="optimize-panel__pill"
+            onClick={onScan}
+            disabled={scanDisabled}
+          >
+            {scanDisabled ? t("actions.scanning") : t("actions.scanNow")}
+          </button>
+        ) : null}
       </span>
     );
   }

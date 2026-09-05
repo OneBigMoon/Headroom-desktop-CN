@@ -5,6 +5,7 @@ mod backend_port;
 mod bearer;
 mod claude_cli;
 mod client_adapters;
+mod codex_bridge;
 mod device;
 mod edition;
 mod insights;
@@ -1172,12 +1173,13 @@ async fn install_addon(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
+    version: Option<String>,
 ) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
             state
                 .tool_manager
-                .install_markitdown()
+                .install_markitdown_version(version.as_deref())
                 .map_err(|err| err.to_string())?;
             client_adapters::enable_markitdown_integration(
                 &state.tool_manager.markitdown_entrypoint(),
@@ -1191,7 +1193,7 @@ async fn install_addon(
         "rtk" => {
             state
                 .tool_manager
-                .install_rtk()
+                .install_rtk_version(version.as_deref())
                 .map_err(|err| err.to_string())?;
             client_adapters::set_rtk_enabled(
                 true,
@@ -1222,7 +1224,7 @@ async fn install_addon(
         "serena" => {
             state
                 .tool_manager
-                .install_serena()
+                .install_serena_version(version.as_deref())
                 .map_err(|err| err.to_string())?;
             if let Err(err) = client_adapters::enable_serena_integration() {
                 return match state.tool_manager.set_serena_enabled(false) {
@@ -1238,13 +1240,13 @@ async fn install_addon(
         "context7" => {
             state
                 .tool_manager
-                .install_context7()
+                .install_context7_version(version.as_deref())
                 .map_err(|err| err.to_string())?;
         }
         "codebase-memory" => {
             state
                 .tool_manager
-                .install_codebase_memory()
+                .install_codebase_memory_version(version.as_deref())
                 .map_err(|err| err.to_string())?;
         }
         other => return Err(format!("unknown addon: {other}")),
@@ -2756,13 +2758,20 @@ fn get_runtime_upgrade_progress(state: State<'_, AppState>) -> RuntimeUpgradePro
 }
 
 #[tauri::command]
-fn update_headroom_cli(app: AppHandle) -> Result<(), String> {
+fn update_headroom_cli(app: AppHandle, version: Option<String>) -> Result<(), String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
         if state.runtime_upgrade_in_progress() {
             return Err("A Headroom CLI update is already running.".into());
         }
-        if state.tool_manager.check_headroom_upgrade().is_none() {
+        if let Some(version) = version.as_deref() {
+            if crate::tool_manager::stable_package_version(version).is_err() {
+                return Err("Headroom CLI version must be stable x.y.z.".into());
+            }
+            if !state.tool_manager.headroom_upgrade_target_is_newer(version) {
+                return Err("Headroom CLI target is not newer than the installed version.".into());
+            }
+        } else if state.tool_manager.check_headroom_upgrade().is_none() {
             return Err("Headroom CLI is already up to date.".into());
         }
     }
@@ -2770,7 +2779,7 @@ fn update_headroom_cli(app: AppHandle) -> Result<(), String> {
     let app_clone = app.clone();
     std::thread::spawn(move || {
         let state: tauri::State<'_, AppState> = app_clone.state();
-        if let Err(err) = state.request_runtime_upgrade(&app_clone) {
+        if let Err(err) = state.request_runtime_upgrade(&app_clone, version.as_deref()) {
             log::warn!("manual Headroom CLI update did not start: {err}");
         }
     });
@@ -4027,6 +4036,65 @@ fn pattern_matches_project(content: &str, entity_refs: &[String], project_path: 
 }
 
 #[tauri::command]
+async fn get_codex_bridge_status(
+    workspace: Option<String>,
+) -> crate::codex_bridge::CodexBridgeStatus {
+    crate::codex_bridge::status(workspace.as_deref())
+}
+
+#[tauri::command]
+async fn install_codex_bridge(
+    workspace: Option<String>,
+) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
+    crate::codex_bridge::install(workspace).await
+}
+
+#[tauri::command]
+async fn uninstall_codex_bridge(
+    workspace: Option<String>,
+) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
+    crate::codex_bridge::uninstall(workspace).await
+}
+
+#[tauri::command]
+async fn run_codex_bridge_action(
+    action: String,
+    workspace: Option<String>,
+) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
+    crate::codex_bridge::action(action, workspace).await
+}
+
+/// Open the native folder picker and return the selected directory as a POSIX path.
+/// Cancellation is a normal empty result.
+#[tauri::command]
+fn pick_workspace_directory() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "POSIX path of (choose folder with prompt \"选择工作区文件夹\")",
+            ])
+            .output()
+            .map_err(|error| format!("无法打开文件夹选择器：{error}"))?;
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok((!path.is_empty()).then_some(path));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("用户取消") {
+            return Ok(None);
+        }
+        Err(format!("文件夹选择失败：{}", stderr.trim()))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前平台暂不支持原生文件夹选择。请手动输入工作区路径。".into())
+    }
+}
+
+#[tauri::command]
 async fn start_headroom_learn(
     app: AppHandle,
     agent: String,
@@ -5135,6 +5203,11 @@ pub fn run() {
             list_applied_patterns_for_projects,
             delete_applied_pattern,
             get_headroom_learn_status,
+            get_codex_bridge_status,
+            install_codex_bridge,
+            uninstall_codex_bridge,
+            run_codex_bridge_action,
+            pick_workspace_directory,
             get_headroom_learn_prereq_status,
             get_transformations_feed,
             start_headroom_learn,
@@ -5771,9 +5844,11 @@ fn stream_headroom_learn_output(
 /// Headroom 0.35.0 invokes the Codex analyzer as `codex exec` while the
 /// desktop deliberately runs Learn from its app-owned runtime directory.
 /// Current Codex releases reject that non-repository working directory unless
-/// `--skip-git-repo-check` is present. Keep the workaround in a tiny PATH
-/// wrapper so it affects only the Learn subprocess, never the user's normal
-/// Codex CLI or configuration.
+/// `--skip-git-repo-check` is present. Learn must also be isolated from the
+/// user's model effort, rules, plugins, and MCP servers: those can turn this
+/// one-shot analyzer into a five-minute timeout. Keep the workaround in a tiny
+/// PATH wrapper so it affects only the Learn subprocess, never the user's
+/// normal Codex CLI or configuration.
 fn write_codex_learn_wrapper(wrapper_dir: &Path) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(wrapper_dir)
         .map_err(|err| format!("Could not create Codex Learn wrapper directory: {err}"))?;
@@ -5784,7 +5859,7 @@ fn write_codex_learn_wrapper(wrapper_dir: &Path) -> Result<std::path::PathBuf, S
         "@echo off\r\n\
 if /I \"%~1\"==\"exec\" (\r\n\
   shift\r\n\
-  \"%HEADROOM_REAL_CODEX%\" exec --skip-git-repo-check %*\r\n\
+  \"%HEADROOM_REAL_CODEX%\" exec --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c \"model_reasoning_effort='low'\" %*\r\n\
 ) else (\r\n\
   \"%HEADROOM_REAL_CODEX%\" %*\r\n\
 )\r\n",
@@ -5796,7 +5871,7 @@ if /I \"%~1\"==\"exec\" (\r\n\
         "#!/bin/sh\n\
 if [ \"$1\" = \"exec\" ]; then\n\
   shift\n\
-  exec \"$HEADROOM_REAL_CODEX\" exec --skip-git-repo-check \"$@\"\n\
+  exec \"$HEADROOM_REAL_CODEX\" exec --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c \"model_reasoning_effort='low'\" \"$@\"\n\
 fi\n\
 exec \"$HEADROOM_REAL_CODEX\" \"$@\"\n",
     );
@@ -10331,7 +10406,7 @@ Some unrelated content.
 
     #[cfg(unix)]
     #[test]
-    fn codex_learn_wrapper_adds_skip_git_repo_check_only_to_exec() {
+    fn codex_learn_wrapper_isolates_exec_only() {
         let wrapper_dir = tempfile::tempdir().expect("wrapper tempdir");
         let wrapper = super::write_codex_learn_wrapper(wrapper_dir.path()).expect("wrapper");
 
@@ -10343,7 +10418,7 @@ Some unrelated content.
         assert!(exec_output.status.success());
         assert_eq!(
             String::from_utf8_lossy(&exec_output.stdout).trim(),
-            "exec --skip-git-repo-check --help"
+            "exec --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c model_reasoning_effort='low' --help"
         );
 
         let passthrough = crate::proc::command(&wrapper)
@@ -10352,10 +10427,7 @@ Some unrelated content.
             .output()
             .expect("run passthrough wrapper");
         assert!(passthrough.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&passthrough.stdout).trim(),
-            "login"
-        );
+        assert_eq!(String::from_utf8_lossy(&passthrough.stdout).trim(), "login");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::models::{
     ClientConnectorStatus, ClientHealth, ClientSetupResult, ClientSetupVerification, ClientStatus,
@@ -982,6 +983,20 @@ fn wait_for_codex_desktop_launch() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn restart_codex_desktop() -> Result<()> {
+    // Ask the application to quit through LaunchServices first. The `ps`
+    // process list can miss Codex during a quick relaunch or while its
+    // renderer is transitioning, in which case `open -b` would merely focus
+    // the existing process instead of restarting it.
+    let quit = crate::proc::command("osascript")
+        .args(["-e", "tell application id \"com.openai.codex\" to quit"])
+        .output()
+        .context("asking Codex Desktop to quit")?;
+    if !quit.status.success() {
+        let stderr = String::from_utf8_lossy(&quit.stderr);
+        if !stderr.contains("isn't running") && !stderr.contains("not running") {
+            log::debug!("Codex quit request returned non-zero: {}", stderr.trim());
+        }
+    }
     let processes = running_codex_desktop_processes()?;
 
     for process in &processes {
@@ -3248,11 +3263,15 @@ fn strip_namespaced_marker_block(content: &str, namespace: &str, block_id: &str)
     let end = format!("# <<< {namespace}:{block_id} <<<");
     let mut out = content.to_string();
     loop {
-        let (Some(start_idx), Some(end_idx)) = (out.find(&start), out.find(&end)) else {
+        let Some(start_idx) = out.find(&start) else {
+            return out.replace(&end, "");
+        };
+        let Some(end_idx) = out.find(&end) else {
             break;
         };
         if end_idx < start_idx {
-            break; // malformed (stray end before start) — leave it alone
+            out.replace_range(end_idx..end_idx + end.len(), "");
+            continue;
         }
         let tail = out[end_idx + end.len()..]
             .trim_start_matches('\n')
@@ -4330,13 +4349,206 @@ fn codex_provider_block_matches() -> Result<bool> {
 }
 
 fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
-    let start = format!("# >>> headroom-local-community:{block_id} >>>");
-    let end = format!("# <<< headroom-local-community:{block_id} <<<");
-    match (content.find(&start), content.find(&end)) {
-        (Some(start_idx), Some(end_idx)) if start_idx < end_idx => {
-            content[start_idx..end_idx].contains(needle)
+    // Accept the current community namespace and the pre-community marker
+    // emitted by older installed builds. Values are still checked by callers.
+    for namespace in ["headroom-local-community", "headroom"] {
+        let start = format!("# >>> {namespace}:{block_id} >>>");
+        let end = format!("# <<< {namespace}:{block_id} <<<");
+        let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) else {
+            continue;
+        };
+        if start_idx < end_idx && content[start_idx..end_idx].contains(needle) {
+            return true;
         }
-        _ => false,
+    }
+    false
+}
+
+/// Health of one Headroom-managed MCP registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedMcpRegistrationState {
+    Healthy,
+    Missing,
+    UserManaged,
+    Mismatch,
+}
+
+/// Read-only health result for the Codex registrations owned by Headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexMcpRegistrationHealth {
+    pub context7: ManagedMcpRegistrationState,
+    pub codebase_memory: ManagedMcpRegistrationState,
+}
+
+/// Check Codex's Headroom MCP registrations against the current expectations.
+///
+/// `config` must be parsed by the caller (normally the existing Codex config
+/// loading path). `owned_entries` must contain only names proven by
+/// `headroom_installed_matching` (including any accepted legacy ledger). A
+/// same-name entry absent from that set is therefore user-managed and is never
+/// treated as healthy, even if its command happens to match.
+fn codex_headroom_mcp_registration_health_for_config(
+    config: &toml::Value,
+    expected_context7_package: &str,
+    expected_codebase_memory_entrypoint: &Path,
+    expected_codebase_memory_cache_dir: &Path,
+    owned_entries: &BTreeSet<String>,
+) -> CodexMcpRegistrationHealth {
+    let context7 = managed_mcp_entry_state(
+        config,
+        "context7",
+        owned_entries.contains("context7"),
+        |entry| {
+            entry.get("command").and_then(toml::Value::as_str) == Some("npx")
+                && entry
+                    .get("args")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|args| {
+                        args.len() == 2
+                            && args[0].as_str() == Some("-y")
+                            && args[1].as_str() == Some(expected_context7_package)
+                    })
+        },
+    );
+    let codebase_memory = managed_mcp_entry_state(
+        config,
+        "codebase-memory",
+        owned_entries.contains("codebase-memory"),
+        |entry| {
+            entry.get("command").and_then(toml::Value::as_str)
+                == expected_codebase_memory_entrypoint.to_str()
+                && entry
+                    .get("env")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|env| env.get("CBM_CACHE_DIR"))
+                    .and_then(toml::Value::as_str)
+                    == expected_codebase_memory_cache_dir.to_str()
+        },
+    );
+
+    CodexMcpRegistrationHealth {
+        context7,
+        codebase_memory,
+    }
+}
+
+/// Read-only health check for Codex's Headroom-managed MCP registrations.
+/// Reads and parses the existing Codex config and both the Community and
+/// legacy Headroom ledgers; it never writes or changes user configuration.
+pub fn codex_headroom_mcp_registration_health(
+    expected_context7_package: &str,
+    expected_codebase_memory_entrypoint: &Path,
+    expected_codebase_memory_cache_dir: &Path,
+) -> Result<CodexMcpRegistrationHealth> {
+    let path = codex_config_toml_path();
+    if !path.exists() {
+        return Ok(CodexMcpRegistrationHealth {
+            context7: ManagedMcpRegistrationState::Missing,
+            codebase_memory: ManagedMcpRegistrationState::Missing,
+        });
+    }
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config = content
+        .parse::<toml::Value>()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let owned_entries = codex_ledger_owned_entries(&config);
+    Ok(codex_headroom_mcp_registration_health_for_config(
+        &config,
+        expected_context7_package,
+        expected_codebase_memory_entrypoint,
+        expected_codebase_memory_cache_dir,
+        &owned_entries,
+    ))
+}
+
+fn codex_ledger_owned_entries(config: &toml::Value) -> BTreeSet<String> {
+    let Some(servers) = config.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return BTreeSet::new();
+    };
+    let ledger_paths = [
+        crate::edition::workspace_dir().join("mcp_installs.json"),
+        home_dir().join(".headroom").join("mcp_installs.json"),
+    ];
+    servers
+        .iter()
+        .filter_map(|(name, entry)| {
+            let table = entry.as_table()?;
+            let fingerprint = mcp_entry_fingerprint(name, table)?;
+            ledger_paths
+                .iter()
+                .any(|path| ledger_contains_fingerprint(path, "codex", name, &fingerprint))
+                .then(|| name.clone())
+        })
+        .collect()
+}
+
+fn ledger_contains_fingerprint(path: &Path, agent: &str, name: &str, fingerprint: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    root.get("agents")
+        .and_then(|v| v.get(agent))
+        .and_then(|v| v.get(name))
+        .and_then(|v| v.get("fingerprint"))
+        .and_then(Value::as_str)
+        == Some(fingerprint)
+}
+
+fn mcp_entry_fingerprint(name: &str, entry: &toml::value::Table) -> Option<String> {
+    let command = entry.get("command")?.as_str()?;
+    let args = entry
+        .get("args")
+        .and_then(toml::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let env = entry
+        .get("env")
+        .and_then(toml::Value::as_table)
+        .map(|env| {
+            env.iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "args": args,
+        "command": command,
+        "env": env,
+        "name": name,
+    });
+    let raw = serde_json::to_vec(&payload).ok()?;
+    Some(format!("{:x}", Sha256::digest(raw)))
+}
+
+fn managed_mcp_entry_state(
+    config: &toml::Value,
+    name: &str,
+    owned: bool,
+    matches: impl FnOnce(&toml::value::Table) -> bool,
+) -> ManagedMcpRegistrationState {
+    let Some(entry) = config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|servers| servers.get(name))
+        .and_then(toml::Value::as_table)
+    else {
+        return ManagedMcpRegistrationState::Missing;
+    };
+    if !owned {
+        return ManagedMcpRegistrationState::UserManaged;
+    }
+    if matches(entry) {
+        ManagedMcpRegistrationState::Healthy
+    } else {
+        ManagedMcpRegistrationState::Mismatch
     }
 }
 
@@ -5413,7 +5625,6 @@ fn claude_settings_hook_matches(hook_fragment: &str) -> Result<bool> {
         })
         .unwrap_or(false))
 }
-
 
 /// Pure core for `detect_oss_remnants`: given the environment facts, produce the
 /// operator-facing warnings. Stale open-source-install remnants coexisting with
@@ -10284,6 +10495,55 @@ keep rtk\n\
     }
 
     #[test]
+    fn codex_provider_block_matches_legacy_headroom_markers() {
+        let home = TestHome::new();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            concat!(
+                "# >>> headroom:codex_cli >>>\n",
+                "model_provider = \"headroom_local_community\"\n",
+                "openai_base_url = \"http://127.0.0.1:6867/v1\"\n",
+                "# <<< headroom:codex_cli <<<\n\n",
+                "# >>> headroom:codex_cli_provider >>>\n",
+                "[model_providers.headroom_local_community]\n",
+                "base_url = \"http://127.0.0.1:6867/v1\"\n",
+                "supports_websockets = false\n",
+                "# <<< headroom:codex_cli_provider <<<\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(super::codex_provider_block_matches().unwrap());
+    }
+
+    #[test]
+    fn render_codex_config_drops_orphan_managed_end_markers() {
+        let malformed = "# <<< headroom-local-community:codex_cli <<<\n\
+                         # <<< headroom-local-community:codex_cli <<<\n\
+                         model = \"gpt-5.4\"\n";
+
+        let rendered = render_codex_config(malformed);
+
+        assert_eq!(
+            rendered
+                .matches("# <<< headroom-local-community:codex_cli <<<")
+                .count(),
+            1,
+            "orphan closing markers must be replaced by one managed block, got:\n{rendered}"
+        );
+        assert!(
+            rendered.parse::<toml::Value>().is_ok(),
+            "rendered config is valid toml, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model = \"gpt-5.4\""),
+            "user config is preserved, got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn render_codex_config_drops_an_unmarked_headroom_provider_table() {
         // Regression for Sentry RUST-6K: an OSS `pip install headroom` (or a
         // hand-added table from before marker blocks) leaves an UNMARKED
@@ -11489,6 +11749,93 @@ keep rtk\n\
                 .iter()
                 .any(|w| w.contains("~/.local/bin/headroom")),
             "absorbing the plugin hook must not hide a real OSS CLI"
+        );
+    }
+
+    #[test]
+    fn codex_mcp_health_requires_ledger_ownership_and_exact_values() {
+        let config: toml::Value = r#"
+        [mcp_servers.context7]
+        command = "npx"
+        args = ["-y", "@upstash/context7-mcp@4.0.4"]
+
+        [mcp_servers.codebase-memory]
+        command = "/managed/codebase-memory-mcp"
+
+        [mcp_servers.codebase-memory.env]
+        CBM_CACHE_DIR = "/managed/cache"
+    "#
+        .parse()
+        .unwrap();
+        let mut owned = BTreeSet::from(["context7".to_string(), "codebase-memory".to_string()]);
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &config,
+            "@upstash/context7-mcp@4.0.4",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &owned,
+        );
+        assert_eq!(health.context7, super::ManagedMcpRegistrationState::Healthy);
+        assert_eq!(
+            health.codebase_memory,
+            super::ManagedMcpRegistrationState::Healthy
+        );
+
+        owned.remove("context7");
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &config,
+            "@upstash/context7-mcp@4.0.4",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &owned,
+        );
+        assert_eq!(
+            health.context7,
+            super::ManagedMcpRegistrationState::UserManaged
+        );
+
+        owned.insert("context7".to_string());
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &config,
+            "@upstash/context7-mcp@4.0.5",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &owned,
+        );
+        assert_eq!(
+            health.context7,
+            super::ManagedMcpRegistrationState::Mismatch
+        );
+        assert_eq!(
+            health.codebase_memory,
+            super::ManagedMcpRegistrationState::Healthy
+        );
+    }
+
+    #[test]
+    fn codex_mcp_health_distinguishes_missing_and_mismatch() {
+        let config: toml::Value = r#"
+        [mcp_servers.context7]
+        command = "npx"
+        args = ["-y", "@upstash/context7-mcp@4.0.3"]
+    "#
+        .parse()
+        .unwrap();
+        let owned = BTreeSet::from(["context7".to_string(), "codebase-memory".to_string()]);
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &config,
+            "@upstash/context7-mcp@4.0.4",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &owned,
+        );
+        assert_eq!(
+            health.context7,
+            super::ManagedMcpRegistrationState::Mismatch
+        );
+        assert_eq!(
+            health.codebase_memory,
+            super::ManagedMcpRegistrationState::Missing
         );
     }
 }

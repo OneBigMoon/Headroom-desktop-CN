@@ -1,6 +1,6 @@
 [package]
 name = "headroom-local-community"
-version = "1.0.10"
+version = "1.0.11"
 description = "Unofficial local-only community desktop for open-source Headroom tooling"
 authors = ["Headroom Local Community contributors"]
 license = "MIT"
@@ -38,6 +38,7 @@ serde_json = "=1.0.149"
 sha2 = "=0.10.9"
 sys-locale = "0.3"
 tar = "0.4"
+tempfile = "3"
 tauri = { version = "=2.11.1", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-deep-link = "2"
@@ -51,7 +52,6 @@ uuid = { version = "=1.22.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 minisign-verify = "0.2.5"
-tempfile = "3"
 serial_test = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]

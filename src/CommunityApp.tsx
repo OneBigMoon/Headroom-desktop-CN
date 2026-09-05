@@ -17,7 +17,7 @@ import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
-import { activationScopeCopy, conflictHeadingCopy, conflictMatrixCopy, sourceLinkCopy, toolCategory, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy } from "./lib/workflowCatalog";
+import { conflictHeadingCopy, conflictMatrixCopy, getActivationScopeCopy, groupToolsByCategory, sourceLinkCopy, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy } from "./lib/workflowCatalog";
 import type {
   ActivityFeedResponse,
   ClaudeCodeProject,
@@ -271,6 +271,8 @@ export function CommunityApp() {
   const [logsError, setLogsError] = useState<string | null>(null);
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const busyActionRef = useRef<string | null>(null);
+  const learnResourcesRequestRef = useRef(0);
+  const learnRunKeyRef = useRef<string | null>(null);
 
   const refresh = useCallback(async (showLoading = false) => {
     if (showLoading) setLoading(true);
@@ -325,6 +327,7 @@ export function CommunityApp() {
   }, [t]);
 
   const refreshLearnResources = useCallback(async () => {
+    const requestId = ++learnResourcesRequestRef.current;
     setLearnResourcesLoading(true);
     const [projectsResult, prereqResult, autoLearnResult] = await Promise.allSettled([
       invoke<ClaudeCodeProject[]>("get_claude_code_projects"),
@@ -334,48 +337,61 @@ export function CommunityApp() {
 
     const errors: string[] = [];
     if (projectsResult.status === "fulfilled") {
-      const projects = projectsResult.value;
-      setClaudeProjects(projects);
-      setSelectedClaudeProjectPath((current) => (
-        current && projects.some((project) => project.projectPath === current)
-          ? current
-          : projects[0]?.projectPath ?? null
-      ));
+      if (requestId === learnResourcesRequestRef.current) {
+        const projects = projectsResult.value;
+        setClaudeProjects(projects);
+        setSelectedClaudeProjectPath((current) => (
+          current && projects.some((project) => project.projectPath === current)
+            ? current
+            : projects[0]?.projectPath ?? null
+        ));
+      }
     } else {
       errors.push(describeError(projectsResult.reason, t));
     }
     if (prereqResult.status === "fulfilled") {
-      const prereq = prereqResult.value;
-      setLearnPrereq(prereq);
-      const hasClaudeProjects = projectsResult.status === "fulfilled" && projectsResult.value.length > 0;
-      if (prereq.codexCliAvailable && prereq.codexLoggedIn
-        && (!prereq.claudeCliAvailable || !hasClaudeProjects)) {
-        setLearnAgent((current) => current === "claude" ? "codex" : current);
+      if (requestId === learnResourcesRequestRef.current) {
+        const prereq = prereqResult.value;
+        setLearnPrereq(prereq);
+        const hasClaudeProjects = projectsResult.status === "fulfilled" && projectsResult.value.length > 0;
+        if (prereq.codexCliAvailable && prereq.codexLoggedIn
+          && (!prereq.claudeCliAvailable || !hasClaudeProjects)) {
+          setLearnAgent((current) => current === "claude" ? "codex" : current);
+        }
       }
     } else {
       errors.push(describeError(prereqResult.reason, t));
     }
     if (autoLearnResult.status === "fulfilled") {
-      setAutoLearnEnabled(autoLearnResult.value);
+      if (requestId === learnResourcesRequestRef.current) setAutoLearnEnabled(autoLearnResult.value);
     } else {
       errors.push(describeError(autoLearnResult.reason, t));
     }
-    setLearnError(errors[0] ?? null);
-    setLearnResourcesLoading(false);
+    if (requestId === learnResourcesRequestRef.current) {
+      setLearnError(errors[0] ?? null);
+      setLearnResourcesLoading(false);
+    }
   }, [t]);
 
   const learnRunKey = learnAgent === "claude" ? selectedClaudeProjectPath : learnAgent;
+  learnRunKeyRef.current = learnRunKey;
+  useEffect(() => {
+    learnResourcesRequestRef.current += 1;
+  }, [learnRunKey]);
 
   const refreshLearnStatus = useCallback(async () => {
     if (!learnRunKey) {
       setLearnStatus(null);
       return;
     }
+    const requestedRunKey = learnRunKey;
     try {
       const next = await invoke<HeadroomLearnStatus>("get_headroom_learn_status", { projectPath: learnRunKey });
+      if (learnRunKeyRef.current !== requestedRunKey) return;
       setLearnStatus(next);
       setLearnError(null);
     } catch (error) {
+      if (learnRunKeyRef.current !== requestedRunKey) return;
       setLearnError(describeError(error, t));
     }
   }, [learnRunKey, t]);
@@ -415,6 +431,15 @@ export function CommunityApp() {
     return () => window.clearInterval(interval);
   }, [activeView, learnStatus?.running, refreshLearnStatus]);
 
+  // A completed Learn run updates the project's persisted metadata (including
+  // `lastLearnRanAt` and the pattern count). Refresh that snapshot before the
+  // applied-patterns panel decides whether this is still an unscanned project;
+  // otherwise the first successful run remains stuck on "not scanned yet".
+  useEffect(() => {
+    if (activeView !== "optimize" || !learnStatus?.finishedAt) return;
+    void refreshLearnResources();
+  }, [activeView, learnStatus?.finishedAt, refreshLearnResources]);
+
   useEffect(() => {
     if (activeView !== "diagnostics") return;
     void refreshLogs();
@@ -452,11 +477,16 @@ export function CommunityApp() {
         await afterSuccess?.(result);
         const message = successMessage?.(result);
         if (message) setNotice(message);
-        await refresh();
-        return result;
-      } catch (error) {
-        setActionError(describeError(error, t));
-        return undefined;
+      await refresh();
+      return result;
+    } catch (error) {
+      // A command may mutate part of the installation before reporting an
+      // error (for example, a post-install verification can fail). Re-read
+      // the authoritative state so the controls never keep their pre-action
+      // labels after a partial success.
+      await refresh();
+      setActionError(describeError(error, t));
+      return undefined;
       } finally {
         busyActionRef.current = null;
         setBusyAction(null);
@@ -611,13 +641,21 @@ export function CommunityApp() {
   const currentProxy = proxyStatus(runtime, t);
   const controlsDisabled = busyAction !== null;
   const tools = dashboard?.tools ?? [];
-  const groupedTools = useMemo(() => {
-    const groups = new Map(TOOL_CATEGORY_ORDER.map((category) => [category, [] as ManagedTool[]]));
-    for (const tool of tools) groups.get(toolCategory(tool.category))?.push(tool);
-    return groups;
-  }, [tools]);
+  const groupedTools = useMemo(() => groupToolsByCategory(tools), [tools]);
   const activeNavigationItem = navigationItems.find((item) => item.id === activeView);
   const selectedLearnAgent = learnAgents.find((item) => item.id === learnAgent) ?? learnAgents[0];
+  const learnTargetPath = learnAgent === "claude" ? selectedClaudeProjectPath : learnAgent;
+  const learnStatusMatchesTarget = Boolean(
+    learnStatus && learnTargetPath && learnStatus.projectPath === learnTargetPath,
+  );
+  // A completed run is authoritative for the currently selected target even
+  // before the project-list cache catches up. This matters for Codex, which
+  // has no Claude project row (and therefore no `lastLearnRanAt` field).
+  const completedLearnForTarget = Boolean(
+    learnStatusMatchesTarget
+      && learnStatus?.success === true
+      && (learnStatus.finishedAt || learnStatus.lastRunAt),
+  );
   const savingsTrend = useMemo(() => {
     if (!dashboard) return { points: [], periodKey: "overview.trendDays" as TranslationKey };
     if (dashboard.dailySavings.length) {
@@ -871,10 +909,15 @@ export function CommunityApp() {
             const categoryTools = groupedTools.get(category) ?? [];
             if (!categoryTools.length) return null;
             const categoryCopy = toolCategoryCopy[category];
-            return <section className="community-tool-group" key={category} aria-labelledby={`tool-group-${category}`}>
+            const workflowGroup = categoryTools.find((tool) => tool.workflowGroup)?.workflowGroup;
+            const singleSelectLabel = workflowGroup
+              ? workflowGroupCopy[workflowGroup]?.[resolvedLocale]
+              : null;
+ return <section className={`community-tool-group community-tool-group--${category}`} key={category} aria-labelledby={`tool-group-${category}`}>
               <div className="community-tool-group__heading">
                 <h3 id={`tool-group-${category}`}>{categoryCopy.title[resolvedLocale]}</h3>
                 <p>{categoryCopy.description[resolvedLocale]}</p>
+                {singleSelectLabel ? <span className="tool-group__rule">{singleSelectLabel}</span> : null}
               </div>
               <div className="community-tool-grid" aria-label={categoryCopy.title[resolvedLocale]}>
             {categoryTools.map((tool) => {
@@ -907,7 +950,9 @@ export function CommunityApp() {
                     </div>
                     <h3>{tool.name}</h3>
               <p>{tool.unavailableReason ?? toolCopy[tool.id]?.[resolvedLocale] ?? description}</p>
-              {tool.activationScope === "new_session" ? <p className="community-tool__activation-note">{activationScopeCopy[resolvedLocale]}</p> : null}
+                      <p className="community-tool__activation-note">
+                        {getActivationScopeCopy(tool.activationScope)[resolvedLocale]}
+                      </p>
                     {supportedModes.length ? (
                       <fieldset className="community-tool__modes">
                         <legend>{t("tools.defaultMode.title")}</legend>
@@ -1137,9 +1182,24 @@ export function CommunityApp() {
                   <p>{t("learn.appliedDescription")}</p>
                 </div>
                 <OptimizePanel
-                  neverScanned={!selectedClaudeProject.lastLearnRanAt}
+                  neverScanned={!selectedClaudeProject.lastLearnRanAt && !completedLearnForTarget}
                   projectPath={selectedClaudeProject.projectPath}
                   refreshSignal={learnStatus?.finishedAt ? Date.parse(learnStatus.finishedAt) : 0}
+                />
+              </section>
+            ) : null}
+            {learnAgent === "codex" ? (
+              <section className="community-learn-applied">
+                <div>
+                  <span className="community-kicker">{t("learn.appliedKicker")}</span>
+                  <h3>{t("learn.appliedHeading")}</h3>
+                  <p>{t("learn.appliedDescription")}</p>
+                </div>
+                <OptimizePanel
+                  neverScanned={!(learnStatus?.lastRunAt && learnStatusMatchesTarget) && !completedLearnForTarget}
+                  projectPath="codex"
+                  refreshSignal={learnStatus?.finishedAt ? Date.parse(learnStatus.finishedAt) : 0}
+                  source="codex"
                 />
               </section>
             ) : null}

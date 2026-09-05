@@ -3,7 +3,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 
 use parking_lot::Mutex;
 use std::thread;
@@ -1081,14 +1084,31 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.46.0";
+const RTK_VERSION: &str = "0.47.0";
+static RTK_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static RTK_INSTALL_NONCE: AtomicU64 = AtomicU64::new(0);
+static PACKAGE_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
 const CONTEXT7_PINNED_VERSION: &str = "4.0.4";
+
+pub(crate) fn stable_package_version(version: &str) -> Result<&str> {
+    if version.len() >= 5
+        && version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        Ok(version)
+    } else {
+        bail!("invalid package version {version:?}; expected stable x.y.z")
+    }
+}
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const CODEBASE_MEMORY_VERSION: &str = "0.10.8";
+static CODEBASE_MEMORY_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
     "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
@@ -1209,6 +1229,7 @@ fn legacy_headroom_mcp_ledger_path() -> PathBuf {
 /// | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
 import sys
+from pathlib import Path
 
 from headroom.mcp_registry import (
     ClaudeRegistrar,
@@ -1225,7 +1246,16 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
+legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 failures = []
+
+def headroom_owns(registrar, current):
+    if headroom_installed_matching(registrar.name, current):
+        return True
+    return legacy_ledger is not None and headroom_installed_matching(
+        registrar.name, current, path=legacy_ledger
+    )
+
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
@@ -1237,12 +1267,14 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             args=("-y", sys.argv[2]),
         )
         result = registrar.register_server(spec)
-        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
-            registrar.name, registrar.get_server("context7")
-        ):
-            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.MISMATCH:
+            current = registrar.get_server("context7")
+            if headroom_owns(registrar, current):
+                result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
+        elif result.status == RegisterStatus.MISMATCH:
+            failures.append(f"{registrar.name}: context7 entry conflicts with user-managed configuration")
         elif result.status == RegisterStatus.FAILED:
             failures.append(f"{registrar.name}: {result.detail}")
         print(f"{registrar.name}: {result.status.value}")
@@ -1251,7 +1283,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if current is None:
             print(f"{registrar.name}: no context7 entry")
             continue
-        if not headroom_installed_matching(registrar.name, current):
+        if not headroom_owns(registrar, current):
             print(f"{registrar.name}: context7 entry is user-managed, leaving it")
             continue
         if registrar.unregister_server("context7"):
@@ -1268,6 +1300,7 @@ if failures:
 /// argv: `register <binary> <cache-dir>` | `unregister`.
 const CODEBASE_MEMORY_MCP_HELPER: &str = r#"
 import sys
+from pathlib import Path
 
 from headroom.mcp_registry import (
     ClaudeRegistrar,
@@ -1284,7 +1317,16 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
+legacy_ledger = Path(sys.argv[4]) if len(sys.argv) > 4 else None
 failures = []
+
+def headroom_owns(registrar, current):
+    if headroom_installed_matching(registrar.name, current):
+        return True
+    return legacy_ledger is not None and headroom_installed_matching(
+        registrar.name, current, path=legacy_ledger
+    )
+
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
@@ -1296,12 +1338,14 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             env={"CBM_CACHE_DIR": sys.argv[3]},
         )
         result = registrar.register_server(spec)
-        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
-            registrar.name, registrar.get_server("codebase-memory")
-        ):
-            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.MISMATCH:
+            current = registrar.get_server("codebase-memory")
+            if headroom_owns(registrar, current):
+                result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
+        elif result.status == RegisterStatus.MISMATCH:
+            failures.append(f"{registrar.name}: codebase-memory entry conflicts with user-managed configuration")
         elif result.status == RegisterStatus.FAILED:
             failures.append(f"{registrar.name}: {result.detail}")
         print(f"{registrar.name}: {result.status.value}")
@@ -1310,7 +1354,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if current is None:
             print(f"{registrar.name}: no codebase-memory entry")
             continue
-        if not headroom_installed_matching(registrar.name, current):
+        if not headroom_owns(registrar, current):
             print(f"{registrar.name}: codebase-memory entry is user-managed, leaving it")
             continue
         if registrar.unregister_server("codebase-memory"):
@@ -1698,10 +1742,10 @@ pub(crate) fn is_plugin_addon(id: &str) -> bool {
 fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Option<String> {
     let installed = installed?;
     match id {
-        // Plugins track a moving marketplace, not a pin, so there is no local
-        // signal for "newer exists" — the Update action is the check. It always
-        // shows for an installed plugin, and the button says just "Update".
-        _ if plugin_addon(id).is_some() => Some(String::new()),
+        // Plugins track a moving marketplace, not a pin, so local state cannot
+        // prove that a newer version exists. The upstream check adds Update only
+        // after it confirms a newer marketplace version.
+        _ if plugin_addon(id).is_some() => None,
         "headroom" | "rtk" | "markitdown" | "serena" | "context7" | "codebase-memory" => {
             let on_disk = parse_major_minor_patch(installed)?;
             let target = parse_major_minor_patch(pinned)?;
@@ -1711,15 +1755,15 @@ fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Opti
     }
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "484e5dd2b4bfdbbb910727a0ba1e2d63b2e23efa922cfcc7300fd131bca3e10a";
+    "3617f9a95d536e0b6bb9e2c6d121d81c3d8fd8ef04c5b2a605f5e7b0309a47d2";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "67eb651fa9cfc4a4ea65876242eb71b8837abdac40521d0dd363214ec1a068dd";
+    "4a6d9268a3dbf3e9d82872a4a3ac444548de613debe16a1458fc2862d1d941b6";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "e8c2e1787f46017ea7c5a711b2bc6a7f7cf61c7ad69385b4c1e4daff1135dcd1";
+    "960ceb5f1f5f0b0939b32b5b1d41dec6d9a7113137b0703c68dca0d169a260fc";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "79aa5b89c69566bbfeceb66c8a27cfbe52237fc7ee3e683115f43745a3262d21";
+    "7c0175d867f96c4f8f788479af82ca8f0990ea944226268834d224a525186fb7";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "9bc5acd54d35a916e4a561435963e0acf2f1a0115cf43dcfe2b719f361c8a970";
+    "26401cf663797bfcfd0d7fbf3acfa5d81a6fb384e8cac188506d69c330d37596";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -2209,7 +2253,7 @@ impl ToolManager {
                 runtime: "python".into(),
                 category: "code_intelligence".into(),
                 workflow_group: None,
-                activation_scope: "immediate".into(),
+                activation_scope: "client_restart".into(),
                 source_url: "https://github.com/oraios/serena".into(),
                 version: SERENA_PINNED_VERSION.into(),
                 checksum: None,
@@ -2224,7 +2268,7 @@ impl ToolManager {
                 runtime: "binary".into(),
                 category: "code_intelligence".into(),
                 workflow_group: None,
-                activation_scope: "immediate".into(),
+                activation_scope: "client_restart".into(),
                 source_url: "https://github.com/DeusData/codebase-memory-mcp".into(),
                 version: CODEBASE_MEMORY_VERSION.into(),
                 checksum: None,
@@ -2239,7 +2283,7 @@ impl ToolManager {
                 runtime: "node".into(),
                 category: "code_intelligence".into(),
                 workflow_group: None,
-                activation_scope: "immediate".into(),
+                activation_scope: "client_restart".into(),
                 source_url: "https://github.com/upstash/context7".into(),
                 version: CONTEXT7_PINNED_VERSION.into(),
                 checksum: None,
@@ -2443,7 +2487,12 @@ impl ToolManager {
             return self.installed_headroom_version();
         }
         if let Some(plugin) = plugin_addon(tool_id) {
-            return installed_plugin_version(plugin);
+            return installed_plugin_version(plugin).or_else(|| {
+                self.read_tool_receipt(tool_id)?
+                    .get("version")?
+                    .as_str()
+                    .map(str::to_string)
+            });
         }
         if !self.addon_installed(tool_id) {
             return None;
@@ -2648,28 +2697,31 @@ impl ToolManager {
     fn allinluna_runtime_path(&self) -> Option<PathBuf> {
         let home = crate::client_adapters::home_dir();
         [
-            home.join(".codex/.tmp/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py"),
-            home.join(".claude/plugins/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py"),
+            home.join(".codex/.tmp/marketplaces/allinluna/plugins/allinluna/runtime"),
+            home.join(".claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime"),
         ]
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| path.join("allinluna_runtime/__main__.py").is_file())
     }
 
     fn ensure_allinluna_launcher(&self) -> Result<()> {
         let launcher = self.allinluna_entrypoint();
         let managed_python = self.runtime.managed_python();
+
         #[cfg(windows)]
-        let body = format!(
-        "@echo off\r\nset \"PLUGIN_RUNTIME=%USERPROFILE%\\.codex\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\allinluna_runtime.py\"\r\nif not exist \"%PLUGIN_RUNTIME%\" (\r\n  echo All in Luna requires the installed marketplace runtime and Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n  exit /b 1\r\n)\r\n\"{}\" \"%PLUGIN_RUNTIME%\" %*\r\n",
-            managed_python.display()
-        );
+    let body = format!(
+        "@echo off\r\nset \"PLUGIN_RUNTIME=%USERPROFILE%\\.codex\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" (\r\n echo All in Luna requires installed marketplace runtime Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n exit /b 1\r\n)\r\nif defined PYTHONPATH (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%;%PYTHONPATH%\"\r\n) else (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%\"\r\n)\r\nset \"PYTHONNOUSERSITE=1\"\r\n\"{}\" -m allinluna_runtime %*\r\n",
+        managed_python.display()
+    );
         #[cfg(not(windows))]
-        let body = format!(
-            "#!/bin/sh\nset -eu\nfor plugin_runtime in \\\n  \"$HOME/.codex/.tmp/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py\" \\\n  \"$HOME/.claude/plugins/marketplaces/allinluna/plugins/allinluna/allinluna_runtime.py\"; do\n  if [ -f \"$plugin_runtime\" ]; then\n    exec '{}' \"$plugin_runtime\" \"$@\"\n  fi\ndone\necho 'All in Luna requires the installed marketplace runtime and Headroom-managed Python >= 3.11.' >&2\nexit 1\n",
-            managed_python.display().to_string().replace('\'', "'\\''")
-        );
+    let body = format!(
+        "#!/bin/sh\nset -eu\nfor plugin_runtime in \\\n \"$HOME/.codex/.tmp/marketplaces/allinluna/plugins/allinluna/runtime\" \\\n \"$HOME/.claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime\"; do\n if [ -f \"$plugin_runtime/allinluna_runtime/__main__.py\" ]; then\n  PYTHONPATH=\"$plugin_runtime${{PYTHONPATH:+:$PYTHONPATH}}\"\n  export PYTHONPATH\n  export PYTHONNOUSERSITE=1\n  exec '{}' -m allinluna_runtime \"$@\"\n fi\ndone\necho 'All in Luna requires installed marketplace runtime Headroom-managed Python >= 3.11.' >&2\nexit 1\n",
+        managed_python.display().to_string().replace('\'', "'\\''")
+    );
+
         crate::client_adapters::atomic_write(&launcher, body.as_bytes())
             .with_context(|| format!("writing {}", launcher.display()))?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2680,6 +2732,7 @@ impl ToolManager {
             std::fs::set_permissions(&launcher, permissions)
                 .with_context(|| format!("marking {} executable", launcher.display()))?;
         }
+
         Ok(())
     }
 
@@ -2689,6 +2742,7 @@ impl ToolManager {
             std::fs::remove_file(&launcher)
                 .with_context(|| format!("removing {}", launcher.display()))?;
         }
+
         Ok(())
     }
 
@@ -2699,14 +2753,17 @@ impl ToolManager {
     }
 
     fn codex_plugin_source_path(&self, plugin: &PluginAddon) -> PathBuf {
+        self.marketplace_package_root(plugin)
+            .join(plugin.codex_local_path.trim_start_matches("./"))
+    }
+
+    fn marketplace_package_root(&self, plugin: &PluginAddon) -> PathBuf {
         crate::client_adapters::home_dir()
             .join(".codex")
             .join(".tmp")
             .join("marketplaces")
             .join(plugin.marketplace_name)
-            .join(plugin.codex_local_path.trim_start_matches("./"))
     }
-
     fn openspec_entrypoint(&self) -> PathBuf {
         self.runtime.bin_dir.join(if cfg!(target_os = "windows") {
             "openspec.cmd"
@@ -2724,7 +2781,9 @@ impl ToolManager {
     }
 
     fn ensure_openspec_launcher(&self, plugin: &PluginAddon) -> Result<()> {
-        let runtime = self.codex_plugin_source_path(plugin).join("bin/openspec.js");
+        let runtime = self
+            .marketplace_package_root(plugin)
+            .join("bin/openspec.js");
         if !runtime.is_file() {
             bail!("OpenSpec runtime was not built at {}", runtime.display());
         }
@@ -2749,7 +2808,7 @@ impl ToolManager {
     }
 
     fn ensure_ralph_launcher(&self, plugin: &PluginAddon) -> Result<()> {
-        let source_root = self.codex_plugin_source_path(plugin);
+        let source_root = self.marketplace_package_root(plugin);
         let source = if cfg!(target_os = "windows") {
             source_root.join("ralph-loop.ps1")
         } else {
@@ -2802,22 +2861,24 @@ impl ToolManager {
     }
 
     fn plugin_runtime_healthy(&self, plugin: &PluginAddon) -> bool {
-        let root = self.codex_plugin_source_path(plugin);
+        let package_root = self.marketplace_package_root(plugin);
+        let source_root = self.codex_plugin_source_path(plugin);
         match plugin.id {
             "allinluna" => self.allinluna_launcher_healthy(),
             "openspec" => {
-                self.openspec_entrypoint().is_file() && root.join("dist/cli/index.js").is_file()
+                self.openspec_entrypoint().is_file()
+                    && package_root.join("dist/cli/index.js").is_file()
             }
             "gstack" => {
                 let browse = if cfg!(target_os = "windows") {
-                    root.join("browse/dist/browse.exe")
+                    package_root.join("browse/dist/browse.exe")
                 } else {
-                    root.join("browse/dist/browse")
+                    package_root.join("browse/dist/browse")
                 };
-                browse.is_file() && root.join(".agents/skills").is_dir()
+                browse.is_file() && source_root.join(".agents/skills").is_dir()
             }
             "ralph-loop" => {
-                self.ralph_entrypoint().is_file() && root.join("ralph-loop.sh").is_file()
+                self.ralph_entrypoint().is_file() && package_root.join("ralph-loop.sh").is_file()
             }
             _ => true,
         }
@@ -2921,12 +2982,9 @@ impl ToolManager {
             .ok()?
             .filter_map(Result::ok)
             .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| {
-                        name.starts_with("headroom-learn-") && name.ends_with(".log")
-                    })
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("headroom-learn-") && name.ends_with(".log")
+                })
             })
             .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
             .max_by_key(|(modified, _)| *modified)
@@ -4032,8 +4090,19 @@ impl ToolManager {
     }
 
     pub fn rtk_needs_install(&self) -> bool {
-        !self.rtk_entrypoint().exists()
-            || self.installed_rtk_version().as_deref() != Some(RTK_VERSION)
+        if !self.rtk_entrypoint().exists() {
+            return true;
+        }
+        match self.installed_rtk_version().as_deref() {
+            Some(version) => match (
+                parse_major_minor_patch(version),
+                parse_major_minor_patch(RTK_VERSION),
+            ) {
+                (Some(current), Some(pin)) => current < pin,
+                _ => true,
+            },
+            None => true,
+        }
     }
 
     /// Refresh an *already installed* rtk to the pinned version. Never creates a
@@ -4041,6 +4110,11 @@ impl ToolManager {
     /// installed it (or uninstalled it) and launch must leave it absent.
     /// Returns Ok(true) if work was done, Ok(false) if already current or absent.
     pub fn ensure_rtk_current(&self) -> Result<bool> {
+        let pending = self.runtime.downloads_dir.join("rtk-install.pending");
+        if pending.exists() {
+            self.install_rtk()?;
+            return Ok(true);
+        }
         if !self.rtk_entrypoint().exists() {
             return Ok(false);
         }
@@ -4083,13 +4157,40 @@ impl ToolManager {
             })
     }
 
-    /// Returns the pinned release if the installed version differs from the pin.
+    /// Returns the bundled release only when the installed version is below the pin.
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
-        let installed = self.installed_headroom_version()?;
-        if installed == HEADROOM_PINNED_VERSION {
+        let installed = parse_major_minor_patch(&self.installed_headroom_version()?)?;
+        let pinned = parse_major_minor_patch(HEADROOM_PINNED_VERSION)?;
+        (installed < pinned)
+            .then(|| pinned_headroom_release().ok())
+            .flatten()
+    }
+
+    pub fn check_headroom_upgrade_for_version(
+        &self,
+        target_version: &str,
+    ) -> Option<HeadroomRelease> {
+        if !self.headroom_upgrade_target_is_newer(target_version) {
             return None;
         }
-        Some(pinned_headroom_release().ok()?)
+        if target_version == HEADROOM_PINNED_VERSION {
+            Some(pinned_headroom_release().ok()?)
+        } else {
+            Some(fetch_headroom_release(target_version).ok()?)
+        }
+    }
+
+    pub fn headroom_upgrade_target_is_newer(&self, target_version: &str) -> bool {
+        let Some(installed) = self.installed_headroom_version() else {
+            return false;
+        };
+        match (
+            parse_major_minor_patch(&installed),
+            parse_major_minor_patch(target_version),
+        ) {
+            (Some(current), Some(target)) => target > current,
+            _ => false,
+        }
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -4934,6 +5035,16 @@ impl ToolManager {
     pub fn smoke_test_plugin(&self, id: &str) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let Some(receipt) = self.read_tool_receipt(plugin.id) else {
+            let registered = plugin.hosts.iter().any(|host| host.plugin_present(plugin));
+            let runtime_residue = match plugin.id {
+                "allinluna" => self.allinluna_runtime_path().is_some(),
+                "openspec" => self.openspec_entrypoint().exists(),
+                "ralph-loop" => self.ralph_entrypoint().exists(),
+                _ => false,
+            };
+            if registered || runtime_residue {
+                bail!("{id} partial/orphan install: host registration or managed runtime exists without receipt");
+            }
             return Ok(());
         };
         let enabled = receipt
@@ -4943,10 +5054,7 @@ impl ToolManager {
         if !enabled {
             return Ok(());
         }
-        if !plugin.hosts
-            .iter()
-            .any(|host| host.plugin_present(plugin))
-        {
+        if !plugin.hosts.iter().any(|host| host.plugin_present(plugin)) {
             // The plugin was removed behind our back (host-native `/plugin`
             // uninstall or a host registry migration). Drop the stale receipt
             // so this warns once instead of on every future upgrade;
@@ -4962,6 +5070,9 @@ impl ToolManager {
                     " (stale receipt could not be removed)"
                 }
             );
+        }
+        if !self.plugin_runtime_healthy(plugin) && plugin.id == "allinluna" {
+            self.ensure_plugin_runtime(plugin)?;
         }
         if !self.plugin_runtime_healthy(plugin) {
             bail!("{id} is registered but its managed runtime is incomplete");
@@ -6272,8 +6383,61 @@ impl ToolManager {
         Ok(McpInstallMethod::FallbackJson)
     }
 
-    pub fn install_rtk(&self) -> Result<()> {
-        let artifact = rtk_distribution_artifact()?;
+    fn recover_rtk_pending(&self) -> Result<()> {
+        let marker = self.runtime.downloads_dir.join("rtk-install.pending");
+        if !marker.exists() {
+            return Ok(());
+        }
+        let pending: Value = serde_json::from_slice(
+            &std::fs::read(&marker).with_context(|| format!("reading {}", marker.display()))?,
+        )
+        .with_context(|| format!("parsing {}", marker.display()))?;
+        let destination = pending
+            .get("destination")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.rtk_entrypoint());
+        let staged = pending
+            .get("staged")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let backup = pending
+            .get("backup")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let receipt = self.runtime.tools_dir.join("rtk.json");
+        let receipt_backup = self.runtime.tools_dir.join("rtk.json.backup");
+
+        // Restore the old binary/receipt when a commit had already moved them
+        // aside. If no backup exists, the marker may have been written before
+        // the first rename; leave the live installation untouched.
+        if let Some(backup) = backup.filter(|p| p.exists()) {
+            if destination.exists() {
+                std::fs::remove_file(&destination)
+                    .with_context(|| format!("removing incomplete {}", destination.display()))?;
+            }
+            std::fs::rename(&backup, &destination)
+                .with_context(|| format!("restoring {}", destination.display()))?;
+        }
+        if receipt_backup.exists() {
+            if receipt.exists() {
+                std::fs::remove_file(&receipt)
+                    .with_context(|| format!("removing incomplete {}", receipt.display()))?;
+            }
+            std::fs::rename(&receipt_backup, &receipt)
+                .with_context(|| format!("restoring {}", receipt.display()))?;
+        }
+        if let Some(staged) = staged.filter(|p| p.exists()) {
+            let _ = std::fs::remove_file(staged);
+        }
+        std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
+        Ok(())
+    }
+
+    fn install_rtk_release(&self, version: &str, url: &str, sha256: &str) -> Result<()> {
+        let _lock = RTK_INSTALL_LOCK.get_or_init(|| Mutex::new(())).lock();
+        self.recover_rtk_pending()?;
+        let nonce = RTK_INSTALL_NONCE.fetch_add(1, Ordering::Relaxed);
         let extension = if cfg!(target_os = "windows") {
             "zip"
         } else {
@@ -6281,12 +6445,12 @@ impl ToolManager {
         };
         let archive_path = self.runtime.downloads_dir.join(format!(
             "rtk-v{}-{}-{}.{}",
-            RTK_VERSION,
+            version,
             std::env::consts::OS,
             std::env::consts::ARCH,
             extension
         ));
-        download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
+        download_to_path(url, &archive_path, Some(sha256))?;
 
         let extract_dir = self.runtime.downloads_dir.join("rtk-extract");
         if extract_dir.exists() {
@@ -6338,7 +6502,7 @@ impl ToolManager {
         let destination = self.rtk_entrypoint();
         let staged = {
             let mut s = destination.as_os_str().to_os_string();
-            s.push(".new");
+            s.push(format!(".new.{}.{}", std::process::id(), nonce));
             PathBuf::from(s)
         };
         std::fs::copy(&extracted_binary, &staged)
@@ -6365,11 +6529,62 @@ impl ToolManager {
             Duration::from_secs(15),
         )
         .context("RTK update failed its smoke test")?;
+        let smoke = Command::new(&staged)
+            .arg("--version")
+            .current_dir(&self.runtime.root_dir)
+            .output()
+            .context("reading RTK staged version")?;
+        let reported = String::from_utf8_lossy(&smoke.stdout);
+        if !rtk_version_output_matches(&reported, version) {
+            bail!("RTK staged binary reported {reported:?}, expected {version}");
+        }
 
-        std::fs::rename(&staged, &destination)
-            .with_context(|| format!("renaming {} into place", staged.display()))?;
+        let backup = {
+            let mut path = destination.as_os_str().to_os_string();
+            path.push(format!(".old.{}.{}", std::process::id(), nonce));
+            PathBuf::from(path)
+        };
+        let receipt = self.runtime.tools_dir.join("rtk.json");
+        let receipt_backup = self.runtime.tools_dir.join("rtk.json.backup");
+        if receipt_backup.exists() {
+            bail!(
+                "stale RTK receipt backup exists without a pending marker; refusing to overwrite recovery data"
+            );
+        }
+        let pending = self.runtime.downloads_dir.join("rtk-install.pending");
+        let pending_bytes = serde_json::to_vec(&json!({
+            "version": version,
+            "staged": staged,
+            "destination": destination,
+            "backup": backup,
+            "hadReceipt": receipt.exists(),
+        }))?;
+        crate::client_adapters::atomic_write(&pending, &pending_bytes)
+            .context("marking RTK install pending")?;
+        if receipt.exists() {
+            std::fs::rename(&receipt, &receipt_backup)
+                .with_context(|| format!("backing up {}", receipt.display()))?;
+        }
+        if destination.exists() {
+            std::fs::rename(&destination, &backup)
+                .with_context(|| format!("backing up {}", destination.display()))?;
+        }
+        if let Err(replace_err) = std::fs::rename(&staged, &destination) {
+            let restore = if backup.exists() {
+                std::fs::rename(&backup, &destination).err()
+            } else {
+                None
+            };
+            return match restore {
+                Some(restore_err) => Err(anyhow!(
+                    "RTK replacement failed: {replace_err}; restoring previous binary failed: {restore_err}; backup retained at {}",
+                    backup.display()
+                )),
+                None => Err(anyhow!("RTK replacement failed: {replace_err}")),
+            };
+        }
 
-        self.write_tool_receipt(
+        let receipt_result = self.write_tool_receipt(
             "rtk",
             json!({
                 "status": "healthy",
@@ -6378,13 +6593,61 @@ impl ToolManager {
                 "runtime": "binary",
                 "entrypoint": destination,
                 "source": "https://github.com/rtk-ai/rtk",
-                "version": RTK_VERSION,
+                "version": version,
                 "artifact": {
-                    "url": artifact.url,
-                    "sha256": artifact.sha256
+                    "url": url,
+                    "sha256": sha256
                 }
             }),
+        );
+        if let Err(err) = receipt_result {
+            return match self.recover_rtk_pending() {
+                Ok(()) => {
+                    Err(err.context("RTK receipt write failed; previous installation restored"))
+                }
+                Err(rollback_err) => Err(anyhow!(
+                    "RTK receipt write failed: {err:#}; rollback also failed: {rollback_err:#}"
+                )),
+            };
+        }
+        for path in [&backup, &receipt_backup, &pending] {
+            if let Err(err) = std::fs::remove_file(path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "RTK installed, but cleanup of {} failed: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn install_rtk(&self) -> Result<()> {
+        let artifact = rtk_distribution_artifact()?;
+        self.install_rtk_release(
+            RTK_VERSION,
+            &artifact.url,
+            artifact.sha256.unwrap_or_default(),
         )
+    }
+
+    pub fn install_rtk_version(&self, version: Option<&str>) -> Result<()> {
+        match version {
+            None => self.install_rtk(),
+            Some(version) => {
+                let release = fetch_rtk_release(version)?;
+                if let Some(current) = self.installed_rtk_version().as_deref() {
+                    if rtk_version_is_downgrade(current, &release.version) {
+                        bail!(
+                            "refusing to downgrade RTK from {current} to {}",
+                            release.version
+                        );
+                    }
+                }
+                self.install_rtk_release(&release.version, &release.url, &release.sha256)
+            }
+        }
     }
 
     fn write_headroom_requirements_lock(&self, contents: &str) -> Result<PathBuf> {
@@ -6467,7 +6730,11 @@ impl ToolManager {
         } else {
             "markitdown"
         };
-        self.runtime.venv_dir.join(bin_subdir()).join(name)
+        self.markitdown_venv_dir().join(bin_subdir()).join(name)
+    }
+
+    fn markitdown_venv_dir(&self) -> PathBuf {
+        self.runtime.root_dir.join("markitdown-venv")
     }
 
     /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
@@ -6559,8 +6826,42 @@ impl ToolManager {
     }
 
     pub fn install_markitdown(&self) -> Result<()> {
-        run_pip_install_with_retries_streaming(
-            &self.runtime.managed_python(),
+        self.install_markitdown_version(None)
+    }
+
+    pub fn install_markitdown_version(&self, version: Option<&str>) -> Result<()> {
+        let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let version = version
+            .map(stable_package_version)
+            .transpose()?
+            .unwrap_or(MARKITDOWN_PINNED_VERSION);
+        if let Some(current) = self
+            .read_tool_receipt("markitdown")
+            .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned))
+            .and_then(|v| parse_major_minor_patch(&v))
+        {
+            if parse_major_minor_patch(version).is_some_and(|target| target < current) {
+                bail!("refusing to downgrade MarkItDown to {version}");
+            }
+        }
+        let final_venv = self.markitdown_venv_dir();
+        let staging = self
+            .runtime
+            .root_dir
+            .join(format!("markitdown-venv.staging-{}", uuid::Uuid::new_v4()));
+        if let Err(err) = run_command_with_timeout(
+            &self.runtime.standalone_python(),
+            &["-m", "venv", "--clear", &staging.to_string_lossy()],
+            &self.runtime.root_dir,
+            Duration::from_secs(120),
+        ) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err).context("creating MarkItDown staging venv");
+        }
+        let python = staging.join(bin_subdir()).join(python_exe_name());
+        let package = format!("markitdown[all]=={version}");
+        if let Err(err) = run_pip_install_with_retries_streaming(
+            &python,
             &[
                 "-m",
                 "pip",
@@ -6569,29 +6870,92 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
-                &format!("markitdown[all]=={MARKITDOWN_PINNED_VERSION}"),
+                &package,
             ],
             &self.runtime.root_dir,
             |line| log::info!("markitdown pip: {line}"),
-        )?;
-        if !self.markitdown_entrypoint().exists() {
+        ) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err).context("installing MarkItDown into staging venv");
+        }
+        let staging_entrypoint = staging
+            .join(bin_subdir())
+            .join(if cfg!(target_os = "windows") {
+                "markitdown.exe"
+            } else {
+                "markitdown"
+            });
+        if !staging_entrypoint.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
             bail!(
                 "markitdown install completed but {} was not found",
-                self.markitdown_entrypoint().display()
+                staging_entrypoint.display()
             );
         }
-        run_command_with_timeout(
-            &self.markitdown_entrypoint(),
+        if let Err(err) = run_command_with_timeout(
+            &staging_entrypoint,
             &["--help"],
             &self.runtime.root_dir,
             HEADROOM_SMOKE_TEST_TIMEOUT,
         )
-        .context("markitdown installed but failed its smoke test")?;
-        self.ensure_markitdown_shim()?;
-        self.write_tool_receipt(
-            "markitdown",
-            json!({ "version": MARKITDOWN_PINNED_VERSION, "enabled": true }),
-        )?;
+        .context("markitdown installed but failed its smoke test")
+        {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+        let backup = self
+            .runtime
+            .root_dir
+            .join(format!("markitdown-venv.backup-{}", uuid::Uuid::new_v4()));
+        let had_old = final_venv.exists();
+        if had_old {
+            std::fs::rename(&final_venv, &backup).context("staging existing MarkItDown venv")?;
+        }
+        if let Err(err) = std::fs::rename(&staging, &final_venv)
+            .context("activating MarkItDown venv")
+            .and_then(|_| self.ensure_markitdown_shim())
+            .and_then(|_| {
+                let enabled = self.tool_enabled("markitdown");
+                self.write_tool_receipt(
+                    "markitdown",
+                    json!({ "version": version, "enabled": enabled }),
+                )
+            })
+        {
+            let activation_error = err.to_string();
+            let _ = std::fs::remove_dir_all(&final_venv);
+            if had_old {
+                if let Err(restore_err) = std::fs::rename(&backup, &final_venv) {
+                    return Err(anyhow!(
+                    "{activation_error}; additionally failed to restore MarkItDown venv: {restore_err}"
+                ));
+                }
+                if let Err(shim_err) = self.ensure_markitdown_shim() {
+                    return Err(anyhow!(
+                    "{activation_error}; additionally failed to restore MarkItDown shim: {shim_err}"
+                ));
+                }
+            } else {
+                let shim = self.markitdown_shim_path();
+                if shim.symlink_metadata().is_ok() {
+                    if let Err(shim_err) = std::fs::remove_file(&shim) {
+                        return Err(anyhow!(
+                        "{activation_error}; additionally failed to remove MarkItDown shim: {shim_err}"
+                    ));
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+        if had_old {
+            if let Err(err) = std::fs::remove_dir_all(&backup) {
+                log::warn!(
+                    "updated MarkItDown, but could not remove backup {}: {err}",
+                    backup.display()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -6599,16 +6963,28 @@ impl ToolManager {
         if !self.markitdown_installed() {
             bail!("markitdown is not installed");
         }
+        let stored_version = self.read_tool_receipt("markitdown").and_then(|receipt| {
+            receipt
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let version = stored_version
+            .as_deref()
+            .unwrap_or(MARKITDOWN_PINNED_VERSION);
         self.write_tool_receipt(
             "markitdown",
-            json!({ "version": MARKITDOWN_PINNED_VERSION, "enabled": enabled }),
+            json!({ "version": version, "enabled": enabled }),
         )?;
         Ok(())
     }
 
     pub fn uninstall_markitdown(&self) -> Result<()> {
         let _ = run_command_streaming(
-            &self.runtime.managed_python(),
+            &self
+                .markitdown_venv_dir()
+                .join(bin_subdir())
+                .join(python_exe_name()),
             &["-m", "pip", "uninstall", "-y", "markitdown"],
             &self.runtime.root_dir,
             &mut |line: &str| log::info!("markitdown pip uninstall: {line}"),
@@ -6634,12 +7010,16 @@ impl ToolManager {
     }
 
     pub fn serena_entrypoint(&self) -> PathBuf {
+        self.serena_entrypoint_in(&self.serena_venv_dir())
+    }
+
+    fn serena_entrypoint_in(&self, venv: &Path) -> PathBuf {
         let name = if cfg!(target_os = "windows") {
             "serena.exe"
         } else {
             "serena"
         };
-        self.serena_venv_dir().join(bin_subdir()).join(name)
+        venv.join(bin_subdir()).join(name)
     }
 
     pub fn serena_installed(&self) -> bool {
@@ -6651,25 +7031,41 @@ impl ToolManager {
     }
 
     pub fn install_serena(&self) -> Result<()> {
-        // --clear so a retry after a partial install starts from a clean venv.
-        run_command_with_timeout(
+        self.install_serena_version(None)
+    }
+
+    pub fn install_serena_version(&self, version: Option<&str>) -> Result<()> {
+        let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let version = version
+            .map(stable_package_version)
+            .transpose()?
+            .unwrap_or(SERENA_PINNED_VERSION);
+        if let (Some(current), Some(target)) = (
+            self.read_tool_receipt("serena")
+                .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned))
+                .as_deref(),
+            parse_major_minor_patch(version),
+        ) {
+            if parse_major_minor_patch(current).is_some_and(|current| target < current) {
+                bail!("refusing to downgrade Serena from {current} to {version}");
+            }
+        }
+        let staging = self
+            .runtime
+            .root_dir
+            .join(format!("serena-venv.staging-{}", uuid::Uuid::new_v4()));
+        if let Err(err) = run_command_with_timeout(
             &self.runtime.standalone_python(),
-            &[
-                "-m",
-                "venv",
-                "--clear",
-                &self.serena_venv_dir().to_string_lossy(),
-            ],
+            &["-m", "venv", "--clear", &staging.to_string_lossy()],
             &self.runtime.root_dir,
             Duration::from_secs(120),
-        )
-        .context("creating serena venv")?;
-        let serena_python = self
-            .serena_venv_dir()
-            .join(bin_subdir())
-            .join(python_exe_name());
-        run_pip_install_with_retries_streaming(
-            &serena_python,
+        ) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err).context("creating Serena staging venv");
+        }
+        let staging_python = staging.join(bin_subdir()).join(python_exe_name());
+        if let Err(err) = run_pip_install_with_retries_streaming(
+            &staging_python,
             &[
                 "-m",
                 "pip",
@@ -6678,30 +7074,96 @@ impl ToolManager {
                 "180",
                 "--retries",
                 "10",
-                &format!("serena-agent=={SERENA_PINNED_VERSION}"),
+                &format!("serena-agent=={version}"),
             ],
             &self.runtime.root_dir,
             |line| log::info!("serena pip: {line}"),
-        )?;
-        if !self.serena_entrypoint().exists() {
+        ) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err).context("installing Serena into staging venv");
+        }
+        let staging_entrypoint = self.serena_entrypoint_in(&staging);
+        if !staging_entrypoint.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
             bail!(
                 "serena install completed but {} was not found",
-                self.serena_entrypoint().display()
+                staging_entrypoint.display()
             );
         }
-        run_command_with_timeout(
-            &self.serena_entrypoint(),
+        if let Err(err) = run_command_with_timeout(
+            &staging_entrypoint,
             &["--help"],
             &self.runtime.root_dir,
             SERENA_SMOKE_TEST_TIMEOUT,
         )
-        .context("serena installed but failed its smoke test")?;
-        self.register_serena_mcp()?;
-        set_serena_global_gitignore(true);
-        self.write_tool_receipt(
-            "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": true }),
-        )?;
+        .context("serena installed but failed its smoke test")
+        {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+        let final_venv = self.serena_venv_dir();
+        let backup = self
+            .runtime
+            .root_dir
+            .join(format!("serena-venv.backup-{}", uuid::Uuid::new_v4()));
+        let had_old = final_venv.exists();
+        if had_old {
+            std::fs::rename(&final_venv, &backup).context("staging existing Serena venv")?;
+        }
+        let activate = || -> Result<()> {
+            std::fs::rename(&staging, &final_venv).context("activating Serena venv")?;
+            self.register_serena_mcp()?;
+            set_serena_global_gitignore(true);
+            let enabled = self.tool_enabled("serena");
+            self.write_tool_receipt("serena", json!({ "version": version, "enabled": enabled }))?;
+            Ok(())
+        }();
+        if let Err(err) = activate {
+            let mut recovery = Vec::new();
+            if let Err(restore_err) = std::fs::remove_dir_all(&final_venv) {
+                if final_venv.exists() {
+                    recovery.push(format!(
+                        "failed to remove partial Serena venv: {restore_err}"
+                    ));
+                }
+            }
+            if had_old {
+                if let Err(restore_err) = std::fs::rename(&backup, &final_venv) {
+                    recovery.push(format!("failed to restore Serena venv: {restore_err}"));
+                } else {
+                    let mcp_result = if self.tool_enabled("serena") {
+                        self.register_serena_mcp()
+                    } else {
+                        self.unregister_serena_mcp()
+                    };
+                    if let Err(mcp_err) = mcp_result {
+                        recovery.push(format!(
+                            "failed to restore Serena MCP registration: {mcp_err}"
+                        ));
+                    }
+                }
+            } else {
+                if let Err(mcp_err) = self.unregister_serena_mcp() {
+                    recovery.push(format!(
+                        "failed to remove Serena MCP registration: {mcp_err}"
+                    ));
+                }
+                set_serena_global_gitignore(false);
+            }
+            let _ = std::fs::remove_dir_all(&staging);
+            if recovery.is_empty() {
+                return Err(err);
+            }
+            return Err(err.context(format!("recovery also failed: {}", recovery.join("; "))));
+        }
+        if had_old {
+            if let Err(err) = std::fs::remove_dir_all(&backup) {
+                log::warn!(
+                    "updated Serena, but could not remove backup {}: {err}",
+                    backup.display()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -6714,10 +7176,14 @@ impl ToolManager {
         } else {
             self.unregister_serena_mcp()?;
         }
-        self.write_tool_receipt(
-            "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled }),
-        )?;
+        let stored_version = self.read_tool_receipt("serena").and_then(|receipt| {
+            receipt
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let version = stored_version.as_deref().unwrap_or(SERENA_PINNED_VERSION);
+        self.write_tool_receipt("serena", json!({ "version": version, "enabled": enabled }))?;
         Ok(())
     }
 
@@ -6797,12 +7263,31 @@ impl ToolManager {
     /// cache), then registers the MCP entry — a broken entry would make every
     /// new agent session spawn a failing server.
     pub fn install_context7(&self) -> Result<()> {
+        self.install_context7_version(None)
+    }
+
+    pub fn install_context7_version(&self, version: Option<&str>) -> Result<()> {
+        let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let version = version
+            .map(stable_package_version)
+            .transpose()?
+            .unwrap_or(CONTEXT7_PINNED_VERSION);
+        if let Some(current) = self
+            .read_tool_receipt("context7")
+            .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            .and_then(parse_major_minor_patch)
+        {
+            if parse_major_minor_patch(version).is_some_and(|target| target < current) {
+                bail!("refusing to downgrade Context7 from {current:?} to {version}");
+            }
+        }
         let npx = crate::claude_cli::detect_npx().context(
             "npx was not found. Context7 runs through Node.js -- install Node.js, then try again.",
         )?;
         run_command_with_timeout(
             &npx,
-            &["-y", &context7_package_spec(), "--help"],
+            &["-y", &context7_package_spec_for(version), "--help"],
             &self.runtime.root_dir,
             CONTEXT7_INSTALL_TIMEOUT,
         )
@@ -6812,11 +7297,25 @@ impl ToolManager {
         .context(
             "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
         )?;
-        self.register_context7_mcp()?;
-        self.write_tool_receipt(
+        let previous = self.read_tool_receipt("context7");
+        self.register_context7_mcp(version)?;
+        let enabled = self.tool_enabled("context7");
+        if let Err(err) = self.write_tool_receipt(
             "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": true }),
-        )?;
+            json!({ "version": version, "enabled": enabled }),
+        ) {
+            let restore = previous
+                .as_ref()
+                .and_then(|r| r.get("version").and_then(Value::as_str))
+                .map(|old| self.register_context7_mcp(old))
+                .unwrap_or_else(|| self.unregister_context7_mcp());
+            if let Err(restore_err) = restore {
+                return Err(err.context(format!(
+                    "writing Context7 receipt failed; restoring previous MCP registration also failed: {restore_err}"
+                )));
+            }
+            return Err(err).context("writing Context7 receipt");
+        }
         Ok(())
     }
 
@@ -6825,13 +7324,27 @@ impl ToolManager {
             bail!("context7 is not installed");
         }
         if enabled {
-            self.register_context7_mcp()?;
+            let stored_version = self.read_tool_receipt("context7").and_then(|receipt| {
+                receipt
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            let version = stored_version.as_deref().unwrap_or(CONTEXT7_PINNED_VERSION);
+            self.register_context7_mcp(version)?;
         } else {
             self.unregister_context7_mcp()?;
         }
+        let stored_version = self.read_tool_receipt("context7").and_then(|receipt| {
+            receipt
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let version = stored_version.as_deref().unwrap_or(CONTEXT7_PINNED_VERSION);
         self.write_tool_receipt(
             "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": enabled }),
+            json!({ "version": version, "enabled": enabled }),
         )?;
         Ok(())
     }
@@ -6846,12 +7359,16 @@ impl ToolManager {
         Ok(())
     }
 
-    fn register_context7_mcp(&self) -> Result<()> {
+    fn register_context7_mcp(&self, version: &str) -> Result<()> {
+        let legacy_ledger = legacy_headroom_mcp_ledger_path()
+            .to_string_lossy()
+            .into_owned();
         self.run_mcp_helper(&[
             "-c",
             CONTEXT7_MCP_HELPER,
             "register",
-            &context7_package_spec(),
+            &context7_package_spec_for(version),
+            &legacy_ledger,
         ])
         .context("registering context7 MCP server")
     }
@@ -6872,16 +7389,129 @@ impl ToolManager {
         self.runtime.tools_dir.join("codebase-memory-cache")
     }
 
+    fn codebase_memory_pending_marker_path(&self) -> PathBuf {
+        self.runtime.tools_dir.join("codebase-memory.pending.json")
+    }
+
+    pub(crate) fn recover_codebase_memory_pending(&self) -> Result<()> {
+        let marker = self.codebase_memory_pending_marker_path();
+        if !marker.exists() {
+            return Ok(());
+        }
+        let pending: Value = serde_json::from_slice(
+            &std::fs::read(&marker).with_context(|| format!("reading {}", marker.display()))?,
+        )
+        .with_context(|| format!("parsing {}", marker.display()))?;
+        let had_destination = pending
+            .get("hadDestination")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let had_receipt = pending
+            .get("hadReceipt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let backup = self.runtime.bin_dir.join("codebase-memory-mcp.backup");
+        let destination = self.codebase_memory_entrypoint();
+        let receipt = self.runtime.tools_dir.join("codebase-memory.json");
+        let receipt_backup = self.runtime.tools_dir.join("codebase-memory.json.backup");
+        let rollback = (|| -> Result<()> {
+            if had_destination {
+                if backup.exists() {
+                    if destination.exists() {
+                        std::fs::remove_file(&destination).with_context(|| {
+                            format!("removing incomplete {}", destination.display())
+                        })?;
+                    }
+                    std::fs::rename(&backup, &destination)
+                        .with_context(|| format!("restoring {}", destination.display()))?;
+                } else if !destination.exists() {
+                    bail!("codebase-memory rollback is missing its binary backup");
+                }
+            } else if destination.exists() {
+                std::fs::remove_file(&destination)
+                    .with_context(|| format!("removing incomplete {}", destination.display()))?;
+            }
+
+            if had_receipt {
+                if receipt_backup.exists() {
+                    if receipt.exists() {
+                        std::fs::remove_file(&receipt).with_context(|| {
+                            format!("removing incomplete {}", receipt.display())
+                        })?;
+                    }
+                    std::fs::rename(&receipt_backup, &receipt)
+                        .with_context(|| format!("restoring {}", receipt.display()))?;
+                } else if !receipt.exists() {
+                    bail!("codebase-memory rollback is missing its receipt backup");
+                }
+            } else if receipt.exists() {
+                std::fs::remove_file(&receipt)
+                    .with_context(|| format!("removing incomplete {}", receipt.display()))?;
+            }
+
+            if self.codebase_memory_installed() && self.tool_enabled("codebase-memory") {
+                self.register_codebase_memory_mcp()?;
+            } else {
+                self.unregister_codebase_memory_mcp()?;
+            }
+            Ok(())
+        })();
+        match rollback {
+            Ok(()) => {
+                std::fs::remove_file(&marker)
+                    .with_context(|| format!("removing {}", marker.display()))?;
+                Ok(())
+            }
+            Err(err) => Err(err.context(format!(
+                "recovering interrupted codebase-memory update; marker retained at {}",
+                marker.display()
+            ))),
+        }
+    }
+
     pub fn codebase_memory_installed(&self) -> bool {
         self.runtime.tools_dir.join("codebase-memory.json").exists()
             && self.codebase_memory_entrypoint().exists()
     }
 
     pub fn install_codebase_memory(&self) -> Result<()> {
-        let artifact = codebase_memory_distribution_artifact()?;
+        self.install_codebase_memory_version(None)
+    }
+
+    pub fn install_codebase_memory_version(&self, version: Option<&str>) -> Result<()> {
+        let _guard = CODEBASE_MEMORY_INSTALL_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock();
+        self.recover_codebase_memory_pending()?;
+        let artifact = match version {
+            None => codebase_memory_distribution_artifact()?,
+            Some(version) => fetch_codebase_memory_release(version)?,
+        };
+        let target_version = version.unwrap_or(CODEBASE_MEMORY_VERSION);
+        if !valid_codebase_memory_version(target_version) {
+            bail!("invalid codebase-memory version: {target_version}");
+        }
+        if let Some(current) = self
+            .read_tool_receipt("codebase-memory")
+            .and_then(|receipt| {
+                receipt
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        {
+            if let (Some(current), Some(target)) = (
+                parse_major_minor_patch(&current),
+                parse_major_minor_patch(target_version),
+            ) {
+                if target < current {
+                    bail!("refusing to downgrade codebase-memory from {current:?} to {target_version}");
+                }
+            }
+        }
         let archive_path = self.runtime.downloads_dir.join(format!(
             "codebase-memory-mcp-v{}-{}-{}.tar.gz",
-            CODEBASE_MEMORY_VERSION,
+            target_version,
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
@@ -6917,7 +7547,7 @@ impl ToolManager {
         let destination = self.codebase_memory_entrypoint();
         let staged = {
             let mut s = destination.as_os_str().to_os_string();
-            s.push(".new");
+            s.push(format!(".new.{}", uuid::Uuid::new_v4()));
             PathBuf::from(s)
         };
         std::fs::rename(&extracted_binary, &staged)
@@ -6941,16 +7571,104 @@ impl ToolManager {
             Duration::from_secs(15),
         )
         .context("codebase-memory update failed its smoke test")?;
+        let reported = Command::new(&staged)
+            .arg("--version")
+            .current_dir(&self.runtime.root_dir)
+            .output()
+            .context("reading staged codebase-memory version")?;
+        let stdout = String::from_utf8_lossy(&reported.stdout);
+        let stderr = String::from_utf8_lossy(&reported.stderr);
+        if !rtk_version_output_matches(&stdout, target_version)
+            && !rtk_version_output_matches(&stderr, target_version)
+        {
+            bail!(
+                "codebase-memory staged binary reported stdout={stdout:?} stderr={stderr:?}, expected {target_version}"
+            );
+        }
 
-        std::fs::rename(&staged, &destination)
-            .with_context(|| format!("installing {}", destination.display()))?;
-        std::fs::create_dir_all(self.codebase_memory_cache_dir())
-            .with_context(|| format!("creating {}", self.codebase_memory_cache_dir().display()))?;
-        self.register_codebase_memory_mcp()?;
-        self.write_tool_receipt(
-            "codebase-memory",
-            json!({ "version": CODEBASE_MEMORY_VERSION, "enabled": true }),
-        )?;
+        let marker = self.codebase_memory_pending_marker_path();
+        let backup = self.runtime.bin_dir.join("codebase-memory-mcp.backup");
+        let receipt = self.runtime.tools_dir.join("codebase-memory.json");
+        let receipt_backup = self.runtime.tools_dir.join("codebase-memory.json.backup");
+        if backup.exists() || receipt_backup.exists() {
+            bail!(
+                "stale codebase-memory update backup exists without a pending marker; refusing to overwrite recovery data"
+            );
+        }
+        let had_destination = destination.exists();
+        let had_receipt = receipt.exists();
+        let enabled = self.tool_enabled("codebase-memory");
+        crate::client_adapters::atomic_write(
+            &marker,
+            &serde_json::to_vec_pretty(&json!({
+                "version": target_version,
+                "hadDestination": had_destination,
+                "hadReceipt": had_receipt,
+            }))
+            .context("serializing codebase-memory pending marker")?,
+        )
+        .with_context(|| format!("writing {}", marker.display()))?;
+
+        let commit = (|| -> Result<()> {
+            if had_receipt {
+                std::fs::rename(&receipt, &receipt_backup)
+                    .with_context(|| format!("backing up {}", receipt.display()))?;
+            }
+            if had_destination {
+                std::fs::rename(&destination, &backup)
+                    .with_context(|| format!("backing up {}", destination.display()))?;
+            }
+            std::fs::rename(&staged, &destination)
+                .with_context(|| format!("installing {}", destination.display()))?;
+            std::fs::create_dir_all(self.codebase_memory_cache_dir()).with_context(|| {
+                format!("creating {}", self.codebase_memory_cache_dir().display())
+            })?;
+            if enabled {
+                self.register_codebase_memory_mcp()?;
+            } else {
+                self.unregister_codebase_memory_mcp()?;
+            }
+            self.write_tool_receipt(
+                "codebase-memory",
+                json!({ "version": target_version, "enabled": enabled }),
+            )?;
+            Ok(())
+        })();
+
+        if let Err(err) = commit {
+            return match self.recover_codebase_memory_pending() {
+                Ok(()) => {
+                    Err(err
+                        .context("codebase-memory update failed; restored previous installation"))
+                }
+                Err(rollback_err) => Err(anyhow!(
+                    "codebase-memory update failed: {err:#}; rollback also failed: {rollback_err:#}"
+                )),
+            };
+        }
+
+        if let Err(err) = std::fs::remove_file(&marker) {
+            return match self.recover_codebase_memory_pending() {
+                Ok(()) => Err(anyhow!(
+                    "committing codebase-memory update failed while removing {}: {err}; restored previous installation",
+                    marker.display()
+                )),
+                Err(rollback_err) => Err(anyhow!(
+                    "committing codebase-memory update failed while removing {}: {err}; rollback also failed: {rollback_err:#}",
+                    marker.display()
+                )),
+            };
+        }
+        for old in [&backup, &receipt_backup] {
+            if old.exists() {
+                if let Err(err) = std::fs::remove_file(old) {
+                    log::warn!(
+                        "could not remove committed codebase-memory backup {}: {err}",
+                        old.display()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -6958,15 +7676,41 @@ impl ToolManager {
         if !self.codebase_memory_installed() {
             bail!("codebase-memory is not installed");
         }
+        let previous = self.read_tool_receipt("codebase-memory");
+        let version = previous
+            .as_ref()
+            .and_then(|receipt| {
+                receipt
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| CODEBASE_MEMORY_VERSION.to_owned());
+        let previous_enabled = previous
+            .as_ref()
+            .and_then(|receipt| receipt.get("enabled").and_then(Value::as_bool))
+            .unwrap_or(false);
         if enabled {
             self.register_codebase_memory_mcp()?;
         } else {
             self.unregister_codebase_memory_mcp()?;
         }
-        self.write_tool_receipt(
+        if let Err(err) = self.write_tool_receipt(
             "codebase-memory",
-            json!({ "version": CODEBASE_MEMORY_VERSION, "enabled": enabled }),
-        )?;
+            json!({ "version": version, "enabled": enabled }),
+        ) {
+            let restore = if previous_enabled {
+                self.register_codebase_memory_mcp()
+            } else {
+                self.unregister_codebase_memory_mcp()
+            };
+            return match restore {
+                Ok(()) => Err(err.context("writing codebase-memory receipt; previous MCP state restored")),
+                Err(restore_err) => Err(anyhow!(
+                    "writing codebase-memory receipt failed: {err:#}; restoring previous MCP state also failed: {restore_err:#}"
+                )),
+            };
+        }
         Ok(())
     }
 
@@ -7001,12 +7745,16 @@ impl ToolManager {
             .codebase_memory_cache_dir()
             .to_string_lossy()
             .into_owned();
+        let legacy_ledger = legacy_headroom_mcp_ledger_path()
+            .to_string_lossy()
+            .into_owned();
         self.run_mcp_helper(&[
             "-c",
             CODEBASE_MEMORY_MCP_HELPER,
             "register",
             &binary,
             &cache_dir,
+            &legacy_ledger,
         ])
         .context("registering codebase-memory MCP server")
     }
@@ -7052,9 +7800,7 @@ impl ToolManager {
             return false;
         };
         self.plugin_receipt_exists(plugin)
-            && plugin.hosts
-                .iter()
-                .any(|host| host.plugin_present(plugin))
+            && plugin.hosts.iter().any(|host| host.plugin_present(plugin))
     }
 
     /// Persists the user-level default only. Plugin environment variables and
@@ -7149,9 +7895,13 @@ impl ToolManager {
     ) -> Result<()> {
         let id = plugin.id;
         let label = host.label();
-        run_command_streaming(cli, args, &self.runtime.root_dir, &mut |line: &str| {
+        let result = run_command_streaming(cli, args, &self.runtime.root_dir, &mut |line: &str| {
             log::info!("{id} [{label}]: {line}")
-        })
+        });
+        if result.is_ok() && matches!(host, PluginHost::Codex) {
+            normalize_codex_plugin_cache(plugin)?;
+        }
+        result
     }
 
     /// Registers the marketplace (best-effort) and installs the plugin into a
@@ -7164,7 +7914,7 @@ impl ToolManager {
     /// the install path replayed.
     fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
         let cli = host.cli().context("CLI not found on PATH")?;
-        if matches!(host, PluginHost::Codex) && codex_plugin_adapter(plugin).is_some() {
+        if uses_codex_plugin_adapter(plugin, host) {
             return self.install_codex_adapter_plugin(plugin, &cli);
         }
         if host.plugin_present(plugin) {
@@ -7206,8 +7956,108 @@ impl ToolManager {
     }
 
     fn install_codex_adapter_plugin(&self, plugin: &'static PluginAddon, cli: &Path) -> Result<()> {
-        let source = prepare_codex_adapter_marketplace(plugin)?;
+        let adapter_source = crate::client_adapters::home_dir()
+            .join(".codex")
+            .join(".tmp")
+            .join("marketplaces")
+            .join(plugin.marketplace_name);
+        let registration =
+            codex_marketplace_registration(cli, &self.runtime.root_dir, plugin.marketplace_name)?;
+        if let CodexMarketplaceRegistration::Local(path) = &registration {
+            if !paths_refer_to_same_location(path, &adapter_source) {
+                bail!(
+                    "refusing to replace user-managed Codex marketplace {} at {}",
+                    plugin.marketplace_name,
+                    path.display()
+                );
+            }
+        } else if matches!(registration, CodexMarketplaceRegistration::Other(_)) {
+            bail!(
+                "refusing to replace user-managed Codex marketplace {}",
+                plugin.marketplace_name
+            );
+        }
+
+        let migrated_backup = migrate_unmanaged_codex_marketplace(plugin)?;
+        let original_git_source = match &registration {
+            CodexMarketplaceRegistration::Git(source) if !source.is_empty() => Some(source.clone()),
+            _ => None,
+        };
+        let registration_removed = matches!(registration, CodexMarketplaceRegistration::Git(_));
+        let replacement_registration_attempted = std::cell::Cell::new(false);
+        let restore_migrated = || -> Result<()> {
+            let mut failures = Vec::new();
+            if registration_removed
+                || replacement_registration_attempted.get()
+                || migrated_backup.is_some()
+            {
+                if registration_removed || replacement_registration_attempted.get() {
+                    if let Err(err) = self.run_plugin_cmd(
+                        plugin,
+                        cli,
+                        PluginHost::Codex,
+                        &PluginHost::Codex.marketplace_remove_args(plugin),
+                    ) {
+                        failures.push(format!(
+                            "removing replacement marketplace registration: {err:#}"
+                        ));
+                    }
+                }
+                if let Some(backup) = migrated_backup.as_deref() {
+                    if let Err(err) = restore_codex_marketplace_backup(backup, &adapter_source) {
+                        failures.push(format!(
+                            "restoring Codex marketplace backup {}: {err:#}",
+                            backup.display()
+                        ));
+                    }
+                }
+                if let Some(source) = original_git_source.as_deref() {
+                    if let Err(err) = self.run_plugin_cmd(
+                        plugin,
+                        cli,
+                        PluginHost::Codex,
+                        &["plugin", "marketplace", "add", source],
+                    ) {
+                        failures.push(format!(
+                            "re-registering original Codex marketplace {source}: {err:#}"
+                        ));
+                    }
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                bail!(failures.join("; "))
+            }
+        };
+        if registration_removed {
+            if let Err(err) = self.run_plugin_cmd(
+                plugin,
+                cli,
+                PluginHost::Codex,
+                &PluginHost::Codex.marketplace_remove_args(plugin),
+            ) {
+                let err = err.context(format!(
+                    "removing existing Codex marketplace {}",
+                    plugin.marketplace_name
+                ));
+                return Err(merge_codex_marketplace_recovery_error(
+                    err,
+                    restore_migrated(),
+                ));
+            }
+        }
+        let source = match prepare_codex_adapter_marketplace(plugin) {
+            Ok(source) => source,
+            Err(err) => {
+                return Err(merge_codex_marketplace_recovery_error(
+                    err,
+                    restore_migrated(),
+                ));
+            }
+        };
         let source_text = source.to_string_lossy().into_owned();
+        replacement_registration_attempted.set(true);
         let marketplace_err = self
             .run_plugin_cmd(
                 plugin,
@@ -7216,18 +8066,58 @@ impl ToolManager {
                 &["plugin", "marketplace", "add", &source_text],
             )
             .err();
-        self.run_plugin_cmd(
-            plugin,
+        let marketplace_registration = match codex_marketplace_registration(
             cli,
-            PluginHost::Codex,
-            &PluginHost::Codex.install_args(plugin),
-        )
-        .map_err(|err| match marketplace_err {
-            Some(add_err) => err.context(format!("local marketplace add failed first: {add_err:#}")),
-            None => err,
-        })?;
+            &self.runtime.root_dir,
+            plugin.marketplace_name,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(merge_codex_marketplace_recovery_error(
+                    err,
+                    restore_migrated(),
+                ));
+            }
+        };
+        let marketplace_is_local = matches!(
+            marketplace_registration,
+            CodexMarketplaceRegistration::Local(path)
+                if paths_refer_to_same_location(&path, &source)
+        );
+        if !marketplace_is_local {
+            let err = anyhow!(
+                "Codex marketplace {} was not registered as the expected local marketplace",
+                plugin.marketplace_name
+            );
+            return Err(merge_codex_marketplace_recovery_error(
+                err,
+                restore_migrated(),
+            ));
+        }
+        let install_result = self
+            .run_plugin_cmd(
+                plugin,
+                cli,
+                PluginHost::Codex,
+                &PluginHost::Codex.install_args(plugin),
+            )
+            .map_err(|err| match marketplace_err {
+                Some(add_err) => {
+                    err.context(format!("local marketplace add failed first: {add_err:#}"))
+                }
+                None => err,
+            });
+        if let Err(err) = install_result {
+            return Err(merge_codex_marketplace_recovery_error(
+                err,
+                restore_migrated(),
+            ));
+        }
         if !PluginHost::Codex.plugin_present(plugin) {
-            bail!("install completed but the Codex adapter plugin was not registered");
+            return Err(merge_codex_marketplace_recovery_error(
+                anyhow!("install completed but the Codex adapter plugin was not registered"),
+                restore_migrated(),
+            ));
         }
         Ok(())
     }
@@ -7239,8 +8129,10 @@ impl ToolManager {
     /// is a version skew the user can only fix by updating Codex.
     pub fn install_plugin(&self, id: &str) -> Result<bool> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let hosts: Vec<PluginHost> = plugin.hosts
-            .iter().copied()
+        let hosts: Vec<PluginHost> = plugin
+            .hosts
+            .iter()
+            .copied()
             .filter(|host| host.cli().is_some())
             .collect();
         if hosts.is_empty()
@@ -7254,19 +8146,52 @@ impl ToolManager {
                 "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
             );
         }
+        let previous_version = self
+            .read_tool_receipt(plugin.id)
+            .and_then(|receipt| receipt.get("version")?.as_str().map(str::to_string));
+        let mut hosts: Vec<(PluginHost, bool)> = hosts
+            .into_iter()
+            .map(|host| (host, host.plugin_present(plugin)))
+            .collect();
+        // Install missing hosts before touching existing ones. If a new host
+        // fails, hosts that were already working remain unchanged.
+        hosts.sort_by_key(|(_, was_registered)| *was_registered);
         let mut errors: Vec<String> = Vec::new();
         let mut installed_any = false;
+        let mut newly_registered_hosts = Vec::new();
         let mut codex_outdated = false;
-        for host in hosts {
+        for (host, was_registered) in hosts {
             match self.install_plugin_into(plugin, host) {
-                Ok(()) => installed_any = true,
+                Ok(()) => {
+                    installed_any = true;
+                    if !was_registered {
+                        newly_registered_hosts.push(host);
+                    }
+                }
                 Err(err) if matches!(host, PluginHost::Codex) && is_outdated_codex(&err) => {
                     codex_outdated = true;
                 }
                 Err(err) => errors.push(format!("{}: {err:#}", host.label())),
             }
         }
+        let rollback_hosts = |manager: &Self| {
+            for host in newly_registered_hosts.iter().copied() {
+                if let Some(cli) = host.cli() {
+                    let _ =
+                        manager.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin));
+                    if !plugin_uses_existing_marketplace(plugin) {
+                        let _ = manager.run_plugin_cmd(
+                            plugin,
+                            &cli,
+                            host,
+                            &host.marketplace_remove_args(plugin),
+                        );
+                    }
+                }
+            }
+        };
         if !installed_any {
+            rollback_hosts(self);
             if codex_outdated && errors.is_empty() {
                 bail!(
                     "Your Codex CLI is too old to install the {id} plugin. Update Codex, then try again."
@@ -7275,6 +8200,7 @@ impl ToolManager {
             bail!("installing the {id} plugin failed: {}", errors.join("; "));
         }
         if !errors.is_empty() {
+            rollback_hosts(self);
             let detail = errors.join("; ");
             // Explicit per-category fingerprint; the bridged warn is local-only
             // (skip_sentry rule) so this doesn't double-report. Mirrors the pip
@@ -7295,11 +8221,42 @@ impl ToolManager {
             );
             log::warn!("{id} installed for some hosts but not all: {detail}");
         }
-        let version =
-            installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
-        self.ensure_plugin_runtime(plugin)?;
+        if !errors.is_empty() {
+            return Err(anyhow!(
+                "installing {id} plugin failed on hosts: {}",
+                errors.join("; ")
+            ));
+        }
+        let version = installed_plugin_version(plugin)
+            .or(previous_version)
+            .unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
+        if let Err(err) = self.ensure_plugin_runtime(plugin) {
+            rollback_hosts(self);
+            let _ = self.remove_plugin_runtime(plugin);
+            return Err(err);
+        }
+        if let Err(err) =
+            self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))
+        {
+            rollback_hosts(self);
+            let _ = self.remove_plugin_runtime(plugin);
+            return Err(err);
+        }
+        if let Err(err) = self.enforce_exclusive_plugin_group(plugin.id) {
+            rollback_hosts(self);
+            let _ = self.remove_plugin_runtime(plugin);
+            let _ =
+                std::fs::remove_file(self.runtime.tools_dir.join(format!("{}.json", plugin.id)));
+            return Err(err);
+        }
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
         self.enforce_exclusive_plugin_group(plugin.id)?;
+        if !errors.is_empty() {
+            return Err(anyhow!(
+                "installing {id} plugin failed on some hosts: {}",
+                errors.join("; ")
+            ));
+        }
         Ok(codex_outdated)
     }
 
@@ -7319,8 +8276,10 @@ impl ToolManager {
         if !self.plugin_receipt_exists(plugin) {
             bail!("{id} is not installed");
         }
+        let previous_version = self
+            .read_tool_receipt(plugin.id)
+            .and_then(|receipt| receipt.get("version")?.as_str().map(str::to_string));
         let mut errors: Vec<String> = Vec::new();
-        let mut changed_any = false;
         for &host in plugin.hosts {
             let Some(cli) = host.cli() else { continue };
             // Codex has no enable/disable verb, so enabling re-installs and
@@ -7332,16 +8291,16 @@ impl ToolManager {
             } else {
                 continue;
             };
-            match result {
-                Ok(()) => changed_any = true,
-                Err(err) => errors.push(format!("{}: {err:#}", host.label())),
+            if let Err(err) = result {
+                errors.push(format!("{}: {err:#}", host.label()));
             }
         }
-        if !changed_any && !errors.is_empty() {
+        if !errors.is_empty() {
             bail!("toggling {id} failed: {}", errors.join("; "));
         }
-        let version =
-            installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
+        let version = installed_plugin_version(plugin)
+            .or(previous_version)
+            .unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": enabled }))?;
         if enabled {
             self.ensure_plugin_runtime(plugin)?;
@@ -7358,18 +8317,36 @@ impl ToolManager {
         if !self.plugin_receipt_exists(plugin) {
             return Ok(());
         }
+        let mut uninstall_errors = Vec::new();
         for &host in plugin.hosts {
             if let Some(cli) = host.cli() {
-                let _ = self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin));
-                if !plugin_uses_existing_marketplace(plugin) {
-                    let _ = self.run_plugin_cmd(
+                if !host.plugin_present(plugin) {
+                    continue;
+                }
+                let mut host_uninstall_succeeded = true;
+                if let Err(err) =
+                    self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin))
+                {
+                    host_uninstall_succeeded = false;
+                    uninstall_errors.push(format!("{}: {err:#}", host.label()));
+                }
+                if host_uninstall_succeeded && !plugin_uses_existing_marketplace(plugin) {
+                    if let Err(err) = self.run_plugin_cmd(
                         plugin,
                         &cli,
                         host,
                         &host.marketplace_remove_args(plugin),
-                    );
+                    ) {
+                        uninstall_errors.push(format!("{} marketplace: {err:#}", host.label()));
+                    }
                 }
             }
+        }
+        if !uninstall_errors.is_empty() {
+            bail!(
+                "uninstalling {id} plugin failed: {}",
+                uninstall_errors.join("; ")
+            );
         }
         let receipt = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
         self.remove_plugin_runtime(plugin)?;
@@ -7397,10 +8374,7 @@ impl ToolManager {
             }
             // Enabled per our receipt: require it still be registered with a host,
             // so a manual `/plugin` removal surfaces as not-installed.
-            return if plugin.hosts
-                .iter()
-                .any(|host| host.plugin_present(plugin))
-            {
+            return if plugin.hosts.iter().any(|host| host.plugin_present(plugin)) {
                 if !self.plugin_runtime_healthy(plugin) {
                     ToolStatus::Degraded
                 } else {
@@ -7412,6 +8386,42 @@ impl ToolManager {
         }
         let installed_path = self.runtime.tools_dir.join(format!("{tool_id}.json"));
         if installed_path.exists() && self.python_runtime_installed() {
+            if crate::client_adapters::is_codex_enabled()
+                && matches!(tool_id, "context7" | "codebase-memory")
+            {
+                let context7_version = self
+                    .read_tool_receipt("context7")
+                    .and_then(|receipt| {
+                        receipt
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| CONTEXT7_PINNED_VERSION.to_string());
+                let context7_package = context7_package_spec_for(&context7_version);
+                let registration = crate::client_adapters::codex_headroom_mcp_registration_health(
+                    &context7_package,
+                    &self.codebase_memory_entrypoint(),
+                    &self.codebase_memory_cache_dir(),
+                );
+                let healthy = match registration {
+                    Ok(health) if tool_id == "context7" => {
+                        health.context7
+                            == crate::client_adapters::ManagedMcpRegistrationState::Healthy
+                    }
+                    Ok(health) => {
+                        health.codebase_memory
+                            == crate::client_adapters::ManagedMcpRegistrationState::Healthy
+                    }
+                    Err(err) => {
+                        log::warn!("checking Codex MCP registration for {tool_id}: {err:#}");
+                        false
+                    }
+                };
+                if !healthy {
+                    return ToolStatus::Degraded;
+                }
+            }
             ToolStatus::Healthy
         } else {
             ToolStatus::NotInstalled
@@ -7462,6 +8472,17 @@ impl PluginHost {
                 .join("marketplaces");
             write_codex_compat_marketplace_manifest_at(&root, plugin)?;
             prepare_codex_plugin_adapter_at(&root, plugin)?;
+            let plugin_root = codex_marketplace_plugin_root(&root, plugin);
+            normalize_codex_plugin_manifest_at(&plugin_root)?;
+            // All in Luna ships Research Routes as a sibling Codex plugin in
+            // the same marketplace checkout; normalize both in one pass.
+            if plugin.id == "allinluna" {
+                normalize_codex_plugin_manifest_at(
+                    &root
+                        .join(plugin.marketplace_name)
+                        .join("plugins/research-routes"),
+                )?;
+            }
         }
         Ok(())
     }
@@ -7530,17 +8551,34 @@ fn write_codex_compat_marketplace_manifest_at(root: &Path, plugin: &PluginAddon)
     let parent = manifest
         .parent()
         .context("Codex compatibility marketplace manifest has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
-    let body = json!({
-        "name": plugin.marketplace_name,
-        "interface": { "displayName": plugin.id },
-        "plugins": [{
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let plugins = if plugin.id == "allinluna" {
+        vec![
+            json!({
+                "name": "allinluna",
+                "source": { "source": "local", "path": "./plugins/allinluna" },
+                "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+                "category": "Productivity"
+            }),
+            json!({
+                "name": "research-routes",
+                "source": { "source": "local", "path": "./plugins/research-routes" },
+                "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+                "category": "Productivity"
+            }),
+        ]
+    } else {
+        vec![json!({
             "name": plugin.id,
             "source": { "source": "local", "path": plugin.codex_local_path },
             "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
             "category": "Productivity"
-        }]
+        })]
+    };
+    let body = json!({
+        "name": plugin.marketplace_name,
+        "interface": { "displayName": plugin.id },
+        "plugins": plugins
     });
     crate::client_adapters::atomic_write(
         &manifest,
@@ -7549,10 +8587,251 @@ fn write_codex_compat_marketplace_manifest_at(root: &Path, plugin: &PluginAddon)
     .with_context(|| format!("writing {}", manifest.display()))
 }
 
-fn codex_plugin_adapter(plugin: &PluginAddon) -> Option<(&'static str, &'static str, &'static str)> {
+/// Normalize third-party Codex manifests at the adapter boundary. Codex
+/// rejects oversized default prompts and warns about icon fields whose paths
+/// do not resolve from the plugin root. Keep all unrelated upstream fields.
+fn normalize_codex_plugin_manifest_at(plugin_root: &Path) -> Result<()> {
+    let manifest = plugin_root.join(".codex-plugin").join("plugin.json");
+    if !manifest.is_file() {
+        return Ok(());
+    }
+    let mut body: Value = serde_json::from_slice(
+        &std::fs::read(&manifest).with_context(|| format!("reading {}", manifest.display()))?,
+    )
+    .with_context(|| format!("parsing {}", manifest.display()))?;
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let Some(interface) = body.get_mut("interface").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+
+    let prompts: Option<&[&str]> = match name.as_str() {
+        "allinluna" => Some(&[
+            "Use All in Luna to compile the goal or plan into an executable task graph.",
+            "Resolve resources by explicit request, task override, user preference, capability, then host default; preserve receipts.",
+            "Execute only the resolved host action with frozen arguments and retain verified handoff evidence.",
+        ]),
+        "research-routes" => Some(&[
+            "Use Research Routes to map evidence-backed routes before choosing one.",
+            "Keep claims, evidence, contradictions, unknowns, failures, and provenance as separate records.",
+            "Require human authorization before route selection, promotion, or implementation.",
+        ]),
+        "stop-that-shit" => Some(&[
+            "Review the diff and report findings without editing.",
+            "Fix only the failing test requested by the user.",
+            "Keep the requested change direct and avoid unnecessary delegation or defensive wording.",
+        ]),
+        _ => None,
+    };
+    if let Some(prompts) = prompts {
+        interface.insert(
+            "defaultPrompt".to_string(),
+            Value::Array(
+                prompts
+                    .iter()
+                    .map(|prompt| Value::String((*prompt).into()))
+                    .collect(),
+            ),
+        );
+    }
+
+    // `composerIcon` and `logo` are not accepted by Codex when their relative
+    // paths cannot be resolved. Remove only invalid icon fields; valid assets
+    // and all other interface metadata remain untouched.
+    for key in ["composerIcon", "logo"] {
+        let invalid = interface
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|path| path.starts_with("./"))
+            .is_some_and(|path| !plugin_root.join(path.trim_start_matches("./")).is_file());
+        if invalid {
+            interface.remove(key);
+        }
+    }
+    if interface.get("icons").is_some_and(Value::is_null) {
+        interface.remove("icons");
+    }
+
+    crate::client_adapters::atomic_write(
+        &manifest,
+        &serde_json::to_vec_pretty(&body)
+            .context("serializing normalized Codex plugin manifest")?,
+    )
+    .with_context(|| format!("writing {}", manifest.display()))
+}
+
+#[cfg(test)]
+mod codex_manifest_compat_tests {
+    use super::{normalize_codex_plugin_cache_at, normalize_codex_plugin_manifest_at};
+    use serde_json::json;
+    use std::fs;
+
+    fn write_manifest(root: &std::path::Path, name: &str, prompts: serde_json::Value) {
+        let path = root.join(".codex-plugin");
+        fs::create_dir_all(&path).expect("manifest directory");
+        fs::write(
+            path.join("plugin.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": name,
+                "version": "9.9.9",
+                "interface": {
+                    "defaultPrompt": prompts,
+                    "shortDescription": "preserve me",
+                    "logo": "./missing/icon.svg"
+                },
+                "custom": {"keep": true}
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+    }
+
+    #[test]
+    fn normalizes_prompts_icons_and_preserves_unrelated_fields_idempotently() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_manifest(root.path(), "allinluna", json!(["oversized"]));
+        normalize_codex_plugin_manifest_at(root.path()).expect("normalize manifest");
+        let path = root.path().join(".codex-plugin/plugin.json");
+        let first = fs::read(&path).expect("read normalized manifest");
+        let value: serde_json::Value = serde_json::from_slice(&first).expect("valid JSON");
+        let prompts = value["interface"]["defaultPrompt"]
+            .as_array()
+            .expect("prompt array");
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts
+            .iter()
+            .all(|p| p.as_str().unwrap().chars().count() <= 128));
+        assert_eq!(value["interface"]["shortDescription"], "preserve me");
+        assert_eq!(value["custom"]["keep"], true);
+        assert!(value["interface"].get("logo").is_none());
+
+        normalize_codex_plugin_manifest_at(root.path()).expect("normalize twice");
+        assert_eq!(
+            first,
+            fs::read(&path).expect("read normalized manifest twice")
+        );
+    }
+
+    #[test]
+    fn normalizes_nested_versioned_cache_and_research_routes_sibling() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let allinluna = cache.path().join("allinluna/allinluna/2.0.0-rc.7");
+        let research_routes = cache.path().join("allinluna/research-routes/0.3.0-rc.7");
+        write_manifest(&allinluna, "allinluna", json!(["old"]));
+        write_manifest(&research_routes, "research-routes", json!(["old"]));
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+
+        normalize_codex_plugin_cache_at(cache.path(), plugin).expect("normalize cache");
+
+        for root in [&allinluna, &research_routes] {
+            let value: serde_json::Value = serde_json::from_slice(
+                &fs::read(root.join(".codex-plugin/plugin.json")).expect("read manifest"),
+            )
+            .expect("valid manifest");
+            let prompts = value["interface"]["defaultPrompt"]
+                .as_array()
+                .expect("prompt array");
+            assert_eq!(prompts.len(), 3);
+            assert!(prompts
+                .iter()
+                .all(|prompt| prompt.as_str().unwrap().chars().count() <= 128));
+            assert!(value["interface"].get("logo").is_none());
+        }
+    }
+
+    #[test]
+    fn stop_that_shit_is_limited_to_three_natural_language_prompts() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_manifest(
+            root.path(),
+            "stop-that-shit",
+            json!(["one", "two", "three", "four"]),
+        );
+        normalize_codex_plugin_manifest_at(root.path()).expect("normalize manifest");
+        let bytes = fs::read(root.path().join(".codex-plugin/plugin.json")).expect("read manifest");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let prompts = value["interface"]["defaultPrompt"]
+            .as_array()
+            .expect("prompt array");
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts.iter().all(|p| {
+            let text = p.as_str().unwrap();
+            text.chars().count() <= 128 && !text.contains('$')
+        }));
+    }
+
+    #[test]
+    fn research_routes_prompts_are_normalized_under_allinluna_marketplace() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_manifest(
+            root.path(),
+            "research-routes",
+            json!(["one", "two", "three", "four"]),
+        );
+        normalize_codex_plugin_manifest_at(root.path()).expect("normalize manifest");
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join(".codex-plugin/plugin.json")).expect("read manifest"),
+        )
+        .expect("valid JSON");
+        let prompts = value["interface"]["defaultPrompt"]
+            .as_array()
+            .expect("prompt array");
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts
+            .iter()
+            .all(|prompt| prompt.as_str().unwrap().chars().count() <= 128));
+    }
+
+    #[test]
+    fn openspec_adapter_metadata_matches_current_cli_version() {
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "openspec")
+            .expect("OpenSpec addon");
+        assert_eq!(super::codex_plugin_adapter(plugin).unwrap().0, "1.12.0");
+    }
+
+    #[test]
+    fn allinluna_adapter_is_selected_for_codex_install() {
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+
+        let (version, _description, skills) =
+            super::codex_plugin_adapter(plugin).expect("All in Luna adapter");
+        assert_eq!(version, "2.0.0-rc.7");
+        assert_eq!(skills, "./skills/");
+        assert!(super::uses_codex_plugin_adapter(
+            plugin,
+            super::PluginHost::Codex
+        ));
+        assert!(!super::uses_codex_plugin_adapter(
+            plugin,
+            super::PluginHost::ClaudeCode
+        ));
+    }
+}
+
+fn codex_plugin_adapter(
+    plugin: &PluginAddon,
+) -> Option<(&'static str, &'static str, &'static str)> {
     match plugin.id {
+        "allinluna" => Some((
+            "2.0.0-rc.7",
+            "Compile goals, plans, active runs, or research routes into executable task graphs",
+            "./skills/",
+        )),
         "openspec" => Some((
-            "1.11.0",
+            // OpenSpec's bundled CLI/package currently resolves to 1.12.0.
+            // Keep the Codex adapter metadata aligned with the executable.
+            "1.12.0",
             "Specification-driven change workflow with OpenSpec CLI support",
             "./skills/",
         )),
@@ -7562,7 +8841,7 @@ fn codex_plugin_adapter(plugin: &PluginAddon) -> Option<(&'static str, &'static 
             "./.agents/skills/",
         )),
         "ralph-loop" => Some((
-            "0.0.0",
+            "0.1.0",
             "Bounded autonomous coding-agent loop with explicit stop signals",
             "./skills/",
         )),
@@ -7570,9 +8849,54 @@ fn codex_plugin_adapter(plugin: &PluginAddon) -> Option<(&'static str, &'static 
     }
 }
 
+fn uses_codex_plugin_adapter(plugin: &PluginAddon, host: PluginHost) -> bool {
+    matches!(host, PluginHost::Codex) && codex_plugin_adapter(plugin).is_some()
+}
+
 fn codex_marketplace_plugin_root(root: &Path, plugin: &PluginAddon) -> PathBuf {
     root.join(plugin.marketplace_name)
         .join(plugin.codex_local_path.trim_start_matches("./"))
+}
+
+/// Codex copies marketplace checkouts into a versioned cache before loading
+/// them. Normalize the copied manifests too; normalizing only `.tmp` leaves
+/// Codex validating the original oversized prompts and invalid icon paths.
+fn normalize_codex_plugin_cache(plugin: &PluginAddon) -> Result<()> {
+    let cache = crate::client_adapters::home_dir()
+        .join(".codex")
+        .join("plugins")
+        .join("cache");
+    normalize_codex_plugin_cache_at(&cache, plugin)
+}
+
+fn normalize_codex_plugin_cache_at(cache: &Path, plugin: &PluginAddon) -> Result<()> {
+    let marketplace = cache.join(plugin.marketplace_name);
+    normalize_codex_plugin_cache_plugin_at(&marketplace.join(plugin.id))?;
+
+    // All in Luna installs Research Routes as a sibling plugin in the same
+    // marketplace cache, so its copied manifest needs the same treatment.
+    if plugin.id == "allinluna" {
+        normalize_codex_plugin_cache_plugin_at(&marketplace.join("research-routes"))?;
+    }
+    Ok(())
+}
+
+fn normalize_codex_plugin_cache_plugin_at(plugin_root: &Path) -> Result<()> {
+    if !plugin_root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(plugin_root)
+        .with_context(|| format!("reading Codex plugin cache {}", plugin_root.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("reading Codex plugin cache entry {}", plugin_root.display())
+        })?;
+        let version_root = entry.path();
+        if version_root.is_dir() {
+            normalize_codex_plugin_manifest_at(&version_root)?;
+        }
+    }
+    Ok(())
 }
 
 fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
@@ -7602,11 +8926,7 @@ fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
         }
         let url = format!("https://github.com/{}.git", plugin.marketplace);
         let source_text = source.to_string_lossy().into_owned();
-        run_codex_adapter_command(
-            "git",
-            &["clone", "--depth", "1", &url, &source_text],
-            &root,
-        )?;
+        run_codex_adapter_command("git", &["clone", "--depth", "1", &url, &source_text], &root)?;
         crate::client_adapters::atomic_write(
             &marker,
             &serde_json::to_vec_pretty(&json!({
@@ -7620,11 +8940,238 @@ fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
 
     write_codex_compat_marketplace_manifest_at(&root, plugin)?;
     prepare_codex_plugin_adapter_at(&root, plugin)?;
+    normalize_codex_plugin_manifest_at(&codex_marketplace_plugin_root(&root, plugin))?;
+    if plugin.id == "allinluna" {
+        normalize_codex_plugin_manifest_at(
+            &root
+                .join(plugin.marketplace_name)
+                .join("plugins/research-routes"),
+        )?;
+    }
     Ok(source)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexAdapterSourceDecision {
+    Create,
+    ReuseManaged,
+    MigrateGit { backup: PathBuf },
+    Refuse,
+}
+
+fn codex_adapter_source_decision(source: &Path, marker: &Path) -> CodexAdapterSourceDecision {
+    if source.join(".git").is_dir() {
+        if marker.is_file() {
+            CodexAdapterSourceDecision::ReuseManaged
+        } else {
+            CodexAdapterSourceDecision::MigrateGit {
+                backup: source.with_file_name(format!(
+                    "{}.headroom-legacy",
+                    source
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("marketplace")
+                )),
+            }
+        }
+    } else if source.exists() {
+        CodexAdapterSourceDecision::Refuse
+    } else {
+        CodexAdapterSourceDecision::Create
+    }
+}
+
+fn migrate_unmanaged_codex_marketplace(plugin: &PluginAddon) -> Result<Option<PathBuf>> {
+    if plugin.id != "allinluna" {
+        return Ok(None);
+    }
+    let root = crate::client_adapters::home_dir()
+        .join(".codex")
+        .join(".tmp")
+        .join("marketplaces");
+    let source = root.join(plugin.marketplace_name);
+    let marker = source.join(".headroom-local-community-adapter.json");
+    let CodexAdapterSourceDecision::MigrateGit { backup } =
+        codex_adapter_source_decision(&source, &marker)
+    else {
+        return Ok(None);
+    };
+    if backup.exists() {
+        bail!(
+            "refusing to overwrite recoverable Codex marketplace backup {}",
+            backup.display()
+        );
+    }
+    std::fs::rename(&source, &backup).with_context(|| {
+        format!(
+            "moving unmanaged Codex marketplace to recoverable backup {}",
+            backup.display()
+        )
+    })?;
+    Ok(Some(backup))
+}
+
+fn restore_codex_marketplace_backup(backup: &Path, destination: &Path) -> Result<()> {
+    if !backup.exists() {
+        bail!(
+            "Codex marketplace backup {} is missing; refusing to infer recovery from destination {}",
+            backup.display(),
+            destination.display()
+        );
+    }
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).with_context(|| {
+            format!(
+                "removing replacement Codex marketplace {}",
+                destination.display()
+            )
+        })?;
+    }
+    std::fs::rename(backup, destination)
+        .with_context(|| format!("restoring Codex marketplace backup {}", backup.display()))
+}
+
+fn merge_codex_marketplace_recovery_error(
+    primary: anyhow::Error,
+    recovery: Result<()>,
+) -> anyhow::Error {
+    match recovery {
+        Ok(()) => primary,
+        Err(recovery) => {
+            anyhow!("{primary:#}; restoring previous Codex marketplace failed: {recovery:#}")
+        }
+    }
+}
+
 fn run_codex_adapter_command(command: &str, args: &[&str], cwd: &Path) -> Result<()> {
-    run_codex_adapter_binary(Path::new(command), args, cwd)
+    let binary = match command {
+        // GUI launches do not reliably inherit the user's shell PATH. Resolve
+        // npm through the same known-path/login-shell probes used by CLI tools.
+        "npm" => crate::claude_cli::detect_npm_cli()
+            .with_context(|| "npm was not found; install Node.js/npm and retry")?,
+        _ => PathBuf::from(command),
+    };
+    run_codex_adapter_binary(&binary, args, cwd)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexMarketplaceRegistration {
+    Missing,
+    Local(PathBuf),
+    Git(String),
+    Other(String),
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn codex_marketplace_registration(
+    cli: &Path,
+    cwd: &Path,
+    marketplace_name: &str,
+) -> Result<CodexMarketplaceRegistration> {
+    // Use the shared GUI-safe command builder so script CLIs such as
+    // `/opt/homebrew/bin/codex` can resolve their `#!/usr/bin/env node`
+    // interpreter even when Headroom was launched from Finder.
+    let output = build_command(cli, &["plugin", "marketplace", "list", "--json"], cwd)
+        .output()
+        .with_context(|| format!("listing Codex marketplaces with {}", cli.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Codex marketplace list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let value: Value =
+        serde_json::from_slice(&output.stdout).context("parsing Codex marketplace list JSON")?;
+    Ok(json_marketplace_registration(&value, marketplace_name)
+        .unwrap_or(CodexMarketplaceRegistration::Missing))
+}
+
+fn json_marketplace_registration(
+    value: &Value,
+    marketplace_name: &str,
+) -> Option<CodexMarketplaceRegistration> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| json_marketplace_registration(item, marketplace_name)),
+        Value::Object(object) => {
+            let name_matches = object
+                .get("name")
+                .or_else(|| object.get("marketplace"))
+                .and_then(Value::as_str)
+                == Some(marketplace_name);
+            if name_matches {
+                let metadata = object
+                    .get("marketplaceSource")
+                    .and_then(Value::as_object)
+                    .unwrap_or(object);
+                let source_type = metadata
+                    .get("sourceType")
+                    .or_else(|| metadata.get("source_type"))
+                    .or_else(|| object.get("sourceType"))
+                    .or_else(|| object.get("source_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let source = metadata
+                    .get("source")
+                    .or_else(|| object.get("source"))
+                    .or_else(|| object.get("root"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                return Some(match source_type.as_str() {
+                    "local" => CodexMarketplaceRegistration::Local(PathBuf::from(source)),
+                    "git" => CodexMarketplaceRegistration::Git(source),
+                    other => CodexMarketplaceRegistration::Other(other.to_string()),
+                });
+            }
+            object
+                .values()
+                .find_map(|item| json_marketplace_registration(item, marketplace_name))
+        }
+        _ => None,
+    }
+}
+
+fn codex_marketplace_is_local(cli: &Path, cwd: &Path, marketplace_name: &str) -> Result<bool> {
+    Ok(matches!(
+        codex_marketplace_registration(cli, cwd, marketplace_name)?,
+        CodexMarketplaceRegistration::Local(_)
+    ))
+}
+
+fn json_marketplace_is_local(value: &Value, marketplace_name: &str) -> bool {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_marketplace_is_local(item, marketplace_name)),
+        Value::Object(object) => {
+            let name_matches = object
+                .get("name")
+                .or_else(|| object.get("marketplace"))
+                .and_then(Value::as_str)
+                == Some(marketplace_name);
+            let source_is_local = object
+                .get("sourceType")
+                .or_else(|| object.get("source_type"))
+                .and_then(Value::as_str)
+                .is_some_and(|source| source.eq_ignore_ascii_case("local"));
+            (name_matches && source_is_local)
+                || object
+                    .values()
+                    .any(|item| json_marketplace_is_local(item, marketplace_name))
+        }
+        _ => false,
+    }
 }
 
 fn run_codex_adapter_binary(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
@@ -7652,14 +9199,15 @@ fn gstack_bun_binary(plugin_root: &Path) -> Result<PathBuf> {
     }
 
     let install_root = plugin_root.join(".headroom-bun");
-    let executable = install_root
-        .join("node_modules")
-        .join(".bin")
-        .join(if cfg!(target_os = "windows") {
-            "bun.cmd"
-        } else {
-            "bun"
-        });
+    let executable =
+        install_root
+            .join("node_modules")
+            .join(".bin")
+            .join(if cfg!(target_os = "windows") {
+                "bun.cmd"
+            } else {
+                "bun"
+            });
     if !executable.is_file() {
         let prefix = install_root.to_string_lossy().into_owned();
         let cache = plugin_root
@@ -7759,8 +9307,7 @@ fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<
     let parent = manifest
         .parent()
         .context("Codex plugin adapter manifest has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let body = json!({
         "name": plugin.id,
         "version": version,
@@ -7785,7 +9332,10 @@ fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<
 
 fn rewrite_gstack_plugin_paths(root: &Path) -> Result<()> {
     if !root.is_dir() {
-        bail!("gstack Codex skills were not generated at {}", root.display());
+        bail!(
+            "gstack Codex skills were not generated at {}",
+            root.display()
+        );
     }
     for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
         let path = entry?.path();
@@ -7795,7 +9345,10 @@ fn rewrite_gstack_plugin_paths(root: &Path) -> Result<()> {
             let original = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let updated = original
-                .replace("${CODEX_HOME:-$HOME/.codex}/skills/gstack", "$CODEX_PLUGIN_ROOT")
+                .replace(
+                    "${CODEX_HOME:-$HOME/.codex}/skills/gstack",
+                    "$CODEX_PLUGIN_ROOT",
+                )
                 .replace("$HOME/.codex/skills/gstack", "$CODEX_PLUGIN_ROOT")
                 .replace("~/.codex/skills/gstack", "$CODEX_PLUGIN_ROOT");
             if updated != original {
@@ -8321,13 +9874,132 @@ fn set_serena_browser_dashboard() {
 }
 
 fn installed_plugin_version(plugin: &PluginAddon) -> Option<String> {
-    let plugins = claude_installed_plugins()?;
-    let installs = plugins.get("plugins")?.get(plugin.plugin_ref)?.as_array()?;
-    installs
-        .first()?
-        .get("version")?
-        .as_str()
-        .map(str::to_string)
+    if let Some(version) = claude_installed_plugins().and_then(|plugins| {
+        plugins
+            .get("plugins")?
+            .get(plugin.plugin_ref)?
+            .as_array()?
+            .first()?
+            .get("version")?
+            .as_str()
+            .map(str::to_string)
+    }) {
+        return Some(version);
+    }
+
+    if !codex_plugin_present(plugin) {
+        return None;
+    }
+
+    let codex_tmp = crate::client_adapters::home_dir()
+        .join(".codex")
+        .join(".tmp");
+    plugin_version_from_codex_cache(plugin, &codex_tmp)
+}
+
+fn plugin_version_from_codex_cache(plugin: &PluginAddon, codex_tmp: &Path) -> Option<String> {
+    let local_path = plugin.codex_local_path.trim_start_matches("./");
+    [
+        codex_tmp
+            .join("marketplaces")
+            .join(plugin.marketplace_name)
+            .join(local_path),
+        codex_tmp.join("plugins").join(local_path),
+    ]
+    .into_iter()
+    .find_map(|root| plugin_version_from_root(&root))
+}
+
+fn plugin_version_from_root(root: &Path) -> Option<String> {
+    for path in [
+        root.join(".codex-plugin/plugin.json"),
+        root.join("package.json"),
+        root.join("VERSION"),
+    ] {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if path.file_name().and_then(|name| name.to_str()) == Some("VERSION") {
+                if let Some(version) = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                {
+                    return Some(version.to_string());
+                }
+            } else if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                let version = value
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.pointer("/package/version").and_then(Value::as_str));
+                if let Some(version) = version {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod plugin_version_tests {
+    use super::{plugin_version_from_codex_cache, plugin_version_from_root, PLUGIN_ADDONS};
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn reads_manifest_then_package_then_version_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            root.path().join("package.json"),
+            serde_json::to_vec(&json!({ "version": "1.79.0", "name": "gstack" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plugin_version_from_root(root.path()).as_deref(),
+            Some("1.79.0")
+        );
+
+        fs::create_dir_all(root.path().join(".codex-plugin")).unwrap();
+        fs::write(
+            root.path().join(".codex-plugin/plugin.json"),
+            serde_json::to_vec(&json!({ "version": "2.0.0-rc.7" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plugin_version_from_root(root.path()).as_deref(),
+            Some("2.0.0-rc.7")
+        );
+
+        fs::write(root.path().join(".codex-plugin/plugin.json"), b"not json").unwrap();
+        fs::remove_file(root.path().join("package.json")).unwrap();
+        fs::write(root.path().join("VERSION"), b"0.3.0\n").unwrap();
+        assert_eq!(
+            plugin_version_from_root(root.path()).as_deref(),
+            Some("0.3.0")
+        );
+    }
+
+    #[test]
+    fn reads_curated_codex_plugin_version_from_shared_cache() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "superpowers")
+            .expect("superpowers addon");
+        let manifest = root
+            .path()
+            .join("plugins/plugins/superpowers/.codex-plugin/plugin.json");
+        fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({ "version": "6.3.0" })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plugin_version_from_codex_cache(plugin, root.path()).as_deref(),
+            Some("6.3.0")
+        );
+    }
 }
 
 /// Claude Code ≥2.x stores user-scope MCP servers in `~/.claude.json` under
@@ -9520,31 +11192,110 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 /// yields `ModuleNotFoundError: No module named 'headroom._core'` at proxy
 /// start (RUST-6E: every 0.7.7 Windows install). Keep this in step with
 /// `python_distribution_artifact`'s platform matrix.
+#[derive(Debug, Clone, Deserialize)]
+struct PyPiFile {
+    filename: String,
+    url: String,
+    digests: PyPiDigests,
+    packagetype: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PyPiDigests {
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PyPiReleaseResponse {
+    info: PyPiReleaseInfo,
+    urls: Vec<PyPiFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PyPiReleaseInfo {
+    version: String,
+}
+
+fn headroom_wheel_platform_tag() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("macosx_11_0_arm64"),
+        ("macos", "x86_64") => Ok("macosx_10_12_x86_64"),
+        ("linux", "aarch64") => Ok("manylinux_2_28_aarch64"),
+        ("linux", "x86_64") => Ok("manylinux_2_28_x86_64"),
+        ("windows", "x86_64") => Ok("win_amd64"),
+        (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
+    }
+}
+
+fn parse_headroom_release(value: &Value, requested_version: &str) -> Result<HeadroomRelease> {
+    let requested = stable_package_version(requested_version)?;
+    let response: PyPiReleaseResponse = serde_json::from_value(value.clone())?;
+    let published = stable_package_version(&response.info.version)?;
+    if published != requested {
+        bail!("PyPI release version does not match requested version");
+    }
+    let platform = headroom_wheel_platform_tag()?;
+    let prefix = format!("headroom_ai-{requested}-");
+    let mut wheels = response.urls.into_iter().filter(|file| {
+        file.packagetype == "bdist_wheel"
+            && file.filename.starts_with(&prefix)
+            && file.filename.ends_with(".whl")
+            && file.filename.contains(platform)
+    });
+    let file = wheels
+        .clone()
+        .find(|file| file.filename.contains("cp312-cp312-"))
+        .or_else(|| wheels.find(|file| file.filename.contains("cp312-abi3-")))
+        .or_else(|| wheels.find(|file| file.filename.contains("abi3-")))
+        .ok_or_else(|| anyhow!("PyPI has no compatible headroom-ai wheel for this platform"))?;
+    let parsed = reqwest::Url::parse(&file.url).context("invalid PyPI wheel URL")?;
+    if parsed.scheme() != "https"
+        || !matches!(
+            parsed.host_str(),
+            Some("pypi.org") | Some("files.pythonhosted.org")
+        )
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.path().starts_with("/packages/")
+            && parsed.host_str() == Some("files.pythonhosted.org")
+    {
+        bail!("PyPI wheel URL is not trusted");
+    }
+    if file.digests.sha256.len() != 64
+        || !file.digests.sha256.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!("PyPI wheel is missing a valid sha256 digest");
+    }
+    Ok(HeadroomRelease {
+        version: requested.into(),
+        wheel_url: file.url,
+        sha256: file.digests.sha256.to_ascii_lowercase(),
+    })
+}
+
+fn fetch_headroom_release(version: &str) -> Result<HeadroomRelease> {
+    stable_package_version(version)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("Headroom Desktop")
+        .build()?;
+    let value: Value = client
+        .get(format!("https://pypi.org/pypi/headroom-ai/{version}/json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    parse_headroom_release(&value, version)
+}
+
 fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/1b/99/410b64a578f36d249b76915d733873192537e986b2bc911373e6d72839e9/headroom_ai-0.36.5-cp310-abi3-macosx_11_0_arm64.whl",
-            "0190c55f022760d49f6268f3c0970438f9bdd5a72bc0288e2788ff7e8b8ce730",
-        ),
-        ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/3a/79/8db10dd06c45c942c2f293b3748d70c8ac53ba048b7796b947f78fcdf952/headroom_ai-0.36.5-cp310-abi3-macosx_10_12_x86_64.whl",
-            "c62f18e261909a3de43c32113ec76c9ad6580e8fac6dc83347a71403d66094bf",
-        ),
-        ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/68/58/97538fcca4505a130e7f65e5a736e1672f3b339f34dde0b86f07a9220edc/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "378ac86ea3d188014be8c98e5af2d5b64b4ac6ad566bcdc95714dcdf02851932",
-        ),
-        ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/15/c9/650195df8133b0f2ae5156bd9780fd70e17d8cead361016983e72d629697/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "56954b76cd10b5312061725e7470575598a4bde3fa7f80f77d82a08a71fceae8",
-        ),
-        ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/87/55/4f68afd415361200c9339ac98ee30ed2ceae573136d852b17f1b276e1c36/headroom_ai-0.36.5-cp310-abi3-win_amd64.whl",
-            "f842990c69e39d967982ef9bd1da20c12b9a7f39507e4f76d638b44f93114986",
-        ),
+        ("macos", "aarch64") => ("https://files.pythonhosted.org/packages/1b/99/410b64a578f36d249b76915d733873192537e986b2bc911373e6d72839e9/headroom_ai-0.36.5-cp310-abi3-macosx_11_0_arm64.whl", "0190c55f022760d49f6268f3c0970438f9bdd5a72bc0288e2788ff7e8b8ce730"),
+        ("macos", "x86_64") => ("https://files.pythonhosted.org/packages/3a/79/8db10dd06c45c942c2f293b3748d70c8ac53ba048b7796b947f78fcdf952/headroom_ai-0.36.5-cp310-abi3-macosx_10_12_x86_64.whl", "c62f18e261909a3de43c32113ec76c9ad6580e8fac6dc83347a71403d66094bf"),
+        ("linux", "aarch64") => ("https://files.pythonhosted.org/packages/68/58/97538fcca4505a130e7f65e5a736e1672f3b339f34dde0b86f07a9220edc/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_aarch64.whl", "378ac86ea3d188014be8c98e5af2d5b64b4ac6ad566bcdc95714dcdf02851932"),
+        ("linux", "x86_64") => ("https://files.pythonhosted.org/packages/15/c9/650195df8133b0f2ae5156bd9780fd70e17d8cead361016983e72d629697/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_x86_64.whl", "56954b76cd10b5312061725e7470575598a4bde3fa7f80f77d82a08a71fceae8"),
+        ("windows", "x86_64") => ("https://files.pythonhosted.org/packages/87/55/4f68afd415361200c9339ac98ee30ed2ceae573136d852b17f1b276e1c36/headroom_ai-0.36.5-cp310-abi3-win_amd64.whl", "f842990c69e39d967982ef9bd1da20c12b9a7f39507e4f76d638b44f93114986"),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
-
     Ok(HeadroomRelease {
         version: HEADROOM_PINNED_VERSION.into(),
         wheel_url: url.into(),
@@ -9620,6 +11371,133 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct RtkReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RtkReleaseResponse {
+    tag_name: String,
+    assets: Vec<RtkReleaseAsset>,
+}
+
+struct RtkReleaseArtifact {
+    version: String,
+    url: String,
+    sha256: String,
+}
+
+fn valid_rtk_version(version: &str) -> bool {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn rtk_version_output_matches(output: &str, version: &str) -> bool {
+    output
+        .split_whitespace()
+        .any(|token| token == version || token.strip_prefix('v') == Some(version))
+}
+
+fn rtk_version_is_downgrade(current: &str, target: &str) -> bool {
+    matches!(
+        (parse_major_minor_patch(current), parse_major_minor_patch(target)),
+        (Some(current), Some(target)) if target < current
+    )
+}
+
+fn rtk_release_asset_name() -> Result<String> {
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
+    };
+    let extension = if cfg!(target_os = "windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    Ok(format!("rtk-{target}.{extension}"))
+}
+
+fn parse_rtk_release(value: &Value, requested_version: &str) -> Result<RtkReleaseArtifact> {
+    let requested = requested_version
+        .strip_prefix('v')
+        .unwrap_or(requested_version);
+    if !valid_rtk_version(requested) {
+        bail!("invalid RTK version: {requested_version}");
+    }
+    let release: RtkReleaseResponse = serde_json::from_value(value.clone())?;
+    let tag_version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
+    if tag_version != requested || !valid_rtk_version(tag_version) {
+        bail!("RTK release tag does not match requested version");
+    }
+    let asset_name = rtk_release_asset_name()?;
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| anyhow!("RTK release has no asset for this platform"))?;
+    if !asset
+        .browser_download_url
+        .starts_with("https://github.com/rtk-ai/rtk/releases/download/")
+    {
+        bail!("RTK release asset URL is not trusted");
+    }
+    let parsed_url = reqwest::Url::parse(&asset.browser_download_url)
+        .context("invalid RTK release asset URL")?;
+    let expected_path = format!("/rtk-ai/rtk/releases/download/v{requested}/{asset_name}");
+    if parsed_url.scheme() != "https"
+        || parsed_url.host_str() != Some("github.com")
+        || parsed_url.query().is_some()
+        || parsed_url.fragment().is_some()
+        || parsed_url.path() != expected_path
+    {
+        bail!("RTK release asset URL not trusted");
+    }
+    let digest = asset.digest.as_deref().unwrap_or("");
+    let sha256 = digest.strip_prefix("sha256:").unwrap_or("");
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("RTK release asset is missing a valid sha256 digest");
+    }
+    Ok(RtkReleaseArtifact {
+        version: requested.to_string(),
+        url: asset.browser_download_url,
+        sha256: sha256.to_ascii_lowercase(),
+    })
+}
+
+fn fetch_rtk_release(version: &str) -> Result<RtkReleaseArtifact> {
+    if !valid_rtk_version(version) {
+        bail!("invalid RTK version: {version}");
+    }
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Headroom")
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let value: Value = client
+        .get(format!(
+            "https://api.github.com/repos/rtk-ai/rtk/releases/tags/v{}",
+            version.strip_prefix('v').unwrap_or(version)
+        ))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    parse_rtk_release(&value, version)
+}
+
 /// Why this addon cannot be installed on the current OS/arch, in one sentence
 /// the Addons tab shows in place of an Install button that could only ever
 /// error. Keyed off the same artifact resolvers the installers call, so a newly
@@ -9659,6 +11537,105 @@ fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
         ),
         sha256: Some(sha256),
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct CodebaseMemoryReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodebaseMemoryReleaseResponse {
+    tag_name: String,
+    assets: Vec<CodebaseMemoryReleaseAsset>,
+}
+
+fn valid_codebase_memory_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn codebase_memory_release_target() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("darwin-arm64"),
+        ("macos", "x86_64") => Ok("darwin-amd64"),
+        ("linux", "aarch64") => Ok("linux-arm64"),
+        ("linux", "x86_64") => Ok("linux-amd64"),
+        (os, arch) => bail!("unsupported codebase-memory target: {os}/{arch}"),
+    }
+}
+
+fn parse_codebase_memory_release(
+    value: &Value,
+    requested_version: &str,
+) -> Result<DownloadArtifact> {
+    if !valid_codebase_memory_version(requested_version) {
+        bail!("invalid codebase-memory version: {requested_version}");
+    }
+    let release: CodebaseMemoryReleaseResponse = serde_json::from_value(value.clone())?;
+    let tag_version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
+    if tag_version != requested_version || !valid_codebase_memory_version(tag_version) {
+        bail!("codebase-memory release tag does not match requested version");
+    }
+    let asset_name = format!(
+        "codebase-memory-mcp-{}.tar.gz",
+        codebase_memory_release_target()?
+    );
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| anyhow!("codebase-memory release has no asset for this platform"))?;
+    let parsed_url = reqwest::Url::parse(&asset.browser_download_url)
+        .context("invalid codebase-memory release asset URL")?;
+    let expected_path = format!(
+        "/DeusData/codebase-memory-mcp/releases/download/v{requested_version}/{asset_name}"
+    );
+    if parsed_url.scheme() != "https"
+        || parsed_url.host_str() != Some("github.com")
+        || parsed_url.path() != expected_path
+        || parsed_url.query().is_some()
+        || parsed_url.fragment().is_some()
+    {
+        bail!("codebase-memory release asset URL not trusted");
+    }
+    let sha256 = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("codebase-memory release asset has no valid SHA-256 digest"))?;
+    Ok(DownloadArtifact {
+        url: asset.browser_download_url,
+        sha256: Some(Box::leak(sha256.to_ascii_lowercase().into_boxed_str())),
+    })
+}
+
+fn fetch_codebase_memory_release(version: &str) -> Result<DownloadArtifact> {
+    if !valid_codebase_memory_version(version) {
+        bail!("invalid codebase-memory version: {version}");
+    }
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Headroom")
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let value: Value = client
+        .get(format!(
+            "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/tags/v{}",
+            version
+        ))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    parse_codebase_memory_release(&value, version)
 }
 
 fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>) -> Result<()> {
@@ -10280,7 +12257,11 @@ fn project_cwd_from_transcript_dir(dir: &Path) -> Option<String> {
 /// shebang (or similar) resolves the interpreter that nvm installs alongside
 /// it. Falls back to the existing PATH when the binary has no parent.
 fn context7_package_spec() -> String {
-    format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
+    context7_package_spec_for(CONTEXT7_PINNED_VERSION)
+}
+
+fn context7_package_spec_for(version: &str) -> String {
+    format!("@upstash/context7-mcp@{version}")
 }
 
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
@@ -10295,10 +12276,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         // CLI in nvm's bin, so prepend the binary's own dir to PATH.
         .env(
             "PATH",
-            crate::claude_cli::path_with_binary_dir(
-                binary,
-                std::env::var_os("PATH").as_deref(),
-            ),
+            crate::claude_cli::path_with_binary_dir(binary, std::env::var_os("PATH").as_deref()),
         )
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
@@ -10920,6 +12898,13 @@ impl std::error::Error for HeadroomStartupFailure {}
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        codebase_memory_release_target, context7_package_spec_for, parse_codebase_memory_release,
+        parse_rtk_release, rtk_release_asset_name, rtk_version_is_downgrade,
+        rtk_version_output_matches, stable_package_version, valid_codebase_memory_version,
+        valid_rtk_version,
+    };
+    use serde_json::json;
     use std::cell::Cell;
     use std::fs;
     #[cfg(unix)]
@@ -10944,20 +12929,18 @@ mod tests {
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
         parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
-        parse_tasklist_image, pending_addon_update, pinned_headroom_release,
-        pip_failure_category, plugin_install_failure_category, pre_upstream_concurrency,
-        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        write_codex_compat_marketplace_manifest_at, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        UNKNOWN_OCCUPANT, PluginHost,
+        parse_tasklist_image, pending_addon_update, pinned_headroom_release, pip_failure_category,
+        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
+        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
+        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        write_codex_compat_marketplace_manifest_at, CommandFailure, HeadroomRelease,
+        ManagedRuntime, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
+        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
+        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -11025,7 +13008,6 @@ No actionable patterns found.
         path
     }
 
-    #[test]
     fn learned_openai_ttl_picks_smallest_death_beyond_largest_life() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_ttl_obs(
@@ -12009,6 +13991,7 @@ asyncio.run(verify())
 
     #[test]
     fn rtk_distribution_artifact_is_pinned_to_current_release_with_checksum() {
+        assert_eq!(RTK_VERSION, "0.47.0");
         let artifact = rtk_distribution_artifact().expect("supported RTK target");
 
         assert!(artifact.url.contains(&format!("/v{RTK_VERSION}/")));
@@ -12065,6 +14048,17 @@ asyncio.run(verify())
             manager.installed_rtk_version().as_deref(),
             Some("0.37.2-test")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn headroom_upgrade_target_comparison_is_strict_and_local() {
+        let (root, _runtime, manager) = seed_test_runtime("headroom-target-comparison");
+
+        assert!(manager.headroom_upgrade_target_is_newer("0.0.2"));
+        assert!(!manager.headroom_upgrade_target_is_newer("0.0.1"));
+        assert!(!manager.headroom_upgrade_target_is_newer("latest"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13495,6 +15489,196 @@ after
     }
 
     #[test]
+    fn allinluna_compat_marketplace_exposes_research_routes_and_preserves_adapter_choice() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        super::write_codex_compat_marketplace_manifest_at(root.path(), plugin)
+            .expect("compatibility manifest");
+        let path = root
+            .path()
+            .join(plugin.marketplace_name)
+            .join(".agents/plugins/marketplace.json");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("manifest bytes")).expect("valid JSON");
+        let plugins = value["plugins"].as_array().expect("plugin entries");
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0]["name"], "allinluna");
+        assert_eq!(plugins[1]["name"], "research-routes");
+        assert_eq!(plugins[1]["source"]["source"], "local");
+        assert_eq!(plugins[1]["source"]["path"], "./plugins/research-routes");
+    }
+
+    #[test]
+    fn codex_adapter_source_decision_is_safe_and_recoverable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("allinluna");
+        let marker = source.join(".headroom-local-community-adapter.json");
+        assert_eq!(
+            super::codex_adapter_source_decision(&source, &marker),
+            super::CodexAdapterSourceDecision::Create
+        );
+        fs::create_dir_all(source.join(".git")).expect("git checkout");
+        assert!(matches!(
+            super::codex_adapter_source_decision(&source, &marker),
+            super::CodexAdapterSourceDecision::MigrateGit { backup }
+                if backup == root.path().join("allinluna.headroom-legacy")
+        ));
+        fs::write(&marker, b"{}").expect("ownership marker");
+        assert_eq!(
+            super::codex_adapter_source_decision(&source, &marker),
+            super::CodexAdapterSourceDecision::ReuseManaged
+        );
+        fs::remove_dir_all(source.join(".git")).expect("remove git marker");
+        assert_eq!(
+            super::codex_adapter_source_decision(&source, &marker),
+            super::CodexAdapterSourceDecision::Refuse
+        );
+    }
+
+    #[test]
+    fn codex_marketplace_backup_restore_moves_original_back() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let destination = root.path().join("allinluna");
+        let backup = root.path().join("allinluna.headroom-legacy");
+        fs::create_dir_all(&destination).expect("replacement marketplace");
+        fs::write(destination.join("source"), b"replacement").expect("replacement marker");
+        fs::create_dir_all(&backup).expect("marketplace backup");
+        fs::create_dir_all(backup.join(".git")).expect("original git marker");
+        fs::write(backup.join("source"), b"original").expect("original marker");
+
+        super::restore_codex_marketplace_backup(&backup, &destination)
+            .expect("restore marketplace backup");
+        assert_eq!(
+            fs::read(destination.join("source")).expect("restored marker"),
+            b"original"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn codex_marketplace_backup_restore_rejects_missing_source_and_destination() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let destination = root.path().join("allinluna");
+        let backup = root.path().join("allinluna.headroom-legacy");
+
+        let err = super::restore_codex_marketplace_backup(&backup, &destination)
+            .expect_err("missing backup must not be reported as restored");
+        assert!(format!("{err:#}").contains("is missing"));
+    }
+
+    #[test]
+    fn codex_marketplace_backup_restore_rejects_managed_replacement_without_backup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let destination = root.path().join("allinluna");
+        let backup = root.path().join("allinluna.headroom-legacy");
+        fs::create_dir_all(destination.join(".git")).expect("replacement git marker");
+        fs::write(
+            destination.join(".headroom-local-community-adapter.json"),
+            b"{}",
+        )
+        .expect("replacement ownership marker");
+
+        super::restore_codex_marketplace_backup(&backup, &destination)
+            .expect_err("managed replacement must not be mistaken for restored backup");
+    }
+
+    #[test]
+    fn codex_marketplace_recovery_error_keeps_primary_and_recovery_failures() {
+        let err = super::merge_codex_marketplace_recovery_error(
+            anyhow::anyhow!("install failed"),
+            Err(anyhow::anyhow!("restore failed")),
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("install failed"));
+        assert!(message.contains("restore failed"));
+    }
+
+    #[test]
+    fn codex_marketplace_list_requires_local_source_type() {
+        let local = json!({
+            "marketplaces": [{"name": "allinluna", "sourceType": "local"}]
+        });
+        let git = json!({
+            "marketplaces": [{"name": "allinluna", "sourceType": "git"}]
+        });
+        assert!(super::json_marketplace_is_local(&local, "allinluna"));
+        assert!(!super::json_marketplace_is_local(&git, "allinluna"));
+        assert!(!super::json_marketplace_is_local(&local, "other"));
+    }
+
+    #[test]
+    fn codex_marketplace_registration_reads_nested_source_and_path() {
+        let local = json!({
+            "marketplaces": [{
+                "name": "allinluna",
+                "root": "/tmp/adapter",
+                "marketplaceSource": {
+                    "sourceType": "local",
+                    "source": "/tmp/adapter"
+                }
+            }]
+        });
+        let git = json!({
+            "marketplaces": [{
+                "name": "allinluna",
+                "marketplaceSource": {
+                    "sourceType": "git",
+                    "source": "https://github.com/zenx0x/allinluna.git"
+                }
+            }]
+        });
+
+        assert_eq!(
+            super::json_marketplace_registration(&local, "allinluna"),
+            Some(super::CodexMarketplaceRegistration::Local(PathBuf::from(
+                "/tmp/adapter"
+            )))
+        );
+        assert_eq!(
+            super::json_marketplace_registration(&git, "allinluna"),
+            Some(super::CodexMarketplaceRegistration::Git(
+                "https://github.com/zenx0x/allinluna.git".into()
+            ))
+        );
+        assert_eq!(
+            super::json_marketplace_registration(&local, "missing"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn codex_marketplace_registration_resolves_node_for_gui_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let node = root.path().join("node");
+        fs::write(&node, "#!/bin/sh\nprintf '%s\\n' '{\"marketplaces\":[]}'\n").expect("fake node");
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).expect("node executable");
+
+        let cli = root.path().join("codex");
+        fs::write(&cli, "#!/usr/bin/env node\n").expect("fake codex");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("codex executable");
+
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/usr/bin:/bin");
+        let result = super::codex_marketplace_registration(&cli, root.path(), "openspec");
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(
+            result.is_ok(),
+            "GUI-safe PATH should resolve node: {result:?}"
+        );
+    }
+
+    #[test]
     fn managed_tool_metadata_and_native_plugin_registry_are_stable() {
         use std::collections::HashSet;
 
@@ -13507,12 +15691,22 @@ after
             ("headroom", "core", "immediate", None),
             ("rtk", "efficiency", "immediate", None),
             ("markitdown", "documents", "immediate", None),
-            ("serena", "code_intelligence", "immediate", None),
-            ("codebase-memory", "code_intelligence", "immediate", None),
-            ("context7", "code_intelligence", "immediate", None),
+            ("serena", "code_intelligence", "client_restart", None),
+            (
+                "codebase-memory",
+                "code_intelligence",
+                "client_restart",
+                None,
+            ),
+            ("context7", "code_intelligence", "client_restart", None),
             ("ponytail", "efficiency", "new_session", None),
             ("caveman", "efficiency", "new_session", None),
-            ("allinluna", "automation", "new_session", Some("execution_engine")),
+            (
+                "allinluna",
+                "automation",
+                "new_session",
+                Some("execution_engine"),
+            ),
             ("stop-that-shit", "guardrails", "new_session", None),
             ("agent-guard", "guardrails", "new_session", None),
             ("grill-me", "learning", "new_session", None),
@@ -13520,7 +15714,11 @@ after
             let tool = listed_tool(&manager, id);
             assert_eq!(tool.category, category, "category for {id}");
             assert_eq!(tool.activation_scope, activation_scope, "scope for {id}");
-            assert_eq!(tool.workflow_group.as_deref(), workflow_group, "workflow for {id}");
+            assert_eq!(
+                tool.workflow_group.as_deref(),
+                workflow_group,
+                "workflow for {id}"
+            );
         }
 
         for (id, marketplace, marketplace_name, plugin_ref, local_path, source_url) in [
@@ -13585,6 +15783,12 @@ after
             "Headroom-managed Python >= 3.11"
         };
         assert!(body.contains(required_python));
+        assert!(body.contains("allinluna/runtime"));
+        assert!(body.contains("allinluna_runtime/__main__.py"));
+        assert!(body.contains("PYTHONPATH"));
+        assert!(body.contains("PYTHONNOUSERSITE=1"));
+        assert!(body.contains("-m allinluna_runtime"));
+        assert!(!body.contains("allinluna_runtime.py"));
         assert!(!body.contains("/usr/bin/python3"));
     }
 
@@ -13939,11 +16143,11 @@ after
             None
         );
 
-        // Plugins track a marketplace, so the action is the check: offered
-        // whenever installed, with no version to advertise.
+        // Plugin updates require a confirmed upstream version; local state alone
+        // must not create an optimistic Update button.
         assert_eq!(
-            pending_addon_update("ponytail", Some("4.7.0"), PLUGIN_DISPLAY_VERSION).as_deref(),
-            Some("")
+            pending_addon_update("ponytail", Some("4.7.0"), PLUGIN_DISPLAY_VERSION),
+            None
         );
         assert_eq!(
             pending_addon_update("caveman", None, PLUGIN_DISPLAY_VERSION),
@@ -14142,6 +16346,28 @@ after
     }
 
     #[test]
+    fn context7_and_codebase_memory_migrate_legacy_entries_and_fail_on_mismatch() {
+        for (helper, tool, legacy_arg) in [
+            (super::CONTEXT7_MCP_HELPER, "context7", "sys.argv[3]"),
+            (
+                super::CODEBASE_MEMORY_MCP_HELPER,
+                "codebase-memory",
+                "sys.argv[4]",
+            ),
+        ] {
+            assert!(helper.contains(&format!(
+                "legacy_ledger = Path({legacy_arg}) if len(sys.argv) >"
+            )));
+            assert!(helper.contains("headroom_installed_matching("));
+            assert!(helper.contains("path=legacy_ledger"));
+            assert!(helper.contains(&format!(
+                "{tool} entry conflicts with user-managed configuration"
+            )));
+            assert!(helper.contains("elif result.status == RegisterStatus.MISMATCH:"));
+        }
+    }
+
+    #[test]
     fn serena_dashboard_listener_parsers_find_late_loopback_ports() {
         let lsof = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
 python3 10 user 4u IPv4 0x1 0t0 TCP 127.0.0.1:24282 (LISTEN)\n\
@@ -14278,6 +16504,51 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
             runtime.venv_dir.join("marker").exists(),
             "live venv untouched"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_rtk_pending_restores_binary_and_receipt() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-pending-recovery");
+        fs::create_dir_all(&runtime.bin_dir).expect("bin dir");
+        let destination = manager.rtk_entrypoint();
+        let backup = destination.with_extension("old-test");
+        let staged = destination.with_extension("new-test");
+        fs::write(&backup, b"old-binary").expect("backup");
+        fs::write(&destination, b"new-binary").expect("new binary");
+        fs::write(&staged, b"staged").expect("staged");
+        fs::write(
+            runtime.tools_dir.join("rtk.json.backup"),
+            br#"{"version":"0.45.0"}"#,
+        )
+        .expect("receipt backup");
+        fs::write(
+            runtime.tools_dir.join("rtk.json"),
+            br#"{"version":"0.46.0"}"#,
+        )
+        .expect("new receipt");
+        let marker = runtime.downloads_dir.join("rtk-install.pending");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "destination": destination,
+                "backup": backup,
+                "staged": staged,
+                "hadReceipt": true,
+            }))
+            .expect("marker"),
+        )
+        .expect("write marker");
+
+        manager.recover_rtk_pending().expect("recover");
+        assert_eq!(fs::read(&destination).expect("destination"), b"old-binary");
+        assert_eq!(
+            fs::read(runtime.tools_dir.join("rtk.json")).expect("receipt"),
+            br#"{"version":"0.45.0"}"#
+        );
+        assert!(!marker.exists());
+        assert!(!staged.exists());
+        assert!(!backup.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -15078,19 +17349,21 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     }
 
     #[test]
+    #[serial_test::serial]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_succeeds_with_executable_python() {
         let (root, runtime, manager) = seed_test_runtime("smoke-ok");
         write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
 
         manager
-            .smoke_test_headroom_with_timeout(Duration::from_secs(2))
+            .smoke_test_headroom_with_timeout(Duration::from_secs(10))
             .expect("smoke test succeeds");
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
+    #[serial_test::serial]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_headroom_returns_command_failure_output_on_nonzero_exit() {
         let (root, runtime, manager) = seed_test_runtime("smoke-fail");
@@ -15100,7 +17373,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         );
 
         let err = manager
-            .smoke_test_headroom_with_timeout(Duration::from_secs(2))
+            .smoke_test_headroom_with_timeout(Duration::from_secs(10))
             .expect_err("smoke test should fail");
         let failure = err
             .chain()
@@ -15123,8 +17396,23 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     }
 
     #[test]
+    fn marketplace_build_root_contains_manifest_source_root() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-marketplace-roots");
+        for id in ["openspec", "gstack"] {
+            let plugin = super::plugin_addon(id).expect("plugin manifest");
+            let package_root = manager.marketplace_package_root(plugin);
+            let source_root = manager.codex_plugin_source_path(plugin);
+            assert!(package_root.ends_with(plugin.marketplace_name));
+            assert!(source_root.starts_with(&package_root));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn smoke_test_plugin_is_noop_when_not_installed() {
         let (root, _runtime, manager) = seed_test_runtime("plugin-smoke-absent");
+        let _home = HomeGuard::new(&root);
         for plugin in &PLUGIN_ADDONS {
             manager
                 .smoke_test_plugin(plugin.id)
@@ -15243,13 +17531,61 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     }
 
     #[test]
+    /// Installs plugins into an explicitly selected live Headroom data root
+    /// and verifies them through the same smoke path used by the dashboard.
+    /// Ignored by default because this requires network access and mutates the
+    /// selected Headroom/Codex installation.
+    #[ignore = "requires network and an explicit live Headroom data root"]
+    fn plugin_live_install_and_smoke() {
+        let base_dir = std::env::var_os("HEADROOM_PLUGIN_LIVE_BASE_DIR")
+            .map(PathBuf::from)
+            .expect("set HEADROOM_PLUGIN_LIVE_BASE_DIR explicitly");
+        assert!(base_dir.is_absolute(), "live data root must be absolute");
+
+        let ids = std::env::var("HEADROOM_PLUGIN_LIVE_IDS")
+            .expect("set HEADROOM_PLUGIN_LIVE_IDS to a comma-separated plugin list");
+        let runtime = ManagedRuntime::bootstrap_root(&base_dir);
+        runtime.ensure_layout().expect("create live runtime layout");
+        let manager = ToolManager::new(runtime);
+
+        for id in ids.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            super::plugin_addon(id).unwrap_or_else(|| panic!("unknown plugin addon: {id}"));
+            manager
+                .install_plugin(id)
+                .unwrap_or_else(|err| panic!("install {id}: {err:#}"));
+            manager
+                .smoke_test_plugin(id)
+                .unwrap_or_else(|err| panic!("smoke-test {id}: {err:#}"));
+            assert!(
+                manager.plugin_installed(id),
+                "{id} not installed after smoke"
+            );
+        }
+    }
+
+    #[test]
     fn workflow_conflict_groups_are_complete_and_symmetric() {
         let (_root, _runtime, manager) = seed_test_runtime("workflow-conflicts");
-        assert_eq!(manager.conflicting_plugin_ids("openspec"), vec!["superpowers".to_string(), "gstack".to_string()]);
-        assert_eq!(manager.conflicting_plugin_ids("superpowers"), vec!["openspec".to_string(), "gstack".to_string()]);
-        assert_eq!(manager.conflicting_plugin_ids("gstack"), vec!["openspec".to_string(), "superpowers".to_string()]);
-        assert_eq!(manager.conflicting_plugin_ids("allinluna"), vec!["ralph-loop".to_string()]);
-        assert_eq!(manager.conflicting_plugin_ids("ralph-loop"), vec!["allinluna".to_string()]);
+        assert_eq!(
+            manager.conflicting_plugin_ids("openspec"),
+            vec!["superpowers".to_string(), "gstack".to_string()]
+        );
+        assert_eq!(
+            manager.conflicting_plugin_ids("superpowers"),
+            vec!["openspec".to_string(), "gstack".to_string()]
+        );
+        assert_eq!(
+            manager.conflicting_plugin_ids("gstack"),
+            vec!["openspec".to_string(), "superpowers".to_string()]
+        );
+        assert_eq!(
+            manager.conflicting_plugin_ids("allinluna"),
+            vec!["ralph-loop".to_string()]
+        );
+        assert_eq!(
+            manager.conflicting_plugin_ids("ralph-loop"),
+            vec!["allinluna".to_string()]
+        );
         assert!(manager.conflicting_plugin_ids("agent-guard").is_empty());
     }
 
@@ -15282,6 +17618,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     }
 
     #[test]
+    #[serial_test::serial]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn smoke_test_markitdown_succeeds_when_entrypoint_runs() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-ok");
@@ -15293,7 +17630,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
 
         manager
-            .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
+            .smoke_test_markitdown_with_timeout(Duration::from_secs(10))
             .expect("smoke test succeeds");
 
         let _ = fs::remove_dir_all(root);
@@ -15438,6 +17775,200 @@ exit 0
         assert_eq!(parse_major_minor_patch(""), None);
         assert_eq!(parse_major_minor_patch("not-a-version"), None);
         assert_eq!(parse_major_minor_patch("0"), None);
+    }
+
+    #[test]
+    fn rtk_release_parser_accepts_platform_asset_and_digest() {
+        let asset_name = rtk_release_asset_name().unwrap();
+        let value = json!({
+            "tag_name": "v0.47.0",
+            "assets": [{
+                "name": asset_name,
+                "browser_download_url": format!("https://github.com/rtk-ai/rtk/releases/download/v0.47.0/{asset_name}"),
+                "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }]
+        });
+        let release = parse_rtk_release(&value, "v0.47.0").unwrap();
+        assert_eq!(release.version, "0.47.0");
+        assert_eq!(release.sha256.len(), 64);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_codebase_memory_enabled_preserves_installed_version() {
+        let (root, runtime, manager) = seed_test_runtime("codebase-memory-preserve-version");
+        write_executable(&runtime.managed_python(), "#!/usr/bin/env bash\nexit 0\n");
+        write_executable(&manager.codebase_memory_entrypoint(), "binary\n");
+        manager
+            .write_tool_receipt(
+                "codebase-memory",
+                json!({ "version": "0.10.9", "enabled": true }),
+            )
+            .unwrap();
+
+        manager.set_codebase_memory_enabled(false).unwrap();
+
+        assert_eq!(
+            manager
+                .read_tool_receipt("codebase-memory")
+                .and_then(|value| {
+                    value
+                        .get("version")
+                        .and_then(|version| version.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref(),
+            Some("0.10.9")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recover_codebase_memory_pending_restores_binary_and_receipt() {
+        let (root, runtime, manager) = seed_test_runtime("codebase-memory-pending-recovery");
+        write_executable(&runtime.managed_python(), "#!/usr/bin/env bash\nexit 0\n");
+
+        let destination = manager.codebase_memory_entrypoint();
+        let backup = runtime.bin_dir.join("codebase-memory-mcp.backup");
+        let receipt = runtime.tools_dir.join("codebase-memory.json");
+        let receipt_backup = runtime.tools_dir.join("codebase-memory.json.backup");
+        let marker = manager.codebase_memory_pending_marker_path();
+        write_executable(&destination, "new binary\n");
+        write_executable(&backup, "old binary\n");
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({ "version": "0.10.9", "enabled": false })).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &receipt_backup,
+            serde_json::to_vec(&json!({ "version": "0.10.8", "enabled": false })).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "version": "0.10.9",
+                "hadDestination": true,
+                "hadReceipt": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        manager
+            .recover_codebase_memory_pending()
+            .expect("recover codebase-memory transaction");
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "old binary\n");
+        assert_eq!(
+            manager
+                .read_tool_receipt("codebase-memory")
+                .and_then(|value| {
+                    value
+                        .get("version")
+                        .and_then(|version| version.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref(),
+            Some("0.10.8")
+        );
+        assert!(!backup.exists());
+        assert!(!receipt_backup.exists());
+        assert!(!marker.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codebase_memory_release_parser_requires_exact_version_url_and_digest() {
+        assert!(valid_codebase_memory_version("0.10.8"));
+        for version in ["v0.10.8", "0.10", "0.10.8-rc.1", "0.10.8/evil"] {
+            assert!(!valid_codebase_memory_version(version));
+        }
+        let asset_name = format!(
+            "codebase-memory-mcp-{}.tar.gz",
+            codebase_memory_release_target().unwrap()
+        );
+        let value = json!({
+            "tag_name": "v0.10.9",
+            "assets": [{
+                "name": asset_name,
+                "browser_download_url": format!(
+                    "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.10.9/{asset_name}"
+                ),
+                "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }]
+        });
+        let artifact = parse_codebase_memory_release(&value, "0.10.9").unwrap();
+        assert_eq!(artifact.sha256.unwrap().len(), 64);
+        assert!(parse_codebase_memory_release(&value, "0.10.8").is_err());
+        let mut bad = value.clone();
+        bad["assets"][0]["browser_download_url"] = json!("https://evil.example/x.tar.gz");
+        assert!(parse_codebase_memory_release(&bad, "0.10.9").is_err());
+    }
+
+    #[test]
+    fn rtk_version_checks_are_exact_and_refuse_downgrade() {
+        assert!(rtk_version_output_matches("rtk 0.47.0\n", "0.47.0"));
+        assert!(rtk_version_output_matches("rtk v0.47.0\n", "0.47.0"));
+        assert!(!rtk_version_output_matches("rtk 0.47.01\n", "0.47.0"));
+        assert!(rtk_version_is_downgrade("0.48.0", "0.47.0"));
+        assert!(!rtk_version_is_downgrade("0.47.0", "0.48.0"));
+    }
+
+    #[test]
+    fn rtk_release_parser_rejects_injection_suffix_and_tag_mismatch() {
+        for version in [
+            "0.47.0-/../../x",
+            "0.47.0-rc.1",
+            "0.47",
+            "0.47.0/evil",
+            " 0.47.0",
+        ] {
+            assert!(
+                !valid_rtk_version(version),
+                "accepted unsafe version {version}"
+            );
+        }
+        let value = json!({ "tag_name": "v0.48.0", "assets": [] });
+        assert!(parse_rtk_release(&value, "0.47.0").is_err());
+    }
+
+    #[test]
+    fn rtk_release_parser_requires_valid_digest_and_trusted_url() {
+        let name = rtk_release_asset_name().unwrap();
+        for (url, digest) in [
+            (
+                "https://github.com/rtk-ai/rtk/releases/download/v0.47.0/x.tar.gz",
+                None,
+            ),
+            (
+                "https://github.com/rtk-ai/rtk/releases/download/v0.47.0/x.tar.gz",
+                Some("sha256:no"),
+            ),
+            (
+                "https://evil.example/rtk.tar.gz",
+                Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ),
+        ] {
+            let value = json!({ "tag_name": "v0.47.0", "assets": [{ "name": name, "browser_download_url": url, "digest": digest }] });
+            assert!(parse_rtk_release(&value, "0.47.0").is_err());
+        }
+    }
+
+    #[test]
+    fn newer_rtk_receipt_is_not_downgraded_to_pin() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-newer-no-downgrade");
+        write_executable(&runtime.bin_dir.join("rtk"), "#!/bin/sh\nexit 0\n");
+        manager
+            .write_tool_receipt("rtk", json!({ "version": "99.0.0" }))
+            .unwrap();
+        assert!(!manager.rtk_needs_install());
+        assert!(!manager.ensure_rtk_current().unwrap());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -15793,5 +18324,20 @@ exit 0
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(attempts.get(), 5, "bounded at ATTEMPTS");
+    }
+
+    #[test]
+    fn package_update_versions_are_stable_and_specs_are_exact() {
+        assert_eq!(stable_package_version("4.0.4").unwrap(), "4.0.4");
+        for version in ["4.0", "4.0.4-rc.1", "latest", "v4.0.4", "4.0.4/evil"] {
+            assert!(
+                stable_package_version(version).is_err(),
+                "accepted {version}"
+            );
+        }
+        assert_eq!(
+            context7_package_spec_for("4.0.5"),
+            "@upstash/context7-mcp@4.0.5"
+        );
     }
 }

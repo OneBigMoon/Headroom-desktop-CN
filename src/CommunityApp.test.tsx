@@ -14,7 +14,7 @@ import { CommunityApp } from "./CommunityApp";
 import { I18nProvider, LOCALE_STORAGE_KEY, resolveSystemLocale } from "./lib/i18n";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
 import { mockDashboard } from "./lib/mockData";
-import type { ClientConnectorStatus, DashboardState, HeadroomLearnStatus, RuntimeStatus } from "./lib/types";
+import type { AppliedPatterns, ClientConnectorStatus, DashboardState, HeadroomLearnStatus, RuntimeStatus } from "./lib/types";
 
 let connectorEnabled = false;
 let rtkInstalled = false;
@@ -33,6 +33,13 @@ let claudeCliAvailable = true;
 let codexCliAvailable = true;
 let codexLoggedIn = true;
 let exposeClaudeProjects = true;
+let codexLastRunAt: string | null = null;
+let appliedPatterns: AppliedPatterns = {
+  claudeMd: [],
+  memoryMd: [],
+  codexAgentsMd: [],
+  codexInstructionsMd: [],
+};
 let learnStatus: HeadroomLearnStatus = {
   running: false,
   projectPath: "/Users/example/project",
@@ -121,6 +128,7 @@ function dashboardState(): DashboardState {
         status: rtkInstalled ? "healthy" : "not_installed",
         sourceUrl: "https://example.invalid/rtk",
         version: "1.0.0",
+        activationScope: "immediate",
       },
       {
         id: "caveman",
@@ -132,6 +140,7 @@ function dashboardState(): DashboardState {
         status: cavemanInstalled ? cavemanStatus : "not_installed",
         sourceUrl: "https://example.invalid/caveman",
         version: "1.0.0",
+        activationScope: "new_session",
         defaultMode: cavemanMode,
         supportedModes: ["lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra"],
         unavailableReason: cavemanUnavailableReason,
@@ -146,6 +155,7 @@ function dashboardState(): DashboardState {
         status: ponytailInstalled ? "healthy" : "not_installed",
         sourceUrl: "https://example.invalid/ponytail",
         version: "1.0.0",
+        activationScope: "new_session",
         defaultMode: ponytailMode,
         supportedModes: ["lite", "full", "ultra"],
       },
@@ -219,6 +229,13 @@ beforeEach(() => {
   codexCliAvailable = true;
   codexLoggedIn = true;
   exposeClaudeProjects = true;
+  codexLastRunAt = null;
+  appliedPatterns = {
+    claudeMd: [],
+    memoryMd: [],
+    codexAgentsMd: [],
+    codexInstructionsMd: [],
+  };
   runtime.headroomLearnSupported = true;
   runtime.headroomLearnDisabledReason = null;
   learnStatus = {
@@ -251,7 +268,11 @@ beforeEach(() => {
           codexLoggedIn,
         });
       case "get_headroom_learn_status":
-        return Promise.resolve(learnStatus);
+        return Promise.resolve((args as { projectPath?: string } | undefined)?.projectPath === "codex"
+          ? { ...learnStatus, projectPath: "codex", lastRunAt: codexLastRunAt }
+          : learnStatus);
+      case "list_applied_patterns":
+        return Promise.resolve(appliedPatterns);
       case "start_headroom_learn":
         learnStatus = {
           ...learnStatus,
@@ -386,6 +407,57 @@ describe("CommunityApp", () => {
     });
   });
 
+  it("refreshes dashboard state after a successful install", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+
+    const rtkCard = screen.getByText("RTK").closest("article");
+    expect(rtkCard).not.toBeNull();
+    const dashboardReadsBeforeAction = invokeMock.mock.calls.filter(
+      ([command]) => command === "get_dashboard_state",
+    ).length;
+    await user.click(await within(rtkCard as HTMLElement).findByRole("button", { name: "Install" }));
+
+    await waitFor(() => {
+      expect(within(rtkCard as HTMLElement).getByRole("button", { name: "Disable" })).toBeInTheDocument();
+      const dashboardReadsAfterAction = invokeMock.mock.calls.filter(
+        ([command]) => command === "get_dashboard_state",
+      ).length;
+      expect(dashboardReadsAfterAction).toBeGreaterThan(dashboardReadsBeforeAction);
+    });
+  });
+
+  it("refreshes dashboard state after a failed install", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+
+    const rtkCard = screen.getByText("RTK").closest("article");
+    expect(rtkCard).not.toBeNull();
+    const dashboardReadsBeforeAction = invokeMock.mock.calls.filter(
+      ([command]) => command === "get_dashboard_state",
+    ).length;
+    const defaultInvoke = invokeMock.getMockImplementation();
+    expect(defaultInvoke).toBeDefined();
+    invokeMock.mockImplementation((command: string, args?: unknown) => {
+      if (command === "install_addon") return Promise.reject(new Error("simulated install failure"));
+      return defaultInvoke?.(command, args);
+    });
+    await user.click(await within(rtkCard as HTMLElement).findByRole("button", { name: "Install" }));
+
+    await waitFor(() => {
+      const dashboardReadsAfterAction = invokeMock.mock.calls.filter(
+        ([command]) => command === "get_dashboard_state",
+      ).length;
+      expect(dashboardReadsAfterAction).toBeGreaterThan(dashboardReadsBeforeAction);
+    });
+    expect(within(rtkCard as HTMLElement).getByRole("button", { name: "Install" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("simulated install failure");
+  });
+
   it("offers All in Luna as a Codex-only plugin", async () => {
     const user = userEvent.setup();
     renderCommunityApp();
@@ -414,10 +486,15 @@ describe("CommunityApp", () => {
     await user.click(screen.getByRole("button", { name: "Tools" }));
     expect(screen.getByRole("heading", { name: "Safety constraints" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Learning" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Primary workflow" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Automation executor" })).toBeInTheDocument();
-    expect(screen.getAllByText(/new sessions/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/No Headroom or 6867 proxy restart is needed/).length).toBeGreaterThan(0);
+    const workflowHeading = screen.getByRole("heading", { name: "Primary workflow" });
+    const automationHeading = screen.getByRole("heading", { name: "Automation executor" });
+    expect(workflowHeading).toBeInTheDocument();
+    expect(automationHeading).toBeInTheDocument();
+    expect(within(workflowHeading.parentElement as HTMLElement).getByText("Only one can be enabled · Primary workflow")).toBeInTheDocument();
+    expect(within(automationHeading.parentElement as HTMLElement).getByText("Only one can be enabled · Automation executor")).toBeInTheDocument();
+    expect(screen.getAllByText(/Takes effect immediately/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Takes effect in a new Codex session/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/no Headroom restart is needed/).length).toBeGreaterThan(0);
     for (const name of ["Stop That Shit", "Agent Guard", "Grill Me", "OpenSpec", "Superpowers", "gstack", "Ralph Loop"]) {
       const card = screen.getByText(name, { selector: "h3" }).closest("article");
       expect(card).not.toBeNull();
@@ -425,9 +502,24 @@ describe("CommunityApp", () => {
       expect(within(card as HTMLElement).getByRole("link", { name: "Source and acknowledgements" })).toBeInTheDocument();
     }
     expect(screen.getByRole("heading", { name: "Conflict and switching rules" })).toBeInTheDocument();
-    expect(screen.getAllByText("Single-select: primary workflow")).toHaveLength(3);
-    expect(screen.getAllByText("Single-select: automation executor").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText(/Headroom and port 6867 stay running/)).toBeInTheDocument();
+  });
+
+  it("explains every functional group and marks single-select groups in Chinese", async () => {
+    localStorage.setItem(LOCALE_STORAGE_KEY, "zh-CN");
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("代理已在线");
+    await user.click(screen.getByRole("button", { name: "工具" }));
+
+    expect(screen.getByText("限制越界和危险操作：Stop That Shit 约束任务范围，Agent Guard 检查密钥与高风险命令；两者可同时启用。")).toBeInTheDocument();
+    const workflowHeading = screen.getByRole("heading", { name: "主工作流" });
+    const automationHeading = screen.getByRole("heading", { name: "自动执行器" });
+    expect(within(workflowHeading.parentElement as HTMLElement).getByText("本组只能启用 1 个 · 主工作流")).toBeInTheDocument();
+    expect(within(automationHeading.parentElement as HTMLElement).getByText("本组只能启用 1 个 · 自动执行器")).toBeInTheDocument();
+    expect(screen.getByText("决定开发任务如何从需求推进到交付：OpenSpec 偏规格与验收，Superpowers 偏计划与 TDD，gstack 偏产品到发布全流程；本组只能启用 1 个。")).toBeInTheDocument();
+    expect(screen.getByText("决定由谁持续推动任务执行：All in Luna 负责多代理协作与持久目标，Ralph Loop 负责循环执行到完成条件；本组只能启用 1 个，且都需用户明确启动。")).toBeInTheDocument();
   });
 
   it("uses addon controls without restarting the proxy for new-session tools", async () => {
@@ -545,6 +637,49 @@ describe("CommunityApp", () => {
     });
   });
 
+  it("renders Codex applied learnings from AGENTS.md and does not use Claude metadata", async () => {
+    codexLastRunAt = "2026-09-03T08:00:00Z";
+    appliedPatterns = {
+      claudeMd: [],
+      memoryMd: [{ title: "Live memory", bullets: ["Claude-only memory"] }],
+      codexAgentsMd: [{ title: "Codex rules", bullets: ["Read AGENTS.md before editing."] }],
+      codexInstructionsMd: [{ title: "Codex instructions", bullets: ["Keep retries bounded."] }],
+    };
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Optimize" }));
+    await user.selectOptions(screen.getByLabelText("Session source"), "codex");
+
+    expect(await screen.findByRole("button", { name: /Headroom learnings in AGENTS\.md: 1/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Headroom reminders in instructions\.md: 1/i })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /not scanned yet/i })).toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith("get_headroom_learn_status", { projectPath: "codex" });
+    expect(invokeMock).toHaveBeenCalledWith("list_applied_patterns", { projectPath: "codex" });
+
+    await user.click(screen.getByRole("button", { name: /Headroom learnings in AGENTS\.md: 1/i }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Read AGENTS.md before editing.");
+    expect(screen.queryByText("Claude-only memory")).not.toBeInTheDocument();
+  });
+
+  it("keeps applied results visible after a successful Learn before project metadata refreshes", async () => {
+    learnStatus = {
+      ...learnStatus,
+      projectPath: "/Users/example/project",
+      finishedAt: "2026-09-03T08:00:00Z",
+      success: true,
+      summary: "Learn completed.",
+    };
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Optimize" }));
+    expect(screen.queryByRole("button", { name: /not scanned yet/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /0 learnings in CLAUDE\.local\.md/i })).toBeDisabled();
+  });
+
   it("shows a local unsupported state instead of starting Learn on an unsupported platform", async () => {
     runtime.headroomLearnSupported = false;
     runtime.headroomLearnDisabledReason = null;
@@ -636,11 +771,11 @@ describe("CommunityApp", () => {
 
   it("localizes the user-level default-mode explanation in every supported language", async () => {
     const locales = [
-      { locale: "en", toolsLabel: "Tools", help: "User-level default. New agent sessions use it; environment variables can override it." },
-      { locale: "zh-CN", toolsLabel: "工具", help: "用户级默认档位，仅对新的 agent 会话生效；环境变量可能覆盖它。" },
-      { locale: "zh-TW", toolsLabel: "工具", help: "使用者層級的預設檔位，只對新的 agent 工作階段生效；環境變數可能覆蓋它。" },
-      { locale: "ja", toolsLabel: "ツール", help: "ユーザー既定値です。新しい agent セッションで有効になり、環境変数が上書きする場合があります。" },
-      { locale: "ko", toolsLabel: "도구", help: "사용자 기본 모드이며 새 agent 세션에 적용됩니다. 환경 변수가 이를 덮어쓸 수 있습니다." },
+      { locale: "en", toolsLabel: "Tools", help: "Saved as your user default. New agent sessions use it; environment variables can override it." },
+      { locale: "zh-CN", toolsLabel: "工具", help: "保存为用户级默认值，仅对新的 agent 会话生效；环境变量可能覆盖它。" },
+      { locale: "zh-TW", toolsLabel: "工具", help: "儲存為使用者層級預設值，只對新的 agent 工作階段生效；環境變數可能覆蓋它。" },
+      { locale: "ja", toolsLabel: "ツール", help: "ユーザー既定値として保存され、新しい agent セッションで有効になります。環境変数が上書きする場合があります。" },
+      { locale: "ko", toolsLabel: "도구", help: "사용자 기본값으로 저장되며 새 agent 세션에 적용됩니다. 환경 변수가 이를 덮어쓸 수 있습니다." },
     ] as const;
 
     for (const { locale, toolsLabel, help } of locales) {

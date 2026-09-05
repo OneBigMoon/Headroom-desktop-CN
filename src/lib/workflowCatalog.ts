@@ -14,16 +14,22 @@ export type ToolCategory =
 type Localized = Record<ResolvedLocale, string>;
 
 export const TOOL_CATEGORY_ORDER: ToolCategory[] = [
-  "core",
-  "guardrails",
-  "learning",
-  "workflow",
-  "automation",
-  "code_intelligence",
-  "documents",
-  "efficiency",
-  "other",
+ "workflow",
+ "automation",
+ "guardrails",
+ "code_intelligence",
+ "efficiency",
+ "documents",
+ "learning",
+ "core",
+ "other",
 ];
+
+export function groupToolsByCategory<T extends { category?: string | null }>(items: T[]): Map<ToolCategory, T[]> {
+  const groups = new Map(TOOL_CATEGORY_ORDER.map((category) => [category, [] as T[]]));
+  for (const item of items) groups.get(toolCategory(item.category))?.push(item);
+  return groups;
+}
 
 export const toolCategoryCopy: Record<
   ToolCategory,
@@ -32,11 +38,11 @@ export const toolCategoryCopy: Record<
   core: {
     title: { en: "Core", "zh-CN": "核心", "zh-TW": "核心", ja: "コア", ko: "핵심" },
     description: {
-      en: "The local routing and runtime foundation.",
-      "zh-CN": "本地路由与运行时基础。",
-      "zh-TW": "本機路由與執行階段基礎。",
-      ja: "ローカルルーティングとランタイムの基盤。",
-      ko: "로컬 라우팅과 런타임 기반입니다.",
+      en: "Provides Headroom's local proxy, request routing, and managed runtime; the system foundation for every other group.",
+      "zh-CN": "提供 Headroom 本地代理、请求路由和受管运行时，是其他分组工作的系统基础。",
+      "zh-TW": "提供 Headroom 本機代理、請求路由與受管執行階段，是其他分組運作的系統基礎。",
+      ja: "Headroom のローカルプロキシ、リクエストルーティング、管理ランタイムを提供し、他のすべてのグループの基盤になります。",
+      ko: "Headroom 로컬 프록시, 요청 라우팅, 관리형 런타임을 제공하는 다른 모든 그룹의 시스템 기반입니다.",
     },
   },
   guardrails: {
@@ -106,67 +112,128 @@ export const toolCategoryCopy: Record<
       ko: "코드 인텔리전스",
     },
     description: {
-      en: "Complementary code navigation, memory, and documentation tools.",
-      "zh-CN": "可共同使用的代码导航、记忆与文档工具。",
-      "zh-TW": "可共同使用的程式碼導覽、記憶與文件工具。",
-      ja: "併用できるコードナビゲーション、メモリ、ドキュメントツール。",
-      ko: "함께 사용할 수 있는 코드 탐색, 메모리, 문서 도구입니다.",
+      en: "Improves lookup and navigation: Serena finds symbols, Codebase Memory reuses project context, and Context7 fetches versioned docs; all can be enabled together.",
+      "zh-CN": "增强代码与资料检索：Serena 做符号级导航，Codebase Memory 复用项目上下文，Context7 查询版本化文档；可同时启用。",
+      "zh-TW": "增強程式碼與資料檢索：Serena 進行符號級導覽，Codebase Memory 重用專案上下文，Context7 查詢版本化文件；可同時啟用。",
+      ja: "検索とナビゲーションを強化します。Serena はシンボルを探し、Codebase Memory はプロジェクト文脈を再利用し、Context7 はバージョン別ドキュメントを取得します。すべて併用できます。",
+      ko: "검색과 탐색을 강화합니다. Serena는 심볼을 찾고, Codebase Memory는 프로젝트 컨텍스트를 재사용하며, Context7은 버전별 문서를 조회합니다. 모두 함께 켤 수 있습니다.",
     },
   },
   documents: {
     title: { en: "Documents", "zh-CN": "文档", "zh-TW": "文件", ja: "文書", ko: "문서" },
     description: {
-      en: "Converters that make local documents easier for agents to read.",
-      "zh-CN": "让代理更容易读取本地文档的转换工具。",
-      "zh-TW": "讓代理更容易讀取本機文件的轉換工具。",
-      ja: "ローカル文書をエージェントが読みやすくする変換ツール。",
-      ko: "에이전트가 로컬 문서를 읽기 쉽게 변환합니다.",
+      en: "Converts local PDF and Office files to Markdown for agents to read; it can coexist with every other group.",
+      "zh-CN": "把本地 PDF、Office 等文档转换为便于代理读取的 Markdown；可与其他分组同时启用。",
+      "zh-TW": "把本機 PDF、Office 等文件轉換為便於代理讀取的 Markdown；可與其他分組同時啟用。",
+      ja: "ローカルの PDF や Office 文書を、エージェントが読みやすい Markdown に変換します。他のすべてのグループと併用できます。",
+      ko: "로컬 PDF와 Office 문서를 에이전트가 읽기 쉬운 Markdown으로 변환하며 다른 모든 그룹과 함께 켤 수 있습니다.",
     },
   },
   efficiency: {
-    title: { en: "Efficiency", "zh-CN": "效率", "zh-TW": "效率", ja: "効率化", ko: "효율" },
+    title: { en: "Efficiency & Expression", "zh-CN": "效率与表达", "zh-TW": "效率與表達", ja: "効率と表現", ko: "효율과 표현" },
     description: {
-      en: "Small local improvements that reduce cost or friction.",
-      "zh-CN": "降低成本或操作摩擦的小型本地优化。",
-      "zh-TW": "降低成本或操作摩擦的小型本機最佳化。",
-      ja: "コストや摩擦を減らす小さなローカル改善。",
-      ko: "비용과 마찰을 줄이는 작은 로컬 개선입니다.",
+      en: "Reduces token use or controls response style: RTK compresses shell output, Ponytail favors minimal code, and Caveman shortens replies; all can be enabled together, but styles may stack.",
+      "zh-CN": "减少 Token 使用或控制回答风格：RTK 压缩终端输出，Ponytail 倾向最小代码，Caveman 缩短回答；可同时启用，但风格会叠加。",
+      "zh-TW": "減少 Token 使用或控制回答風格：RTK 壓縮終端輸出，Ponytail 傾向最小程式碼，Caveman 縮短回答；可同時啟用，但風格會疊加。",
+      ja: "トークン使用量や回答スタイルを調整します。RTK はシェル出力を圧縮し、Ponytail は最小限のコードを優先し、Caveman は回答を短くします。すべて併用できますが、スタイルは重なる場合があります。",
+      ko: "토큰 사용량이나 답변 스타일을 조절합니다. RTK는 셸 출력을 압축하고, Ponytail은 최소 코드를 선호하며, Caveman은 답변을 줄입니다. 모두 함께 켤 수 있지만 스타일은 겹칠 수 있습니다.",
     },
   },
   other: {
     title: { en: "Other", "zh-CN": "其他", "zh-TW": "其他", ja: "その他", ko: "기타" },
     description: {
-      en: "Tools without a recognized category yet.",
-      "zh-CN": "尚未识别分类的工具。",
-      "zh-TW": "尚未識別分類的工具。",
-      ja: "まだ分類を認識できないツール。",
-      ko: "아직 분류가 확인되지 않은 도구입니다.",
+      en: "Uncategorized tools; follow the compatibility and activation rules shown on each card.",
+      "zh-CN": "尚未归类的工具；是否能同时启用及何时生效，以各工具卡片说明为准。",
+      "zh-TW": "尚未歸類的工具；是否能同時啟用及何時生效，以各工具卡片說明為準。",
+      ja: "未分類のツールです。併用可否と反映タイミングは各ツールカードの説明に従います。",
+      ko: "아직 분류되지 않은 도구이며 동시 사용 가능 여부와 적용 시점은 각 도구 카드의 안내를 따릅니다.",
     },
   },
 };
 
-export const activationScopeCopy: Localized = {
-  en: "Enable or disable takes effect in new sessions. No Headroom or 6867 proxy restart is needed.",
-  "zh-CN": "启用或关闭后，新会话生效；无需重启 Headroom 或 6867 代理。",
-  "zh-TW": "啟用或停用後，新工作階段生效；無需重新啟動 Headroom 或 6867 代理。",
-  ja: "有効化または無効化は新しいセッションで反映されます。Headroom や 6867 プロキシの再起動は不要です。",
-  ko: "활성화 또는 비활성화는 새 세션부터 적용되며 Headroom이나 6867 프록시를 다시 시작할 필요가 없습니다.",
+Object.assign(toolCategoryCopy.guardrails.description, {
+  en: "Controls risky or out-of-scope actions: Stop That Shit enforces task boundaries, while Agent Guard checks secrets and dangerous commands; both can be enabled.",
+  "zh-CN": "限制越界和危险操作：Stop That Shit 约束任务范围，Agent Guard 检查密钥与高风险命令；两者可同时启用。",
+  "zh-TW": "限制越界和危險操作：Stop That Shit 約束任務範圍，Agent Guard 檢查密鑰與高風險命令；兩者可同時啟用。",
+  ja: "危険または範囲外の操作を制御します。Stop That Shit はタスク境界を守り、Agent Guard は秘密情報と危険なコマンドを検査します。両方を併用できます。",
+  ko: "위험하거나 범위를 벗어난 작업을 제어합니다. Stop That Shit은 작업 경계를 지키고 Agent Guard는 비밀 정보와 위험한 명령을 검사합니다. 둘 다 함께 켤 수 있습니다.",
+});
+Object.assign(toolCategoryCopy.learning.description, {
+  en: "Verifies code understanding: Grill Me quizzes against the current implementation and corrects knowledge gaps; it can coexist with every other group.",
+  "zh-CN": "帮助理解代码并校验认知：Grill Me 会依据当前实现逐题提问并纠正理解偏差；可与其他分组同时启用。",
+  "zh-TW": "協助理解程式碼並校驗認知：Grill Me 會依據目前實作逐題提問並修正理解偏差；可與其他分組同時啟用。",
+  ja: "コード理解を確認します。Grill Me は現在の実装に基づいて一問ずつ出題し、理解のずれを修正します。他のすべてのグループと併用できます。",
+  ko: "코드 이해를 확인합니다. Grill Me는 현재 구현을 기준으로 한 문제씩 질문하고 이해의 빈틈을 바로잡습니다. 다른 모든 그룹과 함께 켤 수 있습니다.",
+});
+Object.assign(toolCategoryCopy.workflow.description, {
+  en: "Chooses how a development task moves from requirements to delivery: OpenSpec emphasizes specs and acceptance, Superpowers planning and TDD, and gstack product-to-release coverage; only one can be enabled in this group.",
+  "zh-CN": "决定开发任务如何从需求推进到交付：OpenSpec 偏规格与验收，Superpowers 偏计划与 TDD，gstack 偏产品到发布全流程；本组只能启用 1 个。",
+  "zh-TW": "決定開發任務如何從需求推進到交付：OpenSpec 偏規格與驗收，Superpowers 偏計畫與 TDD，gstack 偏產品到發布全流程；本組只能啟用 1 個。",
+  ja: "開発タスクを要件から納品までどう進めるかを選びます。OpenSpec は仕様と受け入れ、Superpowers は計画と TDD、gstack は製品からリリースまでを重視します。このグループでは 1 つだけ有効化できます。",
+  ko: "개발 작업을 요구사항부터 전달까지 어떻게 진행할지 선택합니다. OpenSpec은 명세와 인수 기준, Superpowers는 계획과 TDD, gstack은 제품부터 출시까지의 전체 과정을 중시합니다. 이 그룹에서는 하나만 켤 수 있습니다.",
+});
+Object.assign(toolCategoryCopy.automation.description, {
+  en: "Chooses what continually drives execution: All in Luna coordinates multi-agent goals, while Ralph Loop repeats work until completion conditions; only one can be enabled, and both require an explicit start.",
+  "zh-CN": "决定由谁持续推动任务执行：All in Luna 负责多代理协作与持久目标，Ralph Loop 负责循环执行到完成条件；本组只能启用 1 个，且都需用户明确启动。",
+  "zh-TW": "決定由誰持續推動任務執行：All in Luna 負責多代理協作與持久目標，Ralph Loop 負責循環執行到完成條件；本組只能啟用 1 個，且都需使用者明確啟動。",
+  ja: "何が継続的に実行を進めるかを選びます。All in Luna はマルチエージェントの目標を調整し、Ralph Loop は完了条件まで処理を繰り返します。1 つだけ有効化でき、どちらも明示的な開始が必要です。",
+  ko: "무엇이 작업 실행을 계속 이끌지 선택합니다. All in Luna는 멀티 에이전트 목표를 조율하고 Ralph Loop는 완료 조건까지 작업을 반복합니다. 하나만 켤 수 있으며 둘 다 명시적으로 시작해야 합니다.",
+});
+
+export type ActivationScope = "immediate" | "new_session" | "client_restart" | "unknown";
+
+export const activationScopeCopyByScope: Record<ActivationScope, Localized> = {
+  immediate: {
+    en: "Takes effect immediately; no Headroom restart is needed.",
+    "zh-CN": "即时生效；无需重启 Headroom。",
+    "zh-TW": "即時生效；無需重新啟動 Headroom。",
+    ja: "すぐに反映されます。Headroom の再起動は不要です。",
+    ko: "즉시 적용되며 Headroom을 다시 시작할 필요가 없습니다.",
+  },
+  new_session: {
+    en: "Takes effect in a new Codex session; no Headroom restart is needed.",
+    "zh-CN": "新 Codex 会话生效；无需重启 Headroom。",
+    "zh-TW": "新的 Codex 工作階段生效；無需重新啟動 Headroom。",
+    ja: "新しい Codex セッションで反映されます。Headroom の再起動は不要です。",
+    ko: "새 Codex 세션에서 적용되며 Headroom을 다시 시작할 필요가 없습니다.",
+  },
+  client_restart: {
+    en: "Configuration is installed; restart Codex or the connected client to replace MCPs in open sessions. Headroom does not need a restart.",
+    "zh-CN": "配置已安装；需重启 Codex 或对应客户端，才能替换已打开会话中的 MCP。无需重启 Headroom。",
+    "zh-TW": "設定已安裝；需重新啟動 Codex 或對應用戶端，才能替換已開啟工作階段中的 MCP。無需重新啟動 Headroom。",
+    ja: "設定はインストール済みです。開いているセッションの MCP を置き換えるには Codex または接続先クライアントを再起動してください。Headroom の再起動は不要です。",
+    ko: "구성은 설치되었습니다. 열린 세션의 MCP를 교체하려면 Codex 또는 연결된 클라이언트를 다시 시작해야 합니다. Headroom 재시작은 필요 없습니다.",
+  },
+  unknown: {
+    en: "Activation timing is tool-specific; check the tool details.",
+    "zh-CN": "生效时间取决于具体工具，请查看工具详情。",
+    "zh-TW": "生效時間取決於具體工具，請查看工具詳情。",
+    ja: "反映時期はツールごとに異なります。詳細を確認してください。",
+    ko: "적용 시점은 도구마다 다르므로 도구 세부 정보를 확인하세요.",
+  },
 };
+
+export function getActivationScopeCopy(scope?: string | null): Localized {
+  if (scope === "immediate" || scope === "new_session" || scope === "client_restart") {
+    return activationScopeCopyByScope[scope];
+  }
+  return activationScopeCopyByScope.unknown;
+}
 
 export const workflowGroupCopy: Record<string, Localized> = {
   primary_workflow: {
-    en: "Single-select: primary workflow",
-    "zh-CN": "单选：主工作流",
-    "zh-TW": "單選：主要工作流程",
-    ja: "単一選択：主ワークフロー",
-    ko: "단일 선택: 주 워크플로",
+    en: "Only one can be enabled · Primary workflow",
+    "zh-CN": "本组只能启用 1 个 · 主工作流",
+    "zh-TW": "本組只能啟用 1 個 · 主要工作流程",
+    ja: "このグループでは 1 つだけ有効 · 主ワークフロー",
+    ko: "이 그룹에서는 하나만 활성화 · 주 워크플로",
   },
   execution_engine: {
-    en: "Single-select: automation executor",
-    "zh-CN": "单选：自动执行器",
-    "zh-TW": "單選：自動執行器",
-    ja: "単一選択：自動実行",
-    ko: "단일 선택: 자동 실행기",
+    en: "Only one can be enabled · Automation executor",
+    "zh-CN": "本组只能启用 1 个 · 自动执行器",
+    "zh-TW": "本組只能啟用 1 個 · 自動執行器",
+    ja: "このグループでは 1 つだけ有効 · 自動実行",
+    ko: "이 그룹에서는 하나만 활성화 · 자동 실행기",
   },
 };
 
@@ -237,6 +304,8 @@ export const toolCopy: Record<string, Localized> = {
     ko: "유지 관리 중인 코드 이해도를 읽기 전용 Q&A로 확인합니다. $grill-me 또는 /grill-me로 명시적으로 실행하며 자동 실행되지 않습니다. Joshua Wheelock에게 감사합니다.",
   },
 };
+
+toolCopy.superpowers["zh-CN"] = "复用 Codex 官方精选插件，避免重复安装市场版本。适合强调头脑风暴、计划、TDD、系统调试、审查与交付纪律的开发。感谢 Jesse Vincent 与贡献者。";
 
 export const conflictMatrixCopy: Localized = {
   en: "Safety constraints can stack; Grill Me can coexist with every workflow. OpenSpec, Superpowers, and gstack are single-select. All in Luna and Ralph Loop are single-select. Switching is explicit and affects new sessions only; Headroom and port 6867 stay running.",

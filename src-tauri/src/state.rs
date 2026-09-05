@@ -759,6 +759,10 @@ impl AppState {
             return;
         }
 
+        if let Err(err) = self.tool_manager.recover_codebase_memory_pending() {
+            log::warn!("codebase-memory recovery on launch failed: {err:#}");
+        }
+
         self.set_runtime_starting(true);
         self.enforce_pricing_gate();
         self.stop_python_if_gated();
@@ -778,7 +782,7 @@ impl AppState {
         if self.should_run_runtime_upgrade(app) {
             // Auto-trigger never forces rebuild — that's reserved for the
             // user-facing "Retry with full rebuild" recovery flow.
-            self.run_upgrade_with_ui(app, false);
+            self.run_upgrade_with_ui(app, false, None);
         } else {
             // No Python maintenance needed, but the desktop app version may
             // still have moved (cosmetic-only release on the same headroom-ai
@@ -901,6 +905,14 @@ impl AppState {
         &self,
         current_app_version: &str,
     ) -> Option<RuntimeMaintenancePlan> {
+        self.runtime_maintenance_plan_for_app_version_target(current_app_version, None)
+    }
+
+    fn runtime_maintenance_plan_for_app_version_target(
+        &self,
+        current_app_version: &str,
+        target_version: Option<&str>,
+    ) -> Option<RuntimeMaintenancePlan> {
         if runtime_upgrade_disabled_by_env() {
             log::debug!("HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check.");
             return None;
@@ -922,7 +934,13 @@ impl AppState {
             }
         }
         drop(profile);
-        if let Some(release) = self.tool_manager.check_headroom_upgrade() {
+        let release = match target_version {
+            Some(version) => self
+                .tool_manager
+                .check_headroom_upgrade_for_version(version),
+            None => self.tool_manager.check_headroom_upgrade(),
+        };
+        if let Some(release) = release {
             return Some(RuntimeMaintenancePlan::Upgrade(release));
         }
         if self.tool_manager.requirements_are_stale() {
@@ -953,7 +971,12 @@ impl AppState {
     /// flow when an in-place upgrade installed cleanly but the proxy
     /// failed to boot — typically an ABI mismatch in native deps that pip
     /// can't detect.
-    pub fn run_upgrade_with_ui(&self, app: &tauri::AppHandle, force_rebuild: bool) {
+    pub fn run_upgrade_with_ui(
+        &self,
+        app: &tauri::AppHandle,
+        force_rebuild: bool,
+        target_version: Option<&str>,
+    ) {
         let _guard = match self.upgrade_lock.try_lock() {
             Some(g) => g,
             None => {
@@ -963,16 +986,17 @@ impl AppState {
         };
 
         let current_app_version = app.package_info().version.to_string();
-        let maintenance_plan =
-            match self.runtime_maintenance_plan_for_app_version(&current_app_version) {
-                Some(plan) => plan,
-                None => {
-                    // App version changed but no runtime maintenance is actually
-                    // needed — just stamp the version.
-                    self.stamp_app_version(&current_app_version);
-                    return;
-                }
-            };
+        let maintenance_plan = match self
+            .runtime_maintenance_plan_for_app_version_target(&current_app_version, target_version)
+        {
+            Some(plan) => plan,
+            None => {
+                // App version changed but no runtime maintenance is actually
+                // needed — just stamp the version.
+                self.stamp_app_version(&current_app_version);
+                return;
+            }
+        };
         let maintenance_kind = match &maintenance_plan {
             RuntimeMaintenancePlan::Upgrade(_) => RuntimeMaintenanceKind::Upgrade,
             RuntimeMaintenancePlan::RequirementsRepair => {
@@ -1525,27 +1549,40 @@ impl AppState {
     /// ABI-mismatch failure mode).
     /// Starts the existing transactional runtime-upgrade path from Settings,
     /// even when the desktop app version itself has not changed.
-    pub fn request_runtime_upgrade(&self, app: &tauri::AppHandle) -> Result<(), String> {
+    pub fn request_runtime_upgrade(
+        &self,
+        app: &tauri::AppHandle,
+        target_version: Option<&str>,
+    ) -> Result<(), String> {
         if runtime_upgrade_disabled_by_env() {
             return Err("Headroom CLI updates are disabled by this environment.".into());
         }
         if self.runtime_upgrade_in_progress() {
             return Err("A Headroom CLI update is already running.".into());
         }
-        if self.tool_manager.check_headroom_upgrade().is_none() {
-            return Err("Headroom CLI is already up to date.".into());
-        }
-
         {
             let mut profile = self.launch_profile.lock();
             profile.last_launched_app_version = None;
             persist_launch_profile(&self.launch_profile_path, &profile);
         }
-        self.run_upgrade_with_ui(app, false);
+        let app_version = app.package_info().version.to_string();
+        let plan =
+            self.runtime_maintenance_plan_for_app_version_target(&app_version, target_version);
+        if !matches!(plan, Some(RuntimeMaintenancePlan::Upgrade(_))) {
+            return Err("Headroom CLI is already up to date.".into());
+        }
+
+        self.run_upgrade_with_ui(app, false, target_version);
         Ok(())
     }
 
     pub fn retry_runtime_upgrade(&self, app: &tauri::AppHandle, force_rebuild: bool) {
+        let target_version = self
+            .launch_profile
+            .lock()
+            .last_runtime_upgrade_failure
+            .as_ref()
+            .map(|failure| failure.target_headroom_version.clone());
         {
             let mut profile = self.launch_profile.lock();
             if let Some(failure) = profile.last_runtime_upgrade_failure.as_mut() {
@@ -1553,7 +1590,7 @@ impl AppState {
             }
             persist_launch_profile(&self.launch_profile_path, &profile);
         }
-        self.run_upgrade_with_ui(app, force_rebuild);
+        self.run_upgrade_with_ui(app, force_rebuild, target_version.as_deref());
     }
 
     pub fn runtime_upgrade_in_progress(&self) -> bool {
@@ -9135,7 +9172,10 @@ LLM analysis failed: `codex exec` did not respond within 300s.
 
         assert_eq!(status.project_path.as_deref(), Some("codex"));
         assert_eq!(status.success, Some(false));
-        assert_eq!(status.finished_at.as_deref(), Some("2026-08-31T12:34:11+00:00"));
+        assert_eq!(
+            status.finished_at.as_deref(),
+            Some("2026-08-31T12:34:11+00:00")
+        );
         assert!(status
             .error
             .as_deref()

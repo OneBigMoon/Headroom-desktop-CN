@@ -13,9 +13,22 @@ pub struct AddonUpdateCheck {
 
 #[derive(Clone, Copy)]
 enum UpdateSource {
-    Pypi { project: &'static str },
-    Npm { package: &'static str },
-    GithubRelease { repository: &'static str },
+    Pypi {
+        project: &'static str,
+    },
+    Npm {
+        package: &'static str,
+    },
+    GithubRelease {
+        repository: &'static str,
+    },
+    GithubPluginManifest {
+        repository: &'static str,
+        path: &'static str,
+    },
+    GithubPackageJson {
+        repository: &'static str,
+    },
 }
 
 const MARKITDOWN: UpdateSource = UpdateSource::Pypi {
@@ -39,8 +52,35 @@ const CODEBASE_MEMORY: UpdateSource = UpdateSource::GithubRelease {
 const PONYTAIL: UpdateSource = UpdateSource::GithubRelease {
     repository: "DietrichGebert/ponytail",
 };
-const CAVEMAN: UpdateSource = UpdateSource::GithubRelease {
+const CAVEMAN: UpdateSource = UpdateSource::GithubPluginManifest {
     repository: "JuliusBrussee/caveman",
+    path: "plugins/caveman/.codex-plugin/plugin.json",
+};
+const ALLINLUNA: UpdateSource = UpdateSource::GithubPluginManifest {
+    repository: "zenx0x/allinluna",
+    path: "plugins/allinluna/.codex-plugin/plugin.json",
+};
+const OPENSPEC: UpdateSource = UpdateSource::GithubRelease {
+    repository: "Fission-AI/OpenSpec",
+};
+const SUPERPOWERS: UpdateSource = UpdateSource::GithubRelease {
+    repository: "obra/superpowers",
+};
+const GSTACK: UpdateSource = UpdateSource::GithubPackageJson {
+    repository: "garrytan/gstack",
+};
+const RALPH_LOOP: UpdateSource = UpdateSource::GithubRelease {
+    repository: "SantanderAI/ralph",
+};
+const STOP_THAT_SHIT: UpdateSource = UpdateSource::GithubRelease {
+    repository: "lennney/stop-that-shit",
+};
+const AGENT_GUARD: UpdateSource = UpdateSource::GithubRelease {
+    repository: "JeongJaeSoon/agent-guard",
+};
+const GRILL_ME: UpdateSource = UpdateSource::GithubPluginManifest {
+    repository: "joshuawheelock/grill-me",
+    path: ".codex-plugin/plugin.json",
 };
 
 fn normalize_version(raw: &str) -> Option<String> {
@@ -64,6 +104,14 @@ fn version_from_release_url(path: &str) -> Option<String> {
 
 fn json_version(value: &Value, pointer: &str) -> Option<String> {
     normalize_version(value.pointer(pointer)?.as_str()?)
+}
+
+fn version_from_plugin_manifest(value: &Value) -> Option<String> {
+    json_version(value, "/version")
+}
+
+fn github_raw_url(repository: &str, path: &str) -> String {
+    format!("https://raw.githubusercontent.com/{repository}/HEAD/{path}")
 }
 
 async fn fetch_latest(client: &reqwest::Client, source: UpdateSource) -> anyhow::Result<String> {
@@ -99,6 +147,28 @@ async fn fetch_latest(client: &reqwest::Client, source: UpdateSource) -> anyhow:
             version_from_release_url(response.url().path()).ok_or_else(|| {
                 anyhow::anyhow!("GitHub latest-release redirect did not contain a valid version")
             })
+        }
+        UpdateSource::GithubPluginManifest { repository, path } => {
+            let value: Value = client
+                .get(github_raw_url(repository, path))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            version_from_plugin_manifest(&value)
+                .ok_or_else(|| anyhow::anyhow!("GitHub plugin manifest contained no valid version"))
+        }
+        UpdateSource::GithubPackageJson { repository } => {
+            let value: Value = client
+                .get(github_raw_url(repository, "package.json"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            json_version(&value, "/version")
+                .ok_or_else(|| anyhow::anyhow!("GitHub package.json contained no valid version"))
         }
     }
 }
@@ -144,6 +214,14 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
                 "context7",
                 "ponytail",
                 "caveman",
+                "allinluna",
+                "openspec",
+                "superpowers",
+                "gstack",
+                "ralph-loop",
+                "stop-that-shit",
+                "agent-guard",
+                "grill-me",
             ]
             .into_iter()
             .map(|id| AddonUpdateCheck {
@@ -155,7 +233,24 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         }
     };
 
-    let (headroom, rtk, markitdown, serena, codebase_memory, context7, ponytail, caveman) = tokio::join!(
+    let (
+        headroom,
+        rtk,
+        markitdown,
+        serena,
+        codebase_memory,
+        context7,
+        ponytail,
+        caveman,
+        allinluna,
+        openspec,
+        superpowers,
+        gstack,
+        ralph_loop,
+        stop_that_shit,
+        agent_guard,
+        grill_me,
+    ) = tokio::join!(
         check_one(&client, "headroom", HEADROOM),
         check_one(&client, "rtk", RTK),
         check_one(&client, "markitdown", MARKITDOWN),
@@ -164,6 +259,14 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         check_one(&client, "context7", CONTEXT7),
         check_one(&client, "ponytail", PONYTAIL),
         check_one(&client, "caveman", CAVEMAN),
+        check_one(&client, "allinluna", ALLINLUNA),
+        check_one(&client, "openspec", OPENSPEC),
+        check_one(&client, "superpowers", SUPERPOWERS),
+        check_one(&client, "gstack", GSTACK),
+        check_one(&client, "ralph-loop", RALPH_LOOP),
+        check_one(&client, "stop-that-shit", STOP_THAT_SHIT),
+        check_one(&client, "agent-guard", AGENT_GUARD),
+        check_one(&client, "grill-me", GRILL_ME),
     );
     vec![
         headroom,
@@ -174,12 +277,23 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         context7,
         ponytail,
         caveman,
+        allinluna,
+        openspec,
+        superpowers,
+        gstack,
+        ralph_loop,
+        stop_that_shit,
+        agent_guard,
+        grill_me,
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{json_version, normalize_version, version_from_release_url};
+    use super::{
+        github_raw_url, json_version, normalize_version, version_from_plugin_manifest,
+        version_from_release_url,
+    };
     use serde_json::json;
 
     #[test]
@@ -202,6 +316,27 @@ mod tests {
         assert_eq!(
             json_version(&json!({ "version": "4.0.4" }), "/version").as_deref(),
             Some("4.0.4")
+        );
+    }
+
+    #[test]
+    fn extracts_plugin_manifest_version() {
+        assert_eq!(
+            version_from_plugin_manifest(&json!({ "version": "v2.0.0-rc.7" })).as_deref(),
+            Some("2.0.0-rc.7")
+        );
+        assert_eq!(version_from_plugin_manifest(&json!({})), None);
+        assert_eq!(
+            version_from_plugin_manifest(&json!({ "version": "latest" })),
+            None
+        );
+    }
+
+    #[test]
+    fn github_raw_urls_follow_the_default_branch() {
+        assert_eq!(
+            github_raw_url("owner/repo", ".claude-plugin/plugin.json"),
+            "https://raw.githubusercontent.com/owner/repo/HEAD/.claude-plugin/plugin.json"
         );
     }
 }
